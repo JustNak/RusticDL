@@ -106,6 +106,8 @@ struct IpcState {
     prompt_queue: VecDeque<BrowserPrompt>,
     /// Prompt id currently shown in the ask dialog (if any).
     active_prompt_id: Option<String>,
+    /// Set by `show_window` IPC; UI polls and activates the main window.
+    show_window_requested: bool,
 }
 
 impl IpcBridge {
@@ -118,10 +120,31 @@ impl IpcBridge {
                 jobs: Vec::new(),
                 prompt_queue: VecDeque::new(),
                 active_prompt_id: None,
+                show_window_requested: false,
             })),
             engine,
             paths,
         }
+    }
+
+    /// Request that the main window be focused/restored (extension "Open app").
+    pub fn request_show_window(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.show_window_requested = true;
+        }
+    }
+
+    /// Consume a pending show-window request. Returns true once per request.
+    pub fn take_show_window_request(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .map(|mut guard| {
+                let requested = guard.show_window_requested;
+                guard.show_window_requested = false;
+                requested
+            })
+            .unwrap_or(false)
     }
 
     pub fn update_settings(&self, settings: &Settings) {
@@ -592,7 +615,18 @@ async fn handle_request(bridge: &IpcBridge, request: HostRequest) -> HostRespons
     }
 
     match request.message_type.as_str() {
-        "ping" | "get_status" | "show_window" => {
+        "ping" | "get_status" => {
+            let Some((_, extension, settings, jobs)) = bridge.snapshot() else {
+                return HostResponse::error(
+                    request.request_id,
+                    "INTERNAL_ERROR",
+                    "Could not read app state.",
+                );
+            };
+            HostResponse::ready(request.request_id, &settings, &extension, &jobs)
+        }
+        "show_window" => {
+            bridge.request_show_window();
             let Some((_, extension, settings, jobs)) = bridge.snapshot() else {
                 return HostResponse::error(
                     request.request_id,

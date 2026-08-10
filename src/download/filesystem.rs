@@ -158,6 +158,56 @@ pub fn temp_path_for(target: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Pick a unique target filename within `directory`, avoiding collisions with
+/// existing jobs and on-disk final/partial files.
+pub fn allocate_unique_download_paths(
+    directory: &Path,
+    preferred_name: &str,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+) -> (String, PathBuf, PathBuf) {
+    let preferred = sanitize_filename(preferred_name);
+    let preferred = if preferred.is_empty() {
+        "download.bin".into()
+    } else {
+        preferred
+    };
+
+    let stem = Path::new(&preferred)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download")
+        .to_string();
+    let extension = Path::new(&preferred)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+
+    for index in 0..10_000 {
+        let name = if index == 0 {
+            preferred.clone()
+        } else {
+            format!("{stem} ({index}){extension}")
+        };
+        let target = directory.join(&name);
+        let temp = temp_path_for(&target);
+        let taken = occupied_targets.iter().any(|path| path == &target)
+            || occupied_temps.iter().any(|path| path == &temp)
+            || target.exists()
+            || temp.exists();
+        if !taken {
+            return (name, target, temp);
+        }
+    }
+
+    // Extremely unlikely; fall back to a uuid-suffixed name.
+    let name = format!("{stem}-{}.part-fallback{extension}", uuid::Uuid::new_v4());
+    let target = directory.join(&name);
+    let temp = temp_path_for(&target);
+    (name, target, temp)
+}
+
 pub fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
     let value = value.trim();
     let range_and_total = value.strip_prefix("bytes ")?;
@@ -194,5 +244,19 @@ mod tests {
     fn parses_content_range_header() {
         let (start, end, total) = parse_content_range("bytes 100-199/1000").unwrap();
         assert_eq!((start, end, total), (100, 199, 1000));
+    }
+
+    #[test]
+    fn allocates_unique_download_paths() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-path-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n1, t1, p1) = allocate_unique_download_paths(&dir, "file.zip", &[], &[]);
+        assert_eq!(n1, "file.zip");
+        let (n2, t2, p2) =
+            allocate_unique_download_paths(&dir, "file.zip", &[t1.clone()], &[p1.clone()]);
+        assert_eq!(n2, "file (1).zip");
+        assert_ne!(t1, t2);
+        assert_ne!(p1, p2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
