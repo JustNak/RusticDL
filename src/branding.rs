@@ -11,6 +11,9 @@
 /// User-facing product name for the main desktop application.
 pub const APP_NAME: &str = "RusticDL";
 
+/// Built-in app version from `Cargo.toml` (shown in About / update checks).
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// User-facing name for the native messaging host (backend bridge process).
 ///
 /// Shown by Windows for the host binary (FileDescription) and in host manifests.
@@ -19,6 +22,15 @@ pub const BACKEND_NAME: &str = "RusticDL Backend";
 
 /// About / subtitle line.
 pub const APP_TAGLINE: &str = "Local-first download manager";
+
+/// GitHub repository owner (update feed + release links).
+pub const GITHUB_OWNER: &str = "JustNak";
+
+/// GitHub repository name (update feed + release links).
+pub const GITHUB_REPO: &str = "RusticDL";
+
+/// NSIS installer asset name published on every GitHub Release.
+pub const SETUP_ASSET_NAME: &str = "RusticDL-windows-x64-setup.exe";
 
 /// Windows named-pipe path used by the native messaging host.
 pub const PIPE_NAME: &str = r"\\.\pipe\rusticdl.v1";

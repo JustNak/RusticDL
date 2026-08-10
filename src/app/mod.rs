@@ -29,14 +29,15 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     slider::{Slider, SliderEvent, SliderState},
-    v_flex, ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, TitleBar, WindowExt,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Sizable, StyledExt, TitleBar,
+    WindowExt,
 };
 
 use crate::appearance::{
     accent_swatch_color, apply_appearance, apply_window_opacity, custom_accent_hsla,
     film_grain_image, noise_enabled, resolve_theme_mode, vignette_edge_alpha, vignette_enabled,
 };
-use crate::branding::APP_NAME;
+use crate::branding::{APP_NAME, APP_VERSION};
 use crate::download::{reveal_in_folder, EngineCommand, EngineEvent, EngineHandle, Job, JobState};
 use crate::format::{
     count_jobs, filter_jobs, format_bytes, format_speed, job_matches_search, sort_jobs,
@@ -49,7 +50,10 @@ use crate::settings::{
     AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, Settings, SortColumn, SortDirection,
     UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
-
+use crate::updater::{
+    check_for_update, download_and_launch_installer, open_release_page, open_url, UpdateCheck,
+    UpdateInfo,
+};
 use detail::render_detail;
 use job_row::render_job_row;
 use layout::{
@@ -102,6 +106,10 @@ pub struct DownloadApp {
     jobs_dirty: bool,
     /// Throttle progress-only state.json writes.
     last_jobs_save: Instant,
+    /// True while a GitHub update check or installer download is running.
+    update_busy: bool,
+    /// When set, the next frame opens the “update available” dialog (needs a Window).
+    pending_update_dialog: Option<UpdateInfo>,
 }
 
 impl DownloadApp {
@@ -291,6 +299,9 @@ impl DownloadApp {
         ipc.update_settings(&settings);
         ipc.update_jobs(&jobs);
 
+        // Quiet startup check against GitHub Releases (toast only if an update exists).
+        spawn_update_check(false, cx);
+
         Self {
             jobs,
             settings,
@@ -328,6 +339,8 @@ impl DownloadApp {
             last_jobs_save: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
+            update_busy: false,
+            pending_update_dialog: None,
         }
     }
 
@@ -916,18 +929,21 @@ impl DownloadApp {
     }
 
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_dialog(cx, |dialog, window, cx| {
+        let app_view = cx.entity().clone();
+        let update_busy = self.update_busy;
+        window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme().clone();
             let muted = theme.muted_foreground;
+            let app_view_check = app_view.clone();
 
             // Match Add download: viewport-center so the card sits mid-window, not top-biased.
-            let est_h = 280.0;
+            let est_h = 320.0;
             let view_h = window.viewport_size().height.to_f64() as f32;
             let max_top = (view_h - est_h - 20.0).max(24.0);
             let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
 
             dialog
-                .title(format!("About {}", crate::branding::APP_NAME))
+                .title(format!("About {APP_NAME}"))
                 .alert()
                 .w(px(420.))
                 .margin_top(px(margin_top))
@@ -941,16 +957,229 @@ impl DownloadApp {
                                 .columns(1)
                                 .bordered(false)
                                 .label_width(px(96.))
-                                .item("Version", env!("CARGO_PKG_VERSION"), 1)
+                                .item("Version", APP_VERSION, 1)
                                 .item("Engine", "Single-stream + Range resume", 1)
-                                .item("License", "MIT", 1),
+                                .item("License", "MIT", 1)
+                                .item("Updates", "GitHub Releases", 1),
                         )
                         .child(div().text_xs().text_color(muted).child(format!(
                             "Data folder: %APPDATA%\\{}\\",
                             crate::branding::APP_DATA_DIR_NAME
-                        ))),
+                        )))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("about-check-update")
+                                        .outline()
+                                        .small()
+                                        .label(if update_busy {
+                                            "Checking…"
+                                        } else {
+                                            "Check for updates"
+                                        })
+                                        .disabled(update_busy)
+                                        .on_click(move |_, _window, cx| {
+                                            app_view_check.update(cx, |app, cx| {
+                                                app.begin_update_check(true, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("about-open-releases")
+                                        .ghost()
+                                        .small()
+                                        .label("Open releases")
+                                        .on_click(|_, _, _| {
+                                            let _ = open_release_page();
+                                        }),
+                                ),
+                        ),
                 )
         });
+    }
+
+    /// Manual or silent GitHub Releases update check.
+    fn begin_update_check(&mut self, interactive: bool, cx: &mut Context<Self>) {
+        if self.update_busy {
+            if interactive {
+                self.show_toast("An update check is already running…", cx);
+            }
+            return;
+        }
+        self.update_busy = true;
+        if interactive {
+            self.show_toast("Checking GitHub for updates…", cx);
+        }
+        cx.notify();
+        spawn_update_check(interactive, cx);
+    }
+
+    fn on_update_check_finished(
+        &mut self,
+        interactive: bool,
+        result: Result<UpdateCheck, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Only interactive checks flip `update_busy`; silent startup checks leave it alone.
+        if interactive {
+            self.update_busy = false;
+        }
+        match result {
+            Ok(UpdateCheck::UpToDate { current, latest }) => {
+                if interactive {
+                    self.show_toast(
+                        format!("You're up to date (v{current}; latest is v{latest})."),
+                        cx,
+                    );
+                }
+            }
+            Ok(UpdateCheck::Available(info)) => {
+                if interactive {
+                    // Dialog needs a Window; open on the next frame via render().
+                    self.pending_update_dialog = Some(info);
+                } else {
+                    self.show_toast(
+                        format!(
+                            "Update available: v{} (you have v{}). Use the RusticDL menu to install.",
+                            info.latest_version, info.current_version
+                        ),
+                        cx,
+                    );
+                }
+            }
+            Err(message) => {
+                if interactive {
+                    self.show_error_toast(message, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_update_available_dialog(
+        &mut self,
+        info: UpdateInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app_view = cx.entity().clone();
+        let download_url = info.setup_download_url.clone();
+        let html_url = info.html_url.clone();
+        let size_label = info
+            .setup_size
+            .map(format_bytes)
+            .unwrap_or_else(|| "—".into());
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
+            let notes = info.notes.clone();
+            let app_view_ok = app_view.clone();
+            let download_url_ok = download_url.clone();
+
+            let est_h = if notes.is_some() { 360.0 } else { 280.0 };
+            let view_h = window.viewport_size().height.to_f64() as f32;
+            let max_top = (view_h - est_h - 20.0).max(24.0);
+            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
+
+            dialog
+                .title("Update available")
+                .confirm()
+                .w(px(460.))
+                .margin_top(px(margin_top))
+                .overlay_closable(true)
+                .keyboard(true)
+                .border_color(theme.border.opacity(0.32))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Download & install")
+                        .cancel_text("Later"),
+                )
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().child(format!(
+                            "{APP_NAME} v{} is ready (you have v{}).",
+                            info.latest_version, info.current_version
+                        )))
+                        .child(
+                            DescriptionList::new()
+                                .columns(1)
+                                .bordered(false)
+                                .label_width(px(100.))
+                                .item("Release", info.release_name.clone(), 1)
+                                .item("Installer", size_label.clone(), 1)
+                                .item("Source", "GitHub Releases", 1),
+                        )
+                        .when_some(notes, |el, body| {
+                            el.child(div().text_xs().text_color(muted).child(body))
+                        })
+                        .child(
+                            Button::new("update-open-release")
+                                .ghost()
+                                .small()
+                                .icon(IconName::ExternalLink)
+                                .label("Open release page")
+                                .on_click({
+                                    let html_url = html_url.clone();
+                                    move |_, _, _| {
+                                        let _ = open_url(&html_url);
+                                    }
+                                }),
+                        ),
+                )
+                .on_ok(move |_, _window, cx| {
+                    app_view_ok.update(cx, |app, cx| {
+                        app.begin_download_update(download_url_ok.clone(), cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    fn begin_download_update(&mut self, download_url: String, cx: &mut Context<Self>) {
+        if self.update_busy {
+            self.show_toast("An update is already in progress…", cx);
+            return;
+        }
+        self.update_busy = true;
+        self.show_toast("Downloading update from GitHub…", cx);
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("Could not start download runtime: {e}"))
+                .and_then(|rt| {
+                    rt.block_on(download_and_launch_installer(&download_url))
+                        .map(|_| ())
+                });
+            let _ = tx.send_blocking(result);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("Update download was cancelled unexpectedly.".into()));
+            let _ = this.update(cx, |app, cx| {
+                app.update_busy = false;
+                match result {
+                    Ok(()) => {
+                        app.show_toast(
+                            "Installer started. Finish setup to update, then relaunch RusticDL.",
+                            cx,
+                        );
+                    }
+                    Err(message) => app.show_error_toast(message, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn confirm_remove(
@@ -1271,6 +1500,39 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
         .any(|job| !next.iter().any(|n| n.id == job.id))
 }
 
+/// Run a GitHub Releases update check on a background thread and deliver the result to the UI.
+fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp>) {
+    let delay = if interactive {
+        Duration::from_millis(0)
+    } else {
+        Duration::from_secs(4)
+    };
+
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Could not start update runtime: {e}"))
+            .and_then(|rt| rt.block_on(check_for_update()));
+        let _ = tx.send_blocking(result);
+    });
+
+    cx.spawn(async move |this, cx| {
+        let result = rx
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err("Update check was cancelled unexpectedly.".into()));
+        let _ = this.update(cx, |app, cx| {
+            app.on_update_check_finished(interactive, result, cx);
+        });
+    })
+    .detach();
+}
+
 /// Capture restore bounds from the platform window (not the maximized full-screen rect).
 fn window_layout_from_window(window: &Window) -> WindowLayout {
     let wb = window.window_bounds();
@@ -1290,6 +1552,9 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
+        if let Some(info) = self.pending_update_dialog.take() {
+            self.open_update_available_dialog(info, window, cx);
+        }
         if self.ipc.take_show_window_request() {
             window.activate_window();
         }
@@ -1419,6 +1684,8 @@ impl DownloadApp {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let show_actions = self.filter != FilterKind::Settings;
+        let update_busy = self.update_busy;
+        let view = cx.entity();
         let filtered_count = self.filtered_count();
         let total_speed = total_download_speed(&self.jobs);
         let context_label = if self.filter == FilterKind::Settings {
@@ -1464,11 +1731,58 @@ impl DownloadApp {
                                 ),
                         )
                         .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(theme.foreground)
-                                .child(APP_NAME),
+                            // Clickable product name → overflow menu (updates).
+                            Button::new("app-brand-menu")
+                                .ghost()
+                                .label(APP_NAME)
+                                .tooltip("App menu")
+                                .dropdown_menu_with_anchor(
+                                    Corner::BottomLeft,
+                                    move |menu, _window, _menu_cx| {
+                                        let view = view.clone();
+                                        menu.min_w(px(200.))
+                                            .item(
+                                                PopupMenuItem::new(if update_busy {
+                                                    "Checking for updates…"
+                                                } else {
+                                                    "Check for updates"
+                                                })
+                                                .icon(Icon::empty().path("icons/rotate-cw.svg"))
+                                                .disabled(update_busy)
+                                                .on_click({
+                                                    let view = view.clone();
+                                                    move |_, _window, cx| {
+                                                        view.update(cx, |app, cx| {
+                                                            app.begin_update_check(true, cx);
+                                                        });
+                                                    }
+                                                }),
+                                            )
+                                            .separator()
+                                            .item(
+                                                PopupMenuItem::new("Open releases on GitHub")
+                                                    .icon(IconName::ExternalLink)
+                                                    .on_click(|_, _, _| {
+                                                        let _ = open_release_page();
+                                                    }),
+                                            )
+                                            .separator()
+                                            .item(
+                                                PopupMenuItem::new(format!(
+                                                    "About {APP_NAME}…  v{APP_VERSION}"
+                                                ))
+                                                .icon(IconName::Info)
+                                                .on_click({
+                                                    let view = view.clone();
+                                                    move |_, window, cx| {
+                                                        view.update(cx, |app, cx| {
+                                                            app.open_about_dialog(window, cx);
+                                                        });
+                                                    }
+                                                }),
+                                            )
+                                    },
+                                ),
                         )
                         .when(!context_label.is_empty(), |el| {
                             el.child(

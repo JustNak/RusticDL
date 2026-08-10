@@ -35,7 +35,7 @@ gpui-component = "0.5.1"
 async-channel = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "sync", "time"] }
 # http3 is unstable: requires RUSTFLAGS=--cfg reqwest_unstable (see .cargo/config.toml)
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "http3"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "http3", "json"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

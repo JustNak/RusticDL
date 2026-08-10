@@ -11,6 +11,7 @@ mod ipc;
 mod persistence;
 mod prompt_window;
 mod settings;
+mod updater;
 mod window_icon;
 
 use app::DownloadApp;
