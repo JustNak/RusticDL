@@ -1078,15 +1078,26 @@ impl DownloadApp {
             let app_view_ok = app_view.clone();
             let download_url_ok = download_url.clone();
 
-            let est_h = if notes.is_some() { 360.0 } else { 280.0 };
+            // Keep the card fully inside the viewport. Dialog content already uses
+            // overflow_y_scrollbar when height is capped — without max_h, long release
+            // notes grow the card past the window and clip through the bottom.
+            let edge = 24.0_f32;
             let view_h = window.viewport_size().height.to_f64() as f32;
-            let max_top = (view_h - est_h - 20.0).max(24.0);
-            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
+            let preferred_h = if notes.is_some() { 360.0 } else { 280.0 };
+            let available = (view_h - edge * 2.0).max(120.0);
+            let margin_top = if preferred_h <= available {
+                edge + (available - preferred_h) * 0.5
+            } else {
+                // Short window: pin near the top so the remaining height can scroll.
+                edge
+            };
+            let dialog_max_h = (view_h - margin_top - edge).max(120.0);
 
             dialog
                 .title("Update available")
                 .confirm()
                 .w(px(460.))
+                .max_h(px(dialog_max_h))
                 .margin_top(px(margin_top))
                 .overlay_closable(true)
                 .keyboard(true)
@@ -1113,7 +1124,13 @@ impl DownloadApp {
                                 .item("Source", "GitHub Releases", 1),
                         )
                         .when_some(notes, |el, body| {
-                            el.child(div().text_xs().text_color(muted).child(body))
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .whitespace_normal()
+                                    .child(body),
+                            )
                         })
                         .child(
                             Button::new("update-open-release")
