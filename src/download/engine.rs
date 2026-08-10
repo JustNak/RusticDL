@@ -185,8 +185,11 @@ async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
 
             {
                 let mut guard = inner.lock().await;
-                let mut occupied_targets: Vec<PathBuf> =
-                    guard.jobs.iter().map(|job| job.target_path.clone()).collect();
+                let mut occupied_targets: Vec<PathBuf> = guard
+                    .jobs
+                    .iter()
+                    .map(|job| job.target_path.clone())
+                    .collect();
                 let mut occupied_temps: Vec<PathBuf> =
                     guard.jobs.iter().map(|job| job.temp_path.clone()).collect();
                 occupied_temps.extend(guard.pending_partial_deletes.values().cloned());
@@ -829,4 +832,3 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
         }
     }
 }
-

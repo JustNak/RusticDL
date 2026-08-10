@@ -9,9 +9,7 @@ use gpui_component::{
     v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
 };
 
-use super::layout::{
-    COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, QueueColumns,
-};
+use super::layout::{QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W};
 use super::widgets::{
     ellipsize_name, metric_cell, name_char_budget, soft_tooltip, status_color, status_dot,
     styled_progress,
@@ -20,7 +18,6 @@ use super::DownloadApp;
 use crate::download::{open_path, reveal_in_folder, EngineCommand, Job, JobState};
 use crate::format::{format_date, format_eta, format_size, format_speed};
 use crate::settings::{ProgressStyle, UiDensity};
-
 
 pub(crate) fn render_job_row(
     job: Job,
@@ -355,4 +352,3 @@ pub(crate) fn render_job_row(
 pub(crate) fn restart_icon() -> Icon {
     Icon::empty().path("icons/rotate-cw.svg")
 }
-

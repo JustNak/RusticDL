@@ -13,10 +13,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, point, prelude::FluentBuilder, px, size,
-    App, AppContext, Bounds, Context, Corner, Corners, ElementId, Entity,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    NavigationDirection, ParentElement, Render, SharedString,
+    canvas, div, point, prelude::FluentBuilder, px, size, App, AppContext, Bounds, Context, Corner,
+    Corners, ElementId, Entity, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, NavigationDirection, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, WindowBounds,
 };
 use gpui_component::{
@@ -38,12 +37,10 @@ use crate::appearance::{
     film_grain_image, noise_enabled, resolve_theme_mode, vignette_edge_alpha, vignette_enabled,
 };
 use crate::branding::APP_NAME;
-use crate::download::{
-    reveal_in_folder, EngineCommand, EngineEvent, EngineHandle, Job, JobState,
-};
+use crate::download::{reveal_in_folder, EngineCommand, EngineEvent, EngineHandle, Job, JobState};
 use crate::format::{
-    count_jobs, filter_jobs, format_bytes, format_speed,
-    job_matches_search, sort_jobs, total_completed_bytes, total_download_speed,
+    count_jobs, filter_jobs, format_bytes, format_speed, job_matches_search, sort_jobs,
+    total_completed_bytes, total_download_speed,
 };
 use crate::ipc::IpcBridge;
 use crate::persistence::{save_jobs, save_settings, AppPaths};
@@ -56,15 +53,14 @@ use crate::settings::{
 use detail::render_detail;
 use job_row::render_job_row;
 use layout::{
-    COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, DETAIL_MAX_H, DETAIL_MIN_CAP,
-    LIST_MIN_H, QueueColumns, STATUS_DOT,
+    QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, DETAIL_MAX_H,
+    DETAIL_MIN_CAP, LIST_MIN_H, STATUS_DOT,
 };
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
 use widgets::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, browse_directory,
     empty_state_badge, field_hint, field_label, nav_item, render_vignette_overlay,
-    shorten_path_display, sortable_header, status_chip,
-    styled_progress,
+    shorten_path_display, sortable_header, status_chip, styled_progress,
 };
 
 /// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
@@ -1270,7 +1266,9 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
             _ => {}
         }
     }
-    previous.iter().any(|job| !next.iter().any(|n| n.id == job.id))
+    previous
+        .iter()
+        .any(|job| !next.iter().any(|n| n.id == job.id))
 }
 
 /// Capture restore bounds from the platform window (not the maximized full-screen rect).
@@ -2817,5 +2815,3 @@ impl DownloadApp {
             )
     }
 }
-
-

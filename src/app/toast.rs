@@ -18,4 +18,3 @@ pub(crate) struct Toast {
     pub message: SharedString,
     pub kind: ToastKind,
 }
-

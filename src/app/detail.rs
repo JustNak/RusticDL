@@ -14,7 +14,6 @@ use super::DownloadApp;
 use crate::download::{open_path, reveal_in_folder, EngineCommand, Job, JobState};
 use crate::format::{format_eta, format_size, format_speed};
 
-
 /// Inline “Label value” pair used in the detail meta row (no card chrome).
 pub(crate) fn detail_pair(
     label: &'static str,
@@ -58,7 +57,11 @@ pub(crate) fn detail_meta_sep(theme: &Theme) -> impl IntoElement {
         .bg(theme.border.opacity(0.85))
 }
 
-pub(crate) fn render_detail(job: &Job, max_h: f32, cx: &mut Context<DownloadApp>) -> impl IntoElement {
+pub(crate) fn render_detail(
+    job: &Job,
+    max_h: f32,
+    cx: &mut Context<DownloadApp>,
+) -> impl IntoElement {
     let theme = cx.theme().clone();
     let tone = job.state.tone();
     let accent = status_color(tone, &theme);
@@ -427,4 +430,3 @@ pub(crate) fn render_detail(job: &Job, max_h: f32, cx: &mut Context<DownloadApp>
                 ),
         )
 }
-

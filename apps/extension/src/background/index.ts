@@ -123,11 +123,13 @@ function releaseCapture(url: string): void {
   captureClaims.delete(url);
 }
 
+/** True when desktop accepted the handoff (queued or already tracked). */
 function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
-  if (isErrorResponse(response)) return false;
-  if (!response.ok) return false;
-  if (response.type !== 'enqueue_result') return true;
-  return response.status === 'queued' || response.status === 'duplicate_existing_job';
+  if (isErrorResponse(response) || !response.ok) return false;
+  // Protocol success type is `accepted`; `dismissed` must not cancel the browser download.
+  if (response.type !== 'accepted') return false;
+  const status = response.payload.status;
+  return status === 'queued' || status === 'duplicate_existing_job';
 }
 
 function filenameLooksCaptured(filename: string | undefined, extensions: string[]): boolean {

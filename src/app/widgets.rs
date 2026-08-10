@@ -4,18 +4,14 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    h_flex,
-    input::InputState,
-    progress::Progress,
-    tag::Tag,
-    tooltip::Tooltip,
-    v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme,
+    h_flex, input::InputState, progress::Progress, tag::Tag, tooltip::Tooltip, v_flex, ActiveTheme,
+    Icon, IconName, Sizable, StyledExt, Theme,
 };
 use std::path::PathBuf;
 
 use super::filter::FilterKind;
 use super::layout::{
-    COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, QueueColumns, STATUS_DOT,
+    QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, STATUS_DOT,
 };
 use super::DownloadApp;
 use crate::settings::{AccentPreset, ProgressStyle, SortColumn, SortDirection};
@@ -678,4 +674,3 @@ pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
     let head: String = name.chars().take(keep).collect();
     SharedString::from(format!("{head}..."))
 }
-
