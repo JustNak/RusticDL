@@ -5,8 +5,9 @@ Produces:
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
-Design: deep-slate rounded tile + teal download arrow + open teal tray
-(no solid white mass). Corners outside the rounded square are transparent.
+Design: full-bleed deep-slate square + teal download arrow + open teal tray.
+No rounded mask and no transparent corners — avoids white corner artifacts
+when hosts flatten alpha or composite poorly. OS/UI may round the square.
 """
 from __future__ import annotations
 
@@ -23,28 +24,20 @@ TEAL = (0x2D, 0xD4, 0xBF, 255)  # characteristic accent
 MASTER = 1024
 
 
-def _rounded_mask(size: int, radius: int) -> Image.Image:
-    mask = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(mask)
-    draw.rounded_rectangle((0, 0, size - 1, size - 1), radius=radius, fill=255)
-    return mask
-
-
 def draw_master(size: int = MASTER) -> Image.Image:
-    """Draw the brand mark at `size`×`size` with transparent corners.
+    """Draw the brand mark at `size`×`size` as a full-bleed square.
 
     Design grid is 128 units; everything scales from that.
+    Corners are solid slate (never white, never transparent).
     """
     s = size
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    # Full-bleed slate — no rounded cutout, no alpha holes at corners
+    img = Image.new("RGBA", (s, s), BG)
     draw = ImageDraw.Draw(img)
 
     def u(v: float) -> float:
         """Map design units (0–128) to pixel coordinates."""
         return v * s / 128.0
-
-    radius = max(1, int(round(u(28))))
-    draw.rounded_rectangle((0, 0, s - 1, s - 1), radius=radius, fill=BG)
 
     cx = u(64)
 
@@ -100,11 +93,7 @@ def draw_master(size: int = MASTER) -> Image.Image:
     teal_layer = Image.new("RGBA", (s, s), TEAL)
     img.paste(teal_layer, (0, 0), mask=tray_mask)
 
-    # Transparent outside rounded square
-    mask = _rounded_mask(s, radius)
-    out = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    out.paste(img, (0, 0), mask=mask)
-    return out
+    return img
 
 
 def _sized(master: Image.Image, s: int) -> Image.Image:

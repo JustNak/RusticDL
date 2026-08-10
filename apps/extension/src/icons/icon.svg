@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="RusticDL">
-  <!-- Deep slate tile -->
-  <rect width="128" height="128" rx="28" fill="#2B3A4A"/>
+  <!-- Full-bleed slate (no rounded cutout → no white corner artifacts) -->
+  <rect width="128" height="128" fill="#2B3A4A"/>
   <!-- Download arrow: rounded shaft + solid head -->
   <rect x="56.5" y="24" width="15" height="46" rx="7.5" fill="#2DD4BF"/>
   <path fill="#2DD4BF" d="M64 86 L34 52 H94 Z"/>
