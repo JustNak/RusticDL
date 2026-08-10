@@ -1,13 +1,22 @@
+mod detail;
+mod filter;
+mod job_row;
+mod layout;
+mod toast;
+mod widgets;
+
+pub use filter::FilterKind;
+
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, hsla, linear_color_stop, linear_gradient, point, prelude::FluentBuilder, px, size,
-    App, AppContext, Bounds, Context, Corner, Corners, ElementId, Entity, FontWeight, Hsla,
+    canvas, div, point, prelude::FluentBuilder, px, size,
+    App, AppContext, Bounds, Context, Corner, Corners, ElementId, Entity,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    NavigationDirection, ParentElement, PathPromptOptions, Render, SharedString,
+    NavigationDirection, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, WindowBounds,
 };
 use gpui_component::{
@@ -20,22 +29,20 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
-    progress::Progress,
     slider::{Slider, SliderEvent, SliderState},
-    tag::Tag,
-    tooltip::Tooltip,
-    v_flex, ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, Theme, TitleBar, WindowExt,
+    v_flex, ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, TitleBar, WindowExt,
 };
 
 use crate::appearance::{
     accent_swatch_color, apply_appearance, apply_window_opacity, custom_accent_hsla,
     film_grain_image, noise_enabled, resolve_theme_mode, vignette_edge_alpha, vignette_enabled,
 };
+use crate::branding::APP_NAME;
 use crate::download::{
-    open_path, reveal_in_folder, EngineCommand, EngineEvent, EngineHandle, Job, JobState,
+    reveal_in_folder, EngineCommand, EngineEvent, EngineHandle, Job, JobState,
 };
 use crate::format::{
-    count_jobs, filter_jobs, format_bytes, format_date, format_eta, format_size, format_speed,
+    count_jobs, filter_jobs, format_bytes, format_speed,
     job_matches_search, sort_jobs, total_completed_bytes, total_download_speed,
 };
 use crate::ipc::IpcBridge;
@@ -46,164 +53,22 @@ use crate::settings::{
     UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
 
-/// In-app toast (bottom-right). gpui-component's Notification layer is fixed top-right.
-const TOAST_AUTO_HIDE: Duration = Duration::from_secs(5);
-const TOAST_MAX_STACK: usize = 5;
+use detail::render_detail;
+use job_row::render_job_row;
+use layout::{
+    COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, DETAIL_MAX_H, DETAIL_MIN_CAP,
+    LIST_MIN_H, QueueColumns, STATUS_DOT,
+};
+use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
+use widgets::{
+    accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, browse_directory,
+    empty_state_badge, field_hint, field_label, nav_item, render_vignette_overlay,
+    shorten_path_display, sortable_header, status_chip,
+    styled_progress,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToastKind {
-    Info,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-struct Toast {
-    id: u64,
-    message: SharedString,
-    kind: ToastKind,
-}
-
-// --- Queue layout tokens (shared by header, rows, and width budgets) ---
-// Keep metric columns tight so Name keeps the bulk of the row width.
-/// Fits short-date forms like `08/10/2026` / locale variants (was 68 for relative-only).
-const COL_DATE_W: f32 = 80.0;
-const COL_SPEED_W: f32 = 76.0;
-const COL_ETA_W: f32 = 56.0;
-const COL_SIZE_W: f32 = 92.0;
-/// Single overflow control — no multi-icon action strip.
-const COL_ACTIONS_W: f32 = 40.0;
-/// Status color dot beside the filename (tooltip shows the full label).
-const STATUS_DOT: f32 = 9.0;
-/// Keep at least this much list height when the detail panel is open.
-const LIST_MIN_H: f32 = 140.0;
-/// Hard cap for the selected-job detail panel (also clamped vs viewport).
-const DETAIL_MAX_H: f32 = 280.0;
-const DETAIL_MIN_CAP: f32 = 180.0;
-
-/// Which fixed metric columns fit in the main content area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct QueueColumns {
-    date: bool,
-    speed: bool,
-    eta: bool,
-}
-
-impl QueueColumns {
-    /// Progressive collapse so Name stays dominant; metrics hide first when tight.
-    fn from_main_width(main_w: f32) -> Self {
-        // With compact metrics + overflow actions, full grid fits sooner.
-        if main_w >= 780.0 {
-            Self {
-                date: true,
-                speed: true,
-                eta: true,
-            }
-        } else if main_w >= 680.0 {
-            Self {
-                date: true,
-                speed: true,
-                eta: false,
-            }
-        } else if main_w >= 600.0 {
-            Self {
-                date: false,
-                speed: true,
-                eta: false,
-            }
-        } else {
-            Self {
-                date: false,
-                speed: false,
-                eta: false,
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterKind {
-    All,
-    Active,
-    Completed,
-    Failed,
-    Settings,
-}
-
-impl FilterKind {
-    fn as_index(self) -> i32 {
-        match self {
-            Self::All => 0,
-            Self::Active => 1,
-            Self::Completed => 2,
-            Self::Failed => 3,
-            Self::Settings => 4,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::All => "All downloads",
-            Self::Active => "Active",
-            Self::Completed => "Completed",
-            Self::Failed => "Failed",
-            Self::Settings => "Settings",
-        }
-    }
-
-    fn subtitle(self, count: usize) -> String {
-        match self {
-            Self::Settings => "Preferences and defaults".into(),
-            Self::All if count == 0 => "Your download queue is empty".into(),
-            Self::All => format!("{count} item{}", if count == 1 { "" } else { "s" }),
-            Self::Active if count == 0 => "Nothing in progress".into(),
-            Self::Active => format!("{count} active"),
-            Self::Completed if count == 0 => "No finished downloads yet".into(),
-            Self::Completed => format!("{count} completed"),
-            Self::Failed if count == 0 => "No failures".into(),
-            Self::Failed => format!("{count} failed or canceled"),
-        }
-    }
-
-    fn empty_title(self) -> &'static str {
-        match self {
-            Self::All => "No downloads yet",
-            Self::Active => "No active downloads",
-            Self::Completed => "No completed downloads",
-            Self::Failed => "No failed downloads",
-            Self::Settings => "Settings",
-        }
-    }
-
-    fn empty_body(self) -> &'static str {
-        match self {
-            Self::All => "Paste an HTTP or HTTPS link to start a transfer.",
-            Self::Active => "Queued and in-progress jobs will show up here.",
-            Self::Completed => "Finished files will appear in this list.",
-            Self::Failed => "Failed or canceled jobs will appear here for retry.",
-            Self::Settings => "",
-        }
-    }
-
-    fn empty_icon(self) -> IconName {
-        match self {
-            Self::All => IconName::Inbox,
-            Self::Active => IconName::LoaderCircle,
-            Self::Completed => IconName::CircleCheck,
-            Self::Failed => IconName::TriangleAlert,
-            Self::Settings => IconName::Settings,
-        }
-    }
-
-    fn nav_icon(self) -> IconName {
-        match self {
-            Self::All => IconName::Inbox,
-            Self::Active => IconName::ArrowDown,
-            Self::Completed => IconName::CircleCheck,
-            Self::Failed => IconName::CircleX,
-            Self::Settings => IconName::Settings,
-        }
-    }
-}
+/// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
+const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 pub struct DownloadApp {
     jobs: Vec<Job>,
@@ -237,6 +102,10 @@ pub struct DownloadApp {
     last_window_layout_save: Instant,
     /// Browser ask-mode prompt currently shown in its dedicated window.
     browser_prompt_open_id: Option<String>,
+    /// Queue snapshot differs from last successful disk write.
+    jobs_dirty: bool,
+    /// Throttle progress-only state.json writes.
+    last_jobs_save: Instant,
 }
 
 impl DownloadApp {
@@ -411,6 +280,7 @@ impl DownloadApp {
                         }
                         // Flush a debounced window-layout write after the user stops resizing.
                         app.flush_window_layout_if_due();
+                        app.flush_jobs_save_if_due();
                         // Dedicated prompt windows open even if the main UI is idle.
                         app.poll_browser_prompt(cx);
                     })
@@ -455,9 +325,13 @@ impl DownloadApp {
             window_layout_dirty: false,
             // Allow an immediate first save after the first real bounds change.
             last_window_layout_save: Instant::now()
-                .checked_sub(Duration::from_secs(1))
+                .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             browser_prompt_open_id: None,
+            jobs_dirty: false,
+            last_jobs_save: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
         }
     }
 
@@ -503,9 +377,15 @@ impl DownloadApp {
     }
 
     fn apply_jobs(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
+        let force_persist = jobs_need_immediate_persist(&self.jobs, &jobs);
         self.jobs = jobs;
         self.last_ui_update = Instant::now();
-        let _ = save_jobs(&self.paths, &self.jobs);
+        self.jobs_dirty = true;
+        if force_persist {
+            self.flush_jobs_save_now();
+        } else {
+            self.flush_jobs_save_if_due();
+        }
         self.ipc.update_jobs(&self.jobs);
         // Keep desktop extension settings in sync if the bridge wrote them.
         if let Some(extension) = self.ipc.extension_settings() {
@@ -519,6 +399,25 @@ impl DownloadApp {
             }
         }
         cx.notify();
+    }
+
+    fn flush_jobs_save_if_due(&mut self) {
+        if !self.jobs_dirty {
+            return;
+        }
+        if self.last_jobs_save.elapsed() < JOBS_SAVE_DEBOUNCE {
+            return;
+        }
+        self.flush_jobs_save_now();
+    }
+
+    fn flush_jobs_save_now(&mut self) {
+        if !self.jobs_dirty {
+            return;
+        }
+        self.jobs_dirty = false;
+        self.last_jobs_save = Instant::now();
+        let _ = save_jobs(&self.paths, &self.jobs);
     }
 
     fn flush_toast(&mut self, cx: &mut Context<Self>) {
@@ -1142,9 +1041,10 @@ impl DownloadApp {
                 .child(div().text_sm().child(body))
                 .on_ok(move |_, _, _| {
                     for id in &ids {
+                        // Keep on-disk files (including leftover .part for failed jobs).
                         engine.send(EngineCommand::Remove {
                             id: id.clone(),
-                            delete_partial: true,
+                            delete_partial: false,
                         });
                     }
                     true
@@ -1349,7 +1249,28 @@ impl Drop for DownloadApp {
         // Ensure the last resize/move before close is written even if the
         // debounced timer never got another tick.
         self.flush_window_layout_now();
+        self.flush_jobs_save_now();
     }
+}
+
+/// Persist immediately on queue membership or terminal-state changes; debounce pure progress.
+fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
+    if previous.len() != next.len() {
+        return true;
+    }
+    use std::collections::HashMap;
+    let prev: HashMap<&str, JobState> = previous
+        .iter()
+        .map(|job| (job.id.as_str(), job.state))
+        .collect();
+    for job in next {
+        match prev.get(job.id.as_str()) {
+            None => return true,
+            Some(state) if *state != job.state => return true,
+            _ => {}
+        }
+    }
+    previous.iter().any(|job| !next.iter().any(|n| n.id == job.id))
 }
 
 /// Capture restore bounds from the platform window (not the maximized full-screen rect).
@@ -1371,6 +1292,9 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
+        if self.ipc.take_show_window_request() {
+            window.activate_window();
+        }
         self.sync_window_chrome(window);
         let theme = cx.theme().clone();
         let noise_on = noise_enabled(self.settings.noise_intensity);
@@ -1546,7 +1470,7 @@ impl DownloadApp {
                                 .text_sm()
                                 .font_semibold()
                                 .text_color(theme.foreground)
-                                .child("RusticDL"),
+                                .child(APP_NAME),
                         )
                         .when(!context_label.is_empty(), |el| {
                             el.child(
@@ -2894,1408 +2818,4 @@ impl DownloadApp {
     }
 }
 
-/// Soft edge vignette using four linear-gradient strips.
-fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl IntoElement {
-    let a = edge_alpha.clamp(0.0, 0.5);
-    let edge = if is_dark {
-        hsla(0.0, 0.0, 0.0, a)
-    } else {
-        hsla(0.0, 0.0, 0.08, a * 0.85)
-    };
-    let clear = hsla(0.0, 0.0, 0.0, 0.0);
-    let band = px(96.);
 
-    div()
-        .absolute()
-        .inset_0()
-        .size_full()
-        // Top
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(band)
-                .bg(linear_gradient(
-                    180.0,
-                    linear_color_stop(edge, 0.0),
-                    linear_color_stop(clear, 1.0),
-                )),
-        )
-        // Bottom
-        .child(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .h(band)
-                .bg(linear_gradient(
-                    0.0,
-                    linear_color_stop(edge, 0.0),
-                    linear_color_stop(clear, 1.0),
-                )),
-        )
-        // Left
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(band)
-                .bg(linear_gradient(
-                    90.0,
-                    linear_color_stop(edge, 0.0),
-                    linear_color_stop(clear, 1.0),
-                )),
-        )
-        // Right
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(band)
-                .bg(linear_gradient(
-                    270.0,
-                    linear_color_stop(edge, 0.0),
-                    linear_color_stop(clear, 1.0),
-                )),
-        )
-}
-
-/// Progress bar variants for queue rows and settings preview.
-/// `value` is 0..100.
-fn styled_progress(value: f32, color: Hsla, style: ProgressStyle) -> impl IntoElement {
-    let value = value.clamp(0.0, 100.0);
-    match style {
-        ProgressStyle::Solid => Progress::new()
-            .value(value)
-            .bg(color)
-            .h(px(6.))
-            .w_full()
-            .rounded_full()
-            .into_any_element(),
-        ProgressStyle::Soft => Progress::new()
-            .value(value)
-            .bg(color.opacity(0.85))
-            .h(px(4.))
-            .w_full()
-            .rounded_full()
-            .into_any_element(),
-        ProgressStyle::Glow => Progress::new()
-            .value(value)
-            .bg(color)
-            .h(px(9.))
-            .w_full()
-            .rounded_full()
-            .into_any_element(),
-        ProgressStyle::Segmented => {
-            const SEGMENTS: u32 = 12;
-            let filled = ((value / 100.0) * SEGMENTS as f32).round() as u32;
-            h_flex()
-                .w_full()
-                .gap_0p5()
-                .h(px(8.))
-                .items_center()
-                .children((0..SEGMENTS).map(move |i| {
-                    let on = i < filled;
-                    div().flex_1().h_full().rounded(px(2.)).bg(if on {
-                        color
-                    } else {
-                        color.opacity(0.16)
-                    })
-                }))
-                .into_any_element()
-        }
-    }
-}
-
-/// Decorative icon badge for empty / search-empty states.
-fn empty_state_badge(
-    icon: IconName,
-    icon_color: Hsla,
-    fill: Hsla,
-    ring: Hsla,
-    reduce_motion: bool,
-) -> impl IntoElement {
-    let outer = if reduce_motion { 56.0 } else { 64.0 };
-    let inner = if reduce_motion { 44.0 } else { 48.0 };
-    div()
-        .w(px(outer))
-        .h(px(outer))
-        .rounded_full()
-        .border_1()
-        .border_color(ring)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .w(px(inner))
-                .h(px(inner))
-                .rounded_full()
-                .bg(fill)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(Icon::new(icon).with_size(px(22.)).text_color(icon_color)),
-        )
-}
-
-/// Compact path for secondary UI hints (e.g. Advanced row preview).
-fn shorten_path_display(path: &str) -> String {
-    let path = path.trim();
-    if path.is_empty() {
-        return "default folder".into();
-    }
-    let buf = PathBuf::from(path);
-    let parts: Vec<_> = buf
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    let sep = std::path::MAIN_SEPARATOR;
-    match parts.as_slice() {
-        [] => path.to_string(),
-        [one] => one.clone(),
-        [.., parent, leaf] => format!("{parent}{sep}{leaf}"),
-    }
-}
-
-/// Open the platform folder picker and write the chosen path into `input`.
-///
-/// Uses GPUI's native path prompt (with a proper parent HWND on Windows) instead
-/// of `rfd`, which often fails silently or opens behind the app window.
-fn browse_directory(
-    input: Entity<InputState>,
-    app_view: Entity<DownloadApp>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let rx = cx.prompt_for_paths(PathPromptOptions {
-        files: false,
-        directories: true,
-        multiple: false,
-        prompt: Some(SharedString::from("Select Folder")),
-    });
-
-    window
-        .spawn(cx, async move |cx| match rx.await {
-            Ok(Ok(Some(paths))) => {
-                if let Some(path) = paths.into_iter().next() {
-                    let _ = cx.update(|window, cx| {
-                        input.update(cx, |state, cx| {
-                            state.set_value(path.to_string_lossy().to_string(), window, cx);
-                        });
-                    });
-                }
-            }
-            Ok(Ok(None)) => {}
-            Ok(Err(err)) => {
-                let _ = app_view.update(cx, |app, cx| {
-                    app.show_error_toast(format!("Could not open folder picker: {err}"), cx);
-                });
-            }
-            Err(_) => {}
-        })
-        .detach();
-}
-
-/// Field title — stronger than hints so forms scan as Label → control → help.
-fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    div()
-        .text_xs()
-        .font_semibold()
-        .text_color(theme.foreground)
-        .child(text)
-}
-
-/// Supporting description under a field. Kept smaller/softer than `field_label`.
-fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    div()
-        .text_xs()
-        .font_normal()
-        .text_color(theme.muted_foreground.opacity(0.78))
-        .child(text.into())
-}
-
-/// Equal-size circular preset swatch (solid fill + selection ring).
-fn accent_preset_swatch(
-    preset: AccentPreset,
-    selected: bool,
-    swatch: Hsla,
-    theme: &Theme,
-    cx: &mut Context<DownloadApp>,
-) -> impl IntoElement {
-    let label = preset.label();
-    let tip: SharedString = if preset == AccentPreset::Default {
-        "Default — stock theme color".into()
-    } else {
-        label.to_string().into()
-    };
-    // Light fills (stock dark primary is often near-white) need a stronger edge
-    // so they don't dissolve into the selection ring or the panel.
-    let light_fill = swatch.l > 0.72;
-    let fill_border = if selected {
-        if light_fill {
-            theme.foreground.opacity(0.35)
-        } else {
-            theme.background.opacity(0.35)
-        }
-    } else if light_fill {
-        theme.border.opacity(0.85)
-    } else {
-        theme.border.opacity(0.45)
-    };
-    div()
-        .id(SharedString::from(format!("accent-{label}")))
-        .size(px(32.))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .border_2()
-        .border_color(if selected {
-            // Darker ring when the fill itself is light so selection stays obvious.
-            if light_fill {
-                theme.muted_foreground.opacity(0.95)
-            } else {
-                theme.foreground.opacity(0.92)
-            }
-        } else {
-            theme.border.opacity(0.0)
-        })
-        .when(!selected, |el| {
-            el.hover(|s| {
-                s.border_color(theme.muted_foreground.opacity(0.55))
-                    .bg(theme.secondary.opacity(0.4))
-            })
-        })
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.set_accent_preset(preset, window, cx);
-        }))
-        .child(
-            div()
-                .size(px(20.))
-                .rounded_full()
-                .bg(swatch)
-                .border_1()
-                .border_color(fill_border),
-        )
-}
-
-/// Custom mixer entry: white disc + paintbrush — clearly not a solid preset.
-fn accent_custom_swatch(
-    selected: bool,
-    _custom_color: Hsla,
-    theme: &Theme,
-    cx: &mut Context<DownloadApp>,
-) -> impl IntoElement {
-    let tip: SharedString = "Custom — mix your own accent".into();
-    // White plate always; brush in dark ink so it stays readable on light/dark UI.
-    let plate = hsla(0.0, 0.0, 0.98, 1.0);
-    let brush = hsla(0.0, 0.0, 0.22, 1.0);
-
-    div()
-        .id("accent-Custom")
-        .size(px(32.))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .border_2()
-        .border_color(if selected {
-            theme.foreground.opacity(0.92)
-        } else {
-            theme.border.opacity(0.0)
-        })
-        .when(!selected, |el| {
-            el.hover(|s| {
-                s.border_color(theme.muted_foreground.opacity(0.55))
-                    .bg(theme.secondary.opacity(0.4))
-            })
-        })
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.set_accent_preset(AccentPreset::Custom, window, cx);
-        }))
-        .child(
-            div()
-                .size(px(20.))
-                .rounded_full()
-                .bg(plate)
-                .border_1()
-                .border_color(theme.border.opacity(0.5))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::empty()
-                        .path("icons/paintbrush.svg")
-                        .with_size(px(12.))
-                        .text_color(brush),
-                ),
-        )
-}
-
-fn accent_hsl_slider_row(
-    label: &'static str,
-    value: String,
-    slider: impl IntoElement,
-    theme: &Theme,
-) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .w_full()
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(theme.foreground)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .font_medium()
-                        .text_color(theme.muted_foreground.opacity(0.85))
-                        .child(value),
-                ),
-        )
-        .child(slider)
-}
-
-fn status_chip(text: String, color: Hsla) -> impl IntoElement {
-    div().text_xs().font_medium().text_color(color).child(text)
-}
-
-/// Clickable queue column header with asc/desc indicator for the active sort.
-/// `center` centers the label (and sort chevron) in fixed-width metric columns.
-fn sortable_header(
-    label: &'static str,
-    column: SortColumn,
-    flex: bool,
-    width: Option<gpui::Pixels>,
-    center: bool,
-    active_column: SortColumn,
-    direction: SortDirection,
-    theme: &gpui_component::Theme,
-    cx: &mut Context<DownloadApp>,
-) -> impl IntoElement {
-    let active = active_column == column;
-    let color = if active {
-        theme.foreground
-    } else {
-        theme.muted_foreground
-    };
-    let tip: SharedString = if active {
-        match direction {
-            SortDirection::Asc => {
-                format!("Sorted by {label} · ascending (click to reverse)").into()
-            }
-            SortDirection::Desc => {
-                format!("Sorted by {label} · descending (click to reverse)").into()
-            }
-        }
-    } else {
-        format!("Sort by {label}").into()
-    };
-
-    h_flex()
-        .id(SharedString::from(format!("sort-header-{label}")))
-        .when(flex, |d| d.flex_1().min_w_0())
-        .when_some(width, |d, w| d.w(w).flex_shrink_0())
-        .gap_0p5()
-        .items_center()
-        .when(center, |d| d.justify_center())
-        .cursor_pointer()
-        .rounded(theme.radius)
-        .hover(|s| s.bg(theme.secondary.opacity(0.45)))
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.set_sort_column(column, cx);
-        }))
-        .child(
-            div()
-                .text_xs()
-                .font_semibold()
-                .text_color(color)
-                .child(label),
-        )
-        .when(active, |el| {
-            el.child(
-                Icon::new(match direction {
-                    SortDirection::Asc => IconName::ChevronUp,
-                    SortDirection::Desc => IconName::ChevronDown,
-                })
-                .with_size(px(12.))
-                .text_color(theme.primary),
-            )
-        })
-}
-
-/// Fixed-width metric cell; content is centered under the column header.
-fn metric_cell(
-    width: f32,
-    text: impl Into<SharedString>,
-    color: Hsla,
-    medium: bool,
-) -> impl IntoElement {
-    h_flex()
-        .w(px(width))
-        .flex_shrink_0()
-        .justify_center()
-        .items_center()
-        .overflow_hidden()
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_xs()
-                .when(medium, |d| d.font_medium())
-                .text_color(color)
-                .child(text.into()),
-        )
-}
-
-fn nav_item(
-    label: &'static str,
-    filter: FilterKind,
-    count: i32,
-    active: bool,
-    cx: &mut Context<DownloadApp>,
-) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    let bg = if active {
-        theme.sidebar_accent
-    } else {
-        theme.transparent
-    };
-    let fg = if active {
-        theme.sidebar_accent_foreground
-    } else {
-        theme.sidebar_foreground
-    };
-    let icon_color = if active {
-        theme.sidebar_primary
-    } else {
-        theme.muted_foreground
-    };
-
-    h_flex()
-        .id(SharedString::from(format!("nav-{label}")))
-        .h(px(36.))
-        .px_2()
-        .gap_2()
-        .items_center()
-        .rounded(theme.radius)
-        .bg(bg)
-        .hover(|s| {
-            s.bg(if active {
-                theme.sidebar_accent
-            } else {
-                theme.secondary.opacity(0.55)
-            })
-        })
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.select_filter(filter, window, cx);
-        }))
-        .child(
-            Icon::new(filter.nav_icon())
-                .with_size(px(15.))
-                .text_color(icon_color),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_sm()
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::NORMAL
-                })
-                .text_color(fg)
-                .child(label),
-        )
-        .when(count >= 0, |el| {
-            let empty = count == 0;
-            el.child(
-                div()
-                    .min_w(px(22.))
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_full()
-                    .bg(if active && !empty {
-                        theme.sidebar_primary
-                    } else if active {
-                        theme.sidebar_primary.opacity(0.12)
-                    } else {
-                        theme.muted.opacity(0.55)
-                    })
-                    .text_xs()
-                    .font_semibold()
-                    .text_center()
-                    .text_color(if active && !empty {
-                        theme.sidebar_primary_foreground
-                    } else if active {
-                        theme.sidebar_primary
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(count.to_string()),
-            )
-        })
-}
-
-fn status_color(tone: i32, theme: &gpui_component::Theme) -> Hsla {
-    match tone {
-        1 => theme.primary,
-        2 => theme.success,
-        3 => theme.warning,
-        4 => theme.danger,
-        _ => theme.muted_foreground,
-    }
-}
-
-fn status_tag(status: &'static str, tone: i32) -> Tag {
-    // Text badge kept for the detail panel only.
-    match tone {
-        1 => Tag::primary().small().child(status),
-        2 => Tag::success().small().child(status),
-        3 => Tag::warning().small().child(status),
-        4 => Tag::danger().small().child(status),
-        _ => Tag::secondary().small().child(status),
-    }
-}
-
-/// Compact circular status indicator. Hover shows the full status label.
-fn status_dot(
-    job_id: &str,
-    status: &'static str,
-    color: Hsla,
-    tip_color: Hsla,
-) -> impl IntoElement {
-    let label: SharedString = status.into();
-    div()
-        .id(SharedString::from(format!("status-dot-{job_id}")))
-        .flex_shrink_0()
-        .w(px(STATUS_DOT))
-        .h(px(STATUS_DOT))
-        .rounded_full()
-        .bg(color)
-        .border_1()
-        .border_color(color.opacity(0.45))
-        .tooltip(move |window, cx| soft_tooltip(label.clone(), tip_color, window, cx))
-}
-
-/// Smaller, muted tooltip used for status dots and full filenames.
-fn soft_tooltip(
-    text: SharedString,
-    tip_color: Hsla,
-    window: &mut Window,
-    cx: &mut App,
-) -> gpui::AnyView {
-    Tooltip::new(text)
-        .text_xs()
-        .font_normal()
-        .text_color(tip_color)
-        .py_0()
-        .px_1p5()
-        .build(window, cx)
-}
-
-/// Approximate how many characters fit in the Name column (text-sm / semibold).
-fn name_char_budget(main_w: f32, cols: QueueColumns) -> usize {
-    // Row chrome always present: padding + status dot + size + actions + gaps.
-    let mut used = 32.0 + STATUS_DOT + COL_SIZE_W + COL_ACTIONS_W + 12.0 * 5.0;
-    if cols.date {
-        used += COL_DATE_W + 12.0;
-    }
-    if cols.speed {
-        used += COL_SPEED_W + 12.0;
-    }
-    if cols.eta {
-        used += COL_ETA_W + 12.0;
-    }
-    let name_px = (main_w - used).max(96.0);
-    // ~8px average advance for semibold text-sm on Windows.
-    ((name_px / 8.0) as usize).clamp(16, 200)
-}
-
-/// Force a visible "..." when the label is longer than the name column can show.
-/// (GPUI's text-overflow ellipsis is unreliable for this flex layout.)
-fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
-    let count = name.chars().count();
-    if count <= max_chars {
-        return SharedString::from(name.to_string());
-    }
-    let keep = max_chars.saturating_sub(3).max(1);
-    let head: String = name.chars().take(keep).collect();
-    SharedString::from(format!("{head}..."))
-}
-
-fn render_job_row(
-    job: Job,
-    selected: bool,
-    index: usize,
-    cols: QueueColumns,
-    main_w: f32,
-    density: UiDensity,
-    progress_style: ProgressStyle,
-    cx: &mut Context<DownloadApp>,
-) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    let view = cx.entity();
-    let id = job.id.clone();
-    let id_for_select = job.id.clone();
-    let id_actions = job.id.clone();
-    let filename_for_remove = job.filename.clone();
-
-    let show_progress = matches!(
-        job.state,
-        JobState::Starting | JobState::Downloading | JobState::Paused
-    );
-    // Action availability is resolved when the row overflow menu opens.
-
-    let speed = if matches!(job.state, JobState::Downloading | JobState::Starting) {
-        format_speed(job.speed)
-    } else {
-        "—".into()
-    };
-    let eta = if job.state == JobState::Downloading {
-        format_eta(job.eta_secs)
-    } else {
-        "—".into()
-    };
-    let size = format_size(&job);
-    let date = format_date(job.created_at);
-    let status = job.state.label();
-    let progress = job.progress as f32;
-    let filename_tip: SharedString = job.filename.clone().into();
-    let filename_label = ellipsize_name(&job.filename, name_char_budget(main_w, cols));
-    let tone = job.state.tone();
-    let accent = status_color(tone, &theme);
-    let progress_color = if job.state == JobState::Paused {
-        theme.warning
-    } else {
-        theme.progress_bar
-    };
-    let row_h = if show_progress {
-        px(density.row_h_progress())
-    } else {
-        px(density.row_h())
-    };
-
-    let row_bg = if selected {
-        theme.list_active
-    } else if index % 2 == 1 {
-        theme.list_even
-    } else {
-        theme.list
-    };
-
-    // Fixed-height table row: never grows with wrapped text or flex stretch.
-    // Horizontal padding matches the header so metric columns share the same grid.
-    h_flex()
-        .id(SharedString::from(format!("job-row-{}", id)))
-        .h(row_h)
-        .max_h(row_h)
-        .flex_shrink_0()
-        .px_4()
-        .gap_3()
-        .items_center()
-        .border_b_1()
-        .border_color(theme.border.opacity(0.7))
-        .bg(row_bg)
-        .hover(|s| {
-            s.bg(if selected {
-                theme.list_active
-            } else {
-                theme.list_hover
-            })
-        })
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if this.selected_id.as_deref() == Some(id_for_select.as_str()) {
-                this.selected_id = None;
-            } else {
-                this.selected_id = Some(id_for_select.clone());
-            }
-            cx.notify();
-        }))
-        // Status as a color dot (tooltip = full label), then the filename.
-        .child(status_dot(&id, status, accent, theme.muted_foreground))
-        .child(
-            // Name takes remaining width; metrics stay fixed and compact.
-            v_flex()
-                .flex_1()
-                .gap_1p5()
-                .min_w_0()
-                .justify_center()
-                .child(h_flex().w_full().min_w_0().items_center().child({
-                    // Explicit "..." when too long; hover shows the full name.
-                    let tip_color = theme.muted_foreground;
-                    div()
-                        .id(SharedString::from(format!("job-name-{id}")))
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(theme.foreground)
-                        .tooltip(move |window, cx| {
-                            soft_tooltip(filename_tip.clone(), tip_color, window, cx)
-                        })
-                        .child(filename_label)
-                }))
-                .when(show_progress, |el| {
-                    el.child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .w_full()
-                            .min_w_0()
-                            .child(div().w_full().flex_1().min_w_0().child(styled_progress(
-                                progress,
-                                progress_color,
-                                progress_style,
-                            )))
-                            .child(
-                                div()
-                                    .w(px(40.))
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{:.0}%", progress)),
-                            ),
-                    )
-                }),
-        )
-        .when(cols.date, |el| {
-            el.child(metric_cell(COL_DATE_W, date, theme.muted_foreground, false))
-        })
-        .when(cols.speed, |el| {
-            el.child(metric_cell(
-                COL_SPEED_W,
-                speed,
-                if matches!(job.state, JobState::Downloading | JobState::Starting) {
-                    theme.foreground
-                } else {
-                    theme.muted_foreground
-                },
-                true,
-            ))
-        })
-        .when(cols.eta, |el| {
-            el.child(metric_cell(COL_ETA_W, eta, theme.muted_foreground, false))
-        })
-        .child(metric_cell(COL_SIZE_W, size, theme.foreground, true))
-        .child(
-            h_flex()
-                .w(px(COL_ACTIONS_W))
-                .flex_shrink_0()
-                .justify_end()
-                .items_center()
-                .child(
-                    Button::new(SharedString::from(format!("row-overflow-{id_actions}")))
-                        .ghost()
-                        .small()
-                        .icon(IconName::EllipsisVertical)
-                        .tooltip("Actions")
-                        .dropdown_menu_with_anchor(Corner::TopRight, {
-                            let view = view.clone();
-                            let id = id_actions.clone();
-                            let filename = filename_for_remove.clone();
-                            move |menu, _window, menu_cx| {
-                                let app = view.read(menu_cx);
-                                let engine = app.engine.clone();
-                                let job = app.jobs.iter().find(|j| j.id == id);
-                                let can_pause = job.is_some_and(|j| {
-                                    matches!(
-                                        j.state,
-                                        JobState::Queued
-                                            | JobState::Starting
-                                            | JobState::Downloading
-                                    )
-                                });
-                                let can_resume = job.is_some_and(|j| j.state == JobState::Paused);
-                                let can_retry = job.is_some_and(|j| {
-                                    matches!(j.state, JobState::Failed | JobState::Canceled)
-                                });
-                                let can_open = job.is_some_and(|j| {
-                                    j.state == JobState::Completed && j.target_path.exists()
-                                });
-                                let can_remove = job.is_some_and(|j| {
-                                    j.state.is_terminal() || j.state == JobState::Paused
-                                });
-
-                                let mut menu = menu.min_w(px(180.));
-
-                                if can_pause {
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Pause").icon(IconName::Minus).on_click(
-                                            {
-                                                let engine = engine.clone();
-                                                let id = id.clone();
-                                                move |_, _, _| {
-                                                    engine.send(EngineCommand::Pause(id.clone()));
-                                                }
-                                            },
-                                        ),
-                                    );
-                                }
-                                if can_resume {
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Resume")
-                                            .icon(IconName::Redo2)
-                                            .on_click({
-                                                let engine = engine.clone();
-                                                let id = id.clone();
-                                                move |_, _, _| {
-                                                    engine.send(EngineCommand::Resume(id.clone()));
-                                                }
-                                            }),
-                                    );
-                                }
-                                if can_retry {
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Retry").icon(IconName::Redo).on_click(
-                                            {
-                                                let engine = engine.clone();
-                                                let id = id.clone();
-                                                move |_, _, _| {
-                                                    engine.send(EngineCommand::Retry(id.clone()));
-                                                }
-                                            },
-                                        ),
-                                    );
-                                }
-                                if can_pause || can_resume || can_retry {
-                                    menu = menu.separator();
-                                }
-
-                                if can_open {
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Open file")
-                                            .icon(IconName::ExternalLink)
-                                            .on_click({
-                                                let view = view.clone();
-                                                let id = id.clone();
-                                                move |_, _window, cx| {
-                                                    let _ = view.update(cx, |app, cx| {
-                                                        if let Some(job) =
-                                                            app.jobs.iter().find(|j| j.id == id)
-                                                        {
-                                                            if let Err(msg) =
-                                                                open_path(&job.target_path)
-                                                            {
-                                                                app.show_toast(msg, cx);
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                            }),
-                                    );
-                                }
-
-                                menu = menu.item(
-                                    PopupMenuItem::new("Show in folder")
-                                        .icon(IconName::FolderOpen)
-                                        .on_click({
-                                            let view = view.clone();
-                                            let id = id.clone();
-                                            move |_, _window, cx| {
-                                                let _ = view.update(cx, |app, cx| {
-                                                    if let Some(job) =
-                                                        app.jobs.iter().find(|j| j.id == id)
-                                                    {
-                                                        let path = if job.target_path.exists() {
-                                                            job.target_path.clone()
-                                                        } else {
-                                                            job.temp_path.clone()
-                                                        };
-                                                        if let Err(msg) = reveal_in_folder(&path) {
-                                                            app.show_toast(msg, cx);
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        }),
-                                );
-
-                                menu.separator().item(
-                                    PopupMenuItem::new(if can_remove {
-                                        "Remove"
-                                    } else {
-                                        "Cancel"
-                                    })
-                                    .icon(if can_remove {
-                                        IconName::Delete
-                                    } else {
-                                        IconName::Close
-                                    })
-                                    .on_click({
-                                        let view = view.clone();
-                                        let engine = engine.clone();
-                                        let id = id.clone();
-                                        let filename = filename.clone();
-                                        move |_, window, cx| {
-                                            if can_remove {
-                                                let _ = view.update(cx, |app, cx| {
-                                                    app.confirm_remove(
-                                                        id.clone(),
-                                                        filename.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                            } else {
-                                                engine.send(EngineCommand::Cancel(id.clone()));
-                                            }
-                                        }
-                                    }),
-                                )
-                            }
-                        }),
-                ),
-        )
-}
-
-/// Circular arrow — reads as “start over”, unlike redo’s curved arrow.
-fn restart_icon() -> Icon {
-    Icon::empty().path("icons/rotate-cw.svg")
-}
-
-/// Inline “Label value” pair used in the detail meta row (no card chrome).
-fn detail_pair(
-    label: &'static str,
-    value: impl Into<SharedString>,
-    theme: &Theme,
-) -> impl IntoElement {
-    let value = value.into();
-    let is_placeholder = value.as_ref() == "—" || value.as_ref().is_empty();
-    let value_color = if is_placeholder {
-        theme.muted_foreground.opacity(0.7)
-    } else {
-        theme.foreground
-    };
-    h_flex()
-        .gap_2()
-        .items_baseline()
-        .flex_shrink_0()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(label),
-        )
-        .child(
-            div()
-                .text_xs()
-                .font_medium()
-                .text_color(value_color)
-                .whitespace_nowrap()
-                .child(value),
-        )
-}
-
-/// Thin vertical rule between meta pairs — same language as the status bar separators.
-fn detail_meta_sep(theme: &Theme) -> impl IntoElement {
-    div()
-        .w(px(1.))
-        .h(px(14.))
-        .flex_shrink_0()
-        .mx_0p5()
-        .bg(theme.border.opacity(0.85))
-}
-
-fn render_detail(job: &Job, max_h: f32, cx: &mut Context<DownloadApp>) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    let tone = job.state.tone();
-    let accent = status_color(tone, &theme);
-    let size = format_size(job);
-    let speed = if matches!(job.state, JobState::Downloading | JobState::Starting) {
-        format_speed(job.speed)
-    } else {
-        "—".into()
-    };
-    let eta = if job.state == JobState::Downloading {
-        format_eta(job.eta_secs)
-    } else {
-        "—".into()
-    };
-    let resume = if job.resume_supported {
-        "Supported"
-    } else {
-        "Unavailable"
-    };
-    let progress = format!("{:.1}%", job.progress);
-    let retries = job.retry_attempts.to_string();
-    let path = job.target_path.to_string_lossy().to_string();
-    let path_tip: SharedString = path.clone().into();
-    let tip_color = theme.muted_foreground;
-    let url = job.url.clone();
-    let error = job.error.clone();
-    let id = job.id.clone();
-    let filename = job.filename.clone();
-    let filename_tip: SharedString = job.filename.clone().into();
-
-    let can_pause = matches!(
-        job.state,
-        JobState::Queued | JobState::Starting | JobState::Downloading
-    );
-    let can_resume = job.state == JobState::Paused;
-    let can_retry = matches!(job.state, JobState::Failed | JobState::Canceled);
-    // Restart wipes partial progress and starts from zero — only useful after a
-    // failed or canceled transfer, not on completed jobs.
-    let can_restart = matches!(job.state, JobState::Failed | JobState::Canceled);
-    let can_open = job.state == JobState::Completed && job.target_path.exists();
-    let can_remove = job.state.is_terminal() || job.state == JobState::Paused;
-    let can_cancel = !job.state.is_terminal() && job.state != JobState::Paused;
-
-    // Height-capped inspector: scrolls internally so the job list keeps space.
-    // Flat surfaces only — hierarchy comes from type and a single top border, not nested cards.
-    v_flex()
-        .id("job-detail")
-        .flex_shrink_0()
-        .max_h(px(max_h))
-        .min_h_0()
-        .border_t_1()
-        .border_color(theme.border)
-        .bg(theme.secondary.opacity(0.28))
-        .child(
-            div()
-                .id("job-detail-scroll")
-                .max_h(px(max_h))
-                .min_h_0()
-                .overflow_y_scroll()
-                .px_5()
-                .pt_3()
-                .pb_3()
-                .child(
-                    v_flex()
-                        .gap_3()
-                        // ── Header ──
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .gap_2p5()
-                                .items_center()
-                                .child(
-                                    Icon::new(match job.state {
-                                        JobState::Completed => IconName::CircleCheck,
-                                        JobState::Failed | JobState::Canceled => {
-                                            IconName::TriangleAlert
-                                        }
-                                        JobState::Paused => IconName::Minus,
-                                        _ => IconName::File,
-                                    })
-                                    .with_size(px(16.))
-                                    .text_color(accent)
-                                    .flex_shrink_0(),
-                                )
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .gap_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .child(
-                                            // Soft character clamp — GPUI text-overflow is unreliable
-                                            // in nested flex, same approach as the queue Name column.
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "detail-name-{}",
-                                                    job.id
-                                                )))
-                                                .min_w_0()
-                                                .text_sm()
-                                                .font_semibold()
-                                                .text_color(theme.foreground)
-                                                .child(ellipsize_name(&job.filename, 72))
-                                                .tooltip(move |window, cx| {
-                                                    soft_tooltip(
-                                                        filename_tip.clone(),
-                                                        tip_color,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_1p5()
-                                                .items_center()
-                                                .min_w_0()
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child(url.clone()),
-                                                )
-                                                .child(
-                                                    Clipboard::new(SharedString::from(format!(
-                                                        "copy-url-{}",
-                                                        job.id
-                                                    )))
-                                                    .value(SharedString::from(url.clone())),
-                                                ),
-                                        ),
-                                )
-                                .child(status_tag(job.state.label(), tone))
-                                .child(
-                                    Button::new("detail-close")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Close)
-                                        .tooltip("Hide details")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.selected_id = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        // ── Meta row: inline label/value pairs ──
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .gap_3()
-                                .items_center()
-                                .flex_wrap()
-                                .child(detail_pair("Size", size, &theme))
-                                .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Speed", speed, &theme))
-                                .child(detail_meta_sep(&theme))
-                                .child(detail_pair("ETA", eta, &theme))
-                                .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Progress", progress, &theme))
-                                .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Resume", resume, &theme))
-                                .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Retries", retries, &theme)),
-                        )
-                        // ── Path ──
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .gap_3()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Path"),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("detail-path-{}", job.id)))
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_xs()
-                                        .text_color(theme.foreground)
-                                        .child(path.clone())
-                                        .tooltip(move |window, cx| {
-                                            soft_tooltip(path_tip.clone(), tip_color, window, cx)
-                                        }),
-                                )
-                                .child(
-                                    Clipboard::new(SharedString::from(format!(
-                                        "detail-copy-path-{}",
-                                        id
-                                    )))
-                                    .value(SharedString::from(path.clone())),
-                                ),
-                        )
-                        .when_some(error, |el, err| {
-                            // Error keeps a light tint — semantic, not decorative card chrome.
-                            el.child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_start()
-                                    .child(
-                                        Icon::new(IconName::TriangleAlert)
-                                            .with_size(px(14.))
-                                            .text_color(theme.danger),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(theme.danger)
-                                            .child(err),
-                                    ),
-                            )
-                        })
-                        // ── Actions ──
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .flex_wrap()
-                                .pt_1()
-                                .when(can_pause, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-pause")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Minus)
-                                            .label("Pause")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Pause(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_resume, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-resume")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Redo2)
-                                            .label("Resume")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Resume(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_retry, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-retry")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Redo)
-                                            .label("Retry")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Retry(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_restart, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-restart")
-                                            .outline()
-                                            .small()
-                                            .icon(restart_icon())
-                                            .label("Restart")
-                                            .tooltip("Discard progress and download from the start")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine
-                                                    .send(EngineCommand::Restart(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_cancel, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-cancel")
-                                            .outline()
-                                            .small()
-                                            .danger()
-                                            .icon(IconName::Close)
-                                            .label("Cancel")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Cancel(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_open, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-open")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::ExternalLink)
-                                            .label("Open")
-                                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                                if let Some(job) =
-                                                    this.jobs.iter().find(|j| j.id == id)
-                                                {
-                                                    if let Err(msg) = open_path(&job.target_path) {
-                                                        this.show_toast(msg, cx);
-                                                    }
-                                                }
-                                            })),
-                                    )
-                                })
-                                .child({
-                                    let id = id.clone();
-                                    Button::new("detail-reveal")
-                                        .outline()
-                                        .small()
-                                        .icon(IconName::FolderOpen)
-                                        .label("Open")
-                                        .tooltip("Open containing folder")
-                                        .on_click(cx.listener(move |this, _, _window, cx| {
-                                            if let Some(job) = this.jobs.iter().find(|j| j.id == id)
-                                            {
-                                                let path = if job.target_path.exists() {
-                                                    job.target_path.clone()
-                                                } else {
-                                                    job.temp_path.clone()
-                                                };
-                                                if let Err(msg) = reveal_in_folder(&path) {
-                                                    this.show_toast(msg, cx);
-                                                }
-                                            }
-                                        }))
-                                })
-                                .when(can_remove, |el| {
-                                    let id = id.clone();
-                                    let filename = filename.clone();
-                                    el.child(
-                                        Button::new("detail-remove")
-                                            .danger()
-                                            .small()
-                                            .icon(IconName::Delete)
-                                            .label("Remove")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.confirm_remove(
-                                                    id.clone(),
-                                                    filename.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                }),
-                        ),
-                ),
-        )
-}

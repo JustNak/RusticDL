@@ -119,6 +119,17 @@ function claimCapture(url: string): boolean {
   return true;
 }
 
+function releaseCapture(url: string): void {
+  captureClaims.delete(url);
+}
+
+function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
+  if (isErrorResponse(response)) return false;
+  if (!response.ok) return false;
+  if (response.type !== 'enqueue_result') return true;
+  return response.status === 'queued' || response.status === 'duplicate_existing_job';
+}
+
 function filenameLooksCaptured(filename: string | undefined, extensions: string[]): boolean {
   if (!filename) return false;
   const base = filename.split(/[\\/]/).pop() ?? filename;
@@ -162,8 +173,8 @@ async function handOffUrl(
     referrer?: string;
     incognito?: boolean;
   } = {},
-) {
-  if (!claimCapture(url)) return;
+): Promise<boolean> {
+  if (!claimCapture(url)) return false;
 
   const source = {
     entryPoint: 'browser_download' as const,
@@ -176,20 +187,25 @@ async function handOffUrl(
   // Automatic capture always uses ask/auto from settings.
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, metadata);
 
-  if (isErrorResponse(response)) {
-    const connection = connectionForErrorCode(response.code);
-    const state = await setHostError(
-      response.code,
-      // Prefer the detailed native-messaging registration message when present.
-      response.message || toUserFacingMessage(response.code, response.message),
-      connection,
-    );
-    await updateBrowserBadge(state);
-    return;
+  if (isErrorResponse(response) || !isSuccessfulHandoff(response)) {
+    // Allow a later retry if the desktop rejected or timed out the handoff.
+    releaseCapture(url);
+    if (isErrorResponse(response)) {
+      const connection = connectionForErrorCode(response.code);
+      const state = await setHostError(
+        response.code,
+        // Prefer the detailed native-messaging registration message when present.
+        response.message || toUserFacingMessage(response.code, response.message),
+        connection,
+      );
+      await updateBrowserBadge(state);
+    }
+    return false;
   }
 
   const state = await setLastResult('connected', response);
   await updateBrowserBadge(state);
+  return true;
 }
 
 async function handoffBrowserDownload(
@@ -198,6 +214,18 @@ async function handoffBrowserDownload(
 ) {
   const url = item.finalUrl || item.url;
   if (!url) return;
+
+  // Hand off first. Only cancel/erase the browser download after RusticDL accepts it
+  // so a down desktop / dismissed ask prompt does not lose the file.
+  const ok = await handOffUrl(url, settings, {
+    suggestedFilename: item.filename?.split(/[\\/]/).pop(),
+    totalBytes: item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined,
+  }, {
+    pageUrl: item.referrer,
+    referrer: item.referrer,
+    incognito: item.incognito,
+  });
+  if (!ok) return;
 
   try {
     await browser.downloads.cancel(item.id);
@@ -209,15 +237,6 @@ async function handoffBrowserDownload(
   } catch {
     // optional cleanup
   }
-
-  await handOffUrl(url, settings, {
-    suggestedFilename: item.filename?.split(/[\\/]/).pop(),
-    totalBytes: item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined,
-  }, {
-    pageUrl: item.referrer,
-    referrer: item.referrer,
-    incognito: item.incognito,
-  });
 }
 
 async function onDownloadCreated(item: CapturedDownloadItem) {
@@ -266,7 +285,8 @@ async function handleFirefoxHeadersReceived(
     if (!candidate) {
       return {};
     }
-    // Cancel in the browser, then hand off (handOffUrl dedupes via claimCapture).
+    // Blocking listeners must decide cancel synchronously-ish; we still only cancel
+    // after claiming, and handOffUrl releases the claim if the desktop rejects.
     void handoffFirefoxCandidate(candidate, settings);
     return { cancel: true };
   } catch {

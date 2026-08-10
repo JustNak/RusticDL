@@ -8,13 +8,13 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::sleep;
 
 use super::filesystem::{
-    derive_filename_from_url, remove_partial, sanitize_filename, temp_path_for,
+    allocate_unique_download_paths, derive_filename_from_url, remove_partial, sanitize_filename,
 };
 use super::handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth};
 use super::http::{
     run_http_download, store_control, ProgressCallback, ProgressHint, ProgressUpdate,
 };
-use super::job::{DownloadError, DownloadOutcome, FailureCategory, Job, JobState, WorkerControl};
+use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
 use super::urls::extract_http_urls;
 
 /// Backoff schedule for auto-retry (indexed by attempt number - 1).
@@ -91,6 +91,11 @@ struct EngineInner {
     active: HashMap<String, ()>,
     /// In-memory browser session headers keyed by job id (never written to disk).
     handoff_auth: HashMap<String, HandoffAuth>,
+    /// When a worker exits with Canceled, re-queue instead of marking Canceled.
+    /// Used by Restart so an in-flight cancel does not stick the job in Canceled.
+    requeue_on_cancel: HashMap<String, ()>,
+    /// Partial paths to delete after a still-running worker exits (Remove).
+    pending_partial_deletes: HashMap<String, PathBuf>,
     config: EngineConfig,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     wake: Arc<Notify>,
@@ -121,6 +126,8 @@ pub fn spawn_engine(
         controls: HashMap::new(),
         active: HashMap::new(),
         handoff_auth: HashMap::new(),
+        requeue_on_cancel: HashMap::new(),
+        pending_partial_deletes: HashMap::new(),
         config: EngineConfig {
             max_concurrent: max_concurrent.max(1),
             auto_retry,
@@ -176,52 +183,67 @@ async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             let mut new_jobs = Vec::new();
             let mut first_outcome: Option<EnqueueOutcome> = None;
 
-            for (i, url) in urls.into_iter().enumerate() {
-                if url::Url::parse(&url).is_err() {
-                    last_error = Some(format!("Invalid URL: {url}"));
-                    continue;
-                }
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    last_error = Some("Only HTTP and HTTPS URLs are supported.".into());
-                    continue;
-                }
-
-                let name = if i == 0 {
-                    filename
-                        .as_ref()
-                        .map(|f| sanitize_filename(f.trim()))
-                        .filter(|f| !f.is_empty())
-                        .or_else(|| derive_filename_from_url(&url))
-                        .unwrap_or_else(|| "download.bin".into())
-                } else {
-                    derive_filename_from_url(&url).unwrap_or_else(|| "download.bin".into())
-                };
-
-                let target = directory.join(&name);
-                let temp = temp_path_for(&target);
-                let job = Job::new(url, name.clone(), target, temp);
-                if i == 0 {
-                    first_outcome = Some(EnqueueOutcome {
-                        job_id: job.id.clone(),
-                        filename: name,
-                        status: EnqueueStatus::Queued,
-                    });
-                }
-                new_jobs.push(job);
-                added += 1;
-            }
-
-            if added == 0 {
-                emit_toast(
-                    inner,
-                    last_error.unwrap_or_else(|| "No valid download URLs found.".into()),
-                )
-                .await;
-                return;
-            }
-
             {
                 let mut guard = inner.lock().await;
+                let mut occupied_targets: Vec<PathBuf> =
+                    guard.jobs.iter().map(|job| job.target_path.clone()).collect();
+                let mut occupied_temps: Vec<PathBuf> =
+                    guard.jobs.iter().map(|job| job.temp_path.clone()).collect();
+                occupied_temps.extend(guard.pending_partial_deletes.values().cloned());
+
+                for (i, url) in urls.into_iter().enumerate() {
+                    if url::Url::parse(&url).is_err() {
+                        last_error = Some(format!("Invalid URL: {url}"));
+                        continue;
+                    }
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        last_error = Some("Only HTTP and HTTPS URLs are supported.".into());
+                        continue;
+                    }
+
+                    let preferred = if i == 0 {
+                        filename
+                            .as_ref()
+                            .map(|f| sanitize_filename(f.trim()))
+                            .filter(|f| !f.is_empty())
+                            .or_else(|| derive_filename_from_url(&url))
+                            .unwrap_or_else(|| "download.bin".into())
+                    } else {
+                        derive_filename_from_url(&url).unwrap_or_else(|| "download.bin".into())
+                    };
+
+                    let (name, target, temp) = allocate_unique_download_paths(
+                        &directory,
+                        &preferred,
+                        &occupied_targets,
+                        &occupied_temps,
+                    );
+                    occupied_targets.push(target.clone());
+                    occupied_temps.push(temp.clone());
+
+                    let job = Job::new(url, name.clone(), target, temp);
+                    if i == 0 {
+                        first_outcome = Some(EnqueueOutcome {
+                            job_id: job.id.clone(),
+                            filename: name,
+                            status: EnqueueStatus::Queued,
+                        });
+                    }
+                    new_jobs.push(job);
+                    added += 1;
+                }
+
+                if added == 0 {
+                    drop(guard);
+                    emit_toast(
+                        inner,
+                        last_error.unwrap_or_else(|| "No valid download URLs found.".into()),
+                    )
+                    .await;
+                    // Leave reply dropped: IPC already validates URLs; UI Add path has no reply.
+                    return;
+                }
+
                 // Reverse so the first pasted URL is the first job in the list (insert 0 order).
                 for job in new_jobs.into_iter().rev() {
                     if let Some(auth) = handoff_auth.as_ref() {
@@ -335,6 +357,10 @@ async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             if let Some(ctrl) = guard.controls.get(&id) {
                 store_control(ctrl, WorkerControl::Canceled);
             }
+            // If a worker is still active, the finalizer must not stick the job in Canceled.
+            if guard.active.contains_key(&id) {
+                guard.requeue_on_cancel.insert(id.clone(), ());
+            }
             if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
                 job.state = JobState::Queued;
                 job.progress = 0.0;
@@ -350,7 +376,7 @@ async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
             guard.wake.notify_one();
         }
         EngineCommand::Remove { id, delete_partial } => {
-            let temp_path = {
+            let (temp_path, worker_still_running) = {
                 let mut guard = inner.lock().await;
                 if let Some(ctrl) = guard.controls.get(&id) {
                     store_control(ctrl, WorkerControl::Canceled);
@@ -360,14 +386,24 @@ async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineCommand) {
                     .iter()
                     .find(|j| j.id == id)
                     .map(|j| j.temp_path.clone());
+                let worker_still_running = guard.active.contains_key(&id);
                 guard.jobs.retain(|j| j.id != id);
-                guard.controls.remove(&id);
-                guard.active.remove(&id);
                 guard.handoff_auth.remove(&id);
+                guard.requeue_on_cancel.remove(&id);
+                // Keep the active slot until the worker exits so concurrency stays accurate
+                // and the worker is not racing a deleted .part path.
+                if !worker_still_running {
+                    guard.controls.remove(&id);
+                    guard.pending_partial_deletes.remove(&id);
+                } else if delete_partial {
+                    if let Some(path) = path.clone() {
+                        guard.pending_partial_deletes.insert(id.clone(), path);
+                    }
+                }
                 emit_jobs_locked(&guard);
-                path
+                (path, worker_still_running)
             };
-            if delete_partial {
+            if delete_partial && !worker_still_running {
                 if let Some(path) = temp_path {
                     remove_partial(&path).await;
                 }
@@ -520,15 +556,17 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             (job, control, speed, max_retry, auth)
         };
 
-        let inner_progress = inner.clone();
-        let progress_id = job_id.clone();
+        // Serialize progress updates so out-of-order ticks cannot regress speed/bytes.
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+        let progress_inner = inner.clone();
+        let progress_job_id = job_id.clone();
+        let progress_pump = tokio::spawn(async move {
+            while let Some(update) = progress_rx.recv().await {
+                apply_progress(&progress_inner, &progress_job_id, update).await;
+            }
+        });
         let on_progress: ProgressCallback = Arc::new(move |update: ProgressUpdate| {
-            let inner = inner_progress.clone();
-            let id = progress_id.clone();
-            // Blocking lock is not available; spawn a quick update task.
-            tokio::spawn(async move {
-                apply_progress(&inner, &id, update).await;
-            });
+            let _ = progress_tx.send(update);
         });
 
         let mut attempt_job = job_snapshot;
@@ -537,18 +575,19 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         let final_result = loop {
             {
                 let mut guard = inner.lock().await;
-                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                    job.state = JobState::Downloading;
-                    job.error = None;
-                    emit_jobs_locked(&guard);
+                let restarting = guard.requeue_on_cancel.contains_key(&job_id);
+                if !restarting {
+                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                        job.state = JobState::Downloading;
+                        job.error = None;
+                        emit_jobs_locked(&guard);
+                    }
                 }
             }
 
             // Reset control to continue for each attempt unless user paused/canceled.
             if control.load(Ordering::Relaxed) == 0 {
                 store_control(&control, WorkerControl::Continue);
-            } else if control.load(Ordering::Relaxed) != 0 {
-                // User already set pause/cancel.
             }
 
             match run_http_download(
@@ -562,6 +601,13 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             {
                 Ok(outcome) => break Ok(outcome),
                 Err(error) => {
+                    // Restart requested mid-flight: stop retrying and exit as canceled.
+                    {
+                        let guard = inner.lock().await;
+                        if guard.requeue_on_cancel.contains_key(&job_id) {
+                            break Ok(DownloadOutcome::Canceled);
+                        }
+                    }
                     let can_retry = error.retryable && retry_attempts < max_retry;
                     if can_retry {
                         retry_attempts += 1;
@@ -598,68 +644,91 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             }
         };
 
-        {
+        // Stop accepting progress before applying the terminal state.
+        drop(on_progress);
+        let _ = progress_pump.await;
+
+        let partial_to_delete = {
             let mut guard = inner.lock().await;
             guard.active.remove(&job_id);
-            match final_result {
-                Ok(DownloadOutcome::Completed) => {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        job.state = JobState::Completed;
-                        job.progress = 100.0;
-                        job.speed = 0;
-                        job.eta_secs = 0;
-                        job.error = None;
+            let requeue = guard.requeue_on_cancel.remove(&job_id).is_some();
+            let partial_to_delete = guard.pending_partial_deletes.remove(&job_id);
+
+            if requeue {
+                // Restart already reset the job to Queued; do not overwrite with Canceled.
+                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                    if !matches!(job.state, JobState::Queued) {
+                        job.state = JobState::Queued;
                     }
-                    guard.handoff_auth.remove(&job_id);
+                    job.speed = 0;
+                    job.eta_secs = 0;
                 }
-                Ok(DownloadOutcome::Paused) => {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        job.state = JobState::Paused;
-                        job.speed = 0;
-                        job.eta_secs = 0;
+            } else {
+                match final_result {
+                    Ok(DownloadOutcome::Completed) => {
+                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                            job.state = JobState::Completed;
+                            job.progress = 100.0;
+                            job.speed = 0;
+                            job.eta_secs = 0;
+                            job.error = None;
+                        }
+                        guard.handoff_auth.remove(&job_id);
                     }
-                }
-                Ok(DownloadOutcome::Canceled) => {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        job.state = JobState::Canceled;
-                        job.speed = 0;
-                        job.eta_secs = 0;
-                    }
-                    guard.handoff_auth.remove(&job_id);
-                }
-                Err(error) => {
-                    let clear_auth = match control.load(Ordering::Relaxed) {
-                        1 => false,
-                        _ => true,
-                    };
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        // If user paused/canceled during retry wait, prefer that.
-                        match control.load(Ordering::Relaxed) {
-                            1 => {
-                                job.state = JobState::Paused;
-                                job.speed = 0;
-                            }
-                            2 => {
-                                job.state = JobState::Canceled;
-                                job.speed = 0;
-                            }
-                            _ => {
-                                job.state = JobState::Failed;
-                                job.error = Some(error.message);
-                                job.failure_category = Some(error.category);
-                                job.speed = 0;
-                                job.eta_secs = 0;
-                            }
+                    Ok(DownloadOutcome::Paused) => {
+                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                            job.state = JobState::Paused;
+                            job.speed = 0;
+                            job.eta_secs = 0;
                         }
                     }
-                    if clear_auth {
+                    Ok(DownloadOutcome::Canceled) => {
+                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                            job.state = JobState::Canceled;
+                            job.speed = 0;
+                            job.eta_secs = 0;
+                        }
                         guard.handoff_auth.remove(&job_id);
+                    }
+                    Err(error) => {
+                        let clear_auth = match control.load(Ordering::Relaxed) {
+                            1 => false,
+                            _ => true,
+                        };
+                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                            // If user paused/canceled during retry wait, prefer that.
+                            match control.load(Ordering::Relaxed) {
+                                1 => {
+                                    job.state = JobState::Paused;
+                                    job.speed = 0;
+                                }
+                                2 => {
+                                    job.state = JobState::Canceled;
+                                    job.speed = 0;
+                                }
+                                _ => {
+                                    job.state = JobState::Failed;
+                                    job.error = Some(error.message);
+                                    job.failure_category = Some(error.category);
+                                    job.speed = 0;
+                                    job.eta_secs = 0;
+                                }
+                            }
+                        }
+                        if clear_auth {
+                            guard.handoff_auth.remove(&job_id);
+                        }
                     }
                 }
             }
             guard.controls.remove(&job_id);
             emit_jobs_locked(&guard);
             guard.wake.notify_one();
+            partial_to_delete
+        };
+
+        if let Some(path) = partial_to_delete {
+            remove_partial(&path).await;
         }
     });
 }
@@ -761,6 +830,3 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
     }
 }
 
-// Silence unused import warning for FailureCategory in some builds
-#[allow(dead_code)]
-fn _unused(_: FailureCategory, _: DownloadError) {}
