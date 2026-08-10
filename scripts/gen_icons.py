@@ -5,9 +5,9 @@ Produces:
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
-Design: full-bleed deep-slate square + teal download arrow + open teal tray.
-No rounded mask and no transparent corners — avoids white corner artifacts
-when hosts flatten alpha or composite poorly. OS/UI may round the square.
+Design: full-bleed square matched to the app's default light appearance
+(gpui-component "Default Light"): primary tile #171717 + light glyph #fafafa.
+No rounded mask / no transparent corners (avoids white corner artifacts).
 """
 from __future__ import annotations
 
@@ -17,9 +17,10 @@ from PIL import Image, ImageChops, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Brand palette
-BG = (0x2B, 0x3A, 0x4A, 255)  # deep slate
-TEAL = (0x2D, 0xD4, 0xBF, 255)  # characteristic accent
+# Match gpui-component default-theme.json → "Default Light"
+# primary.background / primary.foreground (AccentPreset::Default keeps these).
+BG = (0x17, 0x17, 0x17, 255)  # #171717 — stock primary
+GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa — primary foreground
 
 MASTER = 1024
 
@@ -28,10 +29,10 @@ def draw_master(size: int = MASTER) -> Image.Image:
     """Draw the brand mark at `size`×`size` as a full-bleed square.
 
     Design grid is 128 units; everything scales from that.
-    Corners are solid slate (never white, never transparent).
+    Corners are solid primary (never white, never transparent).
     """
     s = size
-    # Full-bleed slate — no rounded cutout, no alpha holes at corners
+    # Full-bleed primary — no rounded cutout, no alpha holes at corners
     img = Image.new("RGBA", (s, s), BG)
     draw = ImageDraw.Draw(img)
 
@@ -48,7 +49,7 @@ def draw_master(size: int = MASTER) -> Image.Image:
     draw.rounded_rectangle(
         (cx - shaft_w / 2, shaft_top, cx + shaft_w / 2, shaft_bot),
         radius=max(1, int(u(7.5))),
-        fill=TEAL,
+        fill=GLYPH,
     )
 
     # ---- Arrow head (solid triangle — reads cleanly at 16px) ----
@@ -61,15 +62,15 @@ def draw_master(size: int = MASTER) -> Image.Image:
             (cx - wing, head_top),
             (cx + wing, head_top),
         ],
-        fill=TEAL,
+        fill=GLYPH,
     )
     # Blend shaft into head
     draw.rectangle(
         (cx - shaft_w / 2, head_top, cx + shaft_w / 2, u(70)),
-        fill=TEAL,
+        fill=GLYPH,
     )
 
-    # ---- Open tray: thick U via outer−inner mask (no white fill) ----
+    # ---- Open tray: thick U via outer−inner mask ----
     stroke = max(2, int(round(u(10))))
     outer_l, outer_r = u(26), u(102)
     outer_t, outer_b = u(92), u(114)
@@ -90,8 +91,8 @@ def draw_master(size: int = MASTER) -> Image.Image:
     imd.rectangle((inner_l, 0, inner_r, outer_t + stroke), fill=255)
 
     tray_mask = ImageChops.subtract(outer_m, inner_m)
-    teal_layer = Image.new("RGBA", (s, s), TEAL)
-    img.paste(teal_layer, (0, 0), mask=tray_mask)
+    glyph_layer = Image.new("RGBA", (s, s), GLYPH)
+    img.paste(glyph_layer, (0, 0), mask=tray_mask)
 
     return img
 
