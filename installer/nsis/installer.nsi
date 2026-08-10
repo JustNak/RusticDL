@@ -212,6 +212,9 @@ Function PageReinstall
     Abort
   ${EndIf}
 
+  ; Silent (/S) and passive (/P) self-updates skip this maintenance UI and
+  ; overwrite in place — leave function is not run when we Abort here.
+  IfSilent Abort
   Call SkipIfPassive
 
   nsDialogs::Create 1018

@@ -3,10 +3,12 @@
 //! Always targets the public latest release of this repository:
 //! `https://github.com/JustNak/RusticDL/releases/latest`
 //!
-//! Flow:
+//! Flow (one click in the app):
 //! 1. Query the GitHub Releases API for the latest tag + assets.
 //! 2. Compare against the built-in app version.
-//! 3. If newer, download `RusticDL-windows-x64-setup.exe` and launch it.
+//! 3. If newer, download `RusticDL-windows-x64-setup.exe` and launch it
+//!    silently (`/S /R`) so the installer needs no further clicks and
+//!    relaunches the app when finished.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -46,6 +48,8 @@ pub struct UpdateInfo {
     pub latest_version: String,
     pub release_name: String,
     pub html_url: String,
+    /// Truncated release body from GitHub (optional UI copy).
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
@@ -142,9 +146,13 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
 
 /// Download the NSIS installer to a temp path and launch it.
 ///
-/// Returns the path to the started installer. The caller may exit or leave the
-/// current process running; NSIS handles replacing in-use files after reboot/relaunch.
-pub async fn download_and_launch_installer(download_url: &str) -> Result<PathBuf, String> {
+/// When `silent_relaunch` is true, the installer is started with `/S /R` (no wizard
+/// clicks; app relaunches after success). The caller should quit so files can be
+/// replaced cleanly.
+pub async fn download_and_launch_installer(
+    download_url: &str,
+    silent_relaunch: bool,
+) -> Result<PathBuf, String> {
     let client = github_client()?;
     let response = client
         .get(download_url)
@@ -182,35 +190,40 @@ pub async fn download_and_launch_installer(download_url: &str) -> Result<PathBuf
         .map_err(|e| format!("Could not finalize installer: {e}"))?;
     drop(file);
 
-    launch_installer(&installer_path)?;
+    launch_installer(&installer_path, silent_relaunch)?;
     Ok(installer_path)
 }
 
 /// Open the latest release page in the default browser.
 pub fn open_release_page() -> Result<(), String> {
-    open::that(latest_release_page()).map_err(|e| format!("Could not open browser: {e}"))
+    open_url(&latest_release_page())
 }
 
-/// Open a specific release HTML URL.
+/// Open a URL (release page or similar) in the default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
     open::that(url).map_err(|e| format!("Could not open browser: {e}"))
 }
 
-fn launch_installer(path: &std::path::Path) -> Result<(), String> {
+fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS so the installer outlives us if the user quits.
+        // DETACHED_PROCESS so the installer outlives us when we quit for the update.
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        std::process::Command::new(path)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        let mut cmd = std::process::Command::new(path);
+        // cargo-packager NSIS: /S = silent, /R = relaunch app after success.
+        if silent_relaunch {
+            cmd.args(["/S", "/R"]);
+        }
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .map_err(|e| format!("Could not start installer: {e}"))?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
+        let _ = silent_relaunch;
         std::process::Command::new(path)
             .spawn()
             .map_err(|e| format!("Could not start installer: {e}"))?;
