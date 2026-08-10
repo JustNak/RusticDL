@@ -10,7 +10,10 @@ param(
 
   [string]$FirefoxExtensionId = 'rusticdl@local',
 
-  [string]$InstallRoot = ""
+  [string]$InstallRoot = "",
+
+  # Quieter output for installer / automated use.
+  [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,14 +137,26 @@ Set-RegistryDefaultValue -SubKey "Software\Google\Chrome\NativeMessagingHosts\$h
 Set-RegistryDefaultValue -SubKey "Software\Microsoft\Edge\NativeMessagingHosts\$hostName" -Value $edgeManifestPath
 Set-RegistryDefaultValue -SubKey "Software\Mozilla\NativeMessagingHosts\$hostName" -Value $firefoxManifestPath
 
+if ($Quiet) {
+  Write-Host "Registered RusticDL Backend: $hostName"
+  Write-Host "  Backend     : $HostBinaryPath"
+  if ($DesktopBinaryPath) {
+    Write-Host "  RusticDL    : $DesktopBinaryPath"
+  }
+  Write-Host "  Chrome JSON : $chromiumManifestPath"
+  Write-Host "  Edge JSON   : $edgeManifestPath"
+  Write-Host "  Firefox JSON: $firefoxManifestPath"
+  return
+}
+
 Write-Host ""
-Write-Host "Registered native host: $hostName"
-Write-Host "  Host binary : $HostBinaryPath"
+Write-Host "Registered RusticDL Backend: $hostName"
+Write-Host "  Backend     : $HostBinaryPath"
 if ($DesktopBinaryPath) {
-  Write-Host "  Desktop app : $DesktopBinaryPath"
-  Write-Host "  (native host auto-launches this if the pipe is down)"
+  Write-Host "  RusticDL    : $DesktopBinaryPath"
+  Write-Host "  (RusticDL Backend auto-launches RusticDL if the pipe is down)"
 } else {
-  Write-Host "  Desktop app : (not found - start rusticdl manually)"
+  Write-Host "  RusticDL    : (not found - start rusticdl.exe manually)"
 }
 Write-Host "  Chrome JSON : $chromiumManifestPath"
 Write-Host "  Edge JSON   : $edgeManifestPath"
@@ -149,9 +164,10 @@ Write-Host "  Firefox JSON: $firefoxManifestPath"
 Write-Host "  Firefox id  : $FirefoxExtensionId"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Start the desktop app: cargo run -p rusticdl"
-Write-Host "  2. Reload the Firefox temporary add-on (dist/firefox/manifest.json)"
-Write-Host "  3. Open the popup and confirm the status is Connected"
+Write-Host "  1. Start RusticDL (rusticdl.exe)"
+Write-Host "  2. Load the browser extension (see README)"
+Write-Host "  3. Open the extension popup and confirm status is Connected"
+Write-Host "  4. For Chromium, re-run this script with -ChromiumExtensionId after loading unpacked"
 Write-Host ""
 Write-Host "Firefox manifest preview:"
 Get-Content -Raw $firefoxManifestPath

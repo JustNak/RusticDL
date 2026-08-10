@@ -2,14 +2,24 @@
 name = "rusticdl-native-host"
 version = "0.1.1"
 edition = "2021"
-description = "Native messaging host bridging browser extensions to RusticDL"
+description = "RusticDL Backend — native messaging host for browser extensions"
 license = "MIT"
 repository = "https://github.com/JustNak/RusticDL"
 authors = ["JustNak"]
 
+[package.metadata.winresource]
+ProductName = "RusticDL"
+FileDescription = "RusticDL Backend"
+CompanyName = "JustNak"
+LegalCopyright = "Copyright (c) JustNak"
+OriginalFilename = "rusticdl-native-host.exe"
+
 [[bin]]
 name = "rusticdl-native-host"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

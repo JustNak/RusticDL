@@ -30,13 +30,13 @@ async function sendMessage<T>(message: PopupRequest): Promise<T> {
 function connectionLabel(connection: PopupStateResponse['connection']): string {
   switch (connection) {
     case 'connected':
-      return 'Connected to desktop app';
+      return 'Connected to RusticDL';
     case 'host_missing':
-      return 'Native host not registered';
+      return 'RusticDL Backend not registered';
     case 'app_missing':
-      return 'Desktop app not installed';
+      return 'RusticDL not installed';
     case 'app_unreachable':
-      return 'Desktop app unreachable — start RusticDL';
+      return 'RusticDL unreachable — start the app';
     case 'error':
       return 'Connection error';
     default:

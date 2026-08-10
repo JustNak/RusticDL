@@ -15,9 +15,19 @@ authors = ["JustNak"]
 keywords = ["download-manager", "http", "gpui", "windows"]
 categories = ["network-programming", "gui"]
 
+[package.metadata.winresource]
+ProductName = "RusticDL"
+FileDescription = "RusticDL"
+CompanyName = "JustNak"
+LegalCopyright = "Copyright (c) JustNak"
+OriginalFilename = "rusticdl.exe"
+
 [[bin]]
 name = "rusticdl"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 gpui = "0.2.2"
@@ -47,6 +57,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Time",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
@@ -55,3 +66,35 @@ windows = { version = "0.61", features = [
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Windows NSIS packaging via cargo-packager (v0.11.x).
+# Build: cargo packager --release --formats nsis
+# Or:    powershell -File scripts/package-windows.ps1
+[package.metadata.packager]
+product-name = "RusticDL"
+identifier = "com.rusticdl.app"
+publisher = "JustNak"
+license-file = "LICENSE"
+homepage = "https://github.com/JustNak/RusticDL"
+icons = ["assets/brand/icon.ico", "assets/brand/icon-*.png"]
+formats = ["nsis"]
+out-dir = "dist-release"
+before-packaging-command = "cargo build --release -p rusticdl -p rusticdl-native-host"
+binaries = [
+  { path = "rusticdl", main = true },
+  { path = "rusticdl-native-host", main = false },
+]
+resources = [
+  "LICENSE",
+  { src = "scripts/register-native-host.ps1", target = "scripts/register-native-host.ps1" },
+  { src = "scripts/unregister-native-host.ps1", target = "scripts/unregister-native-host.ps1" },
+  { src = "apps/native-host/manifests/chromium.template.json", target = "scripts/chromium.template.json" },
+  { src = "apps/native-host/manifests/edge.template.json", target = "scripts/edge.template.json" },
+  { src = "apps/native-host/manifests/firefox.template.json", target = "scripts/firefox.template.json" },
+]
+
+[package.metadata.packager.nsis]
+template = "installer/nsis/installer.nsi"
+installer-icon = "assets/brand/icon.ico"
+compression = "lzma"
+appdata-paths = ["$APPDATA/RusticDL"]

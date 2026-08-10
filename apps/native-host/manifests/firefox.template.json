@@ -1,6 +1,6 @@
 {
   "name": "com.rusticdl.native_host",
-  "description": "RusticDL native messaging host",
+  "description": "RusticDL Backend",
   "path": "__HOST_PATH__",
   "type": "stdio",
   "allowed_extensions": [

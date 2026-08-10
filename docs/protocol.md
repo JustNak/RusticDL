@@ -10,7 +10,7 @@ Browser extension
   → desktop app
 ```
 
-Native host name: `com.rusticdl.native_host`  
+Native host name: `com.rusticdl.native_host` (display name: **RusticDL Backend**)  
 Protocol version: `1`
 
 ## Extension → host

@@ -355,13 +355,13 @@ export function isErrorResponse(response: HostToExtensionResponse): response is 
 export function toUserFacingMessage(code: ErrorCode, fallback?: string): string {
   switch (code) {
     case 'HOST_REGISTRATION_MISSING':
-      return 'Native messaging host is not registered. Run scripts/register-native-host.ps1, then reload the extension.';
+      return 'RusticDL Backend is not registered. Run scripts/register-native-host.ps1, then reload the extension.';
     case 'APP_NOT_INSTALLED':
-      return 'RusticDL desktop app was not found.';
+      return 'RusticDL was not found.';
     case 'APP_UNREACHABLE':
-      return 'Desktop app is not responding. Launch RusticDL and try again.';
+      return 'RusticDL is not responding. Launch RusticDL and try again.';
     case 'HOST_PROTOCOL_MISMATCH':
-      return 'Extension and desktop app protocol versions do not match.';
+      return 'Extension and RusticDL protocol versions do not match.';
     case 'RATE_LIMITED':
       return 'Too many handoff requests. Wait a moment and try again.';
     default:
