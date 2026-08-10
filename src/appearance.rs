@@ -231,7 +231,7 @@ pub fn apply_window_opacity(window: &Window, transparency_pct: u8, backdrop_blur
 
     unsafe {
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        if alpha >= 255 {
+        if alpha == 255 {
             let cleared = (ex as u32) & !WS_EX_LAYERED.0;
             SetWindowLongW(hwnd, GWL_EXSTYLE, cleared as i32);
             window.set_background_appearance(WindowBackgroundAppearance::Opaque);

@@ -128,8 +128,14 @@ function filenameLooksCaptured(filename: string | undefined, extensions: string[
   return extensions.includes(ext);
 }
 
+/** Firefox DownloadItem + optional Chromium fields used when capturing. */
+type CapturedDownloadItem = browser.downloads.DownloadItem & {
+  finalUrl?: string;
+  byExtensionId?: string;
+};
+
 function shouldCaptureDownload(
-  item: browser.Downloads.DownloadItem,
+  item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
 ): boolean {
   if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
@@ -187,7 +193,7 @@ async function handOffUrl(
 }
 
 async function handoffBrowserDownload(
-  item: browser.Downloads.DownloadItem,
+  item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
 ) {
   const url = item.finalUrl || item.url;
@@ -214,7 +220,7 @@ async function handoffBrowserDownload(
   });
 }
 
-async function onDownloadCreated(item: browser.Downloads.DownloadItem) {
+async function onDownloadCreated(item: CapturedDownloadItem) {
   const settings = await getCachedSettings();
   if (!shouldCaptureDownload(item, settings)) return;
   await handoffBrowserDownload(item, settings);

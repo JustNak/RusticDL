@@ -155,8 +155,8 @@ export async function saveExtensionSettings(
 }
 
 export function buildContextMenuPayload(
-  info: browser.Menus.OnClickData,
-  tab?: browser.Tabs.Tab,
+  info: browser.menus.OnClickData,
+  tab?: browser.tabs.Tab,
 ): EnqueueDownloadPayload | null {
   if (!info.linkUrl) return null;
   return {
