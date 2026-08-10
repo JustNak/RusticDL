@@ -1,15 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="RusticDL">
-  <!-- Full-bleed primary — matches Default Light theme primary.background -->
+  <!-- Full-bleed primary (Default Light) -->
   <rect width="128" height="128" fill="#171717"/>
-  <!-- Glyph — primary.foreground -->
-  <rect x="56.5" y="24" width="15" height="46" rx="7.5" fill="#fafafa"/>
-  <path fill="#fafafa" d="M64 86 L34 52 H94 Z"/>
-  <!-- Open tray -->
-  <path
-    fill="none"
-    stroke="#fafafa"
-    stroke-width="10"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    d="M31 94 v8 a12 12 0 0 0 12 12 h42 a12 12 0 0 0 12-12 v-8"/>
+  <!-- Download arrow -->
+  <rect x="57.5" y="12" width="13" height="32" rx="6.5" fill="#fafafa"/>
+  <path fill="#fafafa" d="M64 56 L40 32 H88 Z"/>
+  <!-- Antennae -->
+  <rect x="48.25" y="56" width="3.5" height="12" rx="1.75" fill="#fafafa"/>
+  <rect x="76.25" y="56" width="3.5" height="12" rx="1.75" fill="#fafafa"/>
+  <circle cx="50" cy="55.5" r="3.5" fill="#fafafa"/>
+  <circle cx="78" cy="55.5" r="3.5" fill="#fafafa"/>
+  <!-- Crab carapace -->
+  <ellipse cx="64" cy="88" rx="34" ry="24" fill="#fafafa"/>
+  <!-- Claws -->
+  <circle cx="21" cy="83" r="9" fill="#fafafa"/>
+  <circle cx="107" cy="83" r="9" fill="#fafafa"/>
+  <!-- Eyes -->
+  <circle cx="48" cy="84" r="6" fill="#171717"/>
+  <circle cx="80" cy="84" r="6" fill="#171717"/>
 </svg>

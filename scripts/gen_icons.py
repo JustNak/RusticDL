@@ -5,100 +5,99 @@ Produces:
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
-Design: full-bleed square matched to the app's default light appearance
-(gpui-component "Default Light"): primary tile #171717 + light glyph #fafafa.
-No rounded mask / no transparent corners (avoids white corner artifacts).
+Mark: minimal download arrow over a simple crab head (Rust-adjacent),
+using Default Light primary colors. Full-bleed square (no transparent corners).
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Match gpui-component default-theme.json → "Default Light"
-# primary.background / primary.foreground (AccentPreset::Default keeps these).
-BG = (0x17, 0x17, 0x17, 255)  # #171717 — stock primary
-GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa — primary foreground
+# gpui-component Default Light primary tokens
+BG = (0x17, 0x17, 0x17, 255)  # #171717
+GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa
 
 MASTER = 1024
 
 
 def draw_master(size: int = MASTER) -> Image.Image:
-    """Draw the brand mark at `size`×`size` as a full-bleed square.
+    """Minimal download-on-crab mark on a full-bleed primary tile.
 
-    Design grid is 128 units; everything scales from that.
-    Corners are solid primary (never white, never transparent).
+    Design grid is 128 units. Keep shapes chunky so 16–32px still reads.
     """
     s = size
-    # Full-bleed primary — no rounded cutout, no alpha holes at corners
     img = Image.new("RGBA", (s, s), BG)
     draw = ImageDraw.Draw(img)
 
     def u(v: float) -> float:
-        """Map design units (0–128) to pixel coordinates."""
         return v * s / 128.0
 
+    g = GLYPH
     cx = u(64)
 
-    # ---- Arrow shaft (rounded capsule) ----
-    shaft_w = u(15)
-    shaft_top = u(24)
-    shaft_bot = u(66)
+    # ---- Download arrow (on top) ----
+    shaft_w = u(13)
+    shaft_top = u(12)
+    shaft_bot = u(40)
     draw.rounded_rectangle(
         (cx - shaft_w / 2, shaft_top, cx + shaft_w / 2, shaft_bot),
-        radius=max(1, int(u(7.5))),
-        fill=GLYPH,
+        radius=max(1, int(u(6.5))),
+        fill=g,
     )
-
-    # ---- Arrow head (solid triangle — reads cleanly at 16px) ----
-    tip_y = u(86)
-    head_top = u(52)
-    wing = u(30)
+    tip_y = u(56)
+    head_top = u(32)
+    wing = u(24)
     draw.polygon(
         [
             (cx, tip_y),
             (cx - wing, head_top),
             (cx + wing, head_top),
         ],
-        fill=GLYPH,
+        fill=g,
     )
-    # Blend shaft into head
     draw.rectangle(
-        (cx - shaft_w / 2, head_top, cx + shaft_w / 2, u(70)),
-        fill=GLYPH,
+        (cx - shaft_w / 2, head_top, cx + shaft_w / 2, u(44)),
+        fill=g,
     )
 
-    # ---- Open tray: thick U via outer−inner mask ----
-    stroke = max(2, int(round(u(10))))
-    outer_l, outer_r = u(26), u(102)
-    outer_t, outer_b = u(92), u(114)
-    outer_rx = max(1, int(round(u(12))))
+    # ---- Crab head ----
+    # Carapace
+    draw.ellipse((u(30), u(64), u(98), u(112)), fill=g)
 
-    outer_m = Image.new("L", (s, s), 0)
-    om = ImageDraw.Draw(outer_m)
-    om.rounded_rectangle((outer_l, outer_t, outer_r, outer_b), radius=outer_rx, fill=255)
+    # Symmetric claws: solid side ellipses (no cutouts — cleaner at small sizes)
+    claw = u(18)
+    # Left claw — slightly up and out
+    draw.ellipse((u(12), u(74), u(12) + claw, u(74) + claw), fill=g)
+    # Right claw
+    draw.ellipse((u(116) - claw, u(74), u(116), u(74) + claw), fill=g)
 
-    inner_l = outer_l + stroke
-    inner_r = outer_r - stroke
-    inner_b = outer_b - stroke
-    inner_rx = max(1, int(round(u(6))))
-    inner_m = Image.new("L", (s, s), 0)
-    imd = ImageDraw.Draw(inner_m)
-    imd.rounded_rectangle((inner_l, outer_t, inner_r, inner_b), radius=inner_rx, fill=255)
-    # Open the top fully so it's a U not an O
-    imd.rectangle((inner_l, 0, inner_r, outer_t + stroke), fill=255)
+    # Eyes (BG pupils on carapace)
+    eye_r = u(6)
+    for ex in (u(48), u(80)):
+        ey = u(84)
+        draw.ellipse((ex - eye_r, ey - eye_r, ex + eye_r, ey + eye_r), fill=BG)
 
-    tray_mask = ImageChops.subtract(outer_m, inner_m)
-    glyph_layer = Image.new("RGBA", (s, s), GLYPH)
-    img.paste(glyph_layer, (0, 0), mask=tray_mask)
+    # Short antenna stubs between arrow tip and carapace (characteristic, light)
+    ant_w = max(1, int(round(u(3.5))))
+    for ax in (u(50), u(78)):
+        draw.rounded_rectangle(
+            (ax - ant_w / 2, u(56), ax + ant_w / 2, u(68)),
+            radius=max(1, ant_w // 2),
+            fill=g,
+        )
+        tip_r = u(3.5)
+        draw.ellipse(
+            (ax - tip_r, u(52), ax + tip_r, u(52) + tip_r * 2),
+            fill=g,
+        )
 
     return img
 
 
 def _sized(master: Image.Image, s: int) -> Image.Image:
-    """Prefer supersampled redraw for small sizes; lanczos from master for large."""
     if s <= 48:
         return draw_master(s * 4).resize((s, s), Image.Resampling.LANCZOS)
     return master.resize((s, s), Image.Resampling.LANCZOS)
@@ -112,14 +111,12 @@ def main() -> None:
     master.save(brand / "logo.png")
     master.save(brand / "icon-1024.png")
     print("wrote", brand / "logo.png")
-    print("wrote", brand / "icon-1024.png")
 
     for s in [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512]:
         out = brand / f"icon-{s}.png"
         _sized(master, s).save(out)
         print("wrote", out)
 
-    # Largest-first helps Windows shell pick a sharp default bitmap.
     ico_sizes = [256, 128, 64, 48, 32, 24, 16]
     frames = [_sized(master, s) for s in ico_sizes]
     ico_path = brand / "icon.ico"
