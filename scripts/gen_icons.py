@@ -1,18 +1,22 @@
-"""Generate RusticDL brand icons from a drawn master (no external source).
+"""Generate RusticDL brand icons from an Imagine master (or redraw fallback).
 
 Produces:
   - assets/brand/logo.png, icon-*.png, icon.ico
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
-Mark: minimal download arrow over a simple crab head (Rust-adjacent),
-using Default Light primary colors. Full-bleed square (no transparent corners).
+Pipeline:
+  1. Load a square master image (prefer Imagine output).
+  2. Quantize to Default Light primary palette (#171717 / #fafafa).
+  3. Full-bleed slate corners (no white / no alpha holes).
+  4. Export PNG sizes + multi-size ICO.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,92 +26,61 @@ GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa
 
 MASTER = 1024
 
+# Checked-in processed master (from Imagine). Override: python scripts/gen_icons.py path.jpg
+DEFAULT_SRC = ROOT / "assets" / "brand" / "masters" / "icon-master-1024.png"
 
-def draw_master(size: int = MASTER) -> Image.Image:
-    """Minimal download-on-crab mark on a full-bleed primary tile.
 
-    Design grid is 128 units. Keep shapes chunky so 16–32px still reads.
-    """
-    s = size
-    img = Image.new("RGBA", (s, s), BG)
-    draw = ImageDraw.Draw(img)
+def to_brand_palette(img: Image.Image, *, already_brand: bool = False) -> Image.Image:
+    """Force full-bleed 2-tone brand colors from a generated master."""
+    rgba = img.convert("RGBA")
+    if rgba.size != (MASTER, MASTER):
+        rgba = rgba.resize((MASTER, MASTER), Image.Resampling.LANCZOS)
 
-    def u(v: float) -> float:
-        return v * s / 128.0
+    if already_brand:
+        # Ensure opaque full-bleed; keep existing two-tone (plus AA greys on resize).
+        out = Image.new("RGBA", (MASTER, MASTER), BG)
+        out.paste(rgba, (0, 0))
+        return out
 
-    g = GLYPH
-    cx = u(64)
+    rgb = rgba.convert("RGB")
+    # Luminance threshold: dark → BG, light → GLYPH
+    # JPEG noise sits near (27,27,27) / (245,242,233); mid-gray rare in flat icons.
+    out = Image.new("RGBA", (MASTER, MASTER), BG)
+    px_in = rgb.load()
+    px_out = out.load()
+    for y in range(MASTER):
+        for x in range(MASTER):
+            r, g, b = px_in[x, y]
+            yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            px_out[x, y] = GLYPH if yv > 90 else BG
+    return out
 
-    # ---- Download arrow (on top) ----
-    shaft_w = u(13)
-    shaft_top = u(12)
-    shaft_bot = u(40)
-    draw.rounded_rectangle(
-        (cx - shaft_w / 2, shaft_top, cx + shaft_w / 2, shaft_bot),
-        radius=max(1, int(u(6.5))),
-        fill=g,
-    )
-    tip_y = u(56)
-    head_top = u(32)
-    wing = u(24)
-    draw.polygon(
-        [
-            (cx, tip_y),
-            (cx - wing, head_top),
-            (cx + wing, head_top),
-        ],
-        fill=g,
-    )
-    draw.rectangle(
-        (cx - shaft_w / 2, head_top, cx + shaft_w / 2, u(44)),
-        fill=g,
-    )
 
-    # ---- Crab head ----
-    # Carapace
-    draw.ellipse((u(30), u(64), u(98), u(112)), fill=g)
-
-    # Symmetric claws: solid side ellipses (no cutouts — cleaner at small sizes)
-    claw = u(18)
-    # Left claw — slightly up and out
-    draw.ellipse((u(12), u(74), u(12) + claw, u(74) + claw), fill=g)
-    # Right claw
-    draw.ellipse((u(116) - claw, u(74), u(116), u(74) + claw), fill=g)
-
-    # Eyes (BG pupils on carapace)
-    eye_r = u(6)
-    for ex in (u(48), u(80)):
-        ey = u(84)
-        draw.ellipse((ex - eye_r, ey - eye_r, ex + eye_r, ey + eye_r), fill=BG)
-
-    # Short antenna stubs between arrow tip and carapace (characteristic, light)
-    ant_w = max(1, int(round(u(3.5))))
-    for ax in (u(50), u(78)):
-        draw.rounded_rectangle(
-            (ax - ant_w / 2, u(56), ax + ant_w / 2, u(68)),
-            radius=max(1, ant_w // 2),
-            fill=g,
+def load_master(src: Path | None) -> Image.Image:
+    path = src or DEFAULT_SRC
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Master image not found: {path}\n"
+            "Pass a path: python scripts/gen_icons.py path/to/imagine.jpg"
         )
-        tip_r = u(3.5)
-        draw.ellipse(
-            (ax - tip_r, u(52), ax + tip_r, u(52) + tip_r * 2),
-            fill=g,
-        )
-
-    return img
+    print("source", path)
+    # Already-quantized repo master only needs resize consistency.
+    already = path.resolve() == DEFAULT_SRC.resolve() and path.suffix.lower() == ".png"
+    return to_brand_palette(Image.open(path), already_brand=already)
 
 
 def _sized(master: Image.Image, s: int) -> Image.Image:
-    if s <= 48:
-        return draw_master(s * 4).resize((s, s), Image.Resampling.LANCZOS)
     return master.resize((s, s), Image.Resampling.LANCZOS)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    src = Path(args[0]) if args else None
+
     brand = ROOT / "assets" / "brand"
     brand.mkdir(parents=True, exist_ok=True)
 
-    master = draw_master(MASTER)
+    master = load_master(src)
     master.save(brand / "logo.png")
     master.save(brand / "icon-1024.png")
     print("wrote", brand / "logo.png")
@@ -134,6 +107,12 @@ def main() -> None:
         p = ext / f"icon-{s}.png"
         _sized(master, s).save(p)
         print("wrote", p)
+
+    # Keep a project-local copy of the processed master for reproducibility
+    masters_dir = brand / "masters"
+    masters_dir.mkdir(parents=True, exist_ok=True)
+    master.save(masters_dir / "icon-master-1024.png")
+    print("wrote", masters_dir / "icon-master-1024.png")
 
     master.resize((256, 256), Image.Resampling.LANCZOS).save(ROOT / "assets" / "icon.png")
     print("wrote", ROOT / "assets" / "icon.png")
