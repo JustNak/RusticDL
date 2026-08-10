@@ -68,9 +68,7 @@ impl AssetSource for Assets {
         let full = self.base.join(path);
         match fs::read(&full) {
             Ok(bytes) => Ok(Some(Cow::Owned(bytes))),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::load_embedded(path))
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::load_embedded(path)),
             Err(err) => Err(err.into()),
         }
     }
@@ -86,9 +84,7 @@ impl AssetSource for Assets {
                         .map(SharedString::from)
                 })
                 .collect()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::list_embedded(path))
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::list_embedded(path)),
             Err(err) => Err(err.into()),
         }
     }
