@@ -1,124 +1,95 @@
-"""Generate RusticDL brand icons from a drawn master (no external source).
+"""Generate RusticDL brand icons from an Imagine master (or redraw fallback).
 
 Produces:
   - assets/brand/logo.png, icon-*.png, icon.ico
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
-Design: full-bleed deep-slate square + teal download arrow + open teal tray.
-No rounded mask and no transparent corners — avoids white corner artifacts
-when hosts flatten alpha or composite poorly. OS/UI may round the square.
+Pipeline:
+  1. Load a square master image (prefer Imagine output).
+  2. Quantize to Default Light primary palette (#171717 / #fafafa).
+  3. Full-bleed slate corners (no white / no alpha holes).
+  4. Export PNG sizes + multi-size ICO.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Brand palette
-BG = (0x2B, 0x3A, 0x4A, 255)  # deep slate
-TEAL = (0x2D, 0xD4, 0xBF, 255)  # characteristic accent
+# gpui-component Default Light primary tokens
+BG = (0x17, 0x17, 0x17, 255)  # #171717
+GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa
 
 MASTER = 1024
 
+# Checked-in processed master (from Imagine). Override: python scripts/gen_icons.py path.jpg
+DEFAULT_SRC = ROOT / "assets" / "brand" / "masters" / "icon-master-1024.png"
 
-def draw_master(size: int = MASTER) -> Image.Image:
-    """Draw the brand mark at `size`×`size` as a full-bleed square.
 
-    Design grid is 128 units; everything scales from that.
-    Corners are solid slate (never white, never transparent).
-    """
-    s = size
-    # Full-bleed slate — no rounded cutout, no alpha holes at corners
-    img = Image.new("RGBA", (s, s), BG)
-    draw = ImageDraw.Draw(img)
+def to_brand_palette(img: Image.Image, *, already_brand: bool = False) -> Image.Image:
+    """Force full-bleed 2-tone brand colors from a generated master."""
+    rgba = img.convert("RGBA")
+    if rgba.size != (MASTER, MASTER):
+        rgba = rgba.resize((MASTER, MASTER), Image.Resampling.LANCZOS)
 
-    def u(v: float) -> float:
-        """Map design units (0–128) to pixel coordinates."""
-        return v * s / 128.0
+    if already_brand:
+        # Ensure opaque full-bleed; keep existing two-tone (plus AA greys on resize).
+        out = Image.new("RGBA", (MASTER, MASTER), BG)
+        out.paste(rgba, (0, 0))
+        return out
 
-    cx = u(64)
+    rgb = rgba.convert("RGB")
+    # Luminance threshold: dark → BG, light → GLYPH
+    # JPEG noise sits near (27,27,27) / (245,242,233); mid-gray rare in flat icons.
+    out = Image.new("RGBA", (MASTER, MASTER), BG)
+    px_in = rgb.load()
+    px_out = out.load()
+    for y in range(MASTER):
+        for x in range(MASTER):
+            r, g, b = px_in[x, y]
+            yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            px_out[x, y] = GLYPH if yv > 90 else BG
+    return out
 
-    # ---- Arrow shaft (rounded capsule) ----
-    shaft_w = u(15)
-    shaft_top = u(24)
-    shaft_bot = u(66)
-    draw.rounded_rectangle(
-        (cx - shaft_w / 2, shaft_top, cx + shaft_w / 2, shaft_bot),
-        radius=max(1, int(u(7.5))),
-        fill=TEAL,
-    )
 
-    # ---- Arrow head (solid triangle — reads cleanly at 16px) ----
-    tip_y = u(86)
-    head_top = u(52)
-    wing = u(30)
-    draw.polygon(
-        [
-            (cx, tip_y),
-            (cx - wing, head_top),
-            (cx + wing, head_top),
-        ],
-        fill=TEAL,
-    )
-    # Blend shaft into head
-    draw.rectangle(
-        (cx - shaft_w / 2, head_top, cx + shaft_w / 2, u(70)),
-        fill=TEAL,
-    )
-
-    # ---- Open tray: thick U via outer−inner mask (no white fill) ----
-    stroke = max(2, int(round(u(10))))
-    outer_l, outer_r = u(26), u(102)
-    outer_t, outer_b = u(92), u(114)
-    outer_rx = max(1, int(round(u(12))))
-
-    outer_m = Image.new("L", (s, s), 0)
-    om = ImageDraw.Draw(outer_m)
-    om.rounded_rectangle((outer_l, outer_t, outer_r, outer_b), radius=outer_rx, fill=255)
-
-    inner_l = outer_l + stroke
-    inner_r = outer_r - stroke
-    inner_b = outer_b - stroke
-    inner_rx = max(1, int(round(u(6))))
-    inner_m = Image.new("L", (s, s), 0)
-    imd = ImageDraw.Draw(inner_m)
-    imd.rounded_rectangle((inner_l, outer_t, inner_r, inner_b), radius=inner_rx, fill=255)
-    # Open the top fully so it's a U not an O
-    imd.rectangle((inner_l, 0, inner_r, outer_t + stroke), fill=255)
-
-    tray_mask = ImageChops.subtract(outer_m, inner_m)
-    teal_layer = Image.new("RGBA", (s, s), TEAL)
-    img.paste(teal_layer, (0, 0), mask=tray_mask)
-
-    return img
+def load_master(src: Path | None) -> Image.Image:
+    path = src or DEFAULT_SRC
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Master image not found: {path}\n"
+            "Pass a path: python scripts/gen_icons.py path/to/imagine.jpg"
+        )
+    print("source", path)
+    # Already-quantized repo master only needs resize consistency.
+    already = path.resolve() == DEFAULT_SRC.resolve() and path.suffix.lower() == ".png"
+    return to_brand_palette(Image.open(path), already_brand=already)
 
 
 def _sized(master: Image.Image, s: int) -> Image.Image:
-    """Prefer supersampled redraw for small sizes; lanczos from master for large."""
-    if s <= 48:
-        return draw_master(s * 4).resize((s, s), Image.Resampling.LANCZOS)
     return master.resize((s, s), Image.Resampling.LANCZOS)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    src = Path(args[0]) if args else None
+
     brand = ROOT / "assets" / "brand"
     brand.mkdir(parents=True, exist_ok=True)
 
-    master = draw_master(MASTER)
+    master = load_master(src)
     master.save(brand / "logo.png")
     master.save(brand / "icon-1024.png")
     print("wrote", brand / "logo.png")
-    print("wrote", brand / "icon-1024.png")
 
     for s in [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512]:
         out = brand / f"icon-{s}.png"
         _sized(master, s).save(out)
         print("wrote", out)
 
-    # Largest-first helps Windows shell pick a sharp default bitmap.
     ico_sizes = [256, 128, 64, 48, 32, 24, 16]
     frames = [_sized(master, s) for s in ico_sizes]
     ico_path = brand / "icon.ico"
@@ -136,6 +107,12 @@ def main() -> None:
         p = ext / f"icon-{s}.png"
         _sized(master, s).save(p)
         print("wrote", p)
+
+    # Keep a project-local copy of the processed master for reproducibility
+    masters_dir = brand / "masters"
+    masters_dir.mkdir(parents=True, exist_ok=True)
+    master.save(masters_dir / "icon-master-1024.png")
+    print("wrote", masters_dir / "icon-master-1024.png")
 
     master.resize((256, 256), Image.Resampling.LANCZOS).save(ROOT / "assets" / "icon.png")
     print("wrote", ROOT / "assets" / "icon.png")
