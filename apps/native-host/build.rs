@@ -5,8 +5,7 @@ fn main() {
         return;
     }
 
-    let icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/brand/icon.ico");
+    let icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/brand/icon.ico");
 
     let mut res = winresource::WindowsResource::new();
     res.set("ProductName", "RusticDL");
