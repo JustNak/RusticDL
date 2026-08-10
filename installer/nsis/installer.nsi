@@ -562,10 +562,12 @@ Section Install
 
   ; Register RusticDL Backend (browser native messaging host).
   ; Best-effort: failure must not roll back a successful app install.
+  ; Use nsExec (not ExecWait) so PowerShell runs without a visible console —
+  ; a flashing black cmd window looks sketchy to end users.
   DetailPrint "Registering RusticDL Backend..."
-  ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\scripts\register-native-host.ps1" -HostBinaryPath "$INSTDIR\rusticdl-native-host.exe" -DesktopBinaryPath "$INSTDIR\rusticdl.exe" -Quiet' $0
-  ${If} ${Errors}
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\scripts\register-native-host.ps1" -HostBinaryPath "$INSTDIR\rusticdl-native-host.exe" -DesktopBinaryPath "$INSTDIR\rusticdl.exe" -Quiet'
+  Pop $0
+  ${If} $0 == "error"
     DetailPrint "RusticDL Backend registration failed to launch PowerShell (non-fatal)."
   ${ElseIf} $0 != 0
     DetailPrint "RusticDL Backend registration exited with code $0 (non-fatal)."
@@ -604,10 +606,11 @@ Section Uninstall
   !insertmacro CheckIfAppIsRunning
 
   ; Unregister RusticDL Backend before files are removed.
+  ; nsExec keeps PowerShell hidden (no console flash during uninstall).
   DetailPrint "Unregistering RusticDL Backend..."
-  ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\scripts\unregister-native-host.ps1" -Quiet' $0
-  ${If} ${Errors}
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\scripts\unregister-native-host.ps1" -Quiet'
+  Pop $0
+  ${If} $0 == "error"
     DetailPrint "RusticDL Backend unregistration failed to launch PowerShell (continuing uninstall)."
   ${ElseIf} $0 != 0
     DetailPrint "RusticDL Backend unregistration exited with code $0 (continuing uninstall)."
