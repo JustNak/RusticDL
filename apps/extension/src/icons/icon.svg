@@ -1,10 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="RusticDL">
-  <rect width="128" height="128" rx="28" fill="#3d4f61"/>
-  <!-- Download arrow -->
-  <path fill="#2ed3c6" d="M64 24c3.3 0 6 2.7 6 6v42.2l14.1-14.1c2.3-2.3 6.1-2.3 8.5 0s2.3 6.1 0 8.5L68.2 86.9c-2.3 2.3-6.1 2.3-8.5 0L35.4 66.6c-2.3-2.3-2.3-6.1 0-8.5s6.1-2.3 8.5 0L58 72.2V30c0-3.3 2.7-6 6-6z"/>
-  <!-- Tray -->
-  <path fill="#e8eef4" d="M28 88h72c4.4 0 8 3.6 8 8v4c0 6.6-5.4 12-12 12H32c-6.6 0-12-5.4-12-12v-4c0-4.4 3.6-8 8-8zm8 8c0-2.2 1.8-4 4-4h48c2.2 0 4 1.8 4 4v2H36v-2z"/>
-  <!-- File notch in tray -->
-  <path fill="#3d4f61" d="M56 84h16c3.3 0 6 2.7 6 6v6H50v-6c0-3.3 2.7-6 6-6z"/>
-  <path fill="#e8eef4" d="M60 90h8v6h-8z"/>
+  <!-- Deep slate tile -->
+  <rect width="128" height="128" rx="28" fill="#2B3A4A"/>
+  <!-- Download arrow: rounded shaft + solid head -->
+  <rect x="56.5" y="24" width="15" height="46" rx="7.5" fill="#2DD4BF"/>
+  <path fill="#2DD4BF" d="M64 86 L34 52 H94 Z"/>
+  <!-- Open tray — teal U only (no solid white fill) -->
+  <path
+    fill="none"
+    stroke="#2DD4BF"
+    stroke-width="10"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    d="M31 94 v8 a12 12 0 0 0 12 12 h42 a12 12 0 0 0 12-12 v-8"/>
 </svg>
