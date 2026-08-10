@@ -51,8 +51,8 @@ use crate::settings::{
     UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
 use crate::updater::{
-    check_for_update, download_and_launch_installer, open_release_page, open_url, UpdateCheck,
-    UpdateInfo,
+    check_for_update, download_installer, launch_installer, open_release_page, open_url,
+    UpdateCheck, UpdateInfo,
 };
 use detail::render_detail;
 use job_row::render_job_row;
@@ -108,8 +108,8 @@ pub struct DownloadApp {
     last_jobs_save: Instant,
     /// True while a GitHub update check or installer download is running.
     update_busy: bool,
-    /// When set, the next frame opens the “update available” dialog (needs a Window).
-    pending_update_dialog: Option<UpdateInfo>,
+    /// Cached latest release when an update is available (enables one-click install).
+    available_update: Option<UpdateInfo>,
 }
 
 impl DownloadApp {
@@ -340,7 +340,7 @@ impl DownloadApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             update_busy: false,
-            pending_update_dialog: None,
+            available_update: None,
         }
     }
 
@@ -931,6 +931,7 @@ impl DownloadApp {
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app_view = cx.entity().clone();
         let update_busy = self.update_busy;
+        let update_action_label = self.update_action_label();
         window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme().clone();
             let muted = theme.muted_foreground;
@@ -974,14 +975,14 @@ impl DownloadApp {
                                         .outline()
                                         .small()
                                         .label(if update_busy {
-                                            "Checking…"
+                                            "Updating…".to_string()
                                         } else {
-                                            "Check for updates"
+                                            update_action_label.clone()
                                         })
                                         .disabled(update_busy)
                                         .on_click(move |_, _window, cx| {
                                             app_view_check.update(cx, |app, cx| {
-                                                app.begin_update_check(true, cx);
+                                                app.begin_one_click_update(cx);
                                             });
                                         }),
                                 )
@@ -997,6 +998,28 @@ impl DownloadApp {
                         ),
                 )
         });
+    }
+
+    /// Label for the single update action (check or install cached release).
+    fn update_action_label(&self) -> String {
+        if let Some(info) = &self.available_update {
+            format!("Install update v{}", info.latest_version)
+        } else {
+            "Check for updates".into()
+        }
+    }
+
+    /// One click: install a known update, or check GitHub and install if newer.
+    fn begin_one_click_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_busy {
+            self.show_toast("An update is already in progress…", cx);
+            return;
+        }
+        if let Some(info) = self.available_update.clone() {
+            self.begin_download_update(info.setup_download_url, cx);
+            return;
+        }
+        self.begin_update_check(true, cx);
     }
 
     /// Manual or silent GitHub Releases update check.
@@ -1021,13 +1044,11 @@ impl DownloadApp {
         result: Result<UpdateCheck, String>,
         cx: &mut Context<Self>,
     ) {
-        // Only interactive checks flip `update_busy`; silent startup checks leave it alone.
-        if interactive {
-            self.update_busy = false;
-        }
         match result {
             Ok(UpdateCheck::UpToDate { current, latest }) => {
+                self.available_update = None;
                 if interactive {
+                    self.update_busy = false;
                     self.show_toast(
                         format!("You're up to date (v{current}; latest is v{latest})."),
                         cx,
@@ -1035,14 +1056,31 @@ impl DownloadApp {
                 }
             }
             Ok(UpdateCheck::Available(info)) => {
+                self.available_update = Some(info.clone());
                 if interactive {
-                    // Dialog needs a Window; open on the next frame via render().
-                    self.pending_update_dialog = Some(info);
-                } else {
+                    // One click: go straight to silent download + install (no second prompt).
+                    let size_hint = info
+                        .setup_size
+                        .map(|n| format!(" ({})", format_bytes(n)))
+                        .unwrap_or_default();
                     self.show_toast(
                         format!(
-                            "Update available: v{} (you have v{}). Use the RusticDL menu to install.",
-                            info.latest_version, info.current_version
+                            "{} — downloading and installing{size_hint}…",
+                            info.release_name
+                        ),
+                        cx,
+                    );
+                    // Keep `update_busy` true across check → download.
+                    self.begin_download_update_inner(info.setup_download_url, cx);
+                } else {
+                    let size_hint = info
+                        .setup_size
+                        .map(|n| format!(" · {}", format_bytes(n)))
+                        .unwrap_or_default();
+                    self.show_toast(
+                        format!(
+                            "Update available: v{} (you have v{}){size_hint}. Click “Install update” in the {} menu once.",
+                            info.latest_version, info.current_version, APP_NAME
                         ),
                         cx,
                     );
@@ -1050,92 +1088,12 @@ impl DownloadApp {
             }
             Err(message) => {
                 if interactive {
+                    self.update_busy = false;
                     self.show_error_toast(message, cx);
                 }
             }
         }
         cx.notify();
-    }
-
-    fn open_update_available_dialog(
-        &mut self,
-        info: UpdateInfo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let app_view = cx.entity().clone();
-        let download_url = info.setup_download_url.clone();
-        let html_url = info.html_url.clone();
-        let size_label = info
-            .setup_size
-            .map(format_bytes)
-            .unwrap_or_else(|| "—".into());
-
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let theme = cx.theme().clone();
-            let muted = theme.muted_foreground;
-            let notes = info.notes.clone();
-            let app_view_ok = app_view.clone();
-            let download_url_ok = download_url.clone();
-
-            let est_h = if notes.is_some() { 360.0 } else { 280.0 };
-            let view_h = window.viewport_size().height.to_f64() as f32;
-            let max_top = (view_h - est_h - 20.0).max(24.0);
-            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
-
-            dialog
-                .title("Update available")
-                .confirm()
-                .w(px(460.))
-                .margin_top(px(margin_top))
-                .overlay_closable(true)
-                .keyboard(true)
-                .border_color(theme.border.opacity(0.32))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Download & install")
-                        .cancel_text("Later"),
-                )
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(div().text_sm().child(format!(
-                            "{APP_NAME} v{} is ready (you have v{}).",
-                            info.latest_version, info.current_version
-                        )))
-                        .child(
-                            DescriptionList::new()
-                                .columns(1)
-                                .bordered(false)
-                                .label_width(px(100.))
-                                .item("Release", info.release_name.clone(), 1)
-                                .item("Installer", size_label.clone(), 1)
-                                .item("Source", "GitHub Releases", 1),
-                        )
-                        .when_some(notes, |el, body| {
-                            el.child(div().text_xs().text_color(muted).child(body))
-                        })
-                        .child(
-                            Button::new("update-open-release")
-                                .ghost()
-                                .small()
-                                .icon(IconName::ExternalLink)
-                                .label("Open release page")
-                                .on_click({
-                                    let html_url = html_url.clone();
-                                    move |_, _, _| {
-                                        let _ = open_url(&html_url);
-                                    }
-                                }),
-                        ),
-                )
-                .on_ok(move |_, _window, cx| {
-                    app_view_ok.update(cx, |app, cx| {
-                        app.begin_download_update(download_url_ok.clone(), cx);
-                    });
-                    true
-                })
-        });
     }
 
     fn begin_download_update(&mut self, download_url: String, cx: &mut Context<Self>) {
@@ -1144,6 +1102,13 @@ impl DownloadApp {
             return;
         }
         self.update_busy = true;
+        self.begin_download_update_inner(download_url, cx);
+    }
+
+    /// Download the setup binary, persist state, launch silently (`/S /R`), then quit.
+    ///
+    /// Launch happens only after flush so the installer's silent kill cannot race a dirty save.
+    fn begin_download_update_inner(&mut self, download_url: String, cx: &mut Context<Self>) {
         self.show_toast("Downloading update from GitHub…", cx);
         cx.notify();
 
@@ -1153,10 +1118,7 @@ impl DownloadApp {
                 .enable_all()
                 .build()
                 .map_err(|e| format!("Could not start download runtime: {e}"))
-                .and_then(|rt| {
-                    rt.block_on(download_and_launch_installer(&download_url))
-                        .map(|_| ())
-                });
+                .and_then(|rt| rt.block_on(download_installer(&download_url)));
             let _ = tx.send_blocking(result);
         });
 
@@ -1166,17 +1128,27 @@ impl DownloadApp {
                 .await
                 .unwrap_or_else(|_| Err("Update download was cancelled unexpectedly.".into()));
             let _ = this.update(cx, |app, cx| {
-                app.update_busy = false;
                 match result {
-                    Ok(()) => {
-                        app.show_toast(
-                            "Installer started. Finish setup to update, then relaunch RusticDL.",
-                            cx,
-                        );
+                    Ok(installer_path) => {
+                        // Persist before spawn: silent NSIS may KillProcess before Drop runs.
+                        app.flush_jobs_save_now();
+                        app.flush_window_layout_now();
+                        if let Err(message) = launch_installer(&installer_path, true) {
+                            app.update_busy = false;
+                            app.show_error_toast(message, cx);
+                            cx.notify();
+                            return;
+                        }
+                        app.show_toast("Installing update — RusticDL will restart…", cx);
+                        cx.notify();
+                        cx.quit();
                     }
-                    Err(message) => app.show_error_toast(message, cx),
+                    Err(message) => {
+                        app.update_busy = false;
+                        app.show_error_toast(message, cx);
+                        cx.notify();
+                    }
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -1552,9 +1524,6 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
-        if let Some(info) = self.pending_update_dialog.take() {
-            self.open_update_available_dialog(info, window, cx);
-        }
         if self.ipc.take_show_window_request() {
             window.activate_window();
         }
@@ -1685,6 +1654,11 @@ impl DownloadApp {
         let theme = cx.theme().clone();
         let show_actions = self.filter != FilterKind::Settings;
         let update_busy = self.update_busy;
+        let update_action_label = self.update_action_label();
+        let release_page_url = self
+            .available_update
+            .as_ref()
+            .map(|info| info.html_url.clone());
         let view = cx.entity();
         let filtered_count = self.filtered_count();
         let total_speed = total_download_speed(&self.jobs);
@@ -1743,9 +1717,9 @@ impl DownloadApp {
                                         menu.min_w(px(200.))
                                             .item(
                                                 PopupMenuItem::new(if update_busy {
-                                                    "Checking for updates…"
+                                                    "Updating…".to_string()
                                                 } else {
-                                                    "Check for updates"
+                                                    update_action_label.clone()
                                                 })
                                                 .icon(Icon::empty().path("icons/rotate-cw.svg"))
                                                 .disabled(update_busy)
@@ -1753,7 +1727,7 @@ impl DownloadApp {
                                                     let view = view.clone();
                                                     move |_, _window, cx| {
                                                         view.update(cx, |app, cx| {
-                                                            app.begin_update_check(true, cx);
+                                                            app.begin_one_click_update(cx);
                                                         });
                                                     }
                                                 }),
@@ -1762,8 +1736,16 @@ impl DownloadApp {
                                             .item(
                                                 PopupMenuItem::new("Open releases on GitHub")
                                                     .icon(IconName::ExternalLink)
-                                                    .on_click(|_, _, _| {
-                                                        let _ = open_release_page();
+                                                    .on_click({
+                                                        let release_page_url =
+                                                            release_page_url.clone();
+                                                        move |_, _, _| {
+                                                            if let Some(url) = &release_page_url {
+                                                                let _ = open_url(url);
+                                                            } else {
+                                                                let _ = open_release_page();
+                                                            }
+                                                        }
                                                     }),
                                             )
                                             .separator()
