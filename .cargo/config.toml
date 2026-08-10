@@ -1,0 +1,4 @@
+# reqwest's HTTP/3 feature is unstable and requires this cfg.
+# See: https://docs.rs/reqwest/#unstable-features
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]

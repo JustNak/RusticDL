@@ -1,0 +1,19 @@
+{
+  "name": "@rusticdl/extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@rusticdl/protocol": "file:../../packages/protocol",
+    "webextension-polyfill": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "^120.0.4",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

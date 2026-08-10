@@ -1,0 +1,9 @@
+{
+  "name": "com.rusticdl.native_host",
+  "description": "RusticDL native messaging host",
+  "path": "__HOST_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EDGE_EXTENSION_ID__/"
+  ]
+}

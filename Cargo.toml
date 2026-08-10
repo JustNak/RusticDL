@@ -1,0 +1,57 @@
+[workspace]
+members = [".", "apps/native-host"]
+resolver = "2"
+
+[package]
+name = "rusticdl"
+version = "0.1.0"
+edition = "2021"
+description = "RusticDL — a simple local-first HTTP download manager"
+license = "MIT"
+repository = "https://github.com/JustNak/RusticDL"
+homepage = "https://github.com/JustNak/RusticDL"
+readme = "README.md"
+authors = ["JustNak"]
+keywords = ["download-manager", "http", "gpui", "windows"]
+categories = ["network-programming", "gui"]
+
+[[bin]]
+name = "rusticdl"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+async-channel = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "sync", "time"] }
+# http3 is unstable: requires RUSTFLAGS=--cfg reqwest_unstable (see .cargo/config.toml)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "http3"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+open = "5"
+percent-encoding = "2"
+# Film-grain texture generation (RenderImage frames).
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Time",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

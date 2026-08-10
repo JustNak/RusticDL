@@ -1,0 +1,17 @@
+[package]
+name = "rusticdl-native-host"
+version = "0.1.0"
+edition = "2021"
+description = "Native messaging host bridging browser extensions to RusticDL"
+license = "MIT"
+repository = "https://github.com/JustNak/RusticDL"
+authors = ["JustNak"]
+
+[[bin]]
+name = "rusticdl-native-host"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"

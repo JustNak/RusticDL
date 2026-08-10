@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RusticDL — Options</title>
+    <script src="./appearance-preload.js"></script>
+    <link rel="stylesheet" href="./theme.css" />
+    <style>
+      body { margin: 0; background: var(--color-background); color: var(--color-foreground); }
+      main { max-width: 720px; margin: 0 auto; padding: 28px 20px 48px; display: flex; flex-direction: column; gap: 16px; }
+      h1 { margin: 0; font-size: 22px; }
+      h2 { margin: 0; font-size: 15px; font-weight: 650; }
+      p { margin: 0; color: var(--color-muted-foreground); }
+      section { border: 1px solid var(--color-border); border-radius: 12px; padding: 16px; background: var(--color-card); display: flex; flex-direction: column; gap: 10px; }
+      label { font-weight: 600; font-size: 13px; }
+      textarea, input[type="text"] { width: 100%; min-height: 96px; border-radius: 8px; border: 1px solid var(--color-border); background: var(--color-background); color: var(--color-foreground); padding: 10px; font: inherit; box-sizing: border-box; }
+      input[type="text"] { min-height: auto; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .button { border: 0; border-radius: 8px; padding: 10px 14px; font-weight: 600; cursor: pointer; background: var(--color-primary); color: var(--color-primary-foreground); }
+      .button.secondary { background: var(--color-muted); color: var(--color-foreground); border: 1px solid var(--color-border); }
+      .hint { font-size: 12px; color: var(--color-muted-foreground); }
+      #status { min-height: 1.2em; font-size: 13px; }
+      .theme-options { display: flex; gap: 8px; flex-wrap: wrap; }
+      .theme-options label {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-weight: 500; padding: 8px 12px; border-radius: 8px;
+        border: 1px solid var(--color-border); background: var(--color-background); cursor: pointer;
+      }
+      .theme-options input { margin: 0; }
+      .swatches { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .swatch {
+        width: 28px; height: 28px; border-radius: 999px; border: 2px solid transparent;
+        cursor: pointer; padding: 0; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12);
+      }
+      .swatch[aria-pressed="true"] {
+        border-color: var(--color-foreground);
+        box-shadow: 0 0 0 2px var(--color-background), 0 0 0 4px var(--color-primary);
+      }
+      .custom-accent { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .custom-accent input[type="color"] {
+        width: 40px; height: 32px; padding: 0; border: 1px solid var(--color-border);
+        border-radius: 8px; background: transparent; cursor: pointer;
+      }
+      .custom-accent input[type="text"] { width: 110px; font-family: ui-monospace, Consolas, monospace; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>
+        <h1>RusticDL</h1>
+        <p>Browser capture rules and extension appearance. Capture settings sync to the desktop app when connected; theme and accent stay local to this extension.</p>
+      </div>
+
+      <section>
+        <h2>Appearance</h2>
+        <p class="hint">Looks apply only to this extension’s popup and options pages. They do not follow the desktop app.</p>
+
+        <label>Theme</label>
+        <div class="theme-options" role="radiogroup" aria-label="Theme">
+          <label><input type="radio" name="theme" value="system" /> System</label>
+          <label><input type="radio" name="theme" value="light" /> Light</label>
+          <label><input type="radio" name="theme" value="dark" /> Dark</label>
+        </div>
+
+        <label>Accent color</label>
+        <div id="accent-swatches" class="swatches" role="listbox" aria-label="Accent presets"></div>
+        <div class="custom-accent">
+          <input id="accent-color" type="color" value="#3b82f6" aria-label="Custom accent color" />
+          <input id="accent-hex" type="text" maxlength="7" spellcheck="false" placeholder="#3b82f6" aria-label="Accent hex" />
+        </div>
+      </section>
+
+      <section>
+        <h2>Capture</h2>
+        <label class="row"><input id="enabled" type="checkbox" /> Enable browser capture</label>
+        <label class="row"><input id="context-menu" type="checkbox" /> Context menu on links</label>
+        <label class="row"><input id="badge" type="checkbox" /> Show toolbar badge</label>
+        <label class="row"><input id="silent" type="checkbox" /> Silent (auto) handoff</label>
+      </section>
+
+      <section>
+        <label for="excluded-hosts">Excluded hosts (one per line)</label>
+        <textarea id="excluded-hosts" spellcheck="false"></textarea>
+        <div class="hint">Downloads from these hosts stay in the browser.</div>
+      </section>
+
+      <section>
+        <label for="captured-extensions">Captured file extensions (comma or space separated)</label>
+        <input id="captured-extensions" type="text" />
+        <div class="hint">Used as a strong signal for automatic capture.</div>
+      </section>
+
+      <div class="row">
+        <button id="save" class="button" type="button">Save settings</button>
+        <button id="reset-appearance" class="button secondary" type="button">Reset appearance</button>
+        <div id="status"></div>
+      </div>
+    </main>
+    <script type="module" src="./options.js"></script>
+  </body>
+</html>

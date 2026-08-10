@@ -1,0 +1,496 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use crate::extension_settings::ExtensionIntegrationSettings;
+
+/// Default first-run window size (logical px). Matches the designed layout:
+/// sidebar + full metric columns + detail panel with comfortable breathing room.
+pub const DEFAULT_WINDOW_WIDTH: f32 = 1120.0;
+pub const DEFAULT_WINDOW_HEIGHT: f32 = 720.0;
+/// Matches `window_min_size` in `main.rs` (progressive column-collapse floor).
+pub const MIN_WINDOW_WIDTH: f32 = 960.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 600.0;
+const MAX_WINDOW_DIM: f32 = 10_000.0;
+
+/// Persisted main-window geometry (logical pixels).
+///
+/// - Fresh install: centered `DEFAULT_WINDOW_*` size, not maximized.
+/// - After the user resizes/moves: restored on next launch (including maximized).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowLayout {
+    pub width: f32,
+    pub height: f32,
+    /// Top-left origin in screen coordinates; `None` means center on primary display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f32>,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl Default for WindowLayout {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+            x: None,
+            y: None,
+            maximized: false,
+        }
+    }
+}
+
+impl WindowLayout {
+    pub fn sanitize(&mut self) {
+        if !self.width.is_finite() {
+            self.width = DEFAULT_WINDOW_WIDTH;
+        }
+        if !self.height.is_finite() {
+            self.height = DEFAULT_WINDOW_HEIGHT;
+        }
+        self.width = self.width.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_DIM);
+        self.height = self.height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_DIM);
+        if let Some(x) = self.x {
+            if !x.is_finite() {
+                self.x = None;
+            }
+        }
+        if let Some(y) = self.y {
+            if !y.is_finite() {
+                self.y = None;
+            }
+        }
+        // Position is all-or-nothing so restore never anchors only one axis.
+        if self.x.is_none() || self.y.is_none() {
+            self.x = None;
+            self.y = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppTheme {
+    #[default]
+    Light,
+    Dark,
+    System,
+}
+
+/// Preset accent colors for the Appearance section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentPreset {
+    /// Keep the built-in theme primary (no tint override).
+    #[default]
+    Default,
+    Blue,
+    Cyan,
+    Emerald,
+    Amber,
+    Rose,
+    Violet,
+    Orange,
+    Slate,
+    Custom,
+}
+
+impl AccentPreset {
+    pub const ALL: [AccentPreset; 10] = [
+        AccentPreset::Default,
+        AccentPreset::Blue,
+        AccentPreset::Cyan,
+        AccentPreset::Emerald,
+        AccentPreset::Amber,
+        AccentPreset::Rose,
+        AccentPreset::Violet,
+        AccentPreset::Orange,
+        AccentPreset::Slate,
+        AccentPreset::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Blue => "Blue",
+            Self::Cyan => "Cyan",
+            Self::Emerald => "Emerald",
+            Self::Amber => "Amber",
+            Self::Rose => "Rose",
+            Self::Violet => "Violet",
+            Self::Orange => "Orange",
+            Self::Slate => "Slate",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+/// UI spacing / row height density (Phase C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+impl UiDensity {
+    pub const ALL: [UiDensity; 2] = [UiDensity::Comfortable, UiDensity::Compact];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comfortable => "Comfortable",
+            Self::Compact => "Compact",
+        }
+    }
+
+    pub fn row_h(self) -> f32 {
+        match self {
+            Self::Comfortable => 52.0,
+            Self::Compact => 42.0,
+        }
+    }
+
+    pub fn row_h_progress(self) -> f32 {
+        match self {
+            Self::Comfortable => 68.0,
+            Self::Compact => 56.0,
+        }
+    }
+
+    pub fn sidebar_w(self) -> f32 {
+        match self {
+            Self::Comfortable => 220.0,
+            Self::Compact => 192.0,
+        }
+    }
+
+    pub fn settings_pad(self) -> f32 {
+        match self {
+            Self::Comfortable => 24.0,
+            Self::Compact => 16.0,
+        }
+    }
+
+    pub fn font_size(self) -> f32 {
+        match self {
+            Self::Comfortable => 16.0,
+            Self::Compact => 14.0,
+        }
+    }
+}
+
+/// Corner radius scale applied to theme tokens (Phase C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CornerRadiusScale {
+    Sharp,
+    #[default]
+    Default,
+    Soft,
+}
+
+impl CornerRadiusScale {
+    pub const ALL: [CornerRadiusScale; 3] = [
+        CornerRadiusScale::Sharp,
+        CornerRadiusScale::Default,
+        CornerRadiusScale::Soft,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sharp => "Sharp",
+            Self::Default => "Default",
+            Self::Soft => "Soft",
+        }
+    }
+
+    /// (radius, radius_lg) in logical px.
+    pub fn radii(self) -> (f32, f32) {
+        match self {
+            Self::Sharp => (2.0, 4.0),
+            Self::Default => (6.0, 8.0),
+            Self::Soft => (10.0, 14.0),
+        }
+    }
+}
+
+/// Progress bar visual style (Phase D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressStyle {
+    #[default]
+    Solid,
+    Soft,
+    Glow,
+    Segmented,
+}
+
+impl ProgressStyle {
+    pub const ALL: [ProgressStyle; 4] = [
+        ProgressStyle::Solid,
+        ProgressStyle::Soft,
+        ProgressStyle::Glow,
+        ProgressStyle::Segmented,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "Solid",
+            Self::Soft => "Soft",
+            Self::Glow => "Glow",
+            Self::Segmented => "Segmented",
+        }
+    }
+}
+
+/// Hard floor for *effective* window alpha when transparency is maxed.
+/// Slider 100% still keeps the window at least this opaque.
+pub const MIN_WINDOW_OPACITY: u8 = 75;
+pub const MAX_WINDOW_TRANSPARENCY: u8 = 100;
+pub const MAX_NOISE_INTENSITY: u8 = 100;
+pub const MAX_VIGNETTE_INTENSITY: u8 = 100;
+
+fn default_accent_hue() -> f32 {
+    220.0
+}
+
+fn default_accent_saturation() -> f32 {
+    80.0
+}
+
+fn default_accent_lightness() -> f32 {
+    55.0
+}
+
+/// Which queue column drives sort order (persisted as a user preference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumn {
+    Name,
+    #[default]
+    Date,
+    Speed,
+    Eta,
+    Size,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl SortDirection {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub download_directory: PathBuf,
+    pub max_concurrent_downloads: u32,
+    pub auto_retry_attempts: u32,
+    pub speed_limit_kib_per_second: u32,
+    pub theme: AppTheme,
+    /// Accent palette; `Default` keeps the stock theme primary.
+    #[serde(default)]
+    pub accent_preset: AccentPreset,
+    /// Hue in degrees 0..360, used when `accent_preset == Custom`.
+    #[serde(default = "default_accent_hue")]
+    pub accent_hue: f32,
+    /// Saturation 0..100, used when `accent_preset == Custom`.
+    #[serde(default = "default_accent_saturation")]
+    pub accent_saturation: f32,
+    /// Lightness 0..100, used when `accent_preset == Custom`.
+    #[serde(default = "default_accent_lightness")]
+    pub accent_lightness: f32,
+    /// Film-grain overlay strength 0..100 (0 = off).
+    #[serde(default)]
+    pub noise_intensity: u8,
+    /// Window transparency 0..100 (0 = solid / default, 100 = max glass).
+    /// Effective alpha never drops below [`MIN_WINDOW_OPACITY`]%.
+    #[serde(default)]
+    pub window_transparency: u8,
+    /// When true and transparency > 0, request OS backdrop blur / acrylic when available.
+    #[serde(default)]
+    pub backdrop_blur: bool,
+    #[serde(default)]
+    pub ui_density: UiDensity,
+    #[serde(default)]
+    pub corner_radius: CornerRadiusScale,
+    /// Prefer static UI (no decorative motion) when true.
+    #[serde(default)]
+    pub reduce_motion: bool,
+    /// Edge vignette strength 0..100 (0 = off).
+    #[serde(default)]
+    pub vignette_intensity: u8,
+    #[serde(default)]
+    pub progress_style: ProgressStyle,
+    #[serde(default)]
+    pub sort_column: SortColumn,
+    #[serde(default)]
+    pub sort_direction: SortDirection,
+    /// Last main-window size / position / maximized state.
+    #[serde(default)]
+    pub window_layout: WindowLayout,
+    /// Browser extension integration preferences (source of truth for the companion extension).
+    #[serde(default)]
+    pub extension: ExtensionIntegrationSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            download_directory: default_download_directory(),
+            max_concurrent_downloads: 3,
+            auto_retry_attempts: 6,
+            speed_limit_kib_per_second: 0,
+            theme: AppTheme::Light,
+            accent_preset: AccentPreset::Default,
+            accent_hue: default_accent_hue(),
+            accent_saturation: default_accent_saturation(),
+            accent_lightness: default_accent_lightness(),
+            noise_intensity: 0,
+            window_transparency: 0,
+            backdrop_blur: false,
+            ui_density: UiDensity::Comfortable,
+            corner_radius: CornerRadiusScale::Default,
+            reduce_motion: false,
+            vignette_intensity: 0,
+            progress_style: ProgressStyle::Solid,
+            sort_column: SortColumn::Date,
+            sort_direction: SortDirection::Desc,
+            window_layout: WindowLayout::default(),
+            extension: ExtensionIntegrationSettings::default(),
+        }
+    }
+}
+
+impl Settings {
+    /// Clamp appearance fields to safe ranges (call after load / before save).
+    pub fn sanitize_appearance(&mut self) {
+        self.noise_intensity = self.noise_intensity.min(MAX_NOISE_INTENSITY);
+        // Slider is 0–100; the alpha floor is applied when painting, not here.
+        self.window_transparency = self.window_transparency.min(MAX_WINDOW_TRANSPARENCY);
+        self.vignette_intensity = self.vignette_intensity.min(MAX_VIGNETTE_INTENSITY);
+        self.accent_hue = self.accent_hue.rem_euclid(360.0);
+        self.accent_saturation = self.accent_saturation.clamp(0.0, 100.0);
+        self.accent_lightness = self.accent_lightness.clamp(0.0, 100.0);
+        self.window_layout.sanitize();
+        self.extension.sanitize();
+    }
+
+    /// Reset all appearance fields to defaults (keeps download prefs).
+    pub fn reset_appearance(&mut self) {
+        let defaults = Settings::default();
+        self.theme = defaults.theme;
+        self.accent_preset = defaults.accent_preset;
+        self.accent_hue = defaults.accent_hue;
+        self.accent_saturation = defaults.accent_saturation;
+        self.accent_lightness = defaults.accent_lightness;
+        self.noise_intensity = defaults.noise_intensity;
+        self.window_transparency = defaults.window_transparency;
+        self.backdrop_blur = defaults.backdrop_blur;
+        self.ui_density = defaults.ui_density;
+        self.corner_radius = defaults.corner_radius;
+        self.reduce_motion = defaults.reduce_motion;
+        self.vignette_intensity = defaults.vignette_intensity;
+        self.progress_style = defaults.progress_style;
+    }
+}
+
+pub fn default_download_directory() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_clamps_transparency_and_noise() {
+        let mut s = Settings::default();
+        s.window_transparency = 10;
+        s.noise_intensity = 200;
+        s.accent_saturation = 150.0;
+        s.accent_lightness = -10.0;
+        s.sanitize_appearance();
+        assert_eq!(s.window_transparency, 10);
+        s.window_transparency = 200;
+        s.sanitize_appearance();
+        assert_eq!(s.window_transparency, MAX_WINDOW_TRANSPARENCY);
+        assert_eq!(s.noise_intensity, MAX_NOISE_INTENSITY);
+        assert_eq!(s.accent_saturation, 100.0);
+        assert_eq!(s.accent_lightness, 0.0);
+    }
+
+    #[test]
+    fn legacy_json_without_appearance_fields_deserializes() {
+        let json = r#"{
+            "downloadDirectory": "C:/dl",
+            "maxConcurrentDownloads": 2,
+            "autoRetryAttempts": 3,
+            "speedLimitKibPerSecond": 0,
+            "theme": "dark"
+        }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.theme, AppTheme::Dark);
+        assert_eq!(s.accent_preset, AccentPreset::Default);
+        assert_eq!(s.window_transparency, 0); // solid by default
+        assert_eq!(s.noise_intensity, 0);
+        assert!(!s.backdrop_blur);
+        assert_eq!(s.ui_density, UiDensity::Comfortable);
+        assert_eq!(s.corner_radius, CornerRadiusScale::Default);
+        assert!(!s.reduce_motion);
+        assert_eq!(s.vignette_intensity, 0);
+        assert_eq!(s.progress_style, ProgressStyle::Solid);
+        assert_eq!(s.window_layout, WindowLayout::default());
+    }
+
+    #[test]
+    fn window_layout_sanitize_clamps_and_defaults() {
+        let mut layout = WindowLayout {
+            width: 100.0,
+            height: f32::NAN,
+            x: Some(f32::INFINITY),
+            y: Some(40.0),
+            maximized: true,
+        };
+        layout.sanitize();
+        assert_eq!(layout.width, MIN_WINDOW_WIDTH);
+        assert_eq!(layout.height, DEFAULT_WINDOW_HEIGHT);
+        assert!(layout.x.is_none());
+        assert!(layout.y.is_none());
+        assert!(layout.maximized);
+    }
+
+    #[test]
+    fn density_and_radius_tokens() {
+        assert!(UiDensity::Compact.row_h() < UiDensity::Comfortable.row_h());
+        assert!(UiDensity::Compact.sidebar_w() < UiDensity::Comfortable.sidebar_w());
+        let (sharp, _) = CornerRadiusScale::Sharp.radii();
+        let (soft, soft_lg) = CornerRadiusScale::Soft.radii();
+        assert!(sharp < soft);
+        assert!(soft < soft_lg);
+    }
+
+    #[test]
+    fn sanitize_clamps_vignette() {
+        let mut s = Settings::default();
+        s.vignette_intensity = 200;
+        s.sanitize_appearance();
+        assert_eq!(s.vignette_intensity, MAX_VIGNETTE_INTENSITY);
+    }
+}

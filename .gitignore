@@ -1,0 +1,24 @@
+/target
+**/node_modules/
+apps/extension/dist/
+apps/native-host/target/
+dist-release/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Local review / tooling scratch
+.ui-review/
+
+# Logs and env
+*.log
+.env
+.env.*
