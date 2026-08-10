@@ -38,6 +38,9 @@ jobs:
           cargo build --release -p rusticdl
           cargo build --release -p rusticdl-native-host
 
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
       - name: Build browser extension
         working-directory: apps/extension
         run: |
@@ -51,7 +54,16 @@ jobs:
           $dist = "dist-release"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
-          # App-only zip
+          # NSIS installer (recommended for most users)
+          cargo packager --release --formats nsis -p rusticdl
+          $setup = Get-ChildItem -Path $dist -Filter "*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $setup) {
+            throw "NSIS setup.exe not found under $dist"
+          }
+          Copy-Item -Force $setup.FullName "$dist/RusticDL-windows-x64-setup.exe"
+          Write-Host "Packed RusticDL-windows-x64-setup.exe ($([math]::Round((Get-Item "$dist/RusticDL-windows-x64-setup.exe").Length / 1MB, 2)) MB)"
+
+          # App-only zip (portable)
           $appDir = Join-Path $dist "app"
           New-Item -ItemType Directory -Force -Path $appDir | Out-Null
           Copy-Item "target/release/rusticdl.exe" $appDir
@@ -63,7 +75,7 @@ jobs:
           Compress-Archive -Path "apps/extension/dist/chromium/*" -DestinationPath "$dist/extension-chromium.zip" -Force
           Compress-Archive -Path "apps/extension/dist/firefox/*" -DestinationPath "$dist/extension-firefox.zip" -Force
 
-          # Full package
+          # Full package (portable)
           $fullDir = Join-Path $dist "full"
           New-Item -ItemType Directory -Force -Path $fullDir | Out-Null
           Copy-Item "target/release/rusticdl.exe" $fullDir
@@ -93,6 +105,7 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            dist-release/RusticDL-windows-x64-setup.exe
             dist-release/RusticDL-windows-x64.zip
             dist-release/RusticDL-full-windows-x64.zip
             dist-release/extension-chromium.zip
@@ -105,15 +118,19 @@ jobs:
             ### Downloads
             | Asset | Contents |
             | --- | --- |
-            | **RusticDL-windows-x64.zip** | Desktop app (`rusticdl.exe`) |
-            | **RusticDL-full-windows-x64.zip** | App + native host + scripts + extensions |
+            | **RusticDL-windows-x64-setup.exe** | **Recommended** — NSIS installer (app + native host + browser host registration) |
+            | **RusticDL-windows-x64.zip** | Portable desktop app only |
+            | **RusticDL-full-windows-x64.zip** | Portable app + native host + scripts + extensions |
             | **extension-chromium.zip** | Chromium / Edge / Brave extension |
             | **extension-firefox.zip** | Firefox extension |
 
             ### Quick start
-            1. Download **RusticDL-windows-x64.zip**
-            2. Extract and run `rusticdl.exe`
+            1. Download **RusticDL-windows-x64-setup.exe**
+            2. Run the installer (per-user, no admin required)
+            3. Launch RusticDL from the Start Menu
 
-            See the [README](https://github.com/JustNak/RusticDL#readme) for browser extension setup and build-from-source docs.
+            Browser handoff still requires loading the extension (see README). The installer registers the native messaging host automatically.
+
+            See the [README](https://github.com/JustNak/RusticDL#readme) for portable ZIP and build-from-source docs.
 
             **License:** MIT — commercial use allowed; keep attribution (copyright notice).

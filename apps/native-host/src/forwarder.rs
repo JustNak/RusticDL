@@ -53,7 +53,7 @@ impl AppForwarder {
             .spawn()
             .map(|_| ())
             .map_err(|error| {
-                ForwarderError::Transport(format!("Could not launch desktop app: {error}"))
+                ForwarderError::Transport(format!("Could not launch RusticDL: {error}"))
             })
     }
 
@@ -265,7 +265,7 @@ fn map_open_error(error: std::io::Error) -> ForwarderError {
 
     if error.raw_os_error() == Some(5) || error.kind() == std::io::ErrorKind::PermissionDenied {
         return ForwarderError::Transport(
-            "Could not connect to the desktop app pipe (access denied). \
+            "Could not connect to the RusticDL pipe (access denied). \
 Start RusticDL without elevation (not as Administrator), \
 then reload the extension and try again."
                 .into(),

@@ -36,22 +36,37 @@ Get the latest Windows build from GitHub Releases:
 
 | Asset | What it contains |
 | --- | --- |
-| **`RusticDL-windows-x64.zip`** | Desktop app (`rusticdl.exe`) |
-| **`RusticDL-full-windows-x64.zip`** | App + native host + register scripts + browser extension packages |
+| **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app + native host + browser host registration) |
+| **`RusticDL-windows-x64.zip`** | Portable desktop app (`rusticdl.exe`) |
+| **`RusticDL-full-windows-x64.zip`** | Portable app + native host + register scripts + browser extension packages |
 | **`extension-chromium.zip`** | Chromium / Edge / Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 
-### Install (users)
+### Install (recommended)
+
+1. Download **`RusticDL-windows-x64-setup.exe`**.
+2. Run the installer (per-user install; **no administrator rights** required).
+3. Launch **RusticDL** from the Start Menu.
+
+The installer places files under `%LOCALAPPDATA%\RusticDL\`, creates a Start Menu shortcut, and registers the browser **native messaging host** for Chrome, Edge, and Firefox.
+
+Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & Features (optionally remove app data).
+
+> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see below). SmartScreen may warn on unsigned builds until code signing is added.
+
+### Portable install (ZIP)
 
 1. Download **`RusticDL-windows-x64.zip`** (or the full package if you want browser integration).
 2. Extract anywhere you like (for example `C:\Tools\RusticDL\`).
 3. Run `rusticdl.exe`.
 
-No installer required. Settings and queue state live under `%APPDATA%\RusticDL\`.
-
 ### Browser handoff (optional)
 
 If you want downloads captured from Firefox / Chromium:
+
+**With the NSIS installer:** the native host is registered automatically. Continue from step 4.
+
+**With a portable ZIP:**
 
 1. Prefer **`RusticDL-full-windows-x64.zip`**.
 2. Run the app once so it can create data folders.
@@ -112,7 +127,11 @@ RusticDL is a **simple, local-first download manager** focused on everyday HTTP/
 
 ## Quick start
 
-### From a release binary
+### From the installer
+
+Install via **`RusticDL-windows-x64-setup.exe`**, then open **RusticDL** from the Start Menu.
+
+### From a portable ZIP
 
 ```powershell
 # After extracting the zip
@@ -130,6 +149,22 @@ Release build:
 ```bash
 cargo build --release
 ```
+
+### Build the Windows installer (developers)
+
+Requires Windows + Rust. Uses [cargo-packager](https://crates.io/crates/cargo-packager) to produce an NSIS setup executable:
+
+```powershell
+# Install packager once (pinned version used by CI)
+cargo install cargo-packager --locked --version 0.11.8
+
+# Build binaries + NSIS installer
+powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
+```
+
+Output: `dist-release/RusticDL-windows-x64-setup.exe` (plus the packager’s `rusticdl_*_x64-setup.exe` name).
+
+Packager config lives in `[package.metadata.packager]` in `Cargo.toml`, with a custom NSIS template at `installer/nsis/installer.nsi` that registers/unregisters the native messaging host on install/uninstall.
 
 ---
 
@@ -297,7 +332,7 @@ GitHub Actions workflows live in `.github/workflows/`:
 | Workflow | When it runs | What it does |
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
-| **Release** (`release.yml`) | Tag `v*` (e.g. `v0.1.0`) | Build Windows release binaries + extension zips, publish a GitHub Release |
+| **Release** (`release.yml`) | Tag `v*` (e.g. `v0.1.0`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a GitHub Release |
 
 To cut a new release from a clean tree:
 

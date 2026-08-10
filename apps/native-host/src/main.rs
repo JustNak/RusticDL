@@ -130,7 +130,7 @@ fn map_status_response(response: AppResponseEnvelope) -> HostResponseEnvelope {
         response.code.as_deref().unwrap_or("INTERNAL_ERROR"),
         response
             .message
-            .unwrap_or_else(|| "Desktop app rejected the request.".to_string()),
+            .unwrap_or_else(|| "RusticDL rejected the request.".to_string()),
     )
 }
 
@@ -180,7 +180,7 @@ fn map_app_response(response: AppResponseEnvelope) -> HostResponseEnvelope {
         response.code.as_deref().unwrap_or("INTERNAL_ERROR"),
         response
             .message
-            .unwrap_or_else(|| "Desktop app rejected the request.".to_string()),
+            .unwrap_or_else(|| "RusticDL rejected the request.".to_string()),
     )
 }
 
@@ -190,13 +190,13 @@ fn map_forwarder_error(request_id: String, error: ForwarderError) -> HostRespons
             request_id,
             "app_not_installed",
             "APP_NOT_INSTALLED",
-            "Desktop app executable not found.",
+            "RusticDL executable not found.",
         ),
         ForwarderError::AppUnreachable => HostResponseEnvelope::rejected(
             request_id,
             "app_unreachable",
             "APP_UNREACHABLE",
-            "Desktop app did not respond on the named pipe.",
+            "RusticDL did not respond on the named pipe.",
         ),
         ForwarderError::Serialization(message) | ForwarderError::Transport(message) => {
             HostResponseEnvelope::rejected(request_id, "rejected", "INTERNAL_ERROR", message)

@@ -15,7 +15,7 @@ mod window_icon;
 
 use app::DownloadApp;
 use assets::Assets;
-use branding::APP_NAME;
+use branding::{APP_NAME, APP_USER_MODEL_ID};
 use download::spawn_engine;
 use gpui::{
     point, px, size, App, AppContext, Application, Bounds, SharedString, WindowBounds,
@@ -28,6 +28,8 @@ use settings::{WindowLayout, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
 use window_icon::apply_app_icon;
 
 fn main() {
+    set_app_user_model_id();
+
     let paths = app_paths();
     let _ = ensure_app_dirs(&paths);
     let settings = load_settings(&paths);
@@ -142,4 +144,21 @@ fn bounds_visible_on_any_display(bounds: &Bounds<gpui::Pixels>, cx: &App) -> boo
     cx.displays()
         .iter()
         .any(|display| display.bounds().intersects(bounds))
+}
+
+/// Pin the process to a stable AppUserModelID so Start Menu / taskbar / jump
+/// lists group under **RusticDL** (matches installer shortcut ApplicationID).
+fn set_app_user_model_id() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(APP_USER_MODEL_ID)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(wide.as_ptr())) };
+    }
 }

@@ -1,3 +1,8 @@
+param(
+  # Quieter output for installer / automated use.
+  [switch]$Quiet
+)
+
 $ErrorActionPreference = 'Stop'
 $hostName = 'com.rusticdl.native_host'
 
@@ -10,8 +15,16 @@ $keys = @(
 foreach ($subKey in $keys) {
   try {
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey, $false)
-    Write-Host "Removed HKCU:\$subKey"
+    if (-not $Quiet) {
+      Write-Host "Removed HKCU:\$subKey"
+    }
   } catch {
-    Write-Host "Skip (missing): HKCU:\$subKey"
+    if (-not $Quiet) {
+      Write-Host "Skip (missing): HKCU:\$subKey"
+    }
   }
+}
+
+if ($Quiet) {
+  Write-Host "Unregistered RusticDL Backend: $hostName"
 }

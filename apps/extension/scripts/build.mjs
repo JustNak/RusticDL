@@ -30,7 +30,7 @@ const targets = [
       manifest_version: 3,
       name: 'RusticDL',
       version,
-      description: 'Send downloads to the RusticDL desktop app.',
+      description: 'Send downloads to RusticDL.',
       icons: extensionIcons,
       permissions: [
         'alarms',
@@ -67,7 +67,7 @@ const targets = [
       name: 'RusticDL',
       version,
       version_name: version,
-      description: 'Send downloads to the RusticDL desktop app.',
+      description: 'Send downloads to RusticDL.',
       icons: extensionIcons,
       permissions: [
         'alarms',

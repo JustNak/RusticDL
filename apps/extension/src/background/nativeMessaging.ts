@@ -34,7 +34,7 @@ function mapNativeMessagingError(error: unknown): {
     return {
       code: 'HOST_REGISTRATION_MISSING',
       message:
-        'Native host is not registered for Firefox. From the repo root run:\n'
+        'RusticDL Backend is not registered for Firefox. From the repo root run:\n'
         + '.\\scripts\\register-native-host.ps1 -HostBinaryPath "$PWD\\target\\debug\\rusticdl-native-host.exe"',
       connection: 'host_missing',
     };
