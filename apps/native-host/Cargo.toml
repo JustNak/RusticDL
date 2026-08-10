@@ -1,6 +1,6 @@
 [package]
 name = "rusticdl-native-host"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Native messaging host bridging browser extensions to RusticDL"
 license = "MIT"
