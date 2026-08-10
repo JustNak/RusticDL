@@ -6,9 +6,8 @@
 //! Flow (one click in the app):
 //! 1. Query the GitHub Releases API for the latest tag + assets.
 //! 2. Compare against the built-in app version.
-//! 3. If newer, download `RusticDL-windows-x64-setup.exe` and launch it
-//!    silently (`/S /R`) so the installer needs no further clicks and
-//!    relaunches the app when finished.
+//! 3. If newer, download `RusticDL-windows-x64-setup.exe`, flush app state,
+//!    launch silently (`/S /R`), then quit so install can finish and relaunch.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -144,15 +143,11 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
     }))
 }
 
-/// Download the NSIS installer to a temp path and launch it.
+/// Download the NSIS installer to a temp path (does not launch it).
 ///
-/// When `silent_relaunch` is true, the installer is started with `/S /R` (no wizard
-/// clicks; app relaunches after success). The caller should quit so files can be
-/// replaced cleanly.
-pub async fn download_and_launch_installer(
-    download_url: &str,
-    silent_relaunch: bool,
-) -> Result<PathBuf, String> {
+/// Callers should persist app state, then [`launch_installer`], then quit so the
+/// silent installer can replace files without racing a mid-flight save.
+pub async fn download_installer(download_url: &str) -> Result<PathBuf, String> {
     let client = github_client()?;
     let response = client
         .get(download_url)
@@ -190,7 +185,6 @@ pub async fn download_and_launch_installer(
         .map_err(|e| format!("Could not finalize installer: {e}"))?;
     drop(file);
 
-    launch_installer(&installer_path, silent_relaunch)?;
     Ok(installer_path)
 }
 
@@ -204,7 +198,12 @@ pub fn open_url(url: &str) -> Result<(), String> {
     open::that(url).map_err(|e| format!("Could not open browser: {e}"))
 }
 
-fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result<(), String> {
+/// Launch a previously downloaded NSIS setup binary.
+///
+/// When `silent_relaunch` is true, starts with `/S /R` (no wizard; app relaunches
+/// after success). Prefer flushing jobs/settings before calling this, then quit
+/// promptly so the installer can replace in-use files.
+pub fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

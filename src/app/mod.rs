@@ -51,8 +51,8 @@ use crate::settings::{
     UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
 use crate::updater::{
-    check_for_update, download_and_launch_installer, open_release_page, open_url, UpdateCheck,
-    UpdateInfo,
+    check_for_update, download_installer, launch_installer, open_release_page, open_url,
+    UpdateCheck, UpdateInfo,
 };
 use detail::render_detail;
 use job_row::render_job_row;
@@ -1105,7 +1105,9 @@ impl DownloadApp {
         self.begin_download_update_inner(download_url, cx);
     }
 
-    /// Download the setup binary and launch it silently (`/S /R`), then quit so install can finish.
+    /// Download the setup binary, persist state, launch silently (`/S /R`), then quit.
+    ///
+    /// Launch happens only after flush so the installer's silent kill cannot race a dirty save.
     fn begin_download_update_inner(&mut self, download_url: String, cx: &mut Context<Self>) {
         self.show_toast("Downloading update from GitHub…", cx);
         cx.notify();
@@ -1116,10 +1118,7 @@ impl DownloadApp {
                 .enable_all()
                 .build()
                 .map_err(|e| format!("Could not start download runtime: {e}"))
-                .and_then(|rt| {
-                    rt.block_on(download_and_launch_installer(&download_url, true))
-                        .map(|_| ())
-                });
+                .and_then(|rt| rt.block_on(download_installer(&download_url)));
             let _ = tx.send_blocking(result);
         });
 
@@ -1130,11 +1129,16 @@ impl DownloadApp {
                 .unwrap_or_else(|_| Err("Update download was cancelled unexpectedly.".into()));
             let _ = this.update(cx, |app, cx| {
                 match result {
-                    Ok(()) => {
-                        // Flush queue / settings so nothing is lost when the installer
-                        // replaces the binary and `/R` relaunches us.
+                    Ok(installer_path) => {
+                        // Persist before spawn: silent NSIS may KillProcess before Drop runs.
                         app.flush_jobs_save_now();
-                        app.flush_window_layout_if_due();
+                        app.flush_window_layout_now();
+                        if let Err(message) = launch_installer(&installer_path, true) {
+                            app.update_busy = false;
+                            app.show_error_toast(message, cx);
+                            cx.notify();
+                            return;
+                        }
                         app.show_toast("Installing update — RusticDL will restart…", cx);
                         cx.notify();
                         cx.quit();
