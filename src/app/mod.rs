@@ -1255,6 +1255,70 @@ impl DownloadApp {
         cx.notify();
     }
 
+    /// Factory reset of settings prefs into the live draft (keeps window layout + download dir).
+    ///
+    /// Does **not** call `save_settings`, IPC, engine, or startup-registry updates. The
+    /// Settings UI copy still asks the user to press **Save settings** to commit.
+    ///
+    /// Note (pre-existing draft architecture): `self.settings` is the single live model
+    /// used by incidental flushes (`flush_window_layout_*`, sort persist, Drop). Those
+    /// paths write `settings_for_disk()`, which only reverts **extension** when
+    /// `extension_settings_dirty`; other draft fields (theme, limits, system, appearance,
+    /// sort, …) can hit disk without an explicit Save. A full unsaved-settings snapshot
+    /// is out of scope for the Reset-defaults PR — document only.
+    pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.reset_to_defaults_preserving_layout_and_dir();
+
+        // Text inputs bound to General / Browser panels.
+        let dir = self
+            .settings
+            .download_directory
+            .to_string_lossy()
+            .to_string();
+        let concurrent = self.settings.max_concurrent_downloads.to_string();
+        let retry = self.settings.auto_retry_attempts.to_string();
+        let speed = self.settings.speed_limit_kib_per_second.to_string();
+        self.dir_input
+            .update(cx, |i, cx| i.set_value(dir, window, cx));
+        self.concurrent_input
+            .update(cx, |i, cx| i.set_value(concurrent, window, cx));
+        self.retry_input
+            .update(cx, |i, cx| i.set_value(retry, window, cx));
+        self.speed_input
+            .update(cx, |i, cx| i.set_value(speed, window, cx));
+        self.refresh_extension_text_inputs(window, cx);
+
+        // Appearance sliders (same rebind as reset_appearance_draft).
+        let noise = self.settings.noise_intensity as f32;
+        let transparency = self.settings.window_transparency as f32;
+        let hue = self.settings.accent_hue;
+        let sat = self.settings.accent_saturation;
+        let light = self.settings.accent_lightness;
+        let vignette = self.settings.vignette_intensity as f32;
+        self.noise_slider
+            .update(cx, |s, cx| s.set_value(noise, window, cx));
+        self.opacity_slider
+            .update(cx, |s, cx| s.set_value(transparency, window, cx));
+        self.hue_slider
+            .update(cx, |s, cx| s.set_value(hue, window, cx));
+        self.sat_slider
+            .update(cx, |s, cx| s.set_value(sat, window, cx));
+        self.light_slider
+            .update(cx, |s, cx| s.set_value(light, window, cx));
+        self.vignette_slider
+            .update(cx, |s, cx| s.set_value(vignette, window, cx));
+
+        // Browser capture draft may now differ from last committed snapshot.
+        self.extension_settings_dirty = self.settings.extension != self.extension_committed;
+        if !self.settings.clipboard_watch_enabled {
+            self.last_clipboard_urls_key = None;
+        }
+        // Match live System toggle side-effects for tray lifetime.
+        self.sync_tray_lifetime(cx);
+        apply_appearance(&self.settings, Some(window), cx);
+        cx.notify();
+    }
+
     fn sync_window_chrome(&mut self, window: &mut Window) {
         // Re-apply when either transparency or blur preference changes.
         // Encode as transparency in high bits-ish: just re-apply always when blur differs.

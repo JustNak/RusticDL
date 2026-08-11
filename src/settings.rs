@@ -317,7 +317,7 @@ impl OsNotifyMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub download_directory: PathBuf,
@@ -464,6 +464,18 @@ impl Settings {
         self.vignette_intensity = defaults.vignette_intensity;
         self.progress_style = defaults.progress_style;
     }
+
+    /// Factory defaults for every preference except window geometry and download folder.
+    ///
+    /// Used by Settings → Reset defaults (draft only until Save).
+    pub fn reset_to_defaults_preserving_layout_and_dir(&mut self) {
+        let keep_dir = self.download_directory.clone();
+        let keep_layout = self.window_layout.clone();
+        *self = Settings::default();
+        self.download_directory = keep_dir;
+        self.window_layout = keep_layout;
+        self.sanitize_appearance();
+    }
 }
 
 pub fn default_download_directory() -> PathBuf {
@@ -557,5 +569,84 @@ mod tests {
         s.vignette_intensity = 200;
         s.sanitize_appearance();
         assert_eq!(s.vignette_intensity, MAX_VIGNETTE_INTENSITY);
+    }
+
+    #[test]
+    fn reset_to_defaults_preserves_layout_and_dir() {
+        let keep_dir = PathBuf::from("C:/my/custom/downloads");
+        let keep_layout = WindowLayout {
+            width: 1400.0,
+            height: 900.0,
+            x: Some(12.0),
+            y: Some(34.0),
+            maximized: true,
+        };
+
+        let mut s = Settings::default();
+        s.download_directory = keep_dir.clone();
+        s.window_layout = keep_layout.clone();
+        // Mutate fields that must return to defaults (including custom accent HSL).
+        s.max_concurrent_downloads = 9;
+        s.auto_retry_attempts = 1;
+        s.speed_limit_kib_per_second = 512;
+        s.theme = AppTheme::Dark;
+        s.accent_preset = AccentPreset::Custom;
+        s.accent_hue = 12.0;
+        s.accent_saturation = 90.0;
+        s.accent_lightness = 40.0;
+        s.noise_intensity = 40;
+        s.window_transparency = 25;
+        s.backdrop_blur = true;
+        s.ui_density = UiDensity::Compact;
+        s.corner_radius = CornerRadiusScale::Soft;
+        s.reduce_motion = true;
+        s.vignette_intensity = 30;
+        s.progress_style = ProgressStyle::Glow;
+        s.sort_column = SortColumn::Name;
+        s.sort_direction = SortDirection::Asc;
+        s.close_to_tray = false;
+        s.launch_at_startup = true;
+        s.startup_minimized = true;
+        s.os_notify_mode = OsNotifyMode::Always;
+        s.notify_on_complete = false;
+        s.notify_on_fail = false;
+        s.clipboard_watch_enabled = true;
+        s.extension.enabled = false;
+        s.extension.excluded_hosts = vec!["example.com".into()];
+
+        s.reset_to_defaults_preserving_layout_and_dir();
+
+        // Expected = full Default with only preserve fields overlaid (catches new fields).
+        let mut expected = Settings::default();
+        expected.download_directory = keep_dir;
+        expected.window_layout = keep_layout;
+        assert_eq!(s, expected);
+        // Explicit HSL guards if someone later rewrites the helper field-by-field.
+        let defaults = Settings::default();
+        assert_eq!(s.accent_hue, defaults.accent_hue);
+        assert_eq!(s.accent_saturation, defaults.accent_saturation);
+        assert_eq!(s.accent_lightness, defaults.accent_lightness);
+        assert_eq!(s.accent_preset, defaults.accent_preset);
+    }
+
+    #[test]
+    fn reset_to_defaults_is_idempotent_when_already_default() {
+        let keep_dir = PathBuf::from("/tmp/kept");
+        let keep_layout = WindowLayout {
+            width: 1300.0,
+            height: 800.0,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        let mut s = Settings::default();
+        s.download_directory = keep_dir.clone();
+        s.window_layout = keep_layout.clone();
+        s.reset_to_defaults_preserving_layout_and_dir();
+
+        let mut expected = Settings::default();
+        expected.download_directory = keep_dir;
+        expected.window_layout = keep_layout;
+        assert_eq!(s, expected);
     }
 }

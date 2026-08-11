@@ -43,6 +43,7 @@ impl DownloadApp {
             .id("settings-view")
             .size_full()
             .bg(theme.background)
+            // Body: mini-nav + scrolling category content.
             .child(
                 h_flex()
                     .flex_1()
@@ -115,18 +116,40 @@ impl DownloadApp {
                                         SettingsCategory::Data => {
                                             self.render_settings_data(cx).into_any_element()
                                         }
-                                    })
-                                    // Save stays at bottom of content until PR 2 sticky footer.
-                                    .child(
-                                        Button::new("save-settings")
-                                            .primary()
-                                            .icon(IconName::Check)
-                                            .label("Save settings")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.save_settings(window, cx);
-                                            })),
-                                    ),
+                                    }),
                             ),
+                    ),
+            )
+            // Sticky footer (flex shell, not CSS position:sticky): always visible.
+            .child(
+                h_flex()
+                    .id("settings-footer")
+                    .flex_shrink_0()
+                    .w_full()
+                    .px(px(settings_pad))
+                    .py_3()
+                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .child(
+                        Button::new("reset-settings-defaults")
+                            .outline()
+                            .label("Reset defaults")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_reset_settings_defaults(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("save-settings")
+                            .primary()
+                            .icon(IconName::Check)
+                            .label("Save settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_settings(window, cx);
+                            })),
                     ),
             )
     }
