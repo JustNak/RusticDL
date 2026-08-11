@@ -30,6 +30,9 @@ impl DownloadApp {
             dialog
                 .title(format!("About {APP_NAME}"))
                 .alert()
+                // alert() disables outside-click; re-enable for light dismiss UX.
+                .overlay_closable(true)
+                .keyboard(true)
                 .w(px(420.))
                 .margin_top(px(margin_top))
                 .border_color(theme.border.opacity(0.32))
