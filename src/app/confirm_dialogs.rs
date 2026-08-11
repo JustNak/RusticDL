@@ -228,29 +228,18 @@ impl DownloadApp {
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
-                .button_props(
-                    DialogButtonProps::default().ok_text(if count == 1 {
-                        "Add download"
-                    } else {
-                        "Add downloads"
-                    }),
-                )
+                .button_props(DialogButtonProps::default().ok_text(if count == 1 {
+                    "Add download"
+                } else {
+                    "Add downloads"
+                }))
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(format!(
-                                    "Clipboard has {count} HTTP(S) URL(s). Add to the queue?"
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(body),
-                        )
+                        .child(div().text_sm().child(format!(
+                            "Clipboard has {count} HTTP(S) URL(s). Add to the queue?"
+                        )))
+                        .child(div().text_xs().text_color(muted).child(body))
                         .child(
                             div()
                                 .text_xs()

@@ -136,22 +136,38 @@ impl Drop for SystemTray {
     }
 }
 
+/// Capture the Win32 HWND for a GPUI window (0 if unavailable).
+///
+/// Stored so tray / IPC can restore the window without waiting for the next
+/// GPUI render frame (hidden windows often stop painting).
+pub fn main_window_hwnd(window: &gpui::Window) -> isize {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return 0;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return 0;
+        };
+        win32.hwnd.get() as isize
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        0
+    }
+}
+
 /// Hide a GPUI window from the taskbar (true tray hide).
 pub fn hide_main_window(window: &gpui::Window) {
     #[cfg(windows)]
     {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            return;
-        };
-        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-            return;
-        };
-        let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
-        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        let hwnd = main_window_hwnd(window);
+        if hwnd != 0 {
+            show_hwnd(hwnd, false);
+        }
     }
     #[cfg(not(windows))]
     {
@@ -163,28 +179,51 @@ pub fn hide_main_window(window: &gpui::Window) {
 pub fn show_main_window(window: &gpui::Window) {
     #[cfg(windows)]
     {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_RESTORE, SW_SHOW};
+        let hwnd = main_window_hwnd(window);
+        if hwnd != 0 {
+            show_hwnd(hwnd, true);
+        }
+    }
+    window.activate_window();
+}
 
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            window.activate_window();
-            return;
-        };
-        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-            window.activate_window();
-            return;
-        };
-        let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
-        unsafe {
+/// Restore/show a main window by raw HWND (safe without a GPUI `Window`).
+///
+/// Used when the UI is hidden to tray and may not paint until the HWND is shown
+/// again — tray and second-instance activate must not wait on `Render`.
+pub fn show_main_window_hwnd(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        if hwnd != 0 {
+            show_hwnd(hwnd, true);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
+#[cfg(windows)]
+fn show_hwnd(hwnd_raw: isize, show: bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
+    };
+
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    unsafe {
+        if show {
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             } else {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
+            let _ = SetForegroundWindow(hwnd);
+        } else {
+            let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
-    window.activate_window();
 }
 
 #[cfg(windows)]

@@ -12,6 +12,7 @@ mod notifications;
 mod persistence;
 mod prompt_window;
 mod settings;
+mod single_instance;
 mod startup;
 mod tray;
 mod updater;
@@ -29,11 +30,17 @@ use gpui_component::{Root, TitleBar};
 use ipc::{start_ipc_server, IpcBridge};
 use persistence::{app_paths, ensure_app_dirs, load_jobs, load_settings};
 use settings::{WindowLayout, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
+use single_instance::{claim_instance, InstanceRole};
 use startup::{apply_launch_at_startup, launched_minimized};
 use window_icon::apply_app_icon;
 
 fn main() {
     set_app_user_model_id();
+
+    // Second launch: activate the existing window and exit (no duplicate UI).
+    if claim_instance() == InstanceRole::Secondary {
+        return;
+    }
 
     let paths = app_paths();
     let _ = ensure_app_dirs(&paths);
