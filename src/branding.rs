@@ -20,6 +20,12 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[allow(dead_code)] // kept as the single source of truth for packaging / docs
 pub const BACKEND_NAME: &str = "RusticDL Backend";
 
+/// User-facing name for the dedicated self-update helper process.
+pub const UPDATER_NAME: &str = "RusticDL Updater";
+
+/// On-disk updater binary name (next to `rusticdl.exe` in the install dir).
+pub const UPDATER_EXE_NAME: &str = "rusticdl-updater.exe";
+
 /// About / subtitle line.
 pub const APP_TAGLINE: &str = "Local-first download manager";
 
@@ -42,6 +48,10 @@ pub const NATIVE_HOST_NAME: &str = "com.rusticdl.native_host";
 /// AppUserModelID for taskbar / Start Menu identity (must match installer shortcuts).
 #[allow(dead_code)] // used on Windows process bootstrap
 pub const APP_USER_MODEL_ID: &str = "com.rusticdl.app";
+
+/// AppUserModelID for the updater helper (kept distinct so it does not group as the main app).
+#[allow(dead_code)]
+pub const UPDATER_USER_MODEL_ID: &str = "com.rusticdl.updater";
 
 /// App data folder under `%APPDATA%` / XDG.
 pub const APP_DATA_DIR_NAME: &str = "RusticDL";

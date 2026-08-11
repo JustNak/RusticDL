@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "apps/native-host"]
+members = [".", "apps/native-host", "apps/updater"]
 resolver = "2"
 
 [package]
@@ -84,9 +84,10 @@ homepage = "https://github.com/JustNak/RusticDL"
 icons = ["assets/brand/icon.ico", "assets/brand/icon-*.png"]
 formats = ["nsis"]
 out-dir = "dist-release"
-before-packaging-command = "cargo build --release -p rusticdl -p rusticdl-native-host"
+before-packaging-command = "cargo build --release -p rusticdl -p rusticdl-native-host -p rusticdl-updater"
 binaries = [
   { path = "rusticdl", main = true },
+  { path = "rusticdl-updater", main = false },
   { path = "rusticdl-native-host", main = false },
 ]
 resources = [

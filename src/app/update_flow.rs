@@ -1,13 +1,18 @@
-//! Self-update check / download flow extracted from `DownloadApp`.
+//! Self-update check / apply flow extracted from `DownloadApp`.
+//!
+//! Check stays in-process. Apply hands off to **RusticDL Updater**, which shows
+//! progress, runs the NSIS setup, and relaunches the main app.
 
 use std::time::Duration;
 
 use gpui::Context;
 
 use super::DownloadApp;
-use crate::branding::APP_NAME;
+use crate::branding::{APP_NAME, APP_VERSION, UPDATER_NAME};
 use crate::format::format_bytes;
-use crate::updater::{check_for_update, download_installer, launch_installer, UpdateCheck};
+use crate::updater::{
+    check_for_update, launch_updater, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
+};
 
 impl DownloadApp {
     /// Label for the single update action (check or install cached release).
@@ -26,7 +31,7 @@ impl DownloadApp {
             return;
         }
         if let Some(info) = self.available_update.clone() {
-            self.begin_download_update(info.setup_download_url, cx);
+            self.begin_apply_update(info, cx);
             return;
         }
         self.begin_update_check(true, cx);
@@ -57,8 +62,8 @@ impl DownloadApp {
         match result {
             Ok(UpdateCheck::UpToDate { current, latest }) => {
                 self.available_update = None;
+                self.update_busy = false;
                 if interactive {
-                    self.update_busy = false;
                     self.show_toast(
                         format!("You're up to date (v{current}; latest is v{latest})."),
                         cx,
@@ -68,21 +73,22 @@ impl DownloadApp {
             Ok(UpdateCheck::Available(info)) => {
                 self.available_update = Some(info.clone());
                 if interactive {
-                    // One click: go straight to silent download + install (no second prompt).
+                    // One click: hand off to the updater (no second prompt).
                     let size_hint = info
                         .setup_size
                         .map(|n| format!(" ({})", format_bytes(n)))
                         .unwrap_or_default();
                     self.show_toast(
                         format!(
-                            "{} — downloading and installing{size_hint}…",
+                            "{} — starting {UPDATER_NAME}{size_hint}…",
                             info.release_name
                         ),
                         cx,
                     );
-                    // Keep `update_busy` true across check → download.
-                    self.begin_download_update_inner(info.setup_download_url, cx);
+                    // Keep `update_busy` true across check → handoff.
+                    self.begin_apply_update_inner(info, cx);
                 } else {
+                    self.update_busy = false;
                     let size_hint = info
                         .setup_size
                         .map(|n| format!(" · {}", format_bytes(n)))
@@ -97,8 +103,8 @@ impl DownloadApp {
                 }
             }
             Err(message) => {
+                self.update_busy = false;
                 if interactive {
-                    self.update_busy = false;
                     self.show_error_toast(message, cx);
                 }
             }
@@ -106,69 +112,53 @@ impl DownloadApp {
         cx.notify();
     }
 
-    pub(crate) fn begin_download_update(&mut self, download_url: String, cx: &mut Context<Self>) {
+    pub(crate) fn begin_apply_update(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
         if self.update_busy {
             self.show_toast("An update is already in progress…", cx);
             return;
         }
         self.update_busy = true;
-        self.begin_download_update_inner(download_url, cx);
+        self.begin_apply_update_inner(info, cx);
     }
 
-    /// Download the setup binary, persist state, launch silently (`/S /R`), then quit.
-    ///
-    /// Launch happens only after flush so the installer's silent kill cannot race a dirty save.
-    pub(crate) fn begin_download_update_inner(
-        &mut self,
-        download_url: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_toast("Downloading update from GitHub…", cx);
+    /// Persist state, spawn RusticDL Updater, then quit so files can be replaced.
+    pub(crate) fn begin_apply_update_inner(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
+        self.show_toast(
+            format!("Handing off to {UPDATER_NAME} — RusticDL will restart…"),
+            cx,
+        );
         cx.notify();
 
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Could not start download runtime: {e}"))
-                .and_then(|rt| rt.block_on(download_installer(&download_url)));
-            let _ = tx.send_blocking(result);
-        });
+        // Persist before spawn/quit so a kill during install cannot race a dirty save.
+        self.flush_jobs_save_now();
+        self.flush_window_layout_now();
 
-        cx.spawn(async move |this, cx| {
-            let result = rx
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err("Update download was cancelled unexpectedly.".into()));
-            let _ = this.update(cx, |app, cx| {
-                match result {
-                    Ok(installer_path) => {
-                        // Persist before spawn: silent NSIS may KillProcess before Drop runs.
-                        app.flush_jobs_save_now();
-                        app.flush_window_layout_now();
-                        if let Err(message) = launch_installer(&installer_path, true) {
-                            app.update_busy = false;
-                            app.show_error_toast(message, cx);
-                            cx.notify();
-                            return;
-                        }
-                        app.show_toast("Installing update — RusticDL will restart…", cx);
-                        // Bypass close-to-tray so quit actually tears down the process.
-                        app.force_quit = true;
-                        app.stop_tray();
-                        cx.notify();
-                        cx.quit();
-                    }
-                    Err(message) => {
-                        app.update_busy = false;
-                        app.show_error_toast(message, cx);
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
+        let from_version = if info.current_version.trim().is_empty() {
+            APP_VERSION.to_string()
+        } else {
+            info.current_version.clone()
+        };
+
+        let opts = LaunchUpdaterOpts {
+            download_url: info.setup_download_url.clone(),
+            from_version,
+            to_version: info.latest_version.clone(),
+            release_page: info.html_url.clone(),
+            setup_size: info.setup_size,
+        };
+
+        if let Err(message) = launch_updater(&opts) {
+            self.update_busy = false;
+            self.show_error_toast(message, cx);
+            cx.notify();
+            return;
+        }
+
+        // Bypass close-to-tray so quit actually tears down the process.
+        self.force_quit = true;
+        self.stop_tray();
+        cx.notify();
+        cx.quit();
     }
 }
 

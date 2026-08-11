@@ -36,6 +36,7 @@ jobs:
       - name: Build Rust release binaries
         run: |
           cargo build --release -p rusticdl
+          cargo build --release -p rusticdl-updater
           cargo build --release -p rusticdl-native-host
 
       - name: Install cargo-packager
@@ -67,6 +68,7 @@ jobs:
           $appDir = Join-Path $dist "app"
           New-Item -ItemType Directory -Force -Path $appDir | Out-Null
           Copy-Item "target/release/rusticdl.exe" $appDir
+          Copy-Item "target/release/rusticdl-updater.exe" $appDir
           Copy-Item "LICENSE" $appDir
           Copy-Item "README.md" $appDir
           Compress-Archive -Path (Join-Path $appDir "*") -DestinationPath "$dist/RusticDL-windows-x64.zip" -Force
@@ -79,6 +81,7 @@ jobs:
           $fullDir = Join-Path $dist "full"
           New-Item -ItemType Directory -Force -Path $fullDir | Out-Null
           Copy-Item "target/release/rusticdl.exe" $fullDir
+          Copy-Item "target/release/rusticdl-updater.exe" $fullDir
           Copy-Item "target/release/rusticdl-native-host.exe" $fullDir
           Copy-Item "LICENSE" $fullDir
           Copy-Item "README.md" $fullDir
