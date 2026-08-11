@@ -112,6 +112,9 @@ RusticDL is a **simple, local-first download manager** focused on everyday HTTP/
 - Detail panel with full job actions (open, reveal, copy path)
 - Concurrent downloads, auto-retry with exponential backoff, optional global speed limit
 - Nested TLS/network error details (helps diagnose flaky networks)
+- Windows completion notifications: tray balloons, OS notify mode (when hidden / always / off), and in-app terminal toasts when the window is visible
+- Unified active-URL duplicate policy: the same URL is not queued again while an active job already exists (manual Add and browser handoff share one rule)
+- Desktop Browser capture settings panel to configure extension capture preferences from the app
 - Settings for download dir, concurrency, retries, limit, appearance, and data folder
 - Appearance: light / dark / system, accents, transparency, blur, film grain, density, corners, vignette, progress styles, reduce motion
 - Persisted queue, settings, and window geometry
