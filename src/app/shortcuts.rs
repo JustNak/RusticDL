@@ -58,20 +58,28 @@ impl DownloadApp {
             return;
         }
 
+        // Queue-only ops: no-op on Settings (queue is not rendered; visible_jobs
+        // would otherwise treat Settings as "all" via filter_jobs fallthrough).
         if secondary_only && key == "a" {
-            self.shortcut_select_all_visible(cx);
+            if self.queue_shortcuts_active() {
+                self.shortcut_select_all_visible(cx);
+            }
             cx.stop_propagation();
             return;
         }
 
         if no_mods && key == "delete" {
-            self.shortcut_confirm_remove(window, cx);
+            if self.queue_shortcuts_active() {
+                self.shortcut_confirm_remove(window, cx);
+            }
             cx.stop_propagation();
             return;
         }
 
         if no_mods && key == "space" {
-            self.shortcut_toggle_pause_resume();
+            if self.queue_shortcuts_active() {
+                self.shortcut_toggle_pause_resume();
+            }
             cx.stop_propagation();
             return;
         }
@@ -80,6 +88,11 @@ impl DownloadApp {
             self.shortcut_focus_search(window, cx);
             cx.stop_propagation();
         }
+    }
+
+    /// Queue list is shown (not Settings). Select-all / Delete / Space apply only here.
+    fn queue_shortcuts_active(&self) -> bool {
+        self.filter != FilterKind::Settings
     }
 
     /// True when any app-owned text input (search, settings fields) has focus.
@@ -98,7 +111,11 @@ impl DownloadApp {
     }
 
     /// Ctrl/Cmd+A — select every job currently visible (filter + search + sort).
+    /// Caller must ensure `queue_shortcuts_active()` (Settings has no visible list).
     fn shortcut_select_all_visible(&mut self, cx: &mut Context<Self>) {
+        if !self.queue_shortcuts_active() {
+            return;
+        }
         let visible = self.visible_jobs(cx);
         if visible.is_empty() {
             return;
@@ -111,7 +128,7 @@ impl DownloadApp {
 
     /// Delete — confirm remove for primary (N=1) or all selected removable ids.
     fn shortcut_confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_ids.is_empty() {
+        if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
             return;
         }
         if self.selected_ids.len() == 1 {
@@ -130,7 +147,7 @@ impl DownloadApp {
 
     /// Space — pause any pausable selected jobs; else resume paused ones.
     fn shortcut_toggle_pause_resume(&mut self) {
-        if self.selected_ids.is_empty() {
+        if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
             return;
         }
         let any_pausable = self.selected_jobs().iter().any(|j| {
