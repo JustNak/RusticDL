@@ -23,6 +23,7 @@ use crate::format::format_bytes;
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
 use crate::window_icon::apply_app_icon;
+use crate::window_placement::center_window;
 
 const PROMPT_WINDOW_W: f32 = 480.0;
 const PROMPT_WINDOW_H: f32 = 360.0;
@@ -341,6 +342,9 @@ pub fn open_browser_prompt_window(
         Ok(handle) => {
             cx.activate(true);
             let _ = handle.update(cx, |_root, window, _cx| {
+                // PopUp windows often land at CW_USEDEFAULT (screen corner) even when
+                // Bounds::centered was requested — force a work-area center.
+                center_window(window);
                 window.activate_window();
             });
             Some(handle)
