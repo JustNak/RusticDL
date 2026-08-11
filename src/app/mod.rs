@@ -322,6 +322,8 @@ impl DownloadApp {
                             app.pending_tray_exit = true;
                             cx.notify();
                         }
+                        // Policy (open file / show window) lands in a follow-up PR.
+                        TrayEvent::BalloonUserClick { .. } => {}
                     });
                     if result.is_err() {
                         break;
@@ -431,6 +433,8 @@ impl DownloadApp {
                         app.pending_tray_exit = true;
                         cx.notify();
                     }
+                    // Policy (open file / show window) lands in a follow-up PR.
+                    TrayEvent::BalloonUserClick { .. } => {}
                 });
                 if result.is_err() {
                     break;

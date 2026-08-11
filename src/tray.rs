@@ -2,8 +2,22 @@
 //!
 //! Provides a tray icon with a context menu so the user can restore the main
 //! window or fully quit while the app is hidden via "close to tray".
+//!
+//! Balloon notifications (`NIF_INFO`) are shown only on the tray message thread:
+//! the UI calls [`SystemTray::show_notification`], which enqueues a payload and
+//! posts a wake-up to the tray HWND. Ownership of balloon payloads always lives
+//! in the shared queue (never only in a discarded PostMessage `LPARAM`).
 
 use crate::branding::APP_NAME;
+
+/// Severity icon for a tray balloon (`NIIF_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by notification policy (follow-up PR)
+pub enum NotifyLevel {
+    Info,
+    Warning,
+    Error,
+}
 
 /// Events the tray message thread posts back to the GPUI UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +26,37 @@ pub enum TrayEvent {
     ShowWindow,
     /// Fully quit the application.
     Exit,
+    /// User clicked the balloon; `context_id` is the token from
+    /// [`SystemTray::show_notification`] (policy layer maps the click).
+    BalloonUserClick { context_id: u64 },
+}
+
+/// Maximum UTF-16 code units for balloon title (`szInfoTitle` is 64 including NUL).
+#[allow(dead_code)] // used by show_notification + tests; policy PR may re-export
+pub const BALLOON_TITLE_MAX_UTF16: usize = 63;
+/// Maximum UTF-16 code units for balloon body (`szInfo` is 256 including NUL).
+#[allow(dead_code)] // used by show_notification + tests; policy PR may re-export
+pub const BALLOON_BODY_MAX_UTF16: usize = 255;
+
+/// Truncate `s` so its UTF-16 encoding fits in `max_units` code units.
+///
+/// Used for `NOTIFYICONDATAW` string fields that require a trailing NUL.
+#[allow(dead_code)] // used by show_notification + tests; policy PR may call directly
+pub fn truncate_utf16_units(s: &str, max_units: usize) -> &str {
+    if max_units == 0 {
+        return "";
+    }
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (i, ch) in s.char_indices() {
+        let u = ch.len_utf16();
+        if units + u > max_units {
+            break;
+        }
+        units += u;
+        end = i + ch.len_utf8();
+    }
+    &s[..end]
 }
 
 /// RAII handle for the background tray icon. Dropping it removes the icon.
@@ -20,6 +65,9 @@ pub struct SystemTray {
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+    /// Pending balloon payloads owned by the queue (not PostMessage LPARAM).
+    #[cfg(windows)]
+    pending_balloons: windows_impl::PendingBalloons,
 }
 
 impl SystemTray {
@@ -37,6 +85,33 @@ impl SystemTray {
             None
         }
     }
+
+    /// Show a tray balloon notification.
+    ///
+    /// Enqueues the payload and posts a wake-up to the tray message thread
+    /// (never calls `Shell_NotifyIconW` from the caller). No-op if the tray
+    /// HWND is not ready (`hwnd == 0`).
+    ///
+    /// `context_id` is stored for the active balloon (after a successful
+    /// `NIM_MODIFY`) and echoed on [`TrayEvent::BalloonUserClick`].
+    #[allow(dead_code)] // called by notification policy (follow-up PR)
+    pub fn show_notification(&self, title: &str, body: &str, level: NotifyLevel, context_id: u64) {
+        #[cfg(windows)]
+        {
+            windows_impl::show_notification(
+                &self.hwnd,
+                &self.pending_balloons,
+                title,
+                body,
+                level,
+                context_id,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (title, body, level, context_id);
+        }
+    }
 }
 
 impl Drop for SystemTray {
@@ -46,7 +121,8 @@ impl Drop for SystemTray {
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
             use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
-            let raw = self.hwnd.load(std::sync::atomic::Ordering::SeqCst);
+            // Stop accepting new balloons before teardown (swap so we keep the HWND).
+            let raw = self.hwnd.swap(0, std::sync::atomic::Ordering::SeqCst);
             if raw != 0 {
                 let hwnd = HWND(raw as *mut core::ffi::c_void);
                 let _ = unsafe {
@@ -55,6 +131,10 @@ impl Drop for SystemTray {
             }
             if let Some(handle) = self.thread.take() {
                 let _ = handle.join();
+            }
+            // Thread exit drains any leftovers; belt-and-suspenders clear.
+            if let Ok(mut q) = self.pending_balloons.lock() {
+                q.clear();
             }
         }
     }
@@ -113,28 +193,36 @@ pub fn show_main_window(window: &gpui::Window) {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{SystemTray, TrayEvent, APP_NAME};
+    use super::{
+        truncate_utf16_units, NotifyLevel, SystemTray, TrayEvent, APP_NAME, BALLOON_BODY_MAX_UTF16,
+        BALLOON_TITLE_MAX_UTF16,
+    };
     use crate::branding::APP_ICON_ICO;
+    use std::collections::VecDeque;
     use std::os::windows::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO,
+        NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_BALLOONTIMEOUT,
+        NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFYICON_VERSION,
+        NOTIFY_ICON_INFOTIP_FLAGS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
         DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadImageW,
-        PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu,
-        TranslateMessage, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-        HICON, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_STRING, MSG,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+        PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+        TrackPopupMenu, TranslateMessage, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+        GWLP_USERDATA, HICON, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_STRING,
+        MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+        WNDCLASSW,
     };
 
     const TRAY_UID: u32 = 1;
@@ -142,26 +230,46 @@ mod windows_impl {
     const ID_TRAY_EXIT: usize = 1002;
     /// Custom callback message delivered to our message-only window.
     const WM_TRAYICON: u32 = WM_APP + 40;
+    /// UI → tray thread: drain pending balloon queue and apply.
+    /// `LPARAM` is unused — payloads live in [`PendingBalloons`].
+    const WM_SHOW_BALLOON: u32 = WM_APP + 41;
+
+    /// Shared queue of balloon payloads. Always owns the heap data; `PostMessage`
+    /// is only a wake-up so DestroyWindow cannot leak discarded LPARAMs.
+    pub(super) type PendingBalloons = Arc<Mutex<VecDeque<BalloonRequest>>>;
+
+    pub(super) struct BalloonRequest {
+        title: String,
+        body: String,
+        level: NotifyLevel,
+        context_id: u64,
+    }
 
     struct TrayState {
         event_tx: async_channel::Sender<TrayEvent>,
         icon: HICON,
+        pending_balloons: PendingBalloons,
+        /// Context id of the balloon currently shown (if any).
+        /// Only set after a successful `NIM_MODIFY`.
+        active_balloon_context_id: Option<u64>,
     }
 
     pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
         let hwnd_slot = Arc::new(AtomicIsize::new(0));
         let hwnd_for_thread = hwnd_slot.clone();
+        let pending_balloons: PendingBalloons = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_for_thread = pending_balloons.clone();
 
         let thread = thread::Builder::new()
             .name("rusticdl-tray".into())
             .spawn(move || {
-                if let Err(err) = run_tray_loop(event_tx, hwnd_for_thread) {
+                if let Err(err) = run_tray_loop(event_tx, hwnd_for_thread, pending_for_thread) {
                     eprintln!("[rusticdl] tray: {err}");
                 }
             })
             .ok()?;
 
-        // Brief wait so Drop can target a real HWND quickly after startup.
+        // Brief wait so Drop / show_notification see a ready HWND after startup.
         for _ in 0..50 {
             if hwnd_slot.load(Ordering::SeqCst) != 0 {
                 break;
@@ -172,12 +280,58 @@ mod windows_impl {
         Some(SystemTray {
             thread: Some(thread),
             hwnd: hwnd_slot,
+            pending_balloons,
         })
+    }
+
+    #[allow(dead_code)] // entry from SystemTray::show_notification (policy PR)
+    pub(super) fn show_notification(
+        hwnd_slot: &AtomicIsize,
+        pending: &PendingBalloons,
+        title: &str,
+        body: &str,
+        level: NotifyLevel,
+        context_id: u64,
+    ) {
+        let raw = hwnd_slot.load(Ordering::SeqCst);
+        if raw == 0 {
+            return;
+        }
+        let req = BalloonRequest {
+            title: truncate_utf16_units(title, BALLOON_TITLE_MAX_UTF16).to_string(),
+            body: truncate_utf16_units(body, BALLOON_BODY_MAX_UTF16).to_string(),
+            level,
+            context_id,
+        };
+        // Enqueue first so ownership never depends on PostMessage delivery.
+        if let Ok(mut q) = pending.lock() {
+            q.push_back(req);
+        } else {
+            return;
+        }
+        let hwnd = HWND(raw as *mut core::ffi::c_void);
+        // Wake-up only; if this fails (HWND dying), queue is drained on tray stop.
+        let _ = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_SHOW_BALLOON,
+                WPARAM::default(),
+                LPARAM::default(),
+            )
+        };
+    }
+
+    fn drain_pending(pending: &PendingBalloons) -> Vec<BalloonRequest> {
+        pending
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
     }
 
     fn run_tray_loop(
         event_tx: async_channel::Sender<TrayEvent>,
         hwnd_slot: Arc<AtomicIsize>,
+        pending_balloons: PendingBalloons,
     ) -> Result<(), String> {
         unsafe {
             let module = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandle: {e}"))?;
@@ -195,7 +349,12 @@ mod windows_impl {
             let _ = RegisterClassW(&wc);
 
             let icon = load_tray_icon().unwrap_or(HICON(std::ptr::null_mut()));
-            let state = Box::new(TrayState { event_tx, icon });
+            let state = Box::new(TrayState {
+                event_tx,
+                icon,
+                pending_balloons: pending_balloons.clone(),
+                active_balloon_context_id: None,
+            });
             let state_ptr = Box::into_raw(state);
 
             let hwnd = match CreateWindowExW(
@@ -215,12 +374,13 @@ mod windows_impl {
                 Ok(h) => h,
                 Err(e) => {
                     drop(Box::from_raw(state_ptr));
+                    // Drop any balloons posted during a failed start (none expected).
+                    let _ = drain_pending(&pending_balloons);
                     return Err(format!("CreateWindowEx: {e}"));
                 }
             };
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
-            hwnd_slot.store(hwnd.0 as isize, Ordering::SeqCst);
 
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -231,20 +391,45 @@ mod windows_impl {
                 hIcon: icon,
                 ..Default::default()
             };
-            write_tip(&mut nid.szTip, APP_NAME);
+            write_utf16_buf(&mut nid.szTip, APP_NAME);
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-                hwnd_slot.store(0, Ordering::SeqCst);
-                // DestroyWindow → WM_DESTROY frees TrayState; do not free again here.
+                // HWND never published — show_notification cannot race here.
                 let _ = DestroyWindow(hwnd);
+                let _ = drain_pending(&pending_balloons);
                 return Err("Shell_NotifyIcon NIM_ADD failed".into());
             }
+
+            // Version 3 enables NIN_BALLOON* callbacks with the classic lParam packing.
+            let ver = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: TRAY_UID,
+                Anonymous: NOTIFYICONDATAW_0 {
+                    uVersion: NOTIFYICON_VERSION,
+                },
+                ..Default::default()
+            };
+            if !Shell_NotifyIconW(NIM_SETVERSION, &ver).as_bool() {
+                eprintln!(
+                    "[rusticdl] tray: NIM_SETVERSION failed; balloon click callbacks may be unreliable"
+                );
+            }
+
+            // Publish only when the icon is live and version is attempted — balloons
+            // must not NIM_MODIFY a non-existent icon.
+            hwnd_slot.store(hwnd.0 as isize, Ordering::SeqCst);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+
+            // Stop accepting new work, then free any payloads still queued
+            // (e.g. wake-ups discarded by DestroyWindow).
+            hwnd_slot.store(0, Ordering::SeqCst);
+            let _ = drain_pending(&pending_balloons);
 
             let del = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -254,7 +439,6 @@ mod windows_impl {
             };
             let _ = Shell_NotifyIconW(NIM_DELETE, &del);
 
-            hwnd_slot.store(0, Ordering::SeqCst);
             let _ = UnregisterClassW(class_name, Some(hinstance));
             Ok(())
         }
@@ -281,6 +465,9 @@ mod windows_impl {
                     if !ptr.is_null() {
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                         let state = Box::from_raw(ptr);
+                        // Drop any balloons still queued; DestroyWindow may discard
+                        // pending WM_SHOW_BALLOON wake-ups without delivering them.
+                        let _ = drain_pending(&state.pending_balloons);
                         if !state.icon.0.is_null() {
                             let _ = DestroyIcon(state.icon);
                         }
@@ -292,14 +479,29 @@ mod windows_impl {
                     let _ = DestroyWindow(hwnd);
                     LRESULT(0)
                 }
+                WM_SHOW_BALLOON => {
+                    apply_pending_balloons(hwnd);
+                    LRESULT(0)
+                }
                 WM_TRAYICON => {
-                    let mouse = lparam.0 as u32;
-                    match mouse {
+                    let notify = lparam.0 as u32;
+                    match notify {
                         WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
                             send_event(hwnd, TrayEvent::ShowWindow);
                         }
                         WM_RBUTTONUP => {
                             show_context_menu(hwnd);
+                        }
+                        NIN_BALLOONUSERCLICK => {
+                            if let Some(context_id) = take_active_balloon_context(hwnd) {
+                                send_event(hwnd, TrayEvent::BalloonUserClick { context_id });
+                            }
+                        }
+                        // Clear only on timeout. Do not clear on NIN_BALLOONHIDE:
+                        // replacing a balloon can deliver HIDE for the previous tip
+                        // after the new active context was committed.
+                        NIN_BALLOONTIMEOUT => {
+                            clear_active_balloon_context(hwnd);
                         }
                         _ => {}
                     }
@@ -316,6 +518,76 @@ mod windows_impl {
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
+        }
+    }
+
+    unsafe fn apply_pending_balloons(hwnd: HWND) {
+        unsafe {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
+            if ptr.is_null() {
+                return;
+            }
+            let state = &mut *ptr;
+            let pending = drain_pending(&state.pending_balloons);
+            for req in pending {
+                apply_balloon(hwnd, state, req);
+            }
+        }
+    }
+
+    unsafe fn apply_balloon(hwnd: HWND, state: &mut TrayState, req: BalloonRequest) {
+        unsafe {
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: TRAY_UID,
+                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO,
+                uCallbackMessage: WM_TRAYICON,
+                hIcon: state.icon,
+                dwInfoFlags: level_to_flags(req.level),
+                ..Default::default()
+            };
+            write_utf16_buf(&mut nid.szTip, APP_NAME);
+            write_utf16_buf(&mut nid.szInfoTitle, &req.title);
+            write_utf16_buf(&mut nid.szInfo, &req.body);
+            if Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
+                // Commit context only after the balloon is actually shown.
+                state.active_balloon_context_id = Some(req.context_id);
+            } else {
+                eprintln!(
+                    "[rusticdl] tray: NIM_MODIFY (balloon) failed for context_id={}",
+                    req.context_id
+                );
+            }
+        }
+    }
+
+    fn level_to_flags(level: NotifyLevel) -> NOTIFY_ICON_INFOTIP_FLAGS {
+        match level {
+            NotifyLevel::Info => NIIF_INFO,
+            NotifyLevel::Warning => NIIF_WARNING,
+            NotifyLevel::Error => NIIF_ERROR,
+        }
+    }
+
+    unsafe fn take_active_balloon_context(hwnd: HWND) -> Option<u64> {
+        unsafe {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
+            if ptr.is_null() {
+                return None;
+            }
+            let state = &mut *ptr;
+            state.active_balloon_context_id.take()
+        }
+    }
+
+    unsafe fn clear_active_balloon_context(hwnd: HWND) {
+        unsafe {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
+            if ptr.is_null() {
+                return;
+            }
+            (*ptr).active_balloon_context_id = None;
         }
     }
 
@@ -392,8 +664,8 @@ mod windows_impl {
         candidates.into_iter().flatten().find(|p| p.exists())
     }
 
-    fn write_tip(buf: &mut [u16; 128], tip: &str) {
-        let mut wide: Vec<u16> = tip.encode_utf16().collect();
+    fn write_utf16_buf(buf: &mut [u16], text: &str) {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
         if wide.len() >= buf.len() {
             wide.truncate(buf.len() - 1);
         }
@@ -403,5 +675,47 @@ mod windows_impl {
 
     fn wide_null(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_utf16_units, BALLOON_BODY_MAX_UTF16, BALLOON_TITLE_MAX_UTF16};
+
+    #[test]
+    fn truncate_short_unchanged() {
+        assert_eq!(truncate_utf16_units("hello", 63), "hello");
+    }
+
+    #[test]
+    fn truncate_title_to_63_units() {
+        let s: String = "a".repeat(100);
+        let out = truncate_utf16_units(&s, BALLOON_TITLE_MAX_UTF16);
+        assert_eq!(out.encode_utf16().count(), BALLOON_TITLE_MAX_UTF16);
+        assert_eq!(out.len(), BALLOON_TITLE_MAX_UTF16);
+    }
+
+    #[test]
+    fn truncate_body_to_255_units() {
+        let s: String = "b".repeat(300);
+        let out = truncate_utf16_units(&s, BALLOON_BODY_MAX_UTF16);
+        assert_eq!(out.encode_utf16().count(), BALLOON_BODY_MAX_UTF16);
+    }
+
+    #[test]
+    fn truncate_respects_multibyte_utf16() {
+        // U+1F600 😀 is two UTF-16 units (surrogate pair).
+        let s = "😀😀😀";
+        let out = truncate_utf16_units(s, 4);
+        assert_eq!(out, "😀😀");
+        assert_eq!(out.encode_utf16().count(), 4);
+        // Max 3 units cannot fit a second emoji (2 units).
+        let out2 = truncate_utf16_units(s, 3);
+        assert_eq!(out2, "😀");
+    }
+
+    #[test]
+    fn truncate_zero_is_empty() {
+        assert_eq!(truncate_utf16_units("abc", 0), "");
     }
 }
