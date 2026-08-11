@@ -38,6 +38,7 @@ use crate::appearance::{
     vignette_enabled,
 };
 use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job, JobState};
+use crate::extension_settings::DownloadHandoffMode;
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
 use crate::persistence::{save_jobs, save_settings, AppPaths};
@@ -74,6 +75,10 @@ pub struct DownloadApp {
     concurrent_input: Entity<InputState>,
     retry_input: Entity<InputState>,
     speed_input: Entity<InputState>,
+    /// Draft textarea for `settings.extension.excluded_hosts` (one host per line).
+    excluded_hosts_input: Entity<InputState>,
+    /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
+    captured_extensions_input: Entity<InputState>,
     noise_slider: Entity<SliderState>,
     opacity_slider: Entity<SliderState>,
     hue_slider: Entity<SliderState>,
@@ -139,6 +144,18 @@ impl DownloadApp {
             InputState::new(window, cx)
                 .placeholder("0 = unlimited")
                 .default_value(settings.speed_limit_kib_per_second.to_string())
+        });
+        let excluded_hosts_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(3)
+                .placeholder("One host per line…")
+                .default_value(settings.extension.excluded_hosts.join("\n"))
+        });
+        let captured_extensions_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("zip, pdf, exe…")
+                .default_value(settings.extension.captured_file_extensions.join(", "))
         });
 
         let noise_slider = cx.new(|_| {
@@ -353,6 +370,8 @@ impl DownloadApp {
             concurrent_input,
             retry_input,
             speed_input,
+            excluded_hosts_input,
+            captured_extensions_input,
             noise_slider,
             opacity_slider,
             hue_slider,
@@ -706,6 +725,28 @@ impl DownloadApp {
         self.settings.auto_retry_attempts = auto_retry;
         self.settings.speed_limit_kib_per_second = speed_limit;
 
+        // Browser capture text lists — drafts until Save; sanitize via extension.sanitize().
+        let excluded_hosts = self
+            .excluded_hosts_input
+            .read(cx)
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let captured_extensions = self
+            .captured_extensions_input
+            .read(cx)
+            .value()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.settings.extension.excluded_hosts = excluded_hosts;
+        self.settings.extension.captured_file_extensions = captured_extensions;
+
         self.settings.sanitize_appearance();
         let _ = save_settings(&self.paths, &self.settings);
         self.ipc.update_settings(&self.settings);
@@ -745,6 +786,52 @@ impl DownloadApp {
         } else if !self.window_hidden_to_tray {
             self.stop_tray();
         }
+        cx.notify();
+    }
+
+    /// Browser capture toggles preview immediately; disk flush is "Save settings".
+    fn set_extension_enabled(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.extension.enabled = on;
+        cx.notify();
+    }
+
+    fn set_download_handoff_mode(
+        &mut self,
+        mode: DownloadHandoffMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.extension.download_handoff_mode = mode;
+        cx.notify();
+    }
+
+    fn set_context_menu_enabled(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.extension.context_menu_enabled = on;
+        cx.notify();
+    }
+
+    fn set_show_badge_status(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.extension.show_badge_status = on;
+        cx.notify();
+    }
+
+    fn set_show_progress_after_handoff(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.extension.show_progress_after_handoff = on;
+        cx.notify();
+    }
+
+    fn set_download_capture_debug_logging(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.extension.download_capture_debug_logging = on;
         cx.notify();
     }
 
@@ -880,6 +967,12 @@ impl DownloadApp {
     fn select_filter(&mut self, filter: FilterKind, window: &mut Window, cx: &mut Context<Self>) {
         self.filter = filter;
         if filter == FilterKind::Settings {
+            // Prefer bridge copy if the extension saved settings while Settings was closed.
+            if let Some(extension) = self.ipc.extension_settings() {
+                if self.settings.extension != extension {
+                    self.settings.extension = extension;
+                }
+            }
             let dir = self
                 .settings
                 .download_directory
@@ -888,6 +981,8 @@ impl DownloadApp {
             let concurrent = self.settings.max_concurrent_downloads.to_string();
             let retry = self.settings.auto_retry_attempts.to_string();
             let speed = self.settings.speed_limit_kib_per_second.to_string();
+            let excluded = self.settings.extension.excluded_hosts.join("\n");
+            let captured = self.settings.extension.captured_file_extensions.join(", ");
             self.dir_input
                 .update(cx, |i, cx| i.set_value(dir, window, cx));
             self.concurrent_input
@@ -896,6 +991,10 @@ impl DownloadApp {
                 .update(cx, |i, cx| i.set_value(retry, window, cx));
             self.speed_input
                 .update(cx, |i, cx| i.set_value(speed, window, cx));
+            self.excluded_hosts_input
+                .update(cx, |i, cx| i.set_value(excluded, window, cx));
+            self.captured_extensions_input
+                .update(cx, |i, cx| i.set_value(captured, window, cx));
         }
         cx.notify();
     }

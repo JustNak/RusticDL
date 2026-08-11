@@ -22,6 +22,7 @@ use super::widgets::{
 use super::DownloadApp;
 use crate::appearance::{accent_swatch_color, custom_accent_hsla, resolve_theme_mode};
 use crate::download::reveal_in_folder;
+use crate::extension_settings::DownloadHandoffMode;
 use crate::settings::{AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, UiDensity};
 
 impl DownloadApp {
@@ -44,6 +45,12 @@ impl DownloadApp {
         let close_to_tray = self.settings.close_to_tray;
         let launch_at_startup = self.settings.launch_at_startup;
         let startup_minimized = self.settings.startup_minimized;
+        let ext_enabled = self.settings.extension.enabled;
+        let handoff_mode = self.settings.extension.download_handoff_mode;
+        let context_menu_enabled = self.settings.extension.context_menu_enabled;
+        let show_badge_status = self.settings.extension.show_badge_status;
+        let show_progress_after_handoff = self.settings.extension.show_progress_after_handoff;
+        let capture_debug_logging = self.settings.extension.download_capture_debug_logging;
         let data_dir = self.paths.root.display().to_string();
         let settings_pad = ui_density.settings_pad();
         let resolved_mode = resolve_theme_mode(theme_choice, None, cx);
@@ -344,6 +351,374 @@ impl DownloadApp {
                                                 cx,
                                             )),
                                     ),
+                            ),
+                    )
+                    .child(
+                        GroupBox::new()
+                            .outline()
+                            .title(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::ExternalLink)
+                                            .with_size(px(14.))
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .child("Browser capture"),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_4()
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Enable browser capture", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("ext-enabled-off")
+                                                            .label("Off")
+                                                            .when(!ext_enabled, |b| b.primary())
+                                                            .when(ext_enabled, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_extension_enabled(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("ext-enabled-on")
+                                                            .label("On")
+                                                            .when(ext_enabled, |b| b.primary())
+                                                            .when(!ext_enabled, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_extension_enabled(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "When On, the companion extension can hand downloads to RusticDL.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Download handoff", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .flex_wrap()
+                                                    .child(
+                                                        Button::new("handoff-off")
+                                                            .label("Off")
+                                                            .when(
+                                                                handoff_mode
+                                                                    == DownloadHandoffMode::Off,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                handoff_mode
+                                                                    != DownloadHandoffMode::Off,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_download_handoff_mode(
+                                                                        DownloadHandoffMode::Off,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("handoff-ask")
+                                                            .label("Ask")
+                                                            .when(
+                                                                handoff_mode
+                                                                    == DownloadHandoffMode::Ask,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                handoff_mode
+                                                                    != DownloadHandoffMode::Ask,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_download_handoff_mode(
+                                                                        DownloadHandoffMode::Ask,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("handoff-auto")
+                                                            .label("Auto")
+                                                            .when(
+                                                                handoff_mode
+                                                                    == DownloadHandoffMode::Auto,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                handoff_mode
+                                                                    != DownloadHandoffMode::Auto,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_download_handoff_mode(
+                                                                        DownloadHandoffMode::Auto,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Off skips interception. Ask prompts before taking a download. Auto hands off silently.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Context menu", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("ext-ctx-off")
+                                                            .label("Off")
+                                                            .when(!context_menu_enabled, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(context_menu_enabled, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_context_menu_enabled(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("ext-ctx-on")
+                                                            .label("On")
+                                                            .when(context_menu_enabled, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!context_menu_enabled, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_context_menu_enabled(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Show “Download with RusticDL” on link and page context menus.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Toolbar badge status", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("ext-badge-off")
+                                                            .label("Off")
+                                                            .when(!show_badge_status, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(show_badge_status, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_show_badge_status(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("ext-badge-on")
+                                                            .label("On")
+                                                            .when(show_badge_status, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!show_badge_status, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_show_badge_status(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Show connection / activity on the extension toolbar icon.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Show progress after handoff", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("ext-progress-off")
+                                                            .label("Off")
+                                                            .when(
+                                                                !show_progress_after_handoff,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                show_progress_after_handoff,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_show_progress_after_handoff(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("ext-progress-on")
+                                                            .label("On")
+                                                            .when(
+                                                                show_progress_after_handoff,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                !show_progress_after_handoff,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_show_progress_after_handoff(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Focus or surface RusticDL progress after a browser handoff.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1p5()
+                                            .child(field_label("Excluded hosts", cx))
+                                            .child(
+                                                Input::new(&self.excluded_hosts_input).w_full(),
+                                            )
+                                            .child(field_hint(
+                                                "One host per line. Matching sites skip capture.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_1p5()
+                                            .child(field_label("Captured file extensions", cx))
+                                            .child(
+                                                Input::new(&self.captured_extensions_input)
+                                                    .w_full(),
+                                            )
+                                            .child(field_hint(
+                                                "Comma-separated extensions the extension will intercept (e.g. zip, pdf, exe).",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Capture debug logging", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("ext-debug-off")
+                                                            .label("Off")
+                                                            .when(!capture_debug_logging, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(capture_debug_logging, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_download_capture_debug_logging(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("ext-debug-on")
+                                                            .label("On")
+                                                            .when(capture_debug_logging, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!capture_debug_logging, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_download_capture_debug_logging(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Verbose extension logging for capture diagnostics.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(field_hint(
+                                        "Saved with Save settings. Synced to the browser extension when it is connected.",
+                                        cx,
+                                    )),
                             ),
                     )
                     .child(
