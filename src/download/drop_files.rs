@@ -109,9 +109,11 @@ pub fn parse_windows_url_shortcut(contents: &str) -> Option<String> {
             continue;
         }
         // Case-insensitive "URL="
-        if line.as_bytes().get(..4).is_some_and(|p| {
-            p.eq_ignore_ascii_case(b"URL=")
-        }) {
+        if line
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"URL="))
+        {
             let value = line[4..].trim();
             if value.is_empty() {
                 continue;

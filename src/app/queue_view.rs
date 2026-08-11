@@ -56,10 +56,7 @@ impl DownloadApp {
             if summary.skipped > 0 || summary.errors > 0 {
                 let mut notes = Vec::new();
                 if summary.skipped > 0 {
-                    notes.push(format!(
-                        "{} skipped (binary/oversized)",
-                        summary.skipped
-                    ));
+                    notes.push(format!("{} skipped (binary/oversized)", summary.skipped));
                 }
                 if summary.errors > 0 {
                     notes.push(format!("{} unreadable", summary.errors));
