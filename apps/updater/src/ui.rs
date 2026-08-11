@@ -57,7 +57,9 @@ mod windows_ui {
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        GetStockObject, UpdateWindow, DEFAULT_GUI_FONT, HBRUSH, WHITE_BRUSH,
+        GetMonitorInfoW, GetStockObject, MonitorFromPoint, MonitorFromWindow, UpdateWindow,
+        DEFAULT_GUI_FONT, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+        WHITE_BRUSH,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Controls::{
@@ -66,13 +68,14 @@ mod windows_ui {
     };
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-        SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
-        CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, IDYES, MB_ICONERROR, MB_OK,
-        MB_YESNO, MESSAGEBOX_RESULT, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-        WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_OVERLAPPED,
-        WS_SYSMENU, WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+        GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, MessageBoxW, PostMessageW,
+        PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+        SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+        GWLP_USERDATA, HMENU, IDC_ARROW, IDYES, MB_ICONERROR, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
+        MSG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD,
+        WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
     };
 
     const WM_UPD_STATUS: u32 = WM_APP + 1;
@@ -229,7 +232,9 @@ mod windows_ui {
             WINDOW_EX_STYLE::default(),
             class_name,
             PCWSTR(title_w.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            // Create hidden, center on the work area, then ShowWindow so the
+            // first painted frame is already centered (avoids CW_USEDEFAULT flash).
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             width,
@@ -242,6 +247,10 @@ mod windows_ui {
         .expect("CreateWindowExW");
 
         shared.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+
+        // CW_USEDEFAULT places the window at a cascade corner; center on the
+        // work area of the monitor under the cursor (or the host/primary).
+        center_window_on_work_area(hwnd);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
@@ -415,5 +424,69 @@ mod windows_ui {
     /// Pack two 16-bit values into an LPARAM (Win32 MAKELPARAM).
     const fn make_lparam(low: u16, high: u16) -> isize {
         ((high as isize) << 16) | (low as isize & 0xFFFF)
+    }
+
+    /// Center `hwnd` on the monitor work area (excludes taskbar). Uses physical
+    /// screen coordinates so it is correct for any DPI / resolution.
+    unsafe fn center_window_on_work_area(hwnd: HWND) {
+        use windows::Win32::Foundation::{POINT, RECT};
+
+        if hwnd.0.is_null() {
+            return;
+        }
+
+        let mut window_rect = RECT::default();
+        if GetWindowRect(hwnd, &mut window_rect).is_err() {
+            return;
+        }
+        let width = window_rect.right - window_rect.left;
+        let height = window_rect.bottom - window_rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let monitor = {
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_ok() {
+                let m = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+                if !m.0.is_null() {
+                    m
+                } else {
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY)
+                }
+            } else {
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY)
+            }
+        };
+        if monitor.0.is_null() {
+            return;
+        }
+
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+
+        let work = info.rcWork;
+        let work_w = work.right - work.left;
+        let work_h = work.bottom - work.top;
+        if work_w <= 0 || work_h <= 0 {
+            return;
+        }
+
+        let x = work.left + (work_w - width) / 2;
+        let y = work.top + (work_h - height) / 2;
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }

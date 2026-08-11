@@ -17,6 +17,7 @@ mod startup;
 mod tray;
 mod updater;
 mod window_icon;
+mod window_placement;
 
 use app::DownloadApp;
 use assets::Assets;
@@ -33,6 +34,7 @@ use settings::{WindowLayout, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
 use single_instance::{claim_instance, InstanceRole};
 use startup::{apply_launch_at_startup, launched_minimized};
 use window_icon::apply_app_icon;
+use window_placement::center_window;
 
 fn main() {
     set_app_user_model_id();
@@ -84,7 +86,8 @@ fn main() {
             // Theme / accent / opacity are applied when the window opens
             // (DownloadApp::new → appearance::apply_appearance).
 
-            let window_bounds = window_bounds_from_layout(&initial_settings.window_layout, cx);
+            let (window_bounds, needs_center) =
+                window_bounds_from_layout(&initial_settings.window_layout, cx);
             let settings = initial_settings;
             let jobs = initial_jobs;
             let paths = initial_paths;
@@ -93,34 +96,46 @@ fn main() {
             let ipc_bridge = ipc_bridge.clone();
 
             cx.spawn(async move |cx| {
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(window_bounds),
-                        // Client-drawn chrome: gpui-component TitleBar supplies
-                        // drag region + window controls. Keep a title string for
-                        // taskbar / Alt-Tab while drawing our own bar.
-                        titlebar: Some({
-                            let mut opts = TitleBar::title_bar_options();
-                            opts.title = Some(SharedString::from(APP_NAME));
-                            opts
-                        }),
-                        window_decorations: Some(WindowDecorations::Client),
-                        window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-                        // `--minimized` (startup-minimized) keeps the shell hidden until tray show.
-                        show: !start_hidden,
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        apply_app_icon(window);
-                        let view = cx.new(|cx| {
-                            DownloadApp::new(
-                                jobs, settings, paths, engine, ui_rx, ipc_bridge, window, cx,
-                            )
-                        });
-                        cx.new(|cx| Root::new(view, window, cx))
-                    },
-                )
-                .expect("open window");
+                let handle = cx
+                    .open_window(
+                        WindowOptions {
+                            window_bounds: Some(window_bounds),
+                            // Client-drawn chrome: gpui-component TitleBar supplies
+                            // drag region + window controls. Keep a title string for
+                            // taskbar / Alt-Tab while drawing our own bar.
+                            titlebar: Some({
+                                let mut opts = TitleBar::title_bar_options();
+                                opts.title = Some(SharedString::from(APP_NAME));
+                                opts
+                            }),
+                            window_decorations: Some(WindowDecorations::Client),
+                            window_min_size: Some(size(
+                                px(MIN_WINDOW_WIDTH),
+                                px(MIN_WINDOW_HEIGHT),
+                            )),
+                            // `--minimized` (startup-minimized) keeps the shell hidden until tray show.
+                            show: !start_hidden,
+                            ..Default::default()
+                        },
+                        move |window, cx| {
+                            apply_app_icon(window);
+                            let view = cx.new(|cx| {
+                                DownloadApp::new(
+                                    jobs, settings, paths, engine, ui_rx, ipc_bridge, window, cx,
+                                )
+                            });
+                            cx.new(|cx| Root::new(view, window, cx))
+                        },
+                    )
+                    .expect("open window");
+
+                // Fresh install / invalid restore: GPUI may still place the HWND at the
+                // CW_USEDEFAULT cascade corner — re-center with the monitor work area.
+                if needs_center {
+                    let _ = handle.update(cx, |_root, window, _cx| {
+                        center_window(window);
+                    });
+                }
             })
             .detach();
         });
@@ -130,31 +145,37 @@ fn main() {
 ///
 /// Fresh install / missing position → centered default size.
 /// Saved position is used only when it still intersects a display.
-fn window_bounds_from_layout(layout: &WindowLayout, cx: &App) -> WindowBounds {
+///
+/// Returns `(bounds, needs_native_center)` — the second flag is true when we
+/// intended a centered placement and should re-center via Win32 after open.
+fn window_bounds_from_layout(layout: &WindowLayout, cx: &App) -> (WindowBounds, bool) {
     let mut layout = layout.clone();
     layout.sanitize();
 
     let size = size(px(layout.width), px(layout.height));
-    let bounds = match (layout.x, layout.y) {
+    let (bounds, needs_center) = match (layout.x, layout.y) {
         (Some(x), Some(y)) => {
             let candidate = Bounds {
                 origin: point(px(x), px(y)),
                 size,
             };
             if bounds_visible_on_any_display(&candidate, cx) {
-                candidate
+                (candidate, false)
             } else {
-                Bounds::centered(None, size, cx)
+                (Bounds::centered(None, size, cx), true)
             }
         }
-        _ => Bounds::centered(None, size, cx),
+        _ => (Bounds::centered(None, size, cx), true),
     };
 
-    if layout.maximized {
+    let window_bounds = if layout.maximized {
+        // Maximized restore already fills the monitor; no post-open center needed.
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)
-    }
+    };
+
+    (window_bounds, needs_center && !layout.maximized)
 }
 
 fn bounds_visible_on_any_display(bounds: &Bounds<gpui::Pixels>, cx: &App) -> bool {
