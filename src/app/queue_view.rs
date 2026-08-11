@@ -596,24 +596,10 @@ impl DownloadApp {
                 this.handle_external_paths_drop(paths, cx);
             }))
             .child(
-                // Content cluster: label above a large empty-box SVG, centered as a unit.
-                v_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(theme.muted_foreground)
-                            .child("Empty"),
-                    )
-                    .child(
-                        Icon::empty()
-                            .path("icons/empty-box.svg")
-                            .with_size(px(96.))
-                            .text_color(theme.muted_foreground.opacity(0.55)),
-                    ),
+                Icon::empty()
+                    .path("icons/empty-box.svg")
+                    .with_size(px(96.))
+                    .text_color(theme.muted_foreground.opacity(0.28)),
             )
     }
 }
