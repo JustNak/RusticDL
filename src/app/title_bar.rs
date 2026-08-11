@@ -94,9 +94,9 @@ impl DownloadApp {
                                                 .disabled(update_busy)
                                                 .on_click({
                                                     let view = view.clone();
-                                                    move |_, _window, cx| {
+                                                    move |_, window, cx| {
                                                         view.update(cx, |app, cx| {
-                                                            app.begin_one_click_update(cx);
+                                                            app.begin_update_action(window, cx);
                                                         });
                                                     }
                                                 }),

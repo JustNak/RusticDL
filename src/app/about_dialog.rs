@@ -67,9 +67,9 @@ impl DownloadApp {
                                             update_action_label.clone()
                                         })
                                         .disabled(update_busy)
-                                        .on_click(move |_, _window, cx| {
+                                        .on_click(move |_, window, cx| {
                                             app_view_check.update(cx, |app, cx| {
-                                                app.begin_one_click_update(cx);
+                                                app.begin_update_action(window, cx);
                                             });
                                         }),
                                 )

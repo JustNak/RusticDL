@@ -119,10 +119,12 @@ pub struct DownloadApp {
     jobs_dirty: bool,
     /// Throttle progress-only state.json writes.
     last_jobs_save: Instant,
-    /// True while a GitHub update check or installer download is running.
+    /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
-    /// Cached latest release when an update is available (enables one-click install).
+    /// Cached latest release when an update is available (Install update menu label).
     available_update: Option<UpdateInfo>,
+    /// Interactive check found an update; open the dialog on the next frame with a Window.
+    pending_show_update_dialog: bool,
     /// System tray icon (Windows). Present when close-to-tray, hidden-to-tray,
     /// or OS notify mode is enabled (`sync_tray_lifetime`).
     system_tray: Option<SystemTray>,
@@ -467,6 +469,7 @@ impl DownloadApp {
                 .unwrap_or_else(Instant::now),
             update_busy: false,
             available_update: None,
+            pending_show_update_dialog: false,
             system_tray,
             force_quit: false,
             window_hidden_to_tray: started_minimized,
@@ -1541,6 +1544,7 @@ impl Render for DownloadApp {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
         self.apply_pending_tray_actions(window, cx);
+        self.apply_pending_update_dialog(window, cx);
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);
