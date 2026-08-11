@@ -11,6 +11,8 @@ mod ipc;
 mod persistence;
 mod prompt_window;
 mod settings;
+mod startup;
+mod tray;
 mod updater;
 mod window_icon;
 
@@ -26,6 +28,7 @@ use gpui_component::{Root, TitleBar};
 use ipc::{start_ipc_server, IpcBridge};
 use persistence::{app_paths, ensure_app_dirs, load_jobs, load_settings};
 use settings::{WindowLayout, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
+use startup::{apply_launch_at_startup, launched_minimized};
 use window_icon::apply_app_icon;
 
 fn main() {
@@ -34,6 +37,9 @@ fn main() {
     let paths = app_paths();
     let _ = ensure_app_dirs(&paths);
     let settings = load_settings(&paths);
+    // Keep the OS autostart entry aligned with saved prefs (self-heal after moves/updates).
+    let _ = apply_launch_at_startup(settings.launch_at_startup, settings.startup_minimized);
+    let start_hidden = launched_minimized();
     let jobs = load_jobs(&paths);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -92,6 +98,8 @@ fn main() {
                         }),
                         window_decorations: Some(WindowDecorations::Client),
                         window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+                        // `--minimized` (startup-minimized) keeps the shell hidden until tray show.
+                        show: !start_hidden,
                         ..Default::default()
                     },
                     move |window, cx| {

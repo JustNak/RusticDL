@@ -343,9 +343,23 @@ pub struct Settings {
     /// Last main-window size / position / maximized state.
     #[serde(default)]
     pub window_layout: WindowLayout,
+    /// When true, the window close button hides the app to the system tray
+    /// (notification overflow) instead of quitting.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    /// Launch RusticDL automatically when the user signs in to Windows.
+    #[serde(default)]
+    pub launch_at_startup: bool,
+    /// When launching at sign-in, start hidden in the tray (requires tray).
+    #[serde(default)]
+    pub startup_minimized: bool,
     /// Browser extension integration preferences (source of truth for the companion extension).
     #[serde(default)]
     pub extension: ExtensionIntegrationSettings,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -371,6 +385,9 @@ impl Default for Settings {
             sort_column: SortColumn::Date,
             sort_direction: SortDirection::Desc,
             window_layout: WindowLayout::default(),
+            close_to_tray: true,
+            launch_at_startup: false,
+            startup_minimized: false,
             extension: ExtensionIntegrationSettings::default(),
         }
     }
@@ -457,6 +474,10 @@ mod tests {
         assert_eq!(s.vignette_intensity, 0);
         assert_eq!(s.progress_style, ProgressStyle::Solid);
         assert_eq!(s.window_layout, WindowLayout::default());
+        // New system prefs: close-to-tray defaults on for download-manager UX.
+        assert!(s.close_to_tray);
+        assert!(!s.launch_at_startup);
+        assert!(!s.startup_minimized);
     }
 
     #[test]
