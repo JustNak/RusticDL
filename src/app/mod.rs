@@ -64,7 +64,6 @@ use crate::tray::{
 };
 use crate::updater::UpdateInfo;
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
-use update_flow::spawn_update_check;
 use widgets::render_vignette_overlay;
 
 /// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
@@ -119,10 +118,12 @@ pub struct DownloadApp {
     jobs_dirty: bool,
     /// Throttle progress-only state.json writes.
     last_jobs_save: Instant,
-    /// True while a GitHub update check or installer download is running.
+    /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
-    /// Cached latest release when an update is available (enables one-click install).
+    /// Cached latest release when an update is available (Install update menu label).
     available_update: Option<UpdateInfo>,
+    /// Interactive check found an update; open the dialog on the next frame with a Window.
+    pending_show_update_dialog: bool,
     /// System tray icon (Windows). Present when close-to-tray, hidden-to-tray,
     /// or OS notify mode is enabled (`sync_tray_lifetime`).
     system_tray: Option<SystemTray>,
@@ -393,9 +394,6 @@ impl DownloadApp {
         ipc.update_settings(&settings);
         ipc.update_jobs(&jobs);
 
-        // Quiet startup check against GitHub Releases (toast only if an update exists).
-        spawn_update_check(false, cx);
-
         let started_minimized = launched_minimized();
         // Tray is needed for close-to-tray, startup-minimized, and OS balloons.
         let need_tray = settings.close_to_tray
@@ -422,7 +420,7 @@ impl DownloadApp {
         }
 
         let extension_committed = settings.extension.clone();
-        let app = Self {
+        let mut app = Self {
             jobs,
             settings,
             paths,
@@ -467,6 +465,7 @@ impl DownloadApp {
                 .unwrap_or_else(Instant::now),
             update_busy: false,
             available_update: None,
+            pending_show_update_dialog: false,
             system_tray,
             force_quit: false,
             window_hidden_to_tray: started_minimized,
@@ -480,6 +479,10 @@ impl DownloadApp {
             settings_category: SettingsCategory::General,
             settings_return_filter: FilterKind::All,
         };
+
+        // Quiet startup check against GitHub Releases (toast only if an update exists).
+        // Route through begin_update_check so update_busy serializes with interactive checks.
+        app.begin_update_check(false, cx);
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
         let entity = cx.entity();
@@ -1541,6 +1544,7 @@ impl Render for DownloadApp {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
         self.apply_pending_tray_actions(window, cx);
+        self.apply_pending_update_dialog(window, cx);
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);

@@ -3,12 +3,12 @@
 //! Always targets the public latest release of this repository:
 //! `https://github.com/JustNak/RusticDL/releases/latest`
 //!
-//! Flow (one click in the app):
+//! Staged flow (main app UI in `update_flow`):
 //! 1. Query the GitHub Releases API for the latest tag + assets.
-//! 2. Compare against the built-in app version.
-//! 3. If newer, flush app state, spawn **RusticDL Updater** with the setup
-//!    download URL, then quit. The updater shows progress, runs NSIS `/S`,
-//!    and relaunches this app.
+//! 2. Compare against the built-in app version and surface an available-update dialog.
+//! 3. On user confirm (“Install and restart”), flush app state, spawn **RusticDL
+//!    Updater** with the setup download URL, then quit. The updater shows progress,
+//!    runs NSIS `/S`, and relaunches this app.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,8 +51,7 @@ pub struct UpdateInfo {
     pub latest_version: String,
     pub release_name: String,
     pub html_url: String,
-    /// Truncated release body from GitHub (optional UI copy).
-    #[allow(dead_code)]
+    /// Truncated release body from GitHub (shown in the available-update dialog).
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
