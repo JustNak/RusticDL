@@ -155,16 +155,25 @@ impl OsNotifyBuffer {
         }
     }
 
-    /// Drain pending items (caller still must call [`after_flush`]).
+    /// Drain pending items (clear deadline only; does not arm the burst window).
+    ///
+    /// Call [`after_flush`] only after a balloon was actually shown.
     pub fn take_pending(&mut self) -> Vec<PendingOsTerminal> {
         self.coalesce_deadline = None;
         std::mem::take(&mut self.pending)
     }
 
-    /// Open the post-flush burst window (call after fire **or** drop).
+    /// Open the post-flush burst window. Call only after a balloon was shown.
     pub fn after_flush(&mut self, now: Instant) {
         self.coalesce_deadline = None;
         self.burst_open_until = Some(now + OS_BURST_WINDOW);
+    }
+
+    /// Fully reset pending, deadline, and burst window (e.g. mode turned Off).
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.coalesce_deadline = None;
+        self.burst_open_until = None;
     }
 }
 
@@ -623,6 +632,83 @@ mod tests {
         assert!(hard_os_eligible(OsNotifyMode::WhenHiddenToTray, true));
         assert!(hard_os_eligible(OsNotifyMode::Always, false));
         assert!(hard_os_eligible(OsNotifyMode::Always, true));
+    }
+
+    #[test]
+    fn filter_pending_by_toggles_at_flush() {
+        let pending = vec![
+            PendingOsTerminal {
+                kind: TerminalKind::Complete,
+                filename: "a.zip".into(),
+                error: None,
+                job_id: "1".into(),
+                target_path: Some(PathBuf::from("a")),
+            },
+            PendingOsTerminal {
+                kind: TerminalKind::Fail,
+                filename: "b.zip".into(),
+                error: Some("err".into()),
+                job_id: "2".into(),
+                target_path: None,
+            },
+        ];
+        let only_complete = filter_pending_by_toggles(pending.clone(), true, false);
+        assert_eq!(only_complete.len(), 1);
+        assert_eq!(only_complete[0].kind, TerminalKind::Complete);
+        let balloon = compose_balloon(&only_complete).unwrap();
+        assert_eq!(balloon.kind, BalloonOutcome::SingleComplete);
+
+        let only_fail = filter_pending_by_toggles(pending.clone(), false, true);
+        assert_eq!(only_fail.len(), 1);
+        assert_eq!(only_fail[0].kind, TerminalKind::Fail);
+
+        assert!(filter_pending_by_toggles(pending, false, false).is_empty());
+    }
+
+    #[test]
+    fn take_pending_without_after_flush_does_not_arm_burst() {
+        // Simulates hard-eligibility drop: drain pending but skip after_flush.
+        let mut buf = OsNotifyBuffer::default();
+        let now = Instant::now();
+        let edge = PendingOsTerminal {
+            kind: TerminalKind::Complete,
+            filename: "solo.zip".into(),
+            error: None,
+            job_id: "1".into(),
+            target_path: Some(PathBuf::from("solo")),
+        };
+        assert!(buf.enqueue(vec![edge], now));
+        let _ = buf.take_pending();
+        // No after_flush → burst stays closed; next solitary flushes immediately.
+        assert!(!buf.is_burst_open(now + Duration::from_millis(50)));
+        let next = PendingOsTerminal {
+            kind: TerminalKind::Complete,
+            filename: "two.zip".into(),
+            error: None,
+            job_id: "2".into(),
+            target_path: Some(PathBuf::from("two")),
+        };
+        assert!(buf.enqueue(vec![next], now + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn clear_resets_burst_window() {
+        let mut buf = OsNotifyBuffer::default();
+        let now = Instant::now();
+        buf.after_flush(now);
+        assert!(buf.is_burst_open(now + Duration::from_millis(10)));
+        buf.pending.push(PendingOsTerminal {
+            kind: TerminalKind::Complete,
+            filename: "x".into(),
+            error: None,
+            job_id: "1".into(),
+            target_path: None,
+        });
+        buf.coalesce_deadline = Some(now + OS_BURST_WINDOW);
+        buf.clear();
+        assert!(buf.pending.is_empty());
+        assert!(buf.coalesce_deadline.is_none());
+        assert!(!buf.is_burst_open(now + Duration::from_millis(10)));
     }
 
     #[test]

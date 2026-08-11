@@ -44,7 +44,7 @@ use crate::ipc::IpcBridge;
 use crate::notifications::{
     compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
     in_app_summary_messages, soft_os_eligible, terminal_edges, BalloonContextMap, BalloonOutcome,
-    InAppToastKind, OsNotifyBuffer, PendingOsTerminal,
+    InAppToastKind, OsNotifyBuffer, PendingOsTerminal, TerminalKind,
 };
 use crate::persistence::{save_jobs, save_settings, AppPaths};
 use crate::prompt_window::open_browser_prompt_window;
@@ -113,7 +113,8 @@ pub struct DownloadApp {
     update_busy: bool,
     /// Cached latest release when an update is available (enables one-click install).
     available_update: Option<UpdateInfo>,
-    /// System tray icon (Windows). Present when close-to-tray is enabled.
+    /// System tray icon (Windows). Present when close-to-tray, hidden-to-tray,
+    /// or OS notify mode is enabled (`sync_tray_lifetime`).
     system_tray: Option<SystemTray>,
     /// When true, the next close request actually quits (tray Exit / updates).
     force_quit: bool,
@@ -644,17 +645,20 @@ impl DownloadApp {
     }
 
     /// Flush OS coalesce buffer: re-check hard eligibility, compose one balloon, show.
+    ///
+    /// Arms the 2s burst window only after a balloon is actually shown. Hard-drops
+    /// (e.g. WhenHiddenToTray while visible) do not delay the next solitary balloon.
     fn flush_os_notify(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let pending = self.os_notify_buffer.take_pending();
         if pending.is_empty() {
-            self.os_notify_buffer.after_flush(now);
             return;
         }
 
         // Hard eligibility with *current* mode / visibility / toggles.
+        // Do not arm burst on drop — visible completes under WhenHiddenToTray must
+        // not tax the first real OS balloon after the user hides to tray.
         if !hard_os_eligible(self.settings.os_notify_mode, self.window_hidden_to_tray) {
-            self.os_notify_buffer.after_flush(now);
             return;
         }
 
@@ -664,24 +668,49 @@ impl DownloadApp {
             self.settings.notify_on_fail,
         );
         if pending.is_empty() {
-            self.os_notify_buffer.after_flush(now);
             return;
         }
 
         let Some(payload) = compose_balloon(&pending) else {
-            self.os_notify_buffer.after_flush(now);
             return;
         };
 
         // Tray required for balloons; ensure lifetime when notify is on.
         self.sync_tray_lifetime(cx);
-        let context_id = self.balloon_contexts.allocate(&payload);
         if let Some(tray) = self.system_tray.as_ref() {
+            // Allocate context only when we can actually show a balloon.
+            let context_id = self.balloon_contexts.allocate(&payload);
             tray.show_notification(&payload.title, &payload.body, payload.level, context_id);
+            self.os_notify_buffer.after_flush(now);
         } else {
             eprintln!("rusticdl: OS notification skipped (tray unavailable)");
+            // Always mode skips success in-app because "OS covers success". If the
+            // tray is missing, fall back so visible completes are not silent.
+            if self.settings.os_notify_mode == OsNotifyMode::Always && !self.window_hidden_to_tray {
+                self.fallback_in_app_for_missed_os_complete(&pending, cx);
+            }
         }
-        self.os_notify_buffer.after_flush(now);
+    }
+
+    /// In-app Info for complete edges when Always OS path could not show a balloon.
+    fn fallback_in_app_for_missed_os_complete(
+        &mut self,
+        pending: &[PendingOsTerminal],
+        cx: &mut Context<Self>,
+    ) {
+        let completes: Vec<&PendingOsTerminal> = pending
+            .iter()
+            .filter(|p| p.kind == TerminalKind::Complete)
+            .collect();
+        if completes.is_empty() {
+            return;
+        }
+        let message = if completes.len() == 1 {
+            format!("Download complete: {}", completes[0].filename)
+        } else {
+            format!("{} downloads finished", completes.len())
+        };
+        self.show_toast(message, cx);
     }
 
     fn flush_jobs_save_if_due(&mut self) {
@@ -1041,9 +1070,9 @@ impl DownloadApp {
     ) {
         self.settings.os_notify_mode = mode;
         self.sync_tray_lifetime(cx);
-        // Drop pending OS buffer immediately when turning Off.
+        // Drop pending + burst window when turning Off so re-enable is clean.
         if mode == OsNotifyMode::Off {
-            let _ = self.os_notify_buffer.take_pending();
+            self.os_notify_buffer.clear();
         }
         cx.notify();
     }
