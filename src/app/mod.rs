@@ -56,7 +56,10 @@ use crate::settings::{
     MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::{apply_launch_at_startup, launched_minimized};
-use crate::tray::{hide_main_window, main_window_hwnd, show_main_window, show_main_window_hwnd, SystemTray, TrayEvent};
+use crate::tray::{
+    hide_main_window, main_window_hwnd, show_main_window, show_main_window_hwnd, SystemTray,
+    TrayEvent,
+};
 use crate::updater::UpdateInfo;
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
 use update_flow::spawn_update_check;

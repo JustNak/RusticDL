@@ -43,14 +43,19 @@ pub fn claim_instance() -> InstanceRole {
 #[cfg(windows)]
 fn try_acquire_mutex() -> bool {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::Foundation::{
+        GetLastError, SetLastError, ERROR_ALREADY_EXISTS, WIN32_ERROR,
+    };
     use windows::Win32::System::Threading::CreateMutexW;
 
     let wide: Vec<u16> = MUTEX_NAME
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // Intentionally leaked: held for process lifetime.
+    // Clear last error so a stale ERROR_ALREADY_EXISTS cannot misclassify primary.
+    unsafe { SetLastError(WIN32_ERROR(0)) };
+    // Keep the kernel mutex open for process lifetime. On windows 0.61, HANDLE is
+    // Copy and is only closed via Owned/Free — do not wrap this handle in Owned.
     let result = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) };
     match result {
         Ok(_handle) => {
@@ -108,8 +113,8 @@ fn send_show_window_once(request_json: &str) -> bool {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(n) if n > 0 => {
-            // Any non-empty JSON line means the primary handled the request.
-            line.contains("\"ok\"")
+            // Require a successful envelope; `"ok":false` must not count as success.
+            line.contains("\"ok\":true") || line.contains("\"ok\": true")
         }
         _ => false,
     }
