@@ -23,7 +23,9 @@ use super::DownloadApp;
 use crate::appearance::{accent_swatch_color, custom_accent_hsla, resolve_theme_mode};
 use crate::download::reveal_in_folder;
 use crate::extension_settings::DownloadHandoffMode;
-use crate::settings::{AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, UiDensity};
+use crate::settings::{
+    AccentPreset, AppTheme, CornerRadiusScale, OsNotifyMode, ProgressStyle, UiDensity,
+};
 
 impl DownloadApp {
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -45,6 +47,9 @@ impl DownloadApp {
         let close_to_tray = self.settings.close_to_tray;
         let launch_at_startup = self.settings.launch_at_startup;
         let startup_minimized = self.settings.startup_minimized;
+        let os_notify_mode = self.settings.os_notify_mode;
+        let notify_on_complete = self.settings.notify_on_complete;
+        let notify_on_fail = self.settings.notify_on_fail;
         let ext_enabled = self.settings.extension.enabled;
         let handoff_mode = self.settings.extension.download_handoff_mode;
         let context_menu_enabled = self.settings.extension.context_menu_enabled;
@@ -348,6 +353,177 @@ impl DownloadApp {
                                             )
                                             .child(field_hint(
                                                 "When launch at startup is On, open hidden in the tray until you show the window.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("OS notifications", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("os-notify-off")
+                                                            .label(OsNotifyMode::Off.label())
+                                                            .when(
+                                                                os_notify_mode
+                                                                    == OsNotifyMode::Off,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                os_notify_mode
+                                                                    != OsNotifyMode::Off,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_os_notify_mode(
+                                                                        OsNotifyMode::Off,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("os-notify-when-hidden")
+                                                            .label(
+                                                                OsNotifyMode::WhenHiddenToTray
+                                                                    .label(),
+                                                            )
+                                                            .when(
+                                                                os_notify_mode
+                                                                    == OsNotifyMode::WhenHiddenToTray,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                os_notify_mode
+                                                                    != OsNotifyMode::WhenHiddenToTray,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_os_notify_mode(
+                                                                        OsNotifyMode::WhenHiddenToTray,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("os-notify-always")
+                                                            .label(OsNotifyMode::Always.label())
+                                                            .when(
+                                                                os_notify_mode
+                                                                    == OsNotifyMode::Always,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                os_notify_mode
+                                                                    != OsNotifyMode::Always,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_os_notify_mode(
+                                                                        OsNotifyMode::Always,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "OS notifications use the tray icon even if Close to tray is Off. Saved with Save settings.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Notify on complete", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("notify-complete-off")
+                                                            .label("Off")
+                                                            .when(!notify_on_complete, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(notify_on_complete, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_notify_on_complete(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("notify-complete-on")
+                                                            .label("On")
+                                                            .when(notify_on_complete, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!notify_on_complete, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_notify_on_complete(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "In-app and OS notifications when a download finishes. Saved with Save settings.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Notify on fail", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("notify-fail-off")
+                                                            .label("Off")
+                                                            .when(!notify_on_fail, |b| b.primary())
+                                                            .when(notify_on_fail, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_notify_on_fail(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("notify-fail-on")
+                                                            .label("On")
+                                                            .when(notify_on_fail, |b| b.primary())
+                                                            .when(!notify_on_fail, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_notify_on_fail(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "In-app and OS notifications when a download fails after retries. Saved with Save settings.",
                                                 cx,
                                             )),
                                     ),

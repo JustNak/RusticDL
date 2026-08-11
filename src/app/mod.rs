@@ -37,15 +37,21 @@ use crate::appearance::{
     apply_appearance, apply_window_opacity, film_grain_image, noise_enabled, vignette_edge_alpha,
     vignette_enabled,
 };
-use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job, JobState};
+use crate::download::{open_path, EngineCommand, EngineEvent, EngineHandle, Job, JobState};
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
+use crate::notifications::{
+    compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
+    in_app_summary_messages, soft_os_eligible, terminal_edges, BalloonContextMap, BalloonOutcome,
+    InAppToastKind, OsNotifyBuffer, PendingOsTerminal,
+};
 use crate::persistence::{save_jobs, save_settings, AppPaths};
 use crate::prompt_window::open_browser_prompt_window;
 use crate::settings::{
-    AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, Settings, SortColumn, SortDirection,
-    UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
+    AccentPreset, AppTheme, CornerRadiusScale, OsNotifyMode, ProgressStyle, Settings, SortColumn,
+    SortDirection, UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY,
+    MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::{apply_launch_at_startup, launched_minimized};
 use crate::tray::{hide_main_window, show_main_window, SystemTray, TrayEvent};
@@ -117,6 +123,12 @@ pub struct DownloadApp {
     pending_tray_show: bool,
     /// Tray "Exit" was requested; applied on the next render.
     pending_tray_exit: bool,
+    /// Balloon click context id to resolve after showing the main window.
+    pending_balloon_click: Option<u64>,
+    /// OS balloon burst-coalesce buffer (Pipeline B).
+    os_notify_buffer: OsNotifyBuffer,
+    /// Last-N balloon click contexts for open-file / show policy.
+    balloon_contexts: BalloonContextMap,
 }
 
 impl DownloadApp {
@@ -303,6 +315,8 @@ impl DownloadApp {
                         if let Some(jobs) = app.pending_jobs.take() {
                             app.apply_jobs(jobs, cx);
                         }
+                        // OS balloon burst deadline (Pipeline B).
+                        app.flush_os_notify_if_due(cx);
                         // Flush a debounced window-layout write after the user stops resizing.
                         app.flush_window_layout_if_due();
                         app.flush_jobs_save_if_due();
@@ -324,10 +338,12 @@ impl DownloadApp {
         spawn_update_check(false, cx);
 
         let started_minimized = launched_minimized();
-        // Tray is needed for close-to-tray and for startup-minimized restores.
-        let tray_needed = settings.close_to_tray || started_minimized;
+        // Tray is needed for close-to-tray, startup-minimized, and OS balloons.
+        let need_tray = settings.close_to_tray
+            || started_minimized
+            || settings.os_notify_mode != OsNotifyMode::Off;
         let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
-        let system_tray = if tray_needed {
+        let system_tray = if need_tray {
             SystemTray::start(tray_tx)
         } else {
             drop(tray_tx);
@@ -337,19 +353,7 @@ impl DownloadApp {
         if system_tray.is_some() {
             cx.spawn(async move |this, cx| {
                 while let Ok(event) = tray_rx.recv().await {
-                    let result = this.update(cx, |app, cx| match event {
-                        TrayEvent::ShowWindow => {
-                            app.pending_tray_show = true;
-                            cx.notify();
-                        }
-                        TrayEvent::Exit => {
-                            app.force_quit = true;
-                            app.pending_tray_exit = true;
-                            cx.notify();
-                        }
-                        // Policy (open file / show window) lands in a follow-up PR.
-                        TrayEvent::BalloonUserClick { .. } => {}
-                    });
+                    let result = this.update(cx, |app, cx| app.handle_tray_event(event, cx));
                     if result.is_err() {
                         break;
                     }
@@ -408,6 +412,9 @@ impl DownloadApp {
             window_hidden_to_tray: started_minimized,
             pending_tray_show: false,
             pending_tray_exit: false,
+            pending_balloon_click: None,
+            os_notify_buffer: OsNotifyBuffer::default(),
+            balloon_contexts: BalloonContextMap::default(),
         };
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
@@ -454,19 +461,7 @@ impl DownloadApp {
         }
         cx.spawn(async move |this, cx| {
             while let Ok(event) = tray_rx.recv().await {
-                let result = this.update(cx, |app, cx| match event {
-                    TrayEvent::ShowWindow => {
-                        app.pending_tray_show = true;
-                        cx.notify();
-                    }
-                    TrayEvent::Exit => {
-                        app.force_quit = true;
-                        app.pending_tray_exit = true;
-                        cx.notify();
-                    }
-                    // Policy (open file / show window) lands in a follow-up PR.
-                    TrayEvent::BalloonUserClick { .. } => {}
-                });
+                let result = this.update(cx, |app, cx| app.handle_tray_event(event, cx));
                 if result.is_err() {
                     break;
                 }
@@ -479,11 +474,46 @@ impl DownloadApp {
         self.system_tray = None;
     }
 
+    /// Keep tray alive when close-to-tray, currently hidden, or OS notify is enabled.
+    fn sync_tray_lifetime(&mut self, cx: &mut Context<Self>) {
+        let needed = self.settings.close_to_tray
+            || self.window_hidden_to_tray
+            || self.settings.os_notify_mode != OsNotifyMode::Off;
+        if needed {
+            self.ensure_tray(cx);
+        } else {
+            self.stop_tray();
+        }
+    }
+
+    fn handle_tray_event(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
+        match event {
+            TrayEvent::ShowWindow => {
+                self.pending_tray_show = true;
+                cx.notify();
+            }
+            TrayEvent::Exit => {
+                self.force_quit = true;
+                self.pending_tray_exit = true;
+                cx.notify();
+            }
+            TrayEvent::BalloonUserClick { context_id } => {
+                // Always restore/focus the main window; open-file resolved on render.
+                self.pending_tray_show = true;
+                self.pending_balloon_click = Some(context_id);
+                cx.notify();
+            }
+        }
+    }
+
     fn apply_pending_tray_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_tray_show {
             self.pending_tray_show = false;
             self.window_hidden_to_tray = false;
             show_main_window(window);
+        }
+        if let Some(context_id) = self.pending_balloon_click.take() {
+            self.handle_balloon_click(context_id, cx);
         }
         if self.pending_tray_exit {
             self.pending_tray_exit = false;
@@ -492,6 +522,22 @@ impl DownloadApp {
             self.flush_jobs_save_now();
             self.stop_tray();
             cx.quit();
+        }
+    }
+
+    /// Balloon click policy: show window already applied; open file for SingleComplete.
+    fn handle_balloon_click(&mut self, context_id: u64, cx: &mut Context<Self>) {
+        let Some(ctx) = self.balloon_contexts.lookup(context_id).cloned() else {
+            return;
+        };
+        if ctx.kind != BalloonOutcome::SingleComplete {
+            return;
+        }
+        let Some(path) = ctx.target_path else {
+            return;
+        };
+        if let Err(msg) = open_path(&path) {
+            self.show_error_toast(format!("Could not open file: {msg}"), cx);
         }
     }
 
@@ -538,6 +584,38 @@ impl DownloadApp {
     }
 
     fn apply_jobs(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
+        // Edge-detect BEFORE overwrite (Completed / Failed only — never Canceled).
+        let edges = terminal_edges(&self.jobs, &jobs);
+        let notify_edges = filter_notify_edges(
+            &edges,
+            self.settings.notify_on_complete,
+            self.settings.notify_on_fail,
+        );
+
+        // Pipeline A — in-app toasts (immediate when window is visible).
+        if !self.window_hidden_to_tray && !notify_edges.is_empty() {
+            for (kind, message) in
+                in_app_summary_messages(&notify_edges, self.settings.os_notify_mode)
+            {
+                match kind {
+                    InAppToastKind::Info => self.show_toast(message, cx),
+                    InAppToastKind::Error => self.show_error_toast(message, cx),
+                }
+            }
+        }
+
+        // Pipeline B — OS balloons (burst coalesce; hard eligibility at flush).
+        if soft_os_eligible(self.settings.os_notify_mode) && !notify_edges.is_empty() {
+            let pending: Vec<PendingOsTerminal> = notify_edges
+                .iter()
+                .map(PendingOsTerminal::from_edge)
+                .collect();
+            let now = Instant::now();
+            if self.os_notify_buffer.enqueue(pending, now) {
+                self.flush_os_notify(cx);
+            }
+        }
+
         let force_persist = jobs_need_immediate_persist(&self.jobs, &jobs);
         self.jobs = jobs;
         self.last_ui_update = Instant::now();
@@ -557,6 +635,53 @@ impl DownloadApp {
             }
         }
         cx.notify();
+    }
+
+    fn flush_os_notify_if_due(&mut self, cx: &mut Context<Self>) {
+        if self.os_notify_buffer.deadline_elapsed(Instant::now()) {
+            self.flush_os_notify(cx);
+        }
+    }
+
+    /// Flush OS coalesce buffer: re-check hard eligibility, compose one balloon, show.
+    fn flush_os_notify(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let pending = self.os_notify_buffer.take_pending();
+        if pending.is_empty() {
+            self.os_notify_buffer.after_flush(now);
+            return;
+        }
+
+        // Hard eligibility with *current* mode / visibility / toggles.
+        if !hard_os_eligible(self.settings.os_notify_mode, self.window_hidden_to_tray) {
+            self.os_notify_buffer.after_flush(now);
+            return;
+        }
+
+        let pending = filter_pending_by_toggles(
+            pending,
+            self.settings.notify_on_complete,
+            self.settings.notify_on_fail,
+        );
+        if pending.is_empty() {
+            self.os_notify_buffer.after_flush(now);
+            return;
+        }
+
+        let Some(payload) = compose_balloon(&pending) else {
+            self.os_notify_buffer.after_flush(now);
+            return;
+        };
+
+        // Tray required for balloons; ensure lifetime when notify is on.
+        self.sync_tray_lifetime(cx);
+        let context_id = self.balloon_contexts.allocate(&payload);
+        if let Some(tray) = self.system_tray.as_ref() {
+            tray.show_notification(&payload.title, &payload.body, payload.level, context_id);
+        } else {
+            eprintln!("rusticdl: OS notification skipped (tray unavailable)");
+        }
+        self.os_notify_buffer.after_flush(now);
     }
 
     fn flush_jobs_save_if_due(&mut self) {
@@ -822,13 +947,8 @@ impl DownloadApp {
             self.show_toast(format!("Startup setting: {msg}"), cx);
         }
 
-        // Tray is required for close-to-tray; drop it when the preference is off
-        // and the window is not currently hidden.
-        if self.settings.close_to_tray {
-            self.ensure_tray(cx);
-        } else if !self.window_hidden_to_tray {
-            self.stop_tray();
-        }
+        // Tray lifetime: close-to-tray, hidden-to-tray, or OS notify != Off.
+        self.sync_tray_lifetime(cx);
 
         apply_appearance(&self.settings, Some(window), cx);
 
@@ -844,11 +964,7 @@ impl DownloadApp {
 
     fn set_close_to_tray(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.close_to_tray = on;
-        if on {
-            self.ensure_tray(cx);
-        } else if !self.window_hidden_to_tray {
-            self.stop_tray();
-        }
+        self.sync_tray_lifetime(cx);
         cx.notify();
     }
 
@@ -914,6 +1030,31 @@ impl DownloadApp {
 
     fn set_startup_minimized(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.startup_minimized = on && self.settings.launch_at_startup;
+        cx.notify();
+    }
+
+    fn set_os_notify_mode(
+        &mut self,
+        mode: OsNotifyMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.os_notify_mode = mode;
+        self.sync_tray_lifetime(cx);
+        // Drop pending OS buffer immediately when turning Off.
+        if mode == OsNotifyMode::Off {
+            let _ = self.os_notify_buffer.take_pending();
+        }
+        cx.notify();
+    }
+
+    fn set_notify_on_complete(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.notify_on_complete = on;
+        cx.notify();
+    }
+
+    fn set_notify_on_fail(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.notify_on_fail = on;
         cx.notify();
     }
 
