@@ -231,6 +231,7 @@ pub(crate) fn browse_directory(
 }
 
 /// Field title — stronger than hints so forms scan as Label → control → help.
+/// Used by add dialog and other compact forms (`text_xs`).
 pub(crate) fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
@@ -248,6 +249,67 @@ pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl In
         .font_normal()
         .text_color(theme.muted_foreground.opacity(0.78))
         .child(text.into())
+}
+
+// ── Settings layout helpers (settings panels only; leave add-dialog labels alone) ──
+
+/// Settings field label: `text_sm` semibold so hierarchy beats muted hints.
+pub(crate) fn settings_field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    div()
+        .text_sm()
+        .font_semibold()
+        .text_color(theme.foreground)
+        .child(text)
+}
+
+/// Sub-group eyebrow (e.g. NOTIFICATIONS). Optional top hairline divider.
+pub(crate) fn settings_subgroup(
+    title: &'static str,
+    with_divider: bool,
+    cx: &mut App,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let eyebrow: SharedString = title.to_ascii_uppercase().into();
+    v_flex()
+        .w_full()
+        .gap_2()
+        .when(with_divider, |el| {
+            el.child(div().w_full().h(px(1.)).bg(theme.border.opacity(0.55)))
+        })
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(theme.muted_foreground)
+                .child(eyebrow),
+        )
+}
+
+/// Horizontal toggle/choice row: label (+ optional hint) left, control cluster right.
+///
+/// Control side is width-capped so multi-button clusters with `.flex_wrap()` can
+/// wrap under Compact density / narrow content instead of overflowing the label.
+pub(crate) fn settings_choice_row(
+    label: &'static str,
+    hint: Option<&'static str>,
+    control: impl IntoElement,
+    cx: &mut App,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .items_center()
+        .justify_between()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(settings_field_label(label, cx))
+                .when_some(hint, |el, text| el.child(field_hint(text, cx))),
+        )
+        .child(div().min_w_0().max_w(px(300.)).child(control))
 }
 
 /// Equal-size circular preset swatch (solid fill + selection ring).
