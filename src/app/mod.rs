@@ -6,6 +6,7 @@ mod filter;
 mod job_row;
 mod layout;
 mod queue_view;
+mod selection;
 mod settings_panel;
 mod sidebar;
 mod status_bar;
@@ -70,7 +71,10 @@ pub struct DownloadApp {
     engine: EngineHandle,
     ipc: IpcBridge,
     filter: FilterKind,
-    selected_id: Option<String>,
+    /// Selected job ids; primary is `last()` (detail only when len == 1).
+    selected_ids: Vec<String>,
+    /// Anchor for future Shift+range multi-select (PR-07).
+    selection_anchor_id: Option<String>,
     last_ui_update: Instant,
     pending_jobs: Option<Vec<Job>>,
     pending_toast: Option<String>,
@@ -371,7 +375,8 @@ impl DownloadApp {
             engine,
             ipc,
             filter: FilterKind::All,
-            selected_id: None,
+            selected_ids: Vec::new(),
+            selection_anchor_id: None,
             last_ui_update: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
@@ -618,6 +623,7 @@ impl DownloadApp {
         }
 
         let force_persist = jobs_need_immediate_persist(&self.jobs, &jobs);
+        self.prune_selection(&jobs);
         self.jobs = jobs;
         self.last_ui_update = Instant::now();
         self.jobs_dirty = true;
@@ -630,11 +636,6 @@ impl DownloadApp {
         // Adopt bridge extension settings only when the user has no local preview
         // (unsaved toggles). Never clobber while extension_settings_dirty.
         self.sync_extension_settings_from_bridge(false);
-        if let Some(id) = &self.selected_id {
-            if !self.jobs.iter().any(|j| &j.id == id) {
-                self.selected_id = None;
-            }
-        }
         cx.notify();
     }
 
@@ -1232,9 +1233,13 @@ impl DownloadApp {
         cx.notify();
     }
 
+    /// Detail panel job: only when exactly one id is selected.
     fn selected_job(&self) -> Option<&Job> {
-        let id = self.selected_id.as_ref()?;
-        self.jobs.iter().find(|j| &j.id == id)
+        if self.selected_ids.len() != 1 {
+            return None;
+        }
+        let id = self.primary_selected_id()?;
+        self.jobs.iter().find(|j| j.id == id)
     }
 
     fn filtered_count(&self) -> usize {
@@ -1323,14 +1328,21 @@ impl Render for DownloadApp {
             .size_full()
             .relative()
             .bg(theme.background)
-            // Capture Escape before focused inputs consume it, so dialogs always dismiss.
-            .capture_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
-                if !window.has_active_dialog(cx) {
+            // Capture Escape before focused inputs consume it:
+            // dialogs dismiss first; otherwise clear queue selection.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.modified()
+                {
                     return;
                 }
-                if event.keystroke.key.as_str() == "escape" && !event.keystroke.modifiers.modified()
-                {
+                if window.has_active_dialog(cx) {
                     window.close_dialog(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if !this.selected_ids.is_empty() {
+                    this.clear_selection();
+                    cx.notify();
                     cx.stop_propagation();
                 }
             }))

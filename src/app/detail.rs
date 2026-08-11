@@ -208,7 +208,7 @@ pub(crate) fn render_detail(
                                         .icon(IconName::Close)
                                         .tooltip("Hide details")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.selected_id = None;
+                                            this.clear_selection();
                                             cx.notify();
                                         })),
                                 ),
