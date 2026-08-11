@@ -1,10 +1,13 @@
+mod about_dialog;
 mod add_dialog;
+mod confirm_dialogs;
 mod detail;
 mod filter;
 mod job_row;
 mod layout;
 mod settings_panel;
 mod toast;
+mod update_flow;
 mod widgets;
 
 pub use filter::FilterKind;
@@ -19,16 +22,13 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, WindowBounds,
 };
 use gpui_component::{
-    button::{Button, ButtonVariant, ButtonVariants},
-    description_list::DescriptionList,
-    dialog::DialogButtonProps,
+    button::{Button, ButtonVariants},
     divider::Divider,
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     slider::{SliderEvent, SliderState},
-    v_flex, ActiveTheme, Disableable, Icon, IconName, Root, Sizable, StyledExt, TitleBar,
-    WindowExt,
+    v_flex, ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, TitleBar, WindowExt,
 };
 
 use crate::appearance::{
@@ -50,10 +50,7 @@ use crate::settings::{
 };
 use crate::startup::{apply_launch_at_startup, launched_minimized};
 use crate::tray::{hide_main_window, show_main_window, SystemTray, TrayEvent};
-use crate::updater::{
-    check_for_update, download_installer, launch_installer, open_release_page, open_url,
-    UpdateCheck, UpdateInfo,
-};
+use crate::updater::{open_release_page, open_url, UpdateInfo};
 use detail::render_detail;
 use job_row::render_job_row;
 use layout::{
@@ -61,6 +58,7 @@ use layout::{
     DETAIL_MIN_CAP, LIST_MIN_H, STATUS_DOT,
 };
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
+use update_flow::spawn_update_check;
 use widgets::{empty_state_badge, nav_item, render_vignette_overlay, sortable_header, status_chip};
 
 /// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
@@ -685,330 +683,6 @@ impl DownloadApp {
         cx.notify();
     }
 
-    fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let app_view = cx.entity().clone();
-        let update_busy = self.update_busy;
-        let update_action_label = self.update_action_label();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let theme = cx.theme().clone();
-            let muted = theme.muted_foreground;
-            let app_view_check = app_view.clone();
-
-            // Match Add download: viewport-center so the card sits mid-window, not top-biased.
-            let est_h = 320.0;
-            let view_h = window.viewport_size().height.to_f64() as f32;
-            let max_top = (view_h - est_h - 20.0).max(24.0);
-            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
-
-            dialog
-                .title(format!("About {APP_NAME}"))
-                .alert()
-                .w(px(420.))
-                .margin_top(px(margin_top))
-                .border_color(theme.border.opacity(0.32))
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(div().text_sm().child(crate::branding::APP_TAGLINE))
-                        .child(
-                            DescriptionList::new()
-                                .columns(1)
-                                .bordered(false)
-                                .label_width(px(96.))
-                                .item("Version", APP_VERSION, 1)
-                                .item("Engine", "Single-stream + Range resume", 1)
-                                .item("License", "MIT", 1)
-                                .item("Updates", "GitHub Releases", 1),
-                        )
-                        .child(div().text_xs().text_color(muted).child(format!(
-                            "Data folder: %APPDATA%\\{}\\",
-                            crate::branding::APP_DATA_DIR_NAME
-                        )))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("about-check-update")
-                                        .outline()
-                                        .small()
-                                        .label(if update_busy {
-                                            "Updating…".to_string()
-                                        } else {
-                                            update_action_label.clone()
-                                        })
-                                        .disabled(update_busy)
-                                        .on_click(move |_, _window, cx| {
-                                            app_view_check.update(cx, |app, cx| {
-                                                app.begin_one_click_update(cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("about-open-releases")
-                                        .ghost()
-                                        .small()
-                                        .label("Open releases")
-                                        .on_click(|_, _, _| {
-                                            let _ = open_release_page();
-                                        }),
-                                ),
-                        ),
-                )
-        });
-    }
-
-    /// Label for the single update action (check or install cached release).
-    fn update_action_label(&self) -> String {
-        if let Some(info) = &self.available_update {
-            format!("Install update v{}", info.latest_version)
-        } else {
-            "Check for updates".into()
-        }
-    }
-
-    /// One click: install a known update, or check GitHub and install if newer.
-    fn begin_one_click_update(&mut self, cx: &mut Context<Self>) {
-        if self.update_busy {
-            self.show_toast("An update is already in progress…", cx);
-            return;
-        }
-        if let Some(info) = self.available_update.clone() {
-            self.begin_download_update(info.setup_download_url, cx);
-            return;
-        }
-        self.begin_update_check(true, cx);
-    }
-
-    /// Manual or silent GitHub Releases update check.
-    fn begin_update_check(&mut self, interactive: bool, cx: &mut Context<Self>) {
-        if self.update_busy {
-            if interactive {
-                self.show_toast("An update check is already running…", cx);
-            }
-            return;
-        }
-        self.update_busy = true;
-        if interactive {
-            self.show_toast("Checking GitHub for updates…", cx);
-        }
-        cx.notify();
-        spawn_update_check(interactive, cx);
-    }
-
-    fn on_update_check_finished(
-        &mut self,
-        interactive: bool,
-        result: Result<UpdateCheck, String>,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(UpdateCheck::UpToDate { current, latest }) => {
-                self.available_update = None;
-                if interactive {
-                    self.update_busy = false;
-                    self.show_toast(
-                        format!("You're up to date (v{current}; latest is v{latest})."),
-                        cx,
-                    );
-                }
-            }
-            Ok(UpdateCheck::Available(info)) => {
-                self.available_update = Some(info.clone());
-                if interactive {
-                    // One click: go straight to silent download + install (no second prompt).
-                    let size_hint = info
-                        .setup_size
-                        .map(|n| format!(" ({})", format_bytes(n)))
-                        .unwrap_or_default();
-                    self.show_toast(
-                        format!(
-                            "{} — downloading and installing{size_hint}…",
-                            info.release_name
-                        ),
-                        cx,
-                    );
-                    // Keep `update_busy` true across check → download.
-                    self.begin_download_update_inner(info.setup_download_url, cx);
-                } else {
-                    let size_hint = info
-                        .setup_size
-                        .map(|n| format!(" · {}", format_bytes(n)))
-                        .unwrap_or_default();
-                    self.show_toast(
-                        format!(
-                            "Update available: v{} (you have v{}){size_hint}. Click “Install update” in the {} menu once.",
-                            info.latest_version, info.current_version, APP_NAME
-                        ),
-                        cx,
-                    );
-                }
-            }
-            Err(message) => {
-                if interactive {
-                    self.update_busy = false;
-                    self.show_error_toast(message, cx);
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn begin_download_update(&mut self, download_url: String, cx: &mut Context<Self>) {
-        if self.update_busy {
-            self.show_toast("An update is already in progress…", cx);
-            return;
-        }
-        self.update_busy = true;
-        self.begin_download_update_inner(download_url, cx);
-    }
-
-    /// Download the setup binary, persist state, launch silently (`/S /R`), then quit.
-    ///
-    /// Launch happens only after flush so the installer's silent kill cannot race a dirty save.
-    fn begin_download_update_inner(&mut self, download_url: String, cx: &mut Context<Self>) {
-        self.show_toast("Downloading update from GitHub…", cx);
-        cx.notify();
-
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Could not start download runtime: {e}"))
-                .and_then(|rt| rt.block_on(download_installer(&download_url)));
-            let _ = tx.send_blocking(result);
-        });
-
-        cx.spawn(async move |this, cx| {
-            let result = rx
-                .recv()
-                .await
-                .unwrap_or_else(|_| Err("Update download was cancelled unexpectedly.".into()));
-            let _ = this.update(cx, |app, cx| {
-                match result {
-                    Ok(installer_path) => {
-                        // Persist before spawn: silent NSIS may KillProcess before Drop runs.
-                        app.flush_jobs_save_now();
-                        app.flush_window_layout_now();
-                        if let Err(message) = launch_installer(&installer_path, true) {
-                            app.update_busy = false;
-                            app.show_error_toast(message, cx);
-                            cx.notify();
-                            return;
-                        }
-                        app.show_toast("Installing update — RusticDL will restart…", cx);
-                        // Bypass close-to-tray so quit actually tears down the process.
-                        app.force_quit = true;
-                        app.stop_tray();
-                        cx.notify();
-                        cx.quit();
-                    }
-                    Err(message) => {
-                        app.update_busy = false;
-                        app.show_error_toast(message, cx);
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn confirm_remove(
-        &mut self,
-        id: String,
-        filename: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let engine = self.engine.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let engine = engine.clone();
-            let id = id.clone();
-            let muted = cx.theme().muted_foreground;
-            dialog
-                .title("Remove download?")
-                .confirm()
-                .overlay_closable(true)
-                .keyboard(true)
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Remove")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(format!("Remove “{filename}” from the queue?")),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child("Any partial .part file will also be deleted."),
-                        ),
-                )
-                .on_ok(move |_, _, _| {
-                    engine.send(EngineCommand::Remove {
-                        id: id.clone(),
-                        delete_partial: true,
-                    });
-                    true
-                })
-        });
-    }
-
-    /// Remove finished jobs (completed, failed, canceled) from the queue.
-    fn confirm_clear_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
-            .jobs
-            .iter()
-            .filter(|j| j.state.is_terminal())
-            .map(|j| j.id.clone())
-            .collect();
-
-        if ids.is_empty() {
-            self.show_toast("Nothing to clear.", cx);
-            return;
-        }
-
-        let engine = self.engine.clone();
-        let count = ids.len();
-        let body = format!(
-            "Remove {count} finished item(s) from the queue? Active downloads stay. Files on disk are kept."
-        );
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            let engine = engine.clone();
-            let ids = ids.clone();
-            let body = body.clone();
-            dialog
-                .title("Clear all finished downloads?")
-                .confirm()
-                .overlay_closable(true)
-                .keyboard(true)
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Clear all")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .child(div().text_sm().child(body))
-                .on_ok(move |_, _, _| {
-                    for id in &ids {
-                        // Keep on-disk files (including leftover .part for failed jobs).
-                        engine.send(EngineCommand::Remove {
-                            id: id.clone(),
-                            delete_partial: false,
-                        });
-                    }
-                    true
-                })
-        });
-    }
-
     fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let download_directory = PathBuf::from(self.dir_input.read(cx).value().to_string());
         let max_concurrent = self
@@ -1269,39 +943,6 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     previous
         .iter()
         .any(|job| !next.iter().any(|n| n.id == job.id))
-}
-
-/// Run a GitHub Releases update check on a background thread and deliver the result to the UI.
-fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp>) {
-    let delay = if interactive {
-        Duration::from_millis(0)
-    } else {
-        Duration::from_secs(4)
-    };
-
-    let (tx, rx) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Could not start update runtime: {e}"))
-            .and_then(|rt| rt.block_on(check_for_update()));
-        let _ = tx.send_blocking(result);
-    });
-
-    cx.spawn(async move |this, cx| {
-        let result = rx
-            .recv()
-            .await
-            .unwrap_or_else(|_| Err("Update check was cancelled unexpectedly.".into()));
-        let _ = this.update(cx, |app, cx| {
-            app.on_update_check_finished(interactive, result, cx);
-        });
-    })
-    .detach();
 }
 
 /// Capture restore bounds from the platform window (not the maximized full-screen rect).
