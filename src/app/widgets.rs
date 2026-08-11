@@ -517,7 +517,9 @@ pub(crate) fn nav_item(
     let theme = cx.theme().clone();
     // Selected filter: subtle grey highlight. Unselected: plain (white/default surface).
     let bg = if active {
-        theme.secondary.opacity(if theme.is_dark() { 0.55 } else { 0.85 })
+        theme
+            .secondary
+            .opacity(if theme.is_dark() { 0.55 } else { 0.85 })
     } else {
         theme.transparent
     };
@@ -548,7 +550,9 @@ pub(crate) fn nav_item(
         .bg(bg)
         .hover(|s| {
             s.bg(if active {
-                theme.secondary.opacity(if theme.is_dark() { 0.65 } else { 0.95 })
+                theme
+                    .secondary
+                    .opacity(if theme.is_dark() { 0.65 } else { 0.95 })
             } else {
                 theme.secondary.opacity(0.45)
             })
