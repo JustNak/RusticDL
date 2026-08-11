@@ -37,6 +37,46 @@ fn dialog_margin_top(view_h: f32, est_h: f32) -> f32 {
     ((view_h - est_h) * 0.5).clamp(24.0, max_top)
 }
 
+/// Enqueue HTTP(S) URLs via the same `EngineCommand::Add` path used by IPC / drop.
+///
+/// Duplicate policy is applied inside the engine. Returns how many URLs were sent.
+/// `filename_for_first` only applies when a single URL is enqueued (add-dialog Advanced).
+pub(crate) fn enqueue_urls(
+    urls: impl IntoIterator<Item = String>,
+    directory: PathBuf,
+    filename_for_first: Option<String>,
+    engine: &crate::download::EngineHandle,
+) -> usize {
+    let mut count = 0;
+    for (i, url) in urls.into_iter().enumerate() {
+        engine.send(EngineCommand::Add {
+            url,
+            filename: if i == 0 {
+                filename_for_first.clone()
+            } else {
+                None
+            },
+            directory: directory.clone(),
+            handoff_auth: None,
+            reply: None,
+        });
+        count += 1;
+    }
+    count
+}
+
+/// Parse free-form text and enqueue; shared by add dialog (and drop path for text bodies).
+pub(crate) fn enqueue_urls_from_text(
+    raw: &str,
+    directory: PathBuf,
+    filename_for_first: Option<String>,
+    engine: &crate::download::EngineHandle,
+) -> usize {
+    // Engine also splits glued schemes; do it here so filename applies to first only.
+    let urls = crate::download::extract_http_urls(raw);
+    enqueue_urls(urls, directory, filename_for_first, engine)
+}
+
 /// Enqueue one or more URLs from the add dialog; returns whether the dialog should close.
 fn submit_add_download(
     raw: &str,
@@ -46,7 +86,7 @@ fn submit_add_download(
     app_view: &Entity<DownloadApp>,
     cx: &mut App,
 ) -> bool {
-    // Engine also splits glued schemes; do it here so filename applies to first only.
+    // Pre-check so we can toast before enqueue; engine also splits defensively.
     let urls = crate::download::extract_http_urls(raw);
     if urls.is_empty() {
         app_view.update(cx, |app, cx| {
@@ -61,16 +101,8 @@ fn submit_add_download(
         None
     };
 
-    // One Add per URL keeps jobs independent; engine still re-splits defensively.
-    for (i, url) in urls.iter().enumerate() {
-        engine.send(EngineCommand::Add {
-            url: url.clone(),
-            filename: if i == 0 { single_name.clone() } else { None },
-            directory: directory.clone(),
-            handoff_auth: None,
-            reply: None,
-        });
-    }
+    // Shared path with file-drop enqueue (filename only for single-URL Advanced).
+    let _ = enqueue_urls_from_text(raw, directory, single_name, engine);
     true
 }
 
