@@ -46,8 +46,8 @@ pub struct PendingOsTerminal {
     pub target_path: Option<PathBuf>,
 }
 
-impl From<&TerminalEdge> for PendingOsTerminal {
-    fn from(edge: &TerminalEdge) -> Self {
+impl PendingOsTerminal {
+    pub fn from_edge(edge: &TerminalEdge) -> Self {
         Self {
             kind: edge.kind,
             filename: edge.filename.clone(),
@@ -78,63 +78,55 @@ pub struct BalloonClickContext {
     pub target_path: Option<PathBuf>,
 }
 
-/// Composed balloon ready for `SystemTray::show_notification`.
+/// Composed balloon ready for tray show + context allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OsBalloon {
+pub struct BalloonPayload {
     pub title: String,
     pub body: String,
     pub level: NotifyLevel,
-    pub context: BalloonClickContext,
+    pub kind: BalloonOutcome,
+    pub job_id: Option<String>,
+    pub target_path: Option<PathBuf>,
 }
 
-/// Result of pushing soft-eligible edges into the OS coalesce buffer.
+/// In-app toast severity for Pipeline A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoalesceAction {
-    /// Flush `pending` now (solitary edge, high-water, or deadline).
-    FlushNow,
-    /// Hold; wait for deadline tick or more edges.
-    Wait,
-    /// Nothing pending.
-    None,
+pub enum InAppToastKind {
+    Info,
+    Error,
 }
 
 /// OS-only coalesce buffer (Pipeline B). In-app toasts never touch this.
 #[derive(Debug, Default)]
-pub struct OsCoalesceState {
+pub struct OsNotifyBuffer {
     pub pending: Vec<PendingOsTerminal>,
     pub coalesce_deadline: Option<Instant>,
     pub burst_open_until: Option<Instant>,
 }
 
-impl OsCoalesceState {
-    pub fn is_burst_open(&self, now: Instant) -> bool {
+impl OsNotifyBuffer {
+    fn is_burst_open(&self, now: Instant) -> bool {
         self.burst_open_until
             .map(|until| now < until)
             .unwrap_or(false)
     }
 
-    /// Append soft-eligible edges and decide whether to flush immediately.
-    pub fn push_edges(
-        &mut self,
-        edges: impl IntoIterator<Item = PendingOsTerminal>,
-        now: Instant,
-    ) -> CoalesceAction {
-        let before = self.pending.len();
-        self.pending.extend(edges);
-        let added = self.pending.len() - before;
-        if added == 0 {
-            return self.poll_deadline(now);
+    /// Append soft-eligible edges. Returns `true` if the caller should flush now.
+    pub fn enqueue(&mut self, edges: Vec<PendingOsTerminal>, now: Instant) -> bool {
+        if edges.is_empty() {
+            return false;
         }
+        self.pending.extend(edges);
 
         if self.pending.len() >= OS_HIGH_WATER {
-            return CoalesceAction::FlushNow;
+            return true;
         }
 
         let burst_open = self.is_burst_open(now);
 
         // Solitary edge outside a burst window → immediate OS notify.
         if self.pending.len() == 1 && !burst_open {
-            return CoalesceAction::FlushNow;
+            return true;
         }
 
         // Multi-edge and/or open burst: hold until deadline (or high-water).
@@ -146,33 +138,33 @@ impl OsCoalesceState {
                 now + OS_BURST_WINDOW
             });
         }
-
-        CoalesceAction::Wait
+        false
     }
 
-    /// Check if a previously armed deadline has elapsed.
-    pub fn poll_deadline(&self, now: Instant) -> CoalesceAction {
+    /// True when a previously armed deadline has elapsed and items remain.
+    pub fn deadline_elapsed(&self, now: Instant) -> bool {
         if self.pending.is_empty() {
-            return CoalesceAction::None;
+            return false;
         }
         if self.pending.len() >= OS_HIGH_WATER {
-            return CoalesceAction::FlushNow;
+            return true;
         }
         match self.coalesce_deadline {
-            Some(deadline) if now >= deadline => CoalesceAction::FlushNow,
-            Some(_) => CoalesceAction::Wait,
-            None => CoalesceAction::FlushNow,
+            Some(deadline) => now >= deadline,
+            None => true, // pending without deadline → flush-safe
         }
     }
 
-    /// Take all pending items and open the post-flush burst window.
-    ///
-    /// Call after either firing or dropping an OS flush.
-    pub fn take_for_flush(&mut self, now: Instant) -> Vec<PendingOsTerminal> {
-        let items = std::mem::take(&mut self.pending);
+    /// Drain pending items (caller still must call [`after_flush`]).
+    pub fn take_pending(&mut self) -> Vec<PendingOsTerminal> {
+        self.coalesce_deadline = None;
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Open the post-flush burst window (call after fire **or** drop).
+    pub fn after_flush(&mut self, now: Instant) {
         self.coalesce_deadline = None;
         self.burst_open_until = Some(now + OS_BURST_WINDOW);
-        items
     }
 }
 
@@ -184,17 +176,20 @@ pub struct BalloonContextMap {
 }
 
 impl BalloonContextMap {
-    pub fn alloc_id(&mut self) -> u64 {
-        let id = self.next_id;
+    /// Allocate a context id, store payload fields, return the id for the tray.
+    pub fn allocate(&mut self, payload: &BalloonPayload) -> u64 {
+        let context_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        id
-    }
-
-    pub fn push(&mut self, ctx: BalloonClickContext) {
-        self.contexts.push_back(ctx);
+        self.contexts.push_back(BalloonClickContext {
+            context_id,
+            kind: payload.kind,
+            job_id: payload.job_id.clone(),
+            target_path: payload.target_path.clone(),
+        });
         while self.contexts.len() > BALLOON_CONTEXT_CAP {
             self.contexts.pop_front();
         }
+        context_id
     }
 
     pub fn lookup(&self, context_id: u64) -> Option<&BalloonClickContext> {
@@ -206,10 +201,7 @@ impl BalloonContextMap {
 ///
 /// Canceled is intentionally excluded. Intermediate retry states are not terminal.
 pub fn terminal_edges(previous: &[Job], next: &[Job]) -> Vec<TerminalEdge> {
-    let prev: HashMap<&str, JobState> = previous
-        .iter()
-        .map(|j| (j.id.as_str(), j.state))
-        .collect();
+    let prev: HashMap<&str, JobState> = previous.iter().map(|j| (j.id.as_str(), j.state)).collect();
 
     let mut edges = Vec::new();
     for job in next {
@@ -247,7 +239,7 @@ pub fn terminal_edges(previous: &[Job], next: &[Job]) -> Vec<TerminalEdge> {
 }
 
 /// Filter edges by user notify toggles (applies to both pipelines).
-pub fn filter_by_notify_prefs(
+pub fn filter_notify_edges(
     edges: &[TerminalEdge],
     notify_on_complete: bool,
     notify_on_fail: bool,
@@ -263,12 +255,12 @@ pub fn filter_by_notify_prefs(
 }
 
 /// Soft OS eligibility at enqueue (mode not Off). Hard check is at flush.
-pub fn os_soft_eligible(mode: OsNotifyMode) -> bool {
+pub fn soft_os_eligible(mode: OsNotifyMode) -> bool {
     mode != OsNotifyMode::Off
 }
 
 /// Hard OS eligibility re-checked at flush time.
-pub fn os_hard_eligible(mode: OsNotifyMode, window_hidden_to_tray: bool) -> bool {
+pub fn hard_os_eligible(mode: OsNotifyMode, window_hidden_to_tray: bool) -> bool {
     match mode {
         OsNotifyMode::Off => false,
         OsNotifyMode::WhenHiddenToTray => window_hidden_to_tray,
@@ -276,8 +268,7 @@ pub fn os_hard_eligible(mode: OsNotifyMode, window_hidden_to_tray: bool) -> bool
     }
 }
 
-/// Whether Pipeline A should emit an in-app toast for this kind when the window is visible.
-pub fn in_app_for_kind(mode: OsNotifyMode, kind: TerminalKind) -> Option<InAppToastKind> {
+fn in_app_for_kind(mode: OsNotifyMode, kind: TerminalKind) -> Option<InAppToastKind> {
     match (mode, kind) {
         (OsNotifyMode::Always, TerminalKind::Complete) => None,
         (_, TerminalKind::Complete) => Some(InAppToastKind::Info),
@@ -285,21 +276,13 @@ pub fn in_app_for_kind(mode: OsNotifyMode, kind: TerminalKind) -> Option<InAppTo
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InAppToastKind {
-    Info,
-    Error,
-}
-
-/// Aggregated in-app toast lines for one apply (at most one per kind).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InAppToast {
-    pub kind: InAppToastKind,
-    pub message: String,
-}
-
-/// Build immediate in-app toasts for eligible edges (visible window only).
-pub fn compose_in_app_toasts(mode: OsNotifyMode, edges: &[TerminalEdge]) -> Vec<InAppToast> {
+/// Build immediate in-app toast messages for eligible edges (visible window only).
+///
+/// At most one toast per kind (aggregated when multiple edges share a kind).
+pub fn in_app_summary_messages(
+    edges: &[TerminalEdge],
+    mode: OsNotifyMode,
+) -> Vec<(InAppToastKind, String)> {
     let mut completes: Vec<&TerminalEdge> = Vec::new();
     let mut fails: Vec<&TerminalEdge> = Vec::new();
     for e in edges {
@@ -324,10 +307,7 @@ pub fn compose_in_app_toasts(mode: OsNotifyMode, edges: &[TerminalEdge]) -> Vec<
         } else {
             format!("{} downloads finished", completes.len())
         };
-        out.push(InAppToast {
-            kind: InAppToastKind::Info,
-            message,
-        });
+        out.push((InAppToastKind::Info, message));
     }
     if !fails.is_empty() {
         let message = if fails.len() == 1 {
@@ -340,16 +320,13 @@ pub fn compose_in_app_toasts(mode: OsNotifyMode, edges: &[TerminalEdge]) -> Vec<
         } else {
             format!("{} downloads failed", fails.len())
         };
-        out.push(InAppToast {
-            kind: InAppToastKind::Error,
-            message,
-        });
+        out.push((InAppToastKind::Error, message));
     }
     out
 }
 
 /// Re-filter pending OS items by current notify toggles (at flush).
-pub fn refilter_pending(
+pub fn filter_pending_by_toggles(
     pending: Vec<PendingOsTerminal>,
     notify_on_complete: bool,
     notify_on_fail: bool,
@@ -363,8 +340,8 @@ pub fn refilter_pending(
         .collect()
 }
 
-/// Compose a single OS balloon from a non-empty pending buffer + allocate context.
-pub fn compose_os_balloon(pending: &[PendingOsTerminal], context_id: u64) -> Option<OsBalloon> {
+/// Compose a single OS balloon from a non-empty pending buffer.
+pub fn compose_balloon(pending: &[PendingOsTerminal]) -> Option<BalloonPayload> {
     if pending.is_empty() {
         return None;
     }
@@ -380,7 +357,7 @@ pub fn compose_os_balloon(pending: &[PendingOsTerminal], context_id: u64) -> Opt
     let c = completes.len();
     let f = fails.len();
 
-    let (title, body, level, outcome, job_id, target_path) = if c == 1 && f == 0 {
+    let (title, body, level, kind, job_id, target_path) = if c == 1 && f == 0 {
         let item = completes[0];
         (
             "Download complete".to_string(),
@@ -434,30 +411,14 @@ pub fn compose_os_balloon(pending: &[PendingOsTerminal], context_id: u64) -> Opt
         )
     };
 
-    Some(OsBalloon {
+    Some(BalloonPayload {
         title,
         body,
         level,
-        context: BalloonClickContext {
-            context_id,
-            kind: outcome,
-            job_id,
-            target_path,
-        },
+        kind,
+        job_id,
+        target_path,
     })
-}
-
-/// Whether the tray icon is required for current settings / window state.
-pub fn tray_needed(
-    close_to_tray: bool,
-    window_hidden_to_tray: bool,
-    started_minimized: bool,
-    os_notify_mode: OsNotifyMode,
-) -> bool {
-    close_to_tray
-        || window_hidden_to_tray
-        || started_minimized
-        || os_notify_mode != OsNotifyMode::Off
 }
 
 #[cfg(test)]
@@ -528,10 +489,10 @@ mod tests {
                 target_path: PathBuf::from("b"),
             },
         ];
-        assert_eq!(filter_by_notify_prefs(&edges, true, true).len(), 2);
-        assert_eq!(filter_by_notify_prefs(&edges, true, false).len(), 1);
-        assert_eq!(filter_by_notify_prefs(&edges, false, true).len(), 1);
-        assert!(filter_by_notify_prefs(&edges, false, false).is_empty());
+        assert_eq!(filter_notify_edges(&edges, true, true).len(), 2);
+        assert_eq!(filter_notify_edges(&edges, true, false).len(), 1);
+        assert_eq!(filter_notify_edges(&edges, false, true).len(), 1);
+        assert!(filter_notify_edges(&edges, false, false).is_empty());
     }
 
     #[test]
@@ -564,7 +525,7 @@ mod tests {
 
     #[test]
     fn solitary_edge_flushes_immediately() {
-        let mut state = OsCoalesceState::default();
+        let mut buf = OsNotifyBuffer::default();
         let now = Instant::now();
         let edge = PendingOsTerminal {
             kind: TerminalKind::Complete,
@@ -573,15 +534,12 @@ mod tests {
             job_id: "1".into(),
             target_path: Some(PathBuf::from("C:/dl/solo.zip")),
         };
-        assert_eq!(
-            state.push_edges(std::iter::once(edge), now),
-            CoalesceAction::FlushNow
-        );
+        assert!(buf.enqueue(vec![edge], now));
     }
 
     #[test]
     fn multi_edge_same_apply_waits_then_coalesces() {
-        let mut state = OsCoalesceState::default();
+        let mut buf = OsNotifyBuffer::default();
         let now = Instant::now();
         let edges = vec![
             PendingOsTerminal {
@@ -599,22 +557,23 @@ mod tests {
                 target_path: Some(PathBuf::from("b")),
             },
         ];
-        assert_eq!(state.push_edges(edges, now), CoalesceAction::Wait);
-        assert_eq!(state.pending.len(), 2);
-        assert!(state.coalesce_deadline.is_some());
+        assert!(!buf.enqueue(edges, now));
+        assert_eq!(buf.pending.len(), 2);
+        assert!(buf.coalesce_deadline.is_some());
 
         let later = now + OS_BURST_WINDOW + Duration::from_millis(1);
-        assert_eq!(state.poll_deadline(later), CoalesceAction::FlushNow);
-        let taken = state.take_for_flush(later);
-        let balloon = compose_os_balloon(&taken, 1).unwrap();
+        assert!(buf.deadline_elapsed(later));
+        let taken = buf.take_pending();
+        buf.after_flush(later);
+        let balloon = compose_balloon(&taken).unwrap();
         assert_eq!(balloon.title, "Downloads complete");
         assert_eq!(balloon.body, "2 downloads finished");
-        assert_eq!(balloon.context.kind, BalloonOutcome::Coalesced);
+        assert_eq!(balloon.kind, BalloonOutcome::Coalesced);
     }
 
     #[test]
     fn burst_window_holds_next_solitary() {
-        let mut state = OsCoalesceState::default();
+        let mut buf = OsNotifyBuffer::default();
         let t0 = Instant::now();
         let edge = PendingOsTerminal {
             kind: TerminalKind::Complete,
@@ -623,12 +582,10 @@ mod tests {
             job_id: "1".into(),
             target_path: Some(PathBuf::from("a")),
         };
-        assert_eq!(
-            state.push_edges(std::iter::once(edge), t0),
-            CoalesceAction::FlushNow
-        );
-        let _ = state.take_for_flush(t0);
-        assert!(state.is_burst_open(t0 + Duration::from_millis(100)));
+        assert!(buf.enqueue(vec![edge], t0));
+        let _ = buf.take_pending();
+        buf.after_flush(t0);
+        assert!(buf.is_burst_open(t0 + Duration::from_millis(100)));
 
         let edge2 = PendingOsTerminal {
             kind: TerminalKind::Fail,
@@ -638,17 +595,14 @@ mod tests {
             target_path: None,
         };
         let t1 = t0 + Duration::from_millis(200);
-        assert_eq!(
-            state.push_edges(std::iter::once(edge2), t1),
-            CoalesceAction::Wait
-        );
+        assert!(!buf.enqueue(vec![edge2], t1));
     }
 
     #[test]
     fn high_water_flushes() {
-        let mut state = OsCoalesceState::default();
+        let mut buf = OsNotifyBuffer::default();
         let now = Instant::now();
-        state.burst_open_until = Some(now + OS_BURST_WINDOW);
+        buf.burst_open_until = Some(now + OS_BURST_WINDOW);
         let mut edges = Vec::new();
         for i in 0..OS_HIGH_WATER {
             edges.push(PendingOsTerminal {
@@ -659,16 +613,16 @@ mod tests {
                 target_path: Some(PathBuf::from(format!("{i}"))),
             });
         }
-        assert_eq!(state.push_edges(edges, now), CoalesceAction::FlushNow);
+        assert!(buf.enqueue(edges, now));
     }
 
     #[test]
     fn hard_eligibility() {
-        assert!(!os_hard_eligible(OsNotifyMode::Off, true));
-        assert!(!os_hard_eligible(OsNotifyMode::WhenHiddenToTray, false));
-        assert!(os_hard_eligible(OsNotifyMode::WhenHiddenToTray, true));
-        assert!(os_hard_eligible(OsNotifyMode::Always, false));
-        assert!(os_hard_eligible(OsNotifyMode::Always, true));
+        assert!(!hard_os_eligible(OsNotifyMode::Off, true));
+        assert!(!hard_os_eligible(OsNotifyMode::WhenHiddenToTray, false));
+        assert!(hard_os_eligible(OsNotifyMode::WhenHiddenToTray, true));
+        assert!(hard_os_eligible(OsNotifyMode::Always, false));
+        assert!(hard_os_eligible(OsNotifyMode::Always, true));
     }
 
     #[test]
@@ -689,12 +643,11 @@ mod tests {
                 target_path: None,
             },
         ];
-        let b = compose_os_balloon(&pending, 42).unwrap();
+        let b = compose_balloon(&pending).unwrap();
         assert_eq!(b.title, "Downloads finished");
         assert_eq!(b.body, "1 finished, 1 failed");
         assert_eq!(b.level, NotifyLevel::Info);
-        assert_eq!(b.context.kind, BalloonOutcome::Coalesced);
-        assert_eq!(b.context.context_id, 42);
+        assert_eq!(b.kind, BalloonOutcome::Coalesced);
     }
 
     #[test]
@@ -706,26 +659,29 @@ mod tests {
             job_id: "j1".into(),
             target_path: Some(PathBuf::from("C:/dl/file.zip")),
         }];
-        let b = compose_os_balloon(&pending, 7).unwrap();
-        assert_eq!(b.context.kind, BalloonOutcome::SingleComplete);
+        let b = compose_balloon(&pending).unwrap();
+        assert_eq!(b.kind, BalloonOutcome::SingleComplete);
         assert_eq!(
-            b.context.target_path.as_deref(),
+            b.target_path.as_deref(),
             Some(std::path::Path::new("C:/dl/file.zip"))
         );
-        assert_eq!(b.context.job_id.as_deref(), Some("j1"));
+        assert_eq!(b.job_id.as_deref(), Some("j1"));
     }
 
     #[test]
     fn balloon_context_map_caps_at_8() {
         let mut map = BalloonContextMap::default();
-        for _ in 0..12 {
-            let id = map.alloc_id();
-            map.push(BalloonClickContext {
-                context_id: id,
+        for i in 0..12 {
+            let payload = BalloonPayload {
+                title: "t".into(),
+                body: "b".into(),
+                level: NotifyLevel::Info,
                 kind: BalloonOutcome::Coalesced,
                 job_id: None,
                 target_path: None,
-            });
+            };
+            let id = map.allocate(&payload);
+            assert_eq!(id, i);
         }
         assert_eq!(map.contexts.len(), BALLOON_CONTEXT_CAP);
         assert!(map.lookup(11).is_some());
@@ -733,16 +689,10 @@ mod tests {
     }
 
     #[test]
-    fn tray_needed_includes_os_notify() {
-        assert!(tray_needed(false, false, false, OsNotifyMode::Always));
-        assert!(tray_needed(
-            false,
-            false,
-            false,
-            OsNotifyMode::WhenHiddenToTray
-        ));
-        assert!(!tray_needed(false, false, false, OsNotifyMode::Off));
-        assert!(tray_needed(true, false, false, OsNotifyMode::Off));
+    fn soft_os_mode() {
+        assert!(soft_os_eligible(OsNotifyMode::Always));
+        assert!(soft_os_eligible(OsNotifyMode::WhenHiddenToTray));
+        assert!(!soft_os_eligible(OsNotifyMode::Off));
     }
 
     #[test]
@@ -770,10 +720,10 @@ mod tests {
                 target_path: PathBuf::from("c"),
             },
         ];
-        let toasts = compose_in_app_toasts(OsNotifyMode::WhenHiddenToTray, &edges);
+        let toasts = in_app_summary_messages(&edges, OsNotifyMode::WhenHiddenToTray);
         assert_eq!(toasts.len(), 2);
-        assert_eq!(toasts[0].message, "2 downloads finished");
-        assert_eq!(toasts[1].message, "Download failed: c — x");
+        assert_eq!(toasts[0].1, "2 downloads finished");
+        assert_eq!(toasts[1].1, "Download failed: c — x");
     }
 
     #[test]
@@ -785,7 +735,12 @@ mod tests {
             error: None,
             target_path: PathBuf::from("a"),
         }];
-        let toasts = compose_in_app_toasts(OsNotifyMode::Always, &edges);
+        let toasts = in_app_summary_messages(&edges, OsNotifyMode::Always);
         assert!(toasts.is_empty());
+    }
+
+    #[test]
+    fn visible_window_drops_os_when_hidden_mode() {
+        assert!(!hard_os_eligible(OsNotifyMode::WhenHiddenToTray, false));
     }
 }
