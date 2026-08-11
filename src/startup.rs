@@ -48,7 +48,8 @@ mod windows_impl {
     }
 
     fn set_run_value(start_minimized: bool) -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|e| format!("Could not resolve exe path: {e}"))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("Could not resolve exe path: {e}"))?;
         let exe_str = exe.to_string_lossy();
         // Quote the path so spaces are safe; append --minimized when requested.
         let command = if start_minimized {

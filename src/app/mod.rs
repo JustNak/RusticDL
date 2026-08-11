@@ -410,31 +410,12 @@ impl DownloadApp {
             return true;
         }
 
-        // Ensure a tray icon exists so the user can restore the window.
+        // Need a tray icon to restore; without one, quit instead of orphaning.
+        self.ensure_tray(cx);
         if self.system_tray.is_none() {
-            let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
-            self.system_tray = SystemTray::start(tray_tx);
-            if self.system_tray.is_some() {
-                cx.spawn(async move |this, cx| {
-                    while let Ok(event) = tray_rx.recv().await {
-                        let result = this.update(cx, |app, cx| match event {
-                            TrayEvent::ShowWindow => {
-                                app.pending_tray_show = true;
-                                cx.notify();
-                            }
-                            TrayEvent::Exit => {
-                                app.force_quit = true;
-                                app.pending_tray_exit = true;
-                                cx.notify();
-                            }
-                        });
-                        if result.is_err() {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-            }
+            self.flush_window_layout_now();
+            self.flush_jobs_save_now();
+            return true;
         }
 
         self.flush_window_layout_now();
@@ -1291,6 +1272,9 @@ impl DownloadApp {
                             return;
                         }
                         app.show_toast("Installing update — RusticDL will restart…", cx);
+                        // Bypass close-to-tray so quit actually tears down the process.
+                        app.force_quit = true;
+                        app.stop_tray();
                         cx.notify();
                         cx.quit();
                     }

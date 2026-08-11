@@ -129,13 +129,12 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-        LoadImageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
-        TrackPopupMenu, TranslateMessage, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, HICON,
-        HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_STRING, MSG, TPM_BOTTOMALIGN,
-        TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, CW_USEDEFAULT,
-        GWLP_USERDATA,
+        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadImageW,
+        PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu,
+        TranslateMessage, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+        HICON, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_STRING, MSG,
+        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+        WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
     };
 
     const TRAY_UID: u32 = 1;
@@ -235,17 +234,9 @@ mod windows_impl {
             write_tip(&mut nid.szTip, APP_NAME);
 
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-                let _ = DestroyWindow(hwnd);
                 hwnd_slot.store(0, Ordering::SeqCst);
-                // WM_DESTROY frees state; if destroy failed, free here.
-                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
-                if !ptr.is_null() {
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    let state = Box::from_raw(ptr);
-                    if !state.icon.0.is_null() {
-                        let _ = DestroyIcon(state.icon);
-                    }
-                }
+                // DestroyWindow → WM_DESTROY frees TrayState; do not free again here.
+                let _ = DestroyWindow(hwnd);
                 return Err("Shell_NotifyIcon NIM_ADD failed".into());
             }
 
