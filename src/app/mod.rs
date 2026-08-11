@@ -146,6 +146,9 @@ pub struct DownloadApp {
     last_clipboard_urls_key: Option<u64>,
     /// Active Settings mini-nav category (does not discard draft when switched).
     settings_category: SettingsCategory,
+    /// Queue filter to restore when leaving Settings (Back / Esc / mouse-back).
+    /// Never `FilterKind::Settings`.
+    settings_return_filter: FilterKind,
 }
 
 impl DownloadApp {
@@ -447,6 +450,7 @@ impl DownloadApp {
             balloon_contexts: BalloonContextMap::default(),
             last_clipboard_urls_key: None,
             settings_category: SettingsCategory::General,
+            settings_return_filter: FilterKind::All,
         };
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
@@ -1370,6 +1374,10 @@ impl DownloadApp {
     }
 
     fn select_filter(&mut self, filter: FilterKind, window: &mut Window, cx: &mut Context<Self>) {
+        // Remember the queue filter we came from so Back/Esc/mouse-back restore it.
+        if filter == FilterKind::Settings && self.filter != FilterKind::Settings {
+            self.settings_return_filter = self.filter;
+        }
         self.filter = filter;
         if filter == FilterKind::Settings {
             // When the user has no local Browser capture preview, adopt any
@@ -1396,6 +1404,18 @@ impl DownloadApp {
             self.refresh_extension_text_inputs(window, cx);
         }
         cx.notify();
+    }
+
+    /// Leave Settings via Back / Esc / mouse-back. Draft prefs are preserved.
+    pub(crate) fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter != FilterKind::Settings {
+            return;
+        }
+        let dest = match self.settings_return_filter {
+            FilterKind::Settings => FilterKind::All,
+            other => other,
+        };
+        self.select_filter(dest, window, cx);
     }
 
     /// Detail panel job: only when exactly one id is selected.
@@ -1497,16 +1517,22 @@ impl Render for DownloadApp {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
-            // Mouse back (XButton1) dismisses the top dialog, like a browser modal.
-            .capture_any_mouse_down(cx.listener(|_, event: &MouseDownEvent, window, cx| {
-                if !window.has_active_dialog(cx) {
-                    return;
-                }
-                if matches!(
+            // Mouse back (XButton1): close dialog first, else leave Settings
+            // (same destination as the sidebar Back row / Esc).
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if !matches!(
                     event.button,
                     MouseButton::Navigate(NavigationDirection::Back)
                 ) {
+                    return;
+                }
+                if window.has_active_dialog(cx) {
                     window.close_dialog(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.filter == FilterKind::Settings {
+                    this.leave_settings(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -1516,7 +1542,11 @@ impl Render for DownloadApp {
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .child(self.render_sidebar(cx))
+                        .child(if self.filter == FilterKind::Settings {
+                            self.render_settings_sidebar(cx).into_any_element()
+                        } else {
+                            self.render_sidebar(cx).into_any_element()
+                        })
                         .child(
                             v_flex()
                                 .flex_1()
@@ -1527,7 +1557,9 @@ impl Render for DownloadApp {
                                 } else {
                                     self.render_queue(window, cx)
                                 })
-                                .child(self.render_status_bar(cx)),
+                                .when(self.filter != FilterKind::Settings, |col| {
+                                    col.child(self.render_status_bar(cx))
+                                }),
                         ),
                 ),
             )

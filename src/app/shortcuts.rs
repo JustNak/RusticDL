@@ -22,11 +22,16 @@ impl DownloadApp {
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
 
-        // Escape: dialogs dismiss first; otherwise clear queue selection.
-        // Runs even when a text field is focused so selection can always be cleared.
+        // Escape: dialogs → leave Settings → clear queue selection.
+        // Runs even when a text field is focused so Settings/selection stay escapable.
         if key == "escape" && !modifiers.modified() {
             if window.has_active_dialog(cx) {
                 window.close_dialog(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if self.filter == FilterKind::Settings {
+                self.leave_settings(window, cx);
                 cx.stop_propagation();
                 return;
             }

@@ -32,7 +32,7 @@ impl DownloadApp {
         let filtered_count = self.filtered_count();
         let total_speed = total_download_speed(&self.jobs);
         let context_label = if self.filter == FilterKind::Settings {
-            "Settings".to_string()
+            format!("Settings · {}", self.settings_category.label())
         } else if total_speed > 0 {
             format!("↓ {}", format_speed(total_speed))
         } else if filtered_count > 0 {

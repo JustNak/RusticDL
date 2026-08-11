@@ -1,5 +1,6 @@
 //! Settings panel UI extracted from `DownloadApp` for maintainability.
-//! Category shell: vertical mini-nav + one panel at a time.
+//! Category list lives in the left rail (`sidebar::render_settings_sidebar`);
+//! this module renders the active category panel + sticky footer.
 
 use gpui::{
     div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
@@ -18,8 +19,7 @@ use gpui_component::{
 use super::settings_category::SettingsCategory;
 use super::widgets::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, browse_directory,
-    field_hint, settings_choice_row, settings_field_label, settings_nav_item, settings_subgroup,
-    styled_progress,
+    field_hint, settings_choice_row, settings_field_label, settings_subgroup, styled_progress,
 };
 use super::DownloadApp;
 use crate::appearance::{accent_swatch_color, custom_accent_hsla, resolve_theme_mode};
@@ -34,91 +34,66 @@ impl DownloadApp {
         let theme = cx.theme().clone();
         let settings_pad = self.settings.ui_density.settings_pad();
         let category = self.settings_category;
-        // Mini-nav 148–160px; slightly tighter in Compact density.
-        let nav_w = match self.settings.ui_density {
-            UiDensity::Comfortable => 160.0,
-            UiDensity::Compact => 148.0,
-        };
 
+        // Categories live in the main left rail (`render_settings_sidebar`).
+        // This pane is content + sticky footer only.
         v_flex()
             .id("settings-view")
             .size_full()
             .bg(theme.background)
-            // Body: mini-nav + scrolling category content.
             .child(
-                h_flex()
+                div()
+                    // Key id by category so GPUI does not reuse scroll offset
+                    // when switching from a tall panel (Appearance) to a short one.
+                    .id(SharedString::from(format!(
+                        "settings-content-scroll-{}",
+                        category.label()
+                    )))
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .w_full()
+                    .overflow_y_scroll()
+                    .p(px(settings_pad))
                     .child(
                         v_flex()
-                            .id("settings-mini-nav")
-                            .w(px(nav_w))
-                            .flex_shrink_0()
-                            .h_full()
-                            .bg(theme.sidebar)
-                            .border_r_1()
-                            .border_color(theme.sidebar_border)
-                            .p_2()
-                            .gap_0p5()
-                            .children(
-                                SettingsCategory::ALL
-                                    .into_iter()
-                                    .map(|cat| settings_nav_item(cat, category == cat, cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            // Key id by category so GPUI does not reuse scroll offset
-                            // when switching from a tall panel (Appearance) to a short one.
-                            .id(SharedString::from(format!(
-                                "settings-content-scroll-{}",
-                                category.label()
-                            )))
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .p(px(settings_pad))
+                            .gap_5()
+                            .max_w(px(720.))
+                            // Quiet wayfinding — left rail owns "Settings".
                             .child(
-                                v_flex()
-                                    .gap_5()
-                                    .max_w(px(720.))
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
                                     .child(
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .text_lg()
-                                                    .font_bold()
-                                                    .text_color(theme.foreground)
-                                                    .child("Settings"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("Preferences and defaults"),
-                                            ),
+                                        Icon::new(category.icon())
+                                            .with_size(px(16.))
+                                            .text_color(theme.muted_foreground),
                                     )
-                                    .child(match category {
-                                        SettingsCategory::General => {
-                                            self.render_settings_general(cx).into_any_element()
-                                        }
-                                        SettingsCategory::System => {
-                                            self.render_settings_system(cx).into_any_element()
-                                        }
-                                        SettingsCategory::Browser => {
-                                            self.render_settings_browser(cx).into_any_element()
-                                        }
-                                        SettingsCategory::Appearance => {
-                                            self.render_settings_appearance(cx).into_any_element()
-                                        }
-                                        SettingsCategory::Data => {
-                                            self.render_settings_data(cx).into_any_element()
-                                        }
-                                    }),
-                            ),
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_bold()
+                                            .text_color(theme.foreground)
+                                            .child(category.panel_title()),
+                                    ),
+                            )
+                            .child(match category {
+                                SettingsCategory::General => {
+                                    self.render_settings_general(cx).into_any_element()
+                                }
+                                SettingsCategory::System => {
+                                    self.render_settings_system(cx).into_any_element()
+                                }
+                                SettingsCategory::Browser => {
+                                    self.render_settings_browser(cx).into_any_element()
+                                }
+                                SettingsCategory::Appearance => {
+                                    self.render_settings_appearance(cx).into_any_element()
+                                }
+                                SettingsCategory::Data => {
+                                    self.render_settings_data(cx).into_any_element()
+                                }
+                            }),
                     ),
             )
             // Sticky footer (flex shell, not CSS position:sticky): always visible.
