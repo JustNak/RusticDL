@@ -4763,6 +4763,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4994,6 +4995,16 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+ "winresource",
+]
+
+[[package]]
+name = "rusticdl-updater"
+version = "0.2.0"
+dependencies = [
+ "open",
+ "reqwest",
+ "windows 0.61.3",
  "winresource",
 ]
 

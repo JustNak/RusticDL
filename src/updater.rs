@@ -6,8 +6,9 @@
 //! Flow (one click in the app):
 //! 1. Query the GitHub Releases API for the latest tag + assets.
 //! 2. Compare against the built-in app version.
-//! 3. If newer, download `RusticDL-windows-x64-setup.exe`, flush app state,
-//!    launch silently (`/S /R`), then quit so install can finish and relaunch.
+//! 3. If newer, flush app state, spawn **RusticDL Updater** with the setup
+//!    download URL, then quit. The updater shows progress, runs NSIS `/S`,
+//!    and relaunches this app.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,7 +18,10 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
-use crate::branding::{APP_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO, SETUP_ASSET_NAME};
+use crate::branding::{
+    APP_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO, SETUP_ASSET_NAME, UPDATER_EXE_NAME,
+    UPDATER_NAME,
+};
 
 /// GitHub API: latest release for this project.
 pub fn latest_release_api() -> String {
@@ -145,8 +149,9 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
 
 /// Download the NSIS installer to a temp path (does not launch it).
 ///
-/// Callers should persist app state, then [`launch_installer`], then quit so the
-/// silent installer can replace files without racing a mid-flight save.
+/// Interactive updates now hand this off to **RusticDL Updater**. Kept for
+/// tooling / fallback paths that want an in-process download.
+#[allow(dead_code)]
 pub async fn download_installer(download_url: &str) -> Result<PathBuf, String> {
     let client = github_client()?;
     let response = client
@@ -200,9 +205,13 @@ pub fn open_url(url: &str) -> Result<(), String> {
 
 /// Launch a previously downloaded NSIS setup binary.
 ///
+/// Prefer [`launch_updater`] for interactive updates so the user sees a progress
+/// window. This remains available for repair/fallback tooling.
+///
 /// When `silent_relaunch` is true, starts with `/S /R` (no wizard; app relaunches
 /// after success). Prefer flushing jobs/settings before calling this, then quit
 /// promptly so the installer can replace in-use files.
+#[allow(dead_code)]
 pub fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -226,6 +235,77 @@ pub fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result
         std::process::Command::new(path)
             .spawn()
             .map_err(|e| format!("Could not start installer: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Arguments for spawning the dedicated **RusticDL Updater** process.
+#[derive(Debug, Clone)]
+pub struct LaunchUpdaterOpts {
+    pub download_url: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub release_page: String,
+    pub setup_size: Option<u64>,
+}
+
+/// Resolve `rusticdl-updater.exe` next to the running main executable.
+pub fn updater_exe_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "Could not resolve install directory.".to_string())?;
+    let updater = dir.join(UPDATER_EXE_NAME);
+    if !updater.is_file() {
+        return Err(format!(
+            "{UPDATER_NAME} was not found next to the app:\n{}\n\nReinstall RusticDL or rebuild with the updater package.",
+            updater.display()
+        ));
+    }
+    Ok(updater)
+}
+
+/// Spawn the updater, which downloads/installs the update after this process exits.
+///
+/// Callers must flush app state, then quit promptly so the updater can replace files.
+pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
+    let updater = updater_exe_path()?;
+    let app_exe =
+        std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
+    let pid = std::process::id();
+
+    let mut cmd = std::process::Command::new(&updater);
+    cmd.arg("--app-exe")
+        .arg(&app_exe)
+        .arg("--download-url")
+        .arg(&opts.download_url)
+        .arg("--wait-pid")
+        .arg(pid.to_string())
+        .arg("--from-version")
+        .arg(&opts.from_version)
+        .arg("--to-version")
+        .arg(&opts.to_version)
+        .arg("--release-page")
+        .arg(&opts.release_page);
+    if let Some(size) = opts.setup_size {
+        cmd.arg("--expected-size").arg(size.to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS so the updater outlives us when we quit for the update.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map_err(|e| format!("Could not start {UPDATER_NAME}: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.spawn()
+            .map_err(|e| format!("Could not start {UPDATER_NAME}: {e}"))?;
         Ok(())
     }
 }

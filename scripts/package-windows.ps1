@@ -34,7 +34,7 @@ if (-not (Test-CargoPackager)) {
 
 if (-not $SkipBuild) {
   Write-Host "Building release binaries..."
-  cargo build --release -p rusticdl -p rusticdl-native-host
+  cargo build --release -p rusticdl -p rusticdl-updater -p rusticdl-native-host
 }
 
 $outDir = Join-Path $repoRoot "dist-release"

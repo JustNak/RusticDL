@@ -1,0 +1,38 @@
+[package]
+name = "rusticdl-updater"
+version = "0.2.0"
+edition = "2021"
+description = "RusticDL Updater — applies updates and relaunches the main app"
+license = "MIT"
+repository = "https://github.com/JustNak/RusticDL"
+authors = ["JustNak"]
+
+[package.metadata.winresource]
+ProductName = "RusticDL"
+FileDescription = "RusticDL Updater"
+CompanyName = "JustNak"
+LegalCopyright = "Copyright (c) JustNak"
+OriginalFilename = "rusticdl-updater.exe"
+
+[[bin]]
+name = "rusticdl-updater"
+path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
