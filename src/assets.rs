@@ -121,6 +121,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_brand_logos_include_theme_variants() {
+        for path in ["brand/logo.png", "brand/logo-light.png"] {
+            let bytes = Assets::load_embedded(path)
+                .unwrap_or_else(|| panic!("missing embedded asset: {path}"));
+            assert!(
+                !bytes.is_empty(),
+                "embedded asset {path} should not be empty"
+            );
+            // PNG magic
+            assert_eq!(&bytes[..4], b"\x89PNG", "{path} should be a PNG");
+        }
+    }
+
+    #[test]
     fn asset_source_load_falls_back_to_embedded() {
         // Point base at a path that does not exist so disk load fails.
         let assets = Assets {

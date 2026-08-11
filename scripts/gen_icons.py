@@ -1,7 +1,8 @@
 """Generate RusticDL brand icons from an Imagine master (or redraw fallback).
 
 Produces:
-  - assets/brand/logo.png, icon-*.png, icon.ico
+  - assets/brand/logo.png (dark theme), logo-light.png (light theme)
+  - assets/brand/icon-*.png, icon.ico
   - assets/icon.png
   - apps/extension/src/icons/icon-*.png
 
@@ -10,6 +11,7 @@ Pipeline:
   2. Quantize to Default Light primary palette (#171717 / #fafafa).
   3. Full-bleed slate corners (no white / no alpha holes).
   4. Export PNG sizes + multi-size ICO.
+  5. Invert the mark for a light-theme title-bar variant.
 """
 from __future__ import annotations
 
@@ -20,9 +22,13 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# gpui-component Default Light primary tokens
+# gpui-component Default Light primary tokens (dark-theme mark: light glyph on dark field)
 BG = (0x17, 0x17, 0x17, 255)  # #171717
 GLYPH = (0xFA, 0xFA, 0xFA, 255)  # #fafafa
+
+# Light-theme mark: inverted field / glyph
+LIGHT_BG = GLYPH
+LIGHT_GLYPH = BG
 
 MASTER = 1024
 
@@ -73,6 +79,22 @@ def _sized(master: Image.Image, s: int) -> Image.Image:
     return master.resize((s, s), Image.Resampling.LANCZOS)
 
 
+def invert_mark(master: Image.Image) -> Image.Image:
+    """Swap field/glyph for light-theme chrome (dark glyph on light field)."""
+    rgba = master.convert("RGBA")
+    out = Image.new("RGBA", rgba.size, LIGHT_BG)
+    px_in = rgba.load()
+    px_out = out.load()
+    w, h = rgba.size
+    # Luminance midpoint between brand BG (#171717 ≈ 23) and GLYPH (#fafafa ≈ 250).
+    for y in range(h):
+        for x in range(w):
+            r, g, b, _a = px_in[x, y]
+            yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            px_out[x, y] = LIGHT_GLYPH if yv > 90 else LIGHT_BG
+    return out
+
+
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     src = Path(args[0]) if args else None
@@ -84,6 +106,10 @@ def main(argv: list[str] | None = None) -> None:
     master.save(brand / "logo.png")
     master.save(brand / "icon-1024.png")
     print("wrote", brand / "logo.png")
+
+    light = invert_mark(master)
+    light.save(brand / "logo-light.png")
+    print("wrote", brand / "logo-light.png")
 
     for s in [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512]:
         out = brand / f"icon-{s}.png"
@@ -108,11 +134,13 @@ def main(argv: list[str] | None = None) -> None:
         _sized(master, s).save(p)
         print("wrote", p)
 
-    # Keep a project-local copy of the processed master for reproducibility
+    # Keep a project-local copy of the processed masters for reproducibility
     masters_dir = brand / "masters"
     masters_dir.mkdir(parents=True, exist_ok=True)
     master.save(masters_dir / "icon-master-1024.png")
     print("wrote", masters_dir / "icon-master-1024.png")
+    light.save(masters_dir / "icon-master-light-1024.png")
+    print("wrote", masters_dir / "icon-master-light-1024.png")
 
     master.resize((256, 256), Image.Resampling.LANCZOS).save(ROOT / "assets" / "icon.png")
     print("wrote", ROOT / "assets" / "icon.png")

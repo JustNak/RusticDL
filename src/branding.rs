@@ -52,3 +52,9 @@ pub const APP_ICON_ICO: &str = "brand/icon.ico";
 /// Relative path to the square brand mark PNG.
 #[allow(dead_code)] // available for future tray / about UI image
 pub const APP_ICON_PNG: &str = "brand/icon-256.png";
+
+/// Dark-theme title-bar / chrome mark (light glyph on dark field).
+pub const APP_LOGO_DARK: &str = "brand/logo.png";
+
+/// Light-theme title-bar / chrome mark (dark glyph on light field).
+pub const APP_LOGO_LIGHT: &str = "brand/logo-light.png";

@@ -1,19 +1,19 @@
 //! Title bar chrome extracted from `DownloadApp`.
 
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
-    ParentElement, Styled,
+    div, img, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
+    ObjectFit, ParentElement, Styled, StyledImage,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
-    ActiveTheme, Icon, IconName, Sizable, TitleBar,
+    ActiveTheme, Icon, IconName, TitleBar,
 };
 
 use super::filter::FilterKind;
 use super::DownloadApp;
-use crate::branding::{APP_NAME, APP_VERSION};
+use crate::branding::{APP_LOGO_DARK, APP_LOGO_LIGHT, APP_NAME, APP_VERSION};
 use crate::format::format_speed;
 use crate::format::total_download_speed;
 use crate::updater::{open_release_page, open_url};
@@ -58,21 +58,26 @@ impl DownloadApp {
                         .gap_2()
                         .items_center()
                         .flex_shrink_0()
-                        .child(
+                        .child({
+                            // Brand mark switches with theme so the glyph stays readable.
+                            let logo = if theme.is_dark() {
+                                APP_LOGO_DARK
+                            } else {
+                                APP_LOGO_LIGHT
+                            };
                             div()
                                 .w(px(26.))
                                 .h(px(26.))
                                 .rounded(theme.radius)
-                                .bg(theme.primary)
-                                .flex()
-                                .items_center()
-                                .justify_center()
+                                .overflow_hidden()
+                                .flex_shrink_0()
                                 .child(
-                                    Icon::new(IconName::ArrowDown)
-                                        .with_size(px(14.))
-                                        .text_color(theme.primary_foreground),
-                                ),
-                        )
+                                    img(logo)
+                                        .w(px(26.))
+                                        .h(px(26.))
+                                        .object_fit(ObjectFit::Cover),
+                                )
+                        })
                         .child(
                             // Clickable product name → overflow menu (updates).
                             Button::new("app-brand-menu")
