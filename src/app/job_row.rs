@@ -1,5 +1,5 @@
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
+    div, prelude::FluentBuilder, px, ClickEvent, Context, Corner, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 use gpui_component::{
@@ -100,10 +100,19 @@ pub(crate) fn render_job_row(
             })
         })
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| {
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            // Modifier-click multi-select (PR-07): Ctrl/Cmd = toggle, Shift = range.
             // Plain click: select only (no toggle-off). Stop bubble so empty
             // queue chrome can clear selection on background click.
-            this.select_only(id_for_select.clone());
+            let m = event.modifiers();
+            if m.secondary() {
+                this.toggle_select(id_for_select.clone());
+            } else if m.shift {
+                let visible = this.visible_jobs(cx);
+                this.select_range_visible(&id_for_select, &visible);
+            } else {
+                this.select_only(id_for_select.clone());
+            }
             cx.notify();
             cx.stop_propagation();
         }))
