@@ -71,12 +71,7 @@ impl DownloadApp {
                                 .rounded(theme.radius)
                                 .overflow_hidden()
                                 .flex_shrink_0()
-                                .child(
-                                    img(logo)
-                                        .w(px(26.))
-                                        .h(px(26.))
-                                        .object_fit(ObjectFit::Cover),
-                                )
+                                .child(img(logo).w(px(26.)).h(px(26.)).object_fit(ObjectFit::Cover))
                         })
                         .child(
                             // Clickable product name → overflow menu (updates).
