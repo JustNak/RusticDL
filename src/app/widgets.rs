@@ -13,6 +13,7 @@ use super::filter::FilterKind;
 use super::layout::{
     QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, STATUS_DOT,
 };
+use super::settings_category::SettingsCategory;
 use super::DownloadApp;
 use crate::settings::{AccentPreset, ProgressStyle, SortColumn, SortDirection};
 
@@ -587,6 +588,76 @@ pub(crate) fn nav_item(
                     .child(format_nav_count(count)),
             )
         })
+}
+
+/// Settings mini-nav row: icon + label, active styling aligned with [`nav_item`].
+/// No badge counts (categories are not queue filters).
+pub(crate) fn settings_nav_item(
+    category: SettingsCategory,
+    active: bool,
+    cx: &mut Context<DownloadApp>,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let label = category.label();
+    let bg = if active {
+        theme
+            .secondary
+            .opacity(if theme.is_dark() { 0.55 } else { 0.85 })
+    } else {
+        theme.transparent
+    };
+    let fg = if active {
+        theme.sidebar_accent_foreground
+    } else {
+        theme.sidebar_foreground
+    };
+    let icon_color = if active {
+        theme.sidebar_primary
+    } else {
+        theme.muted_foreground
+    };
+
+    h_flex()
+        .id(SharedString::from(format!("settings-nav-{label}")))
+        .h(px(36.))
+        .px_2()
+        .gap_2()
+        .items_center()
+        .rounded(theme.radius)
+        .bg(bg)
+        .hover(|s| {
+            s.bg(if active {
+                theme
+                    .secondary
+                    .opacity(if theme.is_dark() { 0.65 } else { 0.95 })
+            } else {
+                theme.secondary.opacity(0.45)
+            })
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.settings_category != category {
+                this.settings_category = category;
+                cx.notify();
+            }
+        }))
+        .child(
+            Icon::new(category.icon())
+                .with_size(px(15.))
+                .text_color(icon_color),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(fg)
+                .child(label),
+        )
 }
 
 pub(crate) fn status_color(tone: i32, theme: &gpui_component::Theme) -> Hsla {

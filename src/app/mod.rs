@@ -7,6 +7,7 @@ mod job_row;
 mod layout;
 mod queue_view;
 mod selection;
+mod settings_category;
 mod settings_panel;
 mod shortcuts;
 mod sidebar;
@@ -17,6 +18,7 @@ mod update_flow;
 mod widgets;
 
 pub use filter::FilterKind;
+pub(crate) use settings_category::SettingsCategory;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -142,6 +144,8 @@ pub struct DownloadApp {
     balloon_contexts: BalloonContextMap,
     /// Debounce key for the last clipboard URL set offered on focus (PR-10).
     last_clipboard_urls_key: Option<u64>,
+    /// Active Settings mini-nav category (does not discard draft when switched).
+    settings_category: SettingsCategory,
 }
 
 impl DownloadApp {
@@ -442,6 +446,7 @@ impl DownloadApp {
             os_notify_buffer: OsNotifyBuffer::default(),
             balloon_contexts: BalloonContextMap::default(),
             last_clipboard_urls_key: None,
+            settings_category: SettingsCategory::General,
         };
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
