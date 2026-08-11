@@ -135,6 +135,8 @@ pub struct DownloadApp {
     os_notify_buffer: OsNotifyBuffer,
     /// Last-N balloon click contexts for open-file / show policy.
     balloon_contexts: BalloonContextMap,
+    /// Debounce key for the last clipboard URL set offered on focus (PR-10).
+    last_clipboard_urls_key: Option<u64>,
 }
 
 impl DownloadApp {
@@ -295,6 +297,15 @@ impl DownloadApp {
         })
         .detach();
 
+        // Opt-in clipboard URL watch on main-window focus gain (never auto-downloads).
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            this.on_window_activated(window, cx);
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 let result = this.update(cx, |app, cx| match event {
@@ -422,6 +433,7 @@ impl DownloadApp {
             pending_balloon_click: None,
             os_notify_buffer: OsNotifyBuffer::default(),
             balloon_contexts: BalloonContextMap::default(),
+            last_clipboard_urls_key: None,
         };
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
@@ -1087,6 +1099,52 @@ impl DownloadApp {
     fn set_notify_on_fail(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.notify_on_fail = on;
         cx.notify();
+    }
+
+    fn set_clipboard_watch_enabled(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.clipboard_watch_enabled = on;
+        // Fresh enable should re-offer current clipboard on next focus.
+        if !on {
+            self.last_clipboard_urls_key = None;
+        }
+        cx.notify();
+    }
+
+    /// On main-window activation: optionally offer HTTP(S) clipboard URLs.
+    ///
+    /// Safety: never enqueues without a confirm dialog. Skips when disabled,
+    /// tray-hidden, a dialog is already open, or the same URL set was just offered.
+    fn on_window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings.clipboard_watch_enabled {
+            return;
+        }
+        if self.window_hidden_to_tray {
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            return;
+        }
+
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let urls = crate::download::extract_http_urls(&text);
+        if urls.is_empty() {
+            return;
+        }
+
+        let key = confirm_dialogs::clipboard_urls_key(&urls);
+        if self.last_clipboard_urls_key == Some(key) {
+            return;
+        }
+        // Record before open so Cancel / focus flap does not re-prompt the same set.
+        self.last_clipboard_urls_key = Some(key);
+        self.confirm_add_clipboard_urls(urls, window, cx);
     }
 
     /// Poll for browser ask-mode handoffs and open a dedicated prompt window.

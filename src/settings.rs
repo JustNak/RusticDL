@@ -385,6 +385,10 @@ pub struct Settings {
     /// Show notifications when a download fails (after retries).
     #[serde(default = "default_true")]
     pub notify_on_fail: bool,
+    /// When true, on main-window focus gain offer to add HTTP(S) URLs found on the clipboard.
+    /// Never auto-downloads; always confirms. Off by default.
+    #[serde(default)]
+    pub clipboard_watch_enabled: bool,
     /// Browser extension integration preferences (source of truth for the companion extension).
     #[serde(default)]
     pub extension: ExtensionIntegrationSettings,
@@ -423,6 +427,7 @@ impl Default for Settings {
             os_notify_mode: OsNotifyMode::WhenHiddenToTray,
             notify_on_complete: true,
             notify_on_fail: true,
+            clipboard_watch_enabled: false,
             extension: ExtensionIntegrationSettings::default(),
         }
     }
@@ -516,6 +521,7 @@ mod tests {
         assert_eq!(s.os_notify_mode, OsNotifyMode::WhenHiddenToTray);
         assert!(s.notify_on_complete);
         assert!(s.notify_on_fail);
+        assert!(!s.clipboard_watch_enabled);
     }
 
     #[test]
