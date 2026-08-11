@@ -50,6 +50,8 @@ use crate::settings::{
     AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, Settings, SortColumn, SortDirection,
     UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
+use crate::startup::{apply_launch_at_startup, launched_minimized};
+use crate::tray::{hide_main_window, show_main_window, SystemTray, TrayEvent};
 use crate::updater::{
     check_for_update, download_installer, launch_installer, open_release_page, open_url,
     UpdateCheck, UpdateInfo,
@@ -110,6 +112,16 @@ pub struct DownloadApp {
     update_busy: bool,
     /// Cached latest release when an update is available (enables one-click install).
     available_update: Option<UpdateInfo>,
+    /// System tray icon (Windows). Present when close-to-tray is enabled.
+    system_tray: Option<SystemTray>,
+    /// When true, the next close request actually quits (tray Exit / updates).
+    force_quit: bool,
+    /// Main window is currently hidden to the tray.
+    window_hidden_to_tray: bool,
+    /// Tray "Show" was requested; applied on the next render (has Window).
+    pending_tray_show: bool,
+    /// Tray "Exit" was requested; applied on the next render.
+    pending_tray_exit: bool,
 }
 
 impl DownloadApp {
@@ -302,7 +314,40 @@ impl DownloadApp {
         // Quiet startup check against GitHub Releases (toast only if an update exists).
         spawn_update_check(false, cx);
 
-        Self {
+        let started_minimized = launched_minimized();
+        // Tray is needed for close-to-tray and for startup-minimized restores.
+        let tray_needed = settings.close_to_tray || started_minimized;
+        let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
+        let system_tray = if tray_needed {
+            SystemTray::start(tray_tx)
+        } else {
+            drop(tray_tx);
+            None
+        };
+
+        if system_tray.is_some() {
+            cx.spawn(async move |this, cx| {
+                while let Ok(event) = tray_rx.recv().await {
+                    let result = this.update(cx, |app, cx| match event {
+                        TrayEvent::ShowWindow => {
+                            app.pending_tray_show = true;
+                            cx.notify();
+                        }
+                        TrayEvent::Exit => {
+                            app.force_quit = true;
+                            app.pending_tray_exit = true;
+                            cx.notify();
+                        }
+                    });
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+
+        let app = Self {
             jobs,
             settings,
             paths,
@@ -341,6 +386,112 @@ impl DownloadApp {
                 .unwrap_or_else(Instant::now),
             update_busy: false,
             available_update: None,
+            system_tray,
+            force_quit: false,
+            window_hidden_to_tray: started_minimized,
+            pending_tray_show: false,
+            pending_tray_exit: false,
+        };
+
+        // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
+        let entity = cx.entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            entity.update(cx, |app, cx| app.handle_window_should_close(window, cx))
+        });
+
+        app
+    }
+
+    /// Intercept main-window close: hide to tray when the preference is on.
+    fn handle_window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.force_quit || !self.settings.close_to_tray {
+            self.flush_window_layout_now();
+            self.flush_jobs_save_now();
+            return true;
+        }
+
+        // Ensure a tray icon exists so the user can restore the window.
+        if self.system_tray.is_none() {
+            let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
+            self.system_tray = SystemTray::start(tray_tx);
+            if self.system_tray.is_some() {
+                cx.spawn(async move |this, cx| {
+                    while let Ok(event) = tray_rx.recv().await {
+                        let result = this.update(cx, |app, cx| match event {
+                            TrayEvent::ShowWindow => {
+                                app.pending_tray_show = true;
+                                cx.notify();
+                            }
+                            TrayEvent::Exit => {
+                                app.force_quit = true;
+                                app.pending_tray_exit = true;
+                                cx.notify();
+                            }
+                        });
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+
+        self.flush_window_layout_now();
+        self.flush_jobs_save_if_due();
+        hide_main_window(window);
+        self.window_hidden_to_tray = true;
+        cx.notify();
+        false
+    }
+
+    fn ensure_tray(&mut self, cx: &mut Context<Self>) {
+        if self.system_tray.is_some() {
+            return;
+        }
+        let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
+        self.system_tray = SystemTray::start(tray_tx);
+        if self.system_tray.is_none() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = tray_rx.recv().await {
+                let result = this.update(cx, |app, cx| match event {
+                    TrayEvent::ShowWindow => {
+                        app.pending_tray_show = true;
+                        cx.notify();
+                    }
+                    TrayEvent::Exit => {
+                        app.force_quit = true;
+                        app.pending_tray_exit = true;
+                        cx.notify();
+                    }
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_tray(&mut self) {
+        self.system_tray = None;
+    }
+
+    fn apply_pending_tray_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_tray_show {
+            self.pending_tray_show = false;
+            self.window_hidden_to_tray = false;
+            show_main_window(window);
+        }
+        if self.pending_tray_exit {
+            self.pending_tray_exit = false;
+            self.force_quit = true;
+            self.flush_window_layout_now();
+            self.flush_jobs_save_now();
+            self.stop_tray();
+            cx.quit();
         }
     }
 
@@ -1280,6 +1431,22 @@ impl DownloadApp {
         let _ = save_settings(&self.paths, &self.settings);
         self.ipc.update_settings(&self.settings);
 
+        // Keep Windows Run-key entry in sync with launch preferences.
+        if let Err(msg) = apply_launch_at_startup(
+            self.settings.launch_at_startup,
+            self.settings.startup_minimized,
+        ) {
+            self.show_toast(format!("Startup setting: {msg}"), cx);
+        }
+
+        // Tray is required for close-to-tray; drop it when the preference is off
+        // and the window is not currently hidden.
+        if self.settings.close_to_tray {
+            self.ensure_tray(cx);
+        } else if !self.window_hidden_to_tray {
+            self.stop_tray();
+        }
+
         apply_appearance(&self.settings, Some(window), cx);
 
         self.engine.send(EngineCommand::UpdateSettings {
@@ -1289,6 +1456,29 @@ impl DownloadApp {
         });
 
         self.show_toast("Settings saved.", cx);
+        cx.notify();
+    }
+
+    fn set_close_to_tray(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.close_to_tray = on;
+        if on {
+            self.ensure_tray(cx);
+        } else if !self.window_hidden_to_tray {
+            self.stop_tray();
+        }
+        cx.notify();
+    }
+
+    fn set_launch_at_startup(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.launch_at_startup = on;
+        if !on {
+            self.settings.startup_minimized = false;
+        }
+        cx.notify();
+    }
+
+    fn set_startup_minimized(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.startup_minimized = on && self.settings.launch_at_startup;
         cx.notify();
     }
 
@@ -1524,8 +1714,10 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
+        self.apply_pending_tray_actions(window, cx);
         if self.ipc.take_show_window_request() {
-            window.activate_window();
+            self.window_hidden_to_tray = false;
+            show_main_window(window);
         }
         self.sync_window_chrome(window);
         let theme = cx.theme().clone();
@@ -2340,6 +2532,9 @@ impl DownloadApp {
         let accent_sat = self.settings.accent_saturation;
         let accent_light = self.settings.accent_lightness;
         let custom_color = custom_accent_hsla(accent_hue, accent_sat, accent_light);
+        let close_to_tray = self.settings.close_to_tray;
+        let launch_at_startup = self.settings.launch_at_startup;
+        let startup_minimized = self.settings.startup_minimized;
         let data_dir = self.paths.root.display().to_string();
         let settings_pad = ui_density.settings_pad();
         let resolved_mode = resolve_theme_mode(theme_choice, None, cx);
@@ -2471,6 +2666,174 @@ impl DownloadApp {
                                                     .child(Input::new(&self.speed_input).w_full())
                                                     .child(field_hint("0 means unlimited.", cx)),
                                             ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        GroupBox::new()
+                            .outline()
+                            .title(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::Settings)
+                                            .with_size(px(14.))
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .child("System"),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_4()
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Close to tray", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("close-tray-off")
+                                                            .label("Off")
+                                                            .when(!close_to_tray, |b| b.primary())
+                                                            .when(close_to_tray, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_close_to_tray(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("close-tray-on")
+                                                            .label("On")
+                                                            .when(close_to_tray, |b| b.primary())
+                                                            .when(!close_to_tray, |b| b.outline())
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_close_to_tray(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "When On, the close button hides RusticDL to the notification area (overflow tray) instead of quitting. Use the tray icon to show or exit.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Launch at startup", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("startup-off")
+                                                            .label("Off")
+                                                            .when(!launch_at_startup, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(launch_at_startup, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_launch_at_startup(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("startup-on")
+                                                            .label("On")
+                                                            .when(launch_at_startup, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!launch_at_startup, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_launch_at_startup(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "Start RusticDL when you sign in to Windows. Saved with Settings.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Start minimized", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("startup-min-off")
+                                                            .label("Off")
+                                                            .disabled(!launch_at_startup)
+                                                            .when(
+                                                                !startup_minimized
+                                                                    || !launch_at_startup,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                startup_minimized
+                                                                    && launch_at_startup,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_startup_minimized(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("startup-min-on")
+                                                            .label("On")
+                                                            .disabled(!launch_at_startup)
+                                                            .when(
+                                                                startup_minimized
+                                                                    && launch_at_startup,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                !startup_minimized
+                                                                    || !launch_at_startup,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_startup_minimized(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "When launch at startup is On, open hidden in the tray until you show the window.",
+                                                cx,
+                                            )),
                                     ),
                             ),
                     )
