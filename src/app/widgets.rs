@@ -296,20 +296,24 @@ pub(crate) fn settings_choice_row(
     control: impl IntoElement,
     cx: &mut App,
 ) -> impl IntoElement {
+    // Label left, control cluster right. Allow the control column to grow so
+    // multi-button groups (density / radius / progress) do not crush and
+    // stack on top of each other in a narrow pane.
     h_flex()
         .w_full()
         .gap_3()
-        .items_center()
+        .items_start()
         .justify_between()
         .child(
             v_flex()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(120.))
                 .gap_0p5()
+                .pt_1()
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
         )
-        .child(div().min_w_0().max_w(px(300.)).child(control))
+        .child(div().flex_shrink_0().max_w(px(360.)).child(control))
 }
 
 /// Equal-size circular preset swatch (solid fill + selection ring).

@@ -40,7 +40,7 @@ Implementation is split into four incremental PRs suitable for `/execute-plan`.
 ## Non-goals (v1)
 
 - Settings search / “Go to setting…” command palette
-- Replacing the main download sidebar with settings categories when Settings is open
+- ~~Replacing the main download sidebar with settings categories when Settings is open~~ (shipped later: settings-mode left rail)
 - Scrollspy on a single infinite form
 - Auto-save on Reset (user still presses Save)
 - True Switch control if gpui-component has none (Off/On segmented buttons stay acceptable in horizontal rows)
@@ -281,7 +281,7 @@ Remove the lone Save button from the bottom of the old infinite scroll once the 
 4. **Reset is draft-only; Save persists** — Matches existing appearance draft model and avoids dual write paths. Rationale: consistency and undo via not saving / reopening (loaded file still on disk until Save).
 5. **Confirm on global reset only** — Section **Reset appearance** stays one-click. Rationale: global is broad; appearance is already scoped.
 6. **Horizontal boolean rows + rarer hints** — Hierarchy over more chrome. Rationale: screenshots show wall-of-text density.
-7. **Keep main sidebar as download filters** — Settings mini-nav is internal to the settings view. Rationale: avoids “where did my queues go?” when opening Settings.
+7. **~~Keep main sidebar as download filters~~ (superseded)** — Follow-up UX now **replaces** the left rail with Settings nav (Back + categories) while Settings is open; mini-nav moves out of the content pane. Rationale: reclaim width, clearer destination mode, browser-like Back / Esc / mouse-back leave.
 8. **Four PRs, shared file awareness** — Structure → Reset/footer → Readability → Appearance polish. Rationale: reviewable slices; stack linearization 1→2→3→4 reduces `settings_panel.rs` thrash.
 
 ---
