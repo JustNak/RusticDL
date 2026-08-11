@@ -56,7 +56,7 @@ use crate::settings::{
     MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::{apply_launch_at_startup, launched_minimized};
-use crate::tray::{hide_main_window, show_main_window, SystemTray, TrayEvent};
+use crate::tray::{hide_main_window, main_window_hwnd, show_main_window, show_main_window_hwnd, SystemTray, TrayEvent};
 use crate::updater::UpdateInfo;
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
 use update_flow::spawn_update_check;
@@ -125,6 +125,8 @@ pub struct DownloadApp {
     force_quit: bool,
     /// Main window is currently hidden to the tray.
     window_hidden_to_tray: bool,
+    /// Win32 HWND of the main window (0 if unknown). Used to restore without render.
+    main_hwnd: isize,
     /// Tray "Show" was requested; applied on the next render (has Window).
     pending_tray_show: bool,
     /// Tray "Exit" was requested; applied on the next render.
@@ -339,6 +341,8 @@ impl DownloadApp {
                         app.flush_jobs_save_if_due();
                         // Dedicated prompt windows open even if the main UI is idle.
                         app.poll_browser_prompt(cx);
+                        // Second-instance / extension show_window while hidden to tray.
+                        app.poll_hidden_window_actions(cx);
                     })
                     .is_err()
                 {
@@ -428,6 +432,7 @@ impl DownloadApp {
             system_tray,
             force_quit: false,
             window_hidden_to_tray: started_minimized,
+            main_hwnd: main_window_hwnd(window),
             pending_tray_show: false,
             pending_tray_exit: false,
             pending_balloon_click: None,
@@ -463,6 +468,10 @@ impl DownloadApp {
 
         self.flush_window_layout_now();
         self.flush_jobs_save_if_due();
+        let hwnd = main_window_hwnd(window);
+        if hwnd != 0 {
+            self.main_hwnd = hwnd;
+        }
         hide_main_window(window);
         self.window_hidden_to_tray = true;
         cx.notify();
@@ -508,6 +517,8 @@ impl DownloadApp {
     fn handle_tray_event(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
         match event {
             TrayEvent::ShowWindow => {
+                // Show HWND immediately — hidden windows may not paint until visible again.
+                self.restore_main_window_now();
                 self.pending_tray_show = true;
                 cx.notify();
             }
@@ -518,6 +529,7 @@ impl DownloadApp {
             }
             TrayEvent::BalloonUserClick { context_id } => {
                 // Always restore/focus the main window; open-file resolved on render.
+                self.restore_main_window_now();
                 self.pending_tray_show = true;
                 self.pending_balloon_click = Some(context_id);
                 cx.notify();
@@ -525,7 +537,29 @@ impl DownloadApp {
         }
     }
 
+    /// Restore the main window using the cached HWND (no GPUI Window required).
+    fn restore_main_window_now(&mut self) {
+        self.window_hidden_to_tray = false;
+        if self.main_hwnd != 0 {
+            show_main_window_hwnd(self.main_hwnd);
+        }
+    }
+
+    /// Poll IPC show_window while the main window may be hidden (no render).
+    fn poll_hidden_window_actions(&mut self, cx: &mut Context<Self>) {
+        if self.ipc.take_show_window_request() {
+            self.restore_main_window_now();
+            self.pending_tray_show = true;
+            cx.notify();
+        }
+    }
+
     fn apply_pending_tray_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep HWND fresh whenever we have a Window (handles recreate edge cases).
+        let hwnd = main_window_hwnd(window);
+        if hwnd != 0 {
+            self.main_hwnd = hwnd;
+        }
         if self.pending_tray_show {
             self.pending_tray_show = false;
             self.window_hidden_to_tray = false;
