@@ -174,6 +174,52 @@ impl DownloadApp {
         });
     }
 
+    /// Confirm before draft-resetting Settings prefs to defaults (Save still required).
+    pub(crate) fn confirm_reset_settings_defaults(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app_view = cx.entity().clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let app_view = app_view.clone();
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title("Reset settings to defaults?")
+                .confirm()
+                .overlay_closable(true)
+                .keyboard(true)
+                .button_props(DialogButtonProps::default().ok_text("Reset defaults"))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div().text_sm().child(
+                                "Theme, download limits, notifications, system options, and browser capture will return to recommended defaults.",
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Window size and download folder are kept."),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("You still need to press Save settings to persist."),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    app_view.update(cx, |app, cx| {
+                        app.reset_settings_draft(window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
     /// Confirm before enqueueing URLs found on the clipboard (never auto-downloads).
     pub(crate) fn confirm_add_clipboard_urls(
         &mut self,

@@ -1255,6 +1255,62 @@ impl DownloadApp {
         cx.notify();
     }
 
+    /// Draft-only factory reset of settings prefs (keeps window layout + download dir).
+    /// Does not write disk; user must still press Save settings.
+    pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings
+            .reset_to_defaults_preserving_layout_and_dir();
+
+        // Text inputs bound to General / Browser panels.
+        let dir = self
+            .settings
+            .download_directory
+            .to_string_lossy()
+            .to_string();
+        let concurrent = self.settings.max_concurrent_downloads.to_string();
+        let retry = self.settings.auto_retry_attempts.to_string();
+        let speed = self.settings.speed_limit_kib_per_second.to_string();
+        self.dir_input
+            .update(cx, |i, cx| i.set_value(dir, window, cx));
+        self.concurrent_input
+            .update(cx, |i, cx| i.set_value(concurrent, window, cx));
+        self.retry_input
+            .update(cx, |i, cx| i.set_value(retry, window, cx));
+        self.speed_input
+            .update(cx, |i, cx| i.set_value(speed, window, cx));
+        self.refresh_extension_text_inputs(window, cx);
+
+        // Appearance sliders (same rebind as reset_appearance_draft).
+        let noise = self.settings.noise_intensity as f32;
+        let transparency = self.settings.window_transparency as f32;
+        let hue = self.settings.accent_hue;
+        let sat = self.settings.accent_saturation;
+        let light = self.settings.accent_lightness;
+        let vignette = self.settings.vignette_intensity as f32;
+        self.noise_slider
+            .update(cx, |s, cx| s.set_value(noise, window, cx));
+        self.opacity_slider
+            .update(cx, |s, cx| s.set_value(transparency, window, cx));
+        self.hue_slider
+            .update(cx, |s, cx| s.set_value(hue, window, cx));
+        self.sat_slider
+            .update(cx, |s, cx| s.set_value(sat, window, cx));
+        self.light_slider
+            .update(cx, |s, cx| s.set_value(light, window, cx));
+        self.vignette_slider
+            .update(cx, |s, cx| s.set_value(vignette, window, cx));
+
+        // Browser capture draft may now differ from last committed snapshot.
+        self.extension_settings_dirty = self.settings.extension != self.extension_committed;
+        if !self.settings.clipboard_watch_enabled {
+            self.last_clipboard_urls_key = None;
+        }
+        // Match live System toggle side-effects for tray lifetime.
+        self.sync_tray_lifetime(cx);
+        apply_appearance(&self.settings, Some(window), cx);
+        cx.notify();
+    }
+
     fn sync_window_chrome(&mut self, window: &mut Window) {
         // Re-apply when either transparency or blur preference changes.
         // Encode as transparency in high bits-ish: just re-apply always when blur differs.
