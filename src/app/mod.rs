@@ -721,15 +721,20 @@ impl DownloadApp {
 
     /// Pull extension settings from the IPC bridge when safe.
     ///
-    /// Skips when `extension_settings_dirty` so local Off/On / handoff previews
-    /// are not snapped back by frequent `JobsChanged` ticks.
+    /// While dirty, keeps the live preview (`settings.extension`) but still
+    /// advances `extension_committed` from the bridge so incidental disk
+    /// flushes do not overwrite a newer extension-saved snapshot.
     fn sync_extension_settings_from_bridge(&mut self, force_text_refresh: bool) {
-        if self.extension_settings_dirty {
-            return;
-        }
         let Some(extension) = self.ipc.extension_settings() else {
             return;
         };
+        if self.extension_settings_dirty {
+            // Keep preview; only track latest external/disk truth for incidental saves.
+            if self.extension_committed != extension {
+                self.extension_committed = extension;
+            }
+            return;
+        }
         if self.settings.extension == extension {
             return;
         }
