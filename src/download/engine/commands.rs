@@ -40,8 +40,9 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             let mut last_error: Option<String> = None;
             // Insert newest-first while preserving paste order (first URL ends up on top).
             let mut new_jobs = Vec::new();
-            // First *added* job (Queued), or pure-dup DuplicateExistingJob outcome.
+            // First successfully enqueued job in this Add (Queued reply when added > 0).
             let mut first_outcome: Option<EnqueueOutcome> = None;
+            // First active-duplicate identity (pure-dup reply/toast when added == 0).
             let mut first_dup: Option<(String, String)> = None;
 
             {
@@ -55,7 +56,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                     guard.jobs.iter().map(|job| job.temp_path.clone()).collect();
                 occupied_temps.extend(guard.pending_partial_deletes.values().cloned());
 
-                for (i, url) in urls.into_iter().enumerate() {
+                for url in urls {
                     if url::Url::parse(&url).is_err() {
                         last_error = Some(format!("Invalid URL: {url}"));
                         continue;
@@ -77,7 +78,8 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                         continue;
                     }
 
-                    let preferred = if i == 0 {
+                    // Suggested filename applies to the first successfully enqueued job only.
+                    let preferred = if first_outcome.is_none() {
                         filename
                             .as_ref()
                             .map(|f| sanitize_filename(f.trim()))
@@ -113,20 +115,30 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                     drop(guard);
                     if skipped > 0 {
                         // Pure-dup path: always reply when oneshot present (never drop).
-                        let (dup_id, dup_name) = first_dup.expect("skipped > 0 implies first_dup");
-                        if let Some(reply) = reply {
-                            let _ = reply.send(EnqueueOutcome {
-                                job_id: dup_id,
-                                filename: dup_name.clone(),
-                                status: EnqueueStatus::DuplicateExistingJob,
-                            });
-                        }
-                        let message = if skipped == 1 {
-                            format!("Already downloading: {dup_name}")
+                        // first_dup is set on every skip that increments skipped.
+                        if let Some((dup_id, dup_name)) = first_dup {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(EnqueueOutcome {
+                                    job_id: dup_id,
+                                    filename: dup_name.clone(),
+                                    status: EnqueueStatus::DuplicateExistingJob,
+                                });
+                            }
+                            let message = if skipped == 1 {
+                                format!("Already downloading: {dup_name}")
+                            } else {
+                                format!("Skipped {skipped} duplicate(s).")
+                            };
+                            emit_toast(inner, message).await;
                         } else {
-                            format!("Skipped {skipped} duplicate(s).")
-                        };
-                        emit_toast(inner, message).await;
+                            // Defensive: skipped > 0 without identity — treat like invalid.
+                            emit_toast(
+                                inner,
+                                last_error
+                                    .unwrap_or_else(|| "No valid download URLs found.".into()),
+                            )
+                            .await;
+                        }
                         return;
                     }
                     emit_toast(
@@ -141,7 +153,8 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                 // Reverse so the first pasted URL is the first job in the list (insert 0 order).
                 for job in new_jobs.into_iter().rev() {
                     if let Some(auth) = handoff_auth.as_ref() {
-                        // Attach browser session auth only to the primary (first) URL.
+                        // Attach browser session auth only to the first successfully
+                        // enqueued job in this Add (matches first_outcome).
                         if first_outcome
                             .as_ref()
                             .is_some_and(|outcome| outcome.job_id == job.id)
@@ -570,16 +583,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn completed_allows_same_request_url_redownload() {
+    async fn terminal_state_allows_same_request_url_redownload(state: JobState) {
         let dir = temp_dir();
-        let existing = sample_job("https://example.com/done.bin", JobState::Completed, &dir);
+        let url = "https://example.com/done.bin";
+        let existing = sample_job(url, state, &dir);
         let old_id = existing.id.clone();
 
         let (engine, mut events) = spawn_engine(vec![existing], 1, 0, 0);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
-            url: "https://example.com/done.bin".into(),
+            url: url.into(),
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
@@ -587,18 +600,102 @@ mod tests {
         });
 
         let outcome = reply_rx.await.expect("reply");
-        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(
+            outcome.status,
+            EnqueueStatus::Queued,
+            "terminal {state:?} must allow re-add"
+        );
         assert_ne!(outcome.job_id, old_id);
 
         let jobs = next_jobs(&mut events).await;
         assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.iter().filter(|j| j.url == url).count(), 2);
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn completed_allows_same_request_url_redownload() {
+        terminal_state_allows_same_request_url_redownload(JobState::Completed).await;
+    }
+
+    #[tokio::test]
+    async fn failed_allows_same_request_url_redownload() {
+        terminal_state_allows_same_request_url_redownload(JobState::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_allows_same_request_url_redownload() {
+        terminal_state_allows_same_request_url_redownload(JobState::Canceled).await;
+    }
+
+    #[tokio::test]
+    async fn same_batch_non_adjacent_duplicate_skips_second_a() {
+        // extract_http_urls only collapses consecutive exact dups, so A\nB\nA reaches the engine.
+        let dir = temp_dir();
+        let (engine, mut events) = spawn_engine(vec![], 1, 0, 0);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/a.zip\nhttps://example.com/b.zip\nhttps://example.com/a.zip"
+                .into(),
+            filename: None,
+            directory: dir.clone(),
+            handoff_auth: None,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("reply timeout")
+            .expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "a.zip");
+
+        let jobs = next_jobs(&mut events).await;
+        assert_eq!(jobs.len(), 2, "second A must not create a third job");
         assert_eq!(
             jobs.iter()
-                .filter(|j| j.url == "https://example.com/done.bin")
+                .filter(|j| j.url == "https://example.com/a.zip")
                 .count(),
-            2
+            1
         );
+        assert!(jobs.iter().any(|j| j.url == "https://example.com/b.zip"));
 
+        let toast = next_toast(&mut events).await;
+        assert_eq!(toast, "Skipped 1 duplicate(s); added 2.");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn suggested_filename_applies_to_first_successfully_enqueued_job() {
+        // First paste URL is an active dup; suggested name should land on the first *new* job.
+        let dir = temp_dir();
+        let existing = sample_job("https://example.com/old.zip", JobState::Paused, &dir);
+        let (engine, mut events) = spawn_engine(vec![existing], 1, 0, 0);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/old.zip\nhttps://example.com/new-resource".into(),
+            filename: Some("from-caller.bin".into()),
+            directory: dir.clone(),
+            handoff_auth: None,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "from-caller.bin");
+
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs
+            .iter()
+            .find(|j| j.url == "https://example.com/new-resource")
+            .expect("new job");
+        assert_eq!(added.filename, "from-caller.bin");
+
+        let _ = next_toast(&mut events).await;
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
