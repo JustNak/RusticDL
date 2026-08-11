@@ -50,6 +50,7 @@ impl DownloadApp {
         let os_notify_mode = self.settings.os_notify_mode;
         let notify_on_complete = self.settings.notify_on_complete;
         let notify_on_fail = self.settings.notify_on_fail;
+        let clipboard_watch_enabled = self.settings.clipboard_watch_enabled;
         let ext_enabled = self.settings.extension.enabled;
         let handoff_mode = self.settings.extension.download_handoff_mode;
         let context_menu_enabled = self.settings.extension.context_menu_enabled;
@@ -524,6 +525,53 @@ impl DownloadApp {
                                             )
                                             .child(field_hint(
                                                 "In-app and OS notifications when a download fails after retries. Saved with Save settings.",
+                                                cx,
+                                            )),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(field_label("Clipboard URL watch", cx))
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        Button::new("clipboard-watch-off")
+                                                            .label("Off")
+                                                            .when(!clipboard_watch_enabled, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(clipboard_watch_enabled, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_clipboard_watch_enabled(
+                                                                        false, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("clipboard-watch-on")
+                                                            .label("On")
+                                                            .when(clipboard_watch_enabled, |b| {
+                                                                b.primary()
+                                                            })
+                                                            .when(!clipboard_watch_enabled, |b| {
+                                                                b.outline()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.set_clipboard_watch_enabled(
+                                                                        true, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(field_hint(
+                                                "On focus, offer HTTP(S) URLs from clipboard. Never auto-downloads. Saved with Save settings.",
                                                 cx,
                                             )),
                                     ),
