@@ -196,8 +196,11 @@ impl DownloadApp {
             .iter()
             .take(5)
             .map(|u| {
-                if u.len() > 72 {
-                    format!("{}…", &u[..69])
+                // Char-boundary safe: URLs can contain non-ASCII after extraction.
+                let mut iter = u.chars();
+                let prefix: String = iter.by_ref().take(69).collect();
+                if iter.next().is_some() {
+                    format!("{prefix}…")
                 } else {
                     u.clone()
                 }
