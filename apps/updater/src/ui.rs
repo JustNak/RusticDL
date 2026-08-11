@@ -232,7 +232,9 @@ mod windows_ui {
             WINDOW_EX_STYLE::default(),
             class_name,
             PCWSTR(title_w.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            // Create hidden, center on the work area, then ShowWindow so the
+            // first painted frame is already centered (avoids CW_USEDEFAULT flash).
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             width,

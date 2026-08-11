@@ -21,7 +21,8 @@ const MAX_WINDOW_DIM: f32 = 10_000.0;
 pub struct WindowLayout {
     pub width: f32,
     pub height: f32,
-    /// Top-left origin in screen coordinates; `None` means center on primary display.
+    /// Top-left origin in screen coordinates; `None` means center on the cursor's
+    /// monitor work area (fallback: host window monitor, then primary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
