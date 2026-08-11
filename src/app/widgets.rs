@@ -275,12 +275,7 @@ pub(crate) fn settings_subgroup(
         .w_full()
         .gap_2()
         .when(with_divider, |el| {
-            el.child(
-                div()
-                    .w_full()
-                    .h(px(1.))
-                    .bg(theme.border.opacity(0.55)),
-            )
+            el.child(div().w_full().h(px(1.)).bg(theme.border.opacity(0.55)))
         })
         .child(
             div()
@@ -314,12 +309,7 @@ pub(crate) fn settings_choice_row(
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
         )
-        .child(
-            div()
-                .min_w_0()
-                .max_w(px(300.))
-                .child(control),
-        )
+        .child(div().min_w_0().max_w(px(300.)).child(control))
 }
 
 /// Equal-size circular preset swatch (solid fill + selection ring).

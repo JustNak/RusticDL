@@ -315,12 +315,8 @@ impl DownloadApp {
                                 Button::new("startup-min-off")
                                     .label("Off")
                                     .disabled(!launch_at_startup)
-                                    .when(!startup_minimized || !launch_at_startup, |b| {
-                                        b.primary()
-                                    })
-                                    .when(startup_minimized && launch_at_startup, |b| {
-                                        b.outline()
-                                    })
+                                    .when(!startup_minimized || !launch_at_startup, |b| b.primary())
+                                    .when(startup_minimized && launch_at_startup, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_startup_minimized(false, window, cx);
                                     })),
@@ -329,12 +325,8 @@ impl DownloadApp {
                                 Button::new("startup-min-on")
                                     .label("On")
                                     .disabled(!launch_at_startup)
-                                    .when(startup_minimized && launch_at_startup, |b| {
-                                        b.primary()
-                                    })
-                                    .when(!startup_minimized || !launch_at_startup, |b| {
-                                        b.outline()
-                                    })
+                                    .when(startup_minimized && launch_at_startup, |b| b.primary())
+                                    .when(!startup_minimized || !launch_at_startup, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_startup_minimized(true, window, cx);
                                     })),
@@ -360,14 +352,12 @@ impl DownloadApp {
                             .child(
                                 Button::new("os-notify-when-hidden")
                                     .label(OsNotifyMode::WhenHiddenToTray.label())
-                                    .when(
-                                        os_notify_mode == OsNotifyMode::WhenHiddenToTray,
-                                        |b| b.primary(),
-                                    )
-                                    .when(
-                                        os_notify_mode != OsNotifyMode::WhenHiddenToTray,
-                                        |b| b.outline(),
-                                    )
+                                    .when(os_notify_mode == OsNotifyMode::WhenHiddenToTray, |b| {
+                                        b.primary()
+                                    })
+                                    .when(os_notify_mode != OsNotifyMode::WhenHiddenToTray, |b| {
+                                        b.outline()
+                                    })
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_os_notify_mode(
                                             OsNotifyMode::WhenHiddenToTray,
@@ -379,18 +369,10 @@ impl DownloadApp {
                             .child(
                                 Button::new("os-notify-always")
                                     .label(OsNotifyMode::Always.label())
-                                    .when(os_notify_mode == OsNotifyMode::Always, |b| {
-                                        b.primary()
-                                    })
-                                    .when(os_notify_mode != OsNotifyMode::Always, |b| {
-                                        b.outline()
-                                    })
+                                    .when(os_notify_mode == OsNotifyMode::Always, |b| b.primary())
+                                    .when(os_notify_mode != OsNotifyMode::Always, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_os_notify_mode(
-                                            OsNotifyMode::Always,
-                                            window,
-                                            cx,
-                                        );
+                                        this.set_os_notify_mode(OsNotifyMode::Always, window, cx);
                                     })),
                             ),
                         cx,
@@ -529,12 +511,8 @@ impl DownloadApp {
                                 Button::new("handoff-off")
                                     .label("Off")
                                     .disabled(!ext_enabled)
-                                    .when(handoff_mode == DownloadHandoffMode::Off, |b| {
-                                        b.primary()
-                                    })
-                                    .when(handoff_mode != DownloadHandoffMode::Off, |b| {
-                                        b.outline()
-                                    })
+                                    .when(handoff_mode == DownloadHandoffMode::Off, |b| b.primary())
+                                    .when(handoff_mode != DownloadHandoffMode::Off, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_download_handoff_mode(
                                             DownloadHandoffMode::Off,
@@ -547,12 +525,8 @@ impl DownloadApp {
                                 Button::new("handoff-ask")
                                     .label("Ask")
                                     .disabled(!ext_enabled)
-                                    .when(handoff_mode == DownloadHandoffMode::Ask, |b| {
-                                        b.primary()
-                                    })
-                                    .when(handoff_mode != DownloadHandoffMode::Ask, |b| {
-                                        b.outline()
-                                    })
+                                    .when(handoff_mode == DownloadHandoffMode::Ask, |b| b.primary())
+                                    .when(handoff_mode != DownloadHandoffMode::Ask, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.set_download_handoff_mode(
                                             DownloadHandoffMode::Ask,
@@ -705,9 +679,7 @@ impl DownloadApp {
                                     .when(!capture_debug_logging, |b| b.primary())
                                     .when(capture_debug_logging, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_capture_debug_logging(
-                                            false, window, cx,
-                                        );
+                                        this.set_download_capture_debug_logging(false, window, cx);
                                     })),
                             )
                             .child(
@@ -717,9 +689,7 @@ impl DownloadApp {
                                     .when(capture_debug_logging, |b| b.primary())
                                     .when(!capture_debug_logging, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_capture_debug_logging(
-                                            true, window, cx,
-                                        );
+                                        this.set_download_capture_debug_logging(true, window, cx);
                                     })),
                             ),
                         cx,
@@ -1246,8 +1216,7 @@ impl DownloadApp {
                                             .icon(IconName::FolderOpen)
                                             .label("Open")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Err(msg) =
-                                                    reveal_in_folder(&this.paths.root)
+                                                if let Err(msg) = reveal_in_folder(&this.paths.root)
                                                 {
                                                     this.show_toast(msg, cx);
                                                 }
