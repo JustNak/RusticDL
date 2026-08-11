@@ -286,12 +286,14 @@ impl DownloadApp {
                 .child(settings_choice_row(
                     "OS notifications",
                     Some("Uses the tray icon even if Close to tray is Off."),
+                    // Keep Off / When hidden / Always on one row — flex_wrap stacks
+                    // segments and paints them over Notify on complete / fail below.
                     h_flex()
                         .gap_2()
-                        .flex_wrap()
                         .child(
                             Button::new("os-notify-off")
                                 .label(OsNotifyMode::Off.label())
+                                .min_w(px(108.))
                                 .when(os_notify_mode == OsNotifyMode::Off, |b| b.primary())
                                 .when(os_notify_mode != OsNotifyMode::Off, |b| b.outline())
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -301,6 +303,7 @@ impl DownloadApp {
                         .child(
                             Button::new("os-notify-when-hidden")
                                 .label(OsNotifyMode::WhenHiddenToTray.label())
+                                .min_w(px(108.))
                                 .when(os_notify_mode == OsNotifyMode::WhenHiddenToTray, |b| {
                                     b.primary()
                                 })
@@ -318,6 +321,7 @@ impl DownloadApp {
                         .child(
                             Button::new("os-notify-always")
                                 .label(OsNotifyMode::Always.label())
+                                .min_w(px(108.))
                                 .when(os_notify_mode == OsNotifyMode::Always, |b| b.primary())
                                 .when(os_notify_mode != OsNotifyMode::Always, |b| b.outline())
                                 .on_click(cx.listener(|this, _, window, cx| {
