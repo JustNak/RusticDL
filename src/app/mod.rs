@@ -1255,8 +1255,17 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Draft-only factory reset of settings prefs (keeps window layout + download dir).
-    /// Does not write disk; user must still press Save settings.
+    /// Factory reset of settings prefs into the live draft (keeps window layout + download dir).
+    ///
+    /// Does **not** call `save_settings`, IPC, engine, or startup-registry updates. The
+    /// Settings UI copy still asks the user to press **Save settings** to commit.
+    ///
+    /// Note (pre-existing draft architecture): `self.settings` is the single live model
+    /// used by incidental flushes (`flush_window_layout_*`, sort persist, Drop). Those
+    /// paths write `settings_for_disk()`, which only reverts **extension** when
+    /// `extension_settings_dirty`; other draft fields (theme, limits, system, appearance,
+    /// sort, …) can hit disk without an explicit Save. A full unsaved-settings snapshot
+    /// is out of scope for the Reset-defaults PR — document only.
     pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings
             .reset_to_defaults_preserving_layout_and_dir();

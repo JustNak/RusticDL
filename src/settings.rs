@@ -317,7 +317,7 @@ impl OsNotifyMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub download_directory: PathBuf,
@@ -585,12 +585,15 @@ mod tests {
         let mut s = Settings::default();
         s.download_directory = keep_dir.clone();
         s.window_layout = keep_layout.clone();
-        // Mutate fields that must return to defaults.
+        // Mutate fields that must return to defaults (including custom accent HSL).
         s.max_concurrent_downloads = 9;
         s.auto_retry_attempts = 1;
         s.speed_limit_kib_per_second = 512;
         s.theme = AppTheme::Dark;
-        s.accent_preset = AccentPreset::Rose;
+        s.accent_preset = AccentPreset::Custom;
+        s.accent_hue = 12.0;
+        s.accent_saturation = 90.0;
+        s.accent_lightness = 40.0;
         s.noise_intensity = 40;
         s.window_transparency = 25;
         s.backdrop_blur = true;
@@ -613,32 +616,17 @@ mod tests {
 
         s.reset_to_defaults_preserving_layout_and_dir();
 
+        // Expected = full Default with only preserve fields overlaid (catches new fields).
+        let mut expected = Settings::default();
+        expected.download_directory = keep_dir;
+        expected.window_layout = keep_layout;
+        assert_eq!(s, expected);
+        // Explicit HSL guards if someone later rewrites the helper field-by-field.
         let defaults = Settings::default();
-        assert_eq!(s.download_directory, keep_dir);
-        assert_eq!(s.window_layout, keep_layout);
-        assert_eq!(s.max_concurrent_downloads, defaults.max_concurrent_downloads);
-        assert_eq!(s.auto_retry_attempts, defaults.auto_retry_attempts);
-        assert_eq!(s.speed_limit_kib_per_second, defaults.speed_limit_kib_per_second);
-        assert_eq!(s.theme, defaults.theme);
+        assert_eq!(s.accent_hue, defaults.accent_hue);
+        assert_eq!(s.accent_saturation, defaults.accent_saturation);
+        assert_eq!(s.accent_lightness, defaults.accent_lightness);
         assert_eq!(s.accent_preset, defaults.accent_preset);
-        assert_eq!(s.noise_intensity, defaults.noise_intensity);
-        assert_eq!(s.window_transparency, defaults.window_transparency);
-        assert_eq!(s.backdrop_blur, defaults.backdrop_blur);
-        assert_eq!(s.ui_density, defaults.ui_density);
-        assert_eq!(s.corner_radius, defaults.corner_radius);
-        assert_eq!(s.reduce_motion, defaults.reduce_motion);
-        assert_eq!(s.vignette_intensity, defaults.vignette_intensity);
-        assert_eq!(s.progress_style, defaults.progress_style);
-        assert_eq!(s.sort_column, defaults.sort_column);
-        assert_eq!(s.sort_direction, defaults.sort_direction);
-        assert_eq!(s.close_to_tray, defaults.close_to_tray);
-        assert_eq!(s.launch_at_startup, defaults.launch_at_startup);
-        assert_eq!(s.startup_minimized, defaults.startup_minimized);
-        assert_eq!(s.os_notify_mode, defaults.os_notify_mode);
-        assert_eq!(s.notify_on_complete, defaults.notify_on_complete);
-        assert_eq!(s.notify_on_fail, defaults.notify_on_fail);
-        assert_eq!(s.clipboard_watch_enabled, defaults.clipboard_watch_enabled);
-        assert_eq!(s.extension, defaults.extension);
     }
 
     #[test]
@@ -655,12 +643,10 @@ mod tests {
         s.download_directory = keep_dir.clone();
         s.window_layout = keep_layout.clone();
         s.reset_to_defaults_preserving_layout_and_dir();
-        assert_eq!(s.download_directory, keep_dir);
-        assert_eq!(s.window_layout, keep_layout);
-        // Non-preserved fields still match defaults.
-        let defaults = Settings::default();
-        assert_eq!(s.theme, defaults.theme);
-        assert_eq!(s.extension, defaults.extension);
-        assert_eq!(s.max_concurrent_downloads, defaults.max_concurrent_downloads);
+
+        let mut expected = Settings::default();
+        expected.download_directory = keep_dir;
+        expected.window_layout = keep_layout;
+        assert_eq!(s, expected);
     }
 }
