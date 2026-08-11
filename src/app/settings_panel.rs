@@ -258,9 +258,7 @@ impl DownloadApp {
                     .child(settings_subgroup("Window & startup", false, cx))
                     .child(settings_choice_row(
                         "Close to tray",
-                        Some(
-                            "Close hides to the tray instead of quitting. Use the tray icon to show or exit.",
-                        ),
+                        Some("Hides to the tray instead of quitting."),
                         h_flex()
                             .gap_2()
                             .child(
@@ -310,9 +308,7 @@ impl DownloadApp {
                     ))
                     .child(settings_choice_row(
                         "Start minimized",
-                        Some(
-                            "When launch at startup is On, open hidden in the tray until you show the window.",
-                        ),
+                        Some("Opens hidden in the tray when launch at startup is On."),
                         h_flex()
                             .gap_2()
                             .child(
@@ -348,11 +344,10 @@ impl DownloadApp {
                     .child(settings_subgroup("Notifications", true, cx))
                     .child(settings_choice_row(
                         "OS notifications",
-                        Some(
-                            "Uses the tray icon even if Close to tray is Off.",
-                        ),
+                        Some("Uses the tray icon even if Close to tray is Off."),
                         h_flex()
                             .gap_2()
+                            .flex_wrap()
                             .child(
                                 Button::new("os-notify-off")
                                     .label(OsNotifyMode::Off.label())
@@ -453,9 +448,7 @@ impl DownloadApp {
                     .child(settings_subgroup("Clipboard", true, cx))
                     .child(settings_choice_row(
                         "Clipboard URL watch",
-                        Some(
-                            "On focus, offer HTTP(S) URLs from the clipboard. Never auto-downloads.",
-                        ),
+                        Some("Offers clipboard HTTP(S) URLs on focus; never auto-downloads."),
                         h_flex()
                             .gap_2()
                             .child(
@@ -502,9 +495,7 @@ impl DownloadApp {
                     .child(settings_subgroup("Capture", false, cx))
                     .child(settings_choice_row(
                         "Enable browser capture",
-                        Some(
-                            "Lets the companion extension hand downloads to RusticDL. Options below apply only while capture is On.",
-                        ),
+                        Some("Options below apply only while capture is On."),
                         h_flex()
                             .gap_2()
                             .child(
@@ -530,9 +521,7 @@ impl DownloadApp {
                     .child(settings_subgroup("Handoff", true, cx))
                     .child(settings_choice_row(
                         "Download handoff",
-                        Some(
-                            "Off skips interception. Ask prompts before taking a download. Auto hands off silently.",
-                        ),
+                        Some("Off skips; Ask prompts; Auto hands off silently."),
                         h_flex()
                             .gap_2()
                             .flex_wrap()
@@ -595,7 +584,7 @@ impl DownloadApp {
                     .child(settings_subgroup("UI", true, cx))
                     .child(settings_choice_row(
                         "Context menu",
-                        Some("Show “Download with RusticDL” on link and page menus."),
+                        None,
                         h_flex()
                             .gap_2()
                             .child(
@@ -622,7 +611,7 @@ impl DownloadApp {
                     ))
                     .child(settings_choice_row(
                         "Toolbar badge status",
-                        None,
+                        Some("Connection / activity on the extension toolbar icon."),
                         h_flex()
                             .gap_2()
                             .child(

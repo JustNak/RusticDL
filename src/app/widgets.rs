@@ -292,6 +292,9 @@ pub(crate) fn settings_subgroup(
 }
 
 /// Horizontal toggle/choice row: label (+ optional hint) left, control cluster right.
+///
+/// Control side is width-capped so multi-button clusters with `.flex_wrap()` can
+/// wrap under Compact density / narrow content instead of overflowing the label.
 pub(crate) fn settings_choice_row(
     label: &'static str,
     hint: Option<&'static str>,
@@ -313,7 +316,8 @@ pub(crate) fn settings_choice_row(
         )
         .child(
             div()
-                .flex_shrink_0()
+                .min_w_0()
+                .max_w(px(300.))
                 .child(control),
         )
 }
