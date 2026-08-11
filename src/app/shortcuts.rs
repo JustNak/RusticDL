@@ -1,7 +1,7 @@
 //! Global keyboard shortcuts for queue productivity.
 //!
 //! Active when no modal dialog is open and no owned text input is focused
-//! (Escape is special: dialogs first, then clear selection — even with input focus).
+//! (Escape is special: dialogs → leave Settings → clear selection — even with input focus).
 
 use gpui::{App, Context, Focusable, KeyDownEvent, Window};
 use gpui_component::WindowExt;
@@ -171,7 +171,8 @@ impl DownloadApp {
     /// `/` — focus the queue search field (leave Settings so it is visible).
     fn shortcut_focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter == FilterKind::Settings {
-            self.select_filter(FilterKind::All, window, cx);
+            // Same restore path as Back / Esc / mouse-back.
+            self.leave_settings(window, cx);
         }
         self.search_input
             .update(cx, |input, cx| input.focus(window, cx));

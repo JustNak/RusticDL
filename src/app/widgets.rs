@@ -313,12 +313,7 @@ pub(crate) fn settings_choice_row(
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .max_w(px(360.))
-                .child(control),
-        )
+        .child(div().flex_shrink_0().max_w(px(360.)).child(control))
 }
 
 /// Equal-size circular preset swatch (solid fill + selection ring).

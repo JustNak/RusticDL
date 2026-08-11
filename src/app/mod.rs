@@ -1406,7 +1406,7 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Leave Settings via Back / Esc / mouse-back. Draft prefs are preserved.
+    /// Leave Settings via Back / Esc / mouse-back / `/` search. Draft prefs are preserved.
     pub(crate) fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter != FilterKind::Settings {
             return;
