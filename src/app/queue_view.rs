@@ -1,11 +1,14 @@
 //! Queue list, toolbar, and empty states extracted from `DownloadApp`.
+//!
+//! OS file drops (`ExternalPaths` / CF_HDROP) land on the queue list and empty
+//! state — freeform browser text/URL drag is not supported by GPUI on Windows.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px, Context, Corner, ExternalPaths, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -15,6 +18,7 @@ use gpui_component::{
     v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
 };
 
+use super::add_dialog::enqueue_urls;
 use super::detail::render_detail;
 use super::filter::FilterKind;
 use super::job_row::render_job_row;
@@ -24,7 +28,9 @@ use super::layout::{
 };
 use super::widgets::{empty_state_badge, sortable_header};
 use super::DownloadApp;
-use crate::download::{reveal_in_folder, EngineCommand, Job, JobState};
+use crate::download::{
+    extract_urls_from_dropped_paths, reveal_in_folder, EngineCommand, Job, JobState,
+};
 use crate::format::filter_jobs;
 use crate::settings::SortColumn;
 
@@ -32,6 +38,53 @@ use crate::settings::SortColumn;
 const BATCH_REVEAL_DIR_CAP: usize = 5;
 
 impl DownloadApp {
+    /// Handle OS file-path drops on the queue surface.
+    ///
+    /// Reads text-like / small files (cap 1 MiB), parses `.url` shortcuts, extracts
+    /// HTTP(S) URLs, and enqueues via the same Add path as the add dialog.
+    pub(crate) fn handle_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        cx: &mut Context<Self>,
+    ) {
+        let summary = extract_urls_from_dropped_paths(paths.paths());
+        let directory = self.settings.download_directory.clone();
+        let n = enqueue_urls(summary.urls, directory, None, &self.engine);
+
+        if n > 0 {
+            let mut msg = format!("Added {n} from drop");
+            if summary.skipped > 0 || summary.errors > 0 {
+                let mut notes = Vec::new();
+                if summary.skipped > 0 {
+                    notes.push(format!(
+                        "{} skipped (binary/oversized)",
+                        summary.skipped
+                    ));
+                }
+                if summary.errors > 0 {
+                    notes.push(format!("{} unreadable", summary.errors));
+                }
+                msg.push_str(&format!(" ({})", notes.join(", ")));
+            }
+            self.show_toast(msg, cx);
+        } else if summary.skipped > 0 || summary.errors > 0 {
+            // Dropped only binaries / huge / unreadable files.
+            let mut parts = Vec::new();
+            if summary.skipped > 0 {
+                parts.push(format!(
+                    "Skipped {} binary or oversized file(s)",
+                    summary.skipped
+                ));
+            }
+            if summary.errors > 0 {
+                parts.push(format!("Could not read {} file(s)", summary.errors));
+            }
+            self.show_error_toast(parts.join(". "), cx);
+        } else {
+            self.show_toast("No HTTP(S) URLs found", cx);
+        }
+    }
+
     pub(crate) fn render_queue(
         &mut self,
         window: &mut Window,
@@ -150,6 +203,7 @@ impl DownloadApp {
                     .child(div().w(px(COL_ACTIONS_W)).flex_shrink_0()),
             )
             .child(
+                // File-path drops (CF_HDROP → ExternalPaths). Not freeform browser URL drag.
                 div()
                     .id("queue-scroll")
                     .flex_1()
@@ -157,6 +211,10 @@ impl DownloadApp {
                     .when(bottom_open, |el| el.min_h(px(LIST_MIN_H)))
                     .overflow_y_scroll()
                     .bg(theme.list)
+                    .can_drop(|drag, _, _| drag.is::<ExternalPaths>())
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        this.handle_external_paths_drop(paths, cx);
+                    }))
                     // Empty chrome / non-row background clears selection.
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.selected_ids.is_empty() {
@@ -533,12 +591,18 @@ impl DownloadApp {
         let reduce_motion = self.settings.reduce_motion;
         let accent = theme.primary;
 
+        // Same ExternalPaths drop path as #queue-scroll; empty area must also accept drops.
         div()
+            .id("queue-empty")
             .size_full()
             .flex()
             .items_center()
             .justify_center()
             .bg(theme.background)
+            .can_drop(|drag, _, _| drag.is::<ExternalPaths>())
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.handle_external_paths_drop(paths, cx);
+            }))
             .child(
                 v_flex()
                     .w(px(420.))
