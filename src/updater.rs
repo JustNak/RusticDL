@@ -265,11 +265,32 @@ pub fn updater_exe_path() -> Result<PathBuf, String> {
     Ok(updater)
 }
 
+/// Copy the install-dir updater to a temp path before spawn.
+///
+/// NSIS overwrites `$INSTDIR\rusticdl-updater.exe` during silent update. If the
+/// helper is still running from that path, Windows refuses the write and the
+/// install fails (or leaves a stale helper). Running from `%TEMP%` avoids that.
+fn stage_updater_exe(installed: &std::path::Path) -> Result<PathBuf, String> {
+    let temp_dir = std::env::temp_dir().join("rusticdl-update");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| format!("Could not create updater temp folder: {e}"))?;
+    let staged = temp_dir.join(UPDATER_EXE_NAME);
+    std::fs::copy(installed, &staged).map_err(|e| {
+        format!(
+            "Could not stage {UPDATER_NAME} for update:\n{}\n→ {}\n{e}",
+            installed.display(),
+            staged.display()
+        )
+    })?;
+    Ok(staged)
+}
+
 /// Spawn the updater, which downloads/installs the update after this process exits.
 ///
 /// Callers must flush app state, then quit promptly so the updater can replace files.
 pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
-    let updater = updater_exe_path()?;
+    let installed = updater_exe_path()?;
+    let updater = stage_updater_exe(&installed)?;
     let app_exe =
         std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
     let pid = std::process::id();

@@ -70,10 +70,14 @@ fn main() {
         {
             let release = args.release_page.as_deref();
             ui::show_error_message("RusticDL Updater", &message, release);
-            // Best-effort: leave the user with a running app when possible.
+            // Best-effort: leave the user with a running app when the main
+            // process already exited for the update. Skip WaitTimeout — the
+            // original app is still alive in that case.
             if matches!(
                 outcome,
-                UpdateOutcome::InstallFailed(_) | UpdateOutcome::RelaunchFailed(_)
+                UpdateOutcome::DownloadFailed(_)
+                    | UpdateOutcome::InstallFailed(_)
+                    | UpdateOutcome::RelaunchFailed(_)
             ) {
                 let _ = install::relaunch_app(&args.app_exe);
             }
