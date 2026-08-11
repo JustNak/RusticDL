@@ -302,14 +302,14 @@ impl DownloadApp {
             )
     }
 
-    fn selected_jobs(&self) -> Vec<&Job> {
+    pub(crate) fn selected_jobs(&self) -> Vec<&Job> {
         self.jobs
             .iter()
             .filter(|j| self.selected_ids.iter().any(|id| id == &j.id))
             .collect()
     }
 
-    fn batch_pause_selected(&self) {
+    pub(crate) fn batch_pause_selected(&self) {
         for job in self.selected_jobs() {
             if matches!(
                 job.state,
@@ -320,7 +320,7 @@ impl DownloadApp {
         }
     }
 
-    fn batch_resume_selected(&self) {
+    pub(crate) fn batch_resume_selected(&self) {
         for job in self.selected_jobs() {
             if job.state == JobState::Paused {
                 self.engine.send(EngineCommand::Resume(job.id.clone()));

@@ -1,0 +1,174 @@
+//! Global keyboard shortcuts for queue productivity.
+//!
+//! Active when no modal dialog is open and no owned text input is focused
+//! (Escape is special: dialogs first, then clear selection — even with input focus).
+
+use gpui::{App, Context, Focusable, KeyDownEvent, Window};
+use gpui_component::WindowExt;
+
+use super::filter::FilterKind;
+use super::DownloadApp;
+use crate::download::JobState;
+
+impl DownloadApp {
+    /// Root key handler (capture phase). Returns after handling Escape or a
+    /// matched shortcut; stops propagation only when an action is taken.
+    pub(crate) fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+
+        // Escape: dialogs dismiss first; otherwise clear queue selection.
+        // Runs even when a text field is focused so selection can always be cleared.
+        if key == "escape" && !modifiers.modified() {
+            if window.has_active_dialog(cx) {
+                window.close_dialog(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if !self.selected_ids.is_empty() {
+                self.clear_selection();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        // Remaining shortcuts require an idle chrome (no modal, no text focus).
+        if window.has_active_dialog(cx) || self.any_text_input_focused(window, cx) {
+            return;
+        }
+
+        let secondary_only = modifiers.secondary() && modifiers.number_of_modifiers() == 1;
+        let no_mods = !modifiers.modified();
+
+        if secondary_only && key == "n" {
+            self.open_add_dialog(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if secondary_only && key == "," {
+            self.select_filter(FilterKind::Settings, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        // Queue-only ops: no-op on Settings (queue is not rendered; visible_jobs
+        // would otherwise treat Settings as "all" via filter_jobs fallthrough).
+        if secondary_only && key == "a" {
+            if self.queue_shortcuts_active() {
+                self.shortcut_select_all_visible(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        if no_mods && key == "delete" {
+            if self.queue_shortcuts_active() {
+                self.shortcut_confirm_remove(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        if no_mods && key == "space" {
+            if self.queue_shortcuts_active() {
+                self.shortcut_toggle_pause_resume();
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        if no_mods && key == "/" {
+            self.shortcut_focus_search(window, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Queue list is shown (not Settings). Select-all / Delete / Space apply only here.
+    fn queue_shortcuts_active(&self) -> bool {
+        self.filter != FilterKind::Settings
+    }
+
+    /// True when any app-owned text input (search, settings fields) has focus.
+    fn any_text_input_focused(&self, window: &Window, cx: &App) -> bool {
+        [
+            &self.search_input,
+            &self.dir_input,
+            &self.concurrent_input,
+            &self.retry_input,
+            &self.speed_input,
+            &self.excluded_hosts_input,
+            &self.captured_extensions_input,
+        ]
+        .into_iter()
+        .any(|input| input.focus_handle(cx).is_focused(window))
+    }
+
+    /// Ctrl/Cmd+A — select every job currently visible (filter + search + sort).
+    /// Caller must ensure `queue_shortcuts_active()` (Settings has no visible list).
+    fn shortcut_select_all_visible(&mut self, cx: &mut Context<Self>) {
+        if !self.queue_shortcuts_active() {
+            return;
+        }
+        let visible = self.visible_jobs(cx);
+        if visible.is_empty() {
+            return;
+        }
+        self.selected_ids = visible.iter().map(|j| j.id.clone()).collect();
+        // Keep a stable Shift-range anchor at the first visible row; primary = last.
+        self.selection_anchor_id = self.selected_ids.first().cloned();
+        cx.notify();
+    }
+
+    /// Delete — confirm remove for primary (N=1) or all selected removable ids.
+    fn shortcut_confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
+            return;
+        }
+        if self.selected_ids.len() == 1 {
+            let id = self.selected_ids[0].clone();
+            let filename = self
+                .jobs
+                .iter()
+                .find(|j| j.id == id)
+                .map(|j| j.filename.clone())
+                .unwrap_or_else(|| id.clone());
+            self.confirm_remove(id, filename, window, cx);
+        } else {
+            self.confirm_remove_selected(window, cx);
+        }
+    }
+
+    /// Space — pause any pausable selected jobs; else resume paused ones.
+    fn shortcut_toggle_pause_resume(&mut self) {
+        if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
+            return;
+        }
+        let any_pausable = self.selected_jobs().iter().any(|j| {
+            matches!(
+                j.state,
+                JobState::Queued | JobState::Starting | JobState::Downloading
+            )
+        });
+        if any_pausable {
+            self.batch_pause_selected();
+        } else {
+            self.batch_resume_selected();
+        }
+    }
+
+    /// `/` — focus the queue search field (leave Settings so it is visible).
+    fn shortcut_focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter == FilterKind::Settings {
+            self.select_filter(FilterKind::All, window, cx);
+        }
+        self.search_input
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+}
