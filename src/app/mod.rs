@@ -1267,8 +1267,7 @@ impl DownloadApp {
     /// sort, …) can hit disk without an explicit Save. A full unsaved-settings snapshot
     /// is out of scope for the Reset-defaults PR — document only.
     pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings
-            .reset_to_defaults_preserving_layout_and_dir();
+        self.settings.reset_to_defaults_preserving_layout_and_dir();
 
         // Text inputs bound to General / Browser panels.
         let dir = self
