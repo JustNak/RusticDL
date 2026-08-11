@@ -498,6 +498,15 @@ pub(crate) fn metric_cell(
         )
 }
 
+/// Format a sidebar nav count for display. Caps at 999 (`999+` beyond that).
+pub(crate) fn format_nav_count(count: i32) -> SharedString {
+    if count > 999 {
+        "999+".into()
+    } else {
+        count.to_string().into()
+    }
+}
+
 pub(crate) fn nav_item(
     label: &'static str,
     filter: FilterKind,
@@ -506,8 +515,9 @@ pub(crate) fn nav_item(
     cx: &mut Context<DownloadApp>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
+    // Selected filter: subtle grey highlight. Unselected: plain (white/default surface).
     let bg = if active {
-        theme.sidebar_accent
+        theme.secondary.opacity(if theme.is_dark() { 0.55 } else { 0.85 })
     } else {
         theme.transparent
     };
@@ -521,6 +531,12 @@ pub(crate) fn nav_item(
     } else {
         theme.muted_foreground
     };
+    // Count text: muted grey when selected, brighter when not.
+    let count_color = if active {
+        theme.muted_foreground
+    } else {
+        theme.sidebar_foreground.opacity(0.9)
+    };
 
     h_flex()
         .id(SharedString::from(format!("nav-{label}")))
@@ -532,9 +548,9 @@ pub(crate) fn nav_item(
         .bg(bg)
         .hover(|s| {
             s.bg(if active {
-                theme.sidebar_accent
+                theme.secondary.opacity(if theme.is_dark() { 0.65 } else { 0.95 })
             } else {
-                theme.secondary.opacity(0.55)
+                theme.secondary.opacity(0.45)
             })
         })
         .cursor_pointer()
@@ -559,31 +575,12 @@ pub(crate) fn nav_item(
                 .child(label),
         )
         .when(count >= 0, |el| {
-            let empty = count == 0;
             el.child(
                 div()
-                    .min_w(px(22.))
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_full()
-                    .bg(if active && !empty {
-                        theme.sidebar_primary
-                    } else if active {
-                        theme.sidebar_primary.opacity(0.12)
-                    } else {
-                        theme.muted.opacity(0.55)
-                    })
                     .text_xs()
-                    .font_semibold()
-                    .text_center()
-                    .text_color(if active && !empty {
-                        theme.sidebar_primary_foreground
-                    } else if active {
-                        theme.sidebar_primary
-                    } else {
-                        theme.muted_foreground
-                    })
-                    .child(count.to_string()),
+                    .font_medium()
+                    .text_color(count_color)
+                    .child(format_nav_count(count)),
             )
         })
 }
@@ -673,4 +670,22 @@ pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
     let keep = max_chars.saturating_sub(3).max(1);
     let head: String = name.chars().take(keep).collect();
     SharedString::from(format!("{head}..."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_nav_count;
+
+    #[test]
+    fn nav_count_shows_exact_value_up_to_999() {
+        assert_eq!(format_nav_count(0).as_ref(), "0");
+        assert_eq!(format_nav_count(42).as_ref(), "42");
+        assert_eq!(format_nav_count(999).as_ref(), "999");
+    }
+
+    #[test]
+    fn nav_count_caps_above_999() {
+        assert_eq!(format_nav_count(1000).as_ref(), "999+");
+        assert_eq!(format_nav_count(12_345).as_ref(), "999+");
+    }
 }
