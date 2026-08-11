@@ -13,7 +13,8 @@ use super::protocol::{
     HostRequest, HostResponse, RawHandoffAuth, MAX_METADATA_LENGTH,
 };
 use crate::download::{
-    EngineCommand, EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader, Job, JobState,
+    find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus, HandoffAuth,
+    HandoffAuthHeader,
 };
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::persistence::save_settings;
@@ -237,16 +238,6 @@ async fn prompt_download(
             .await
         }
     }
-}
-
-fn find_active_duplicate<'a>(jobs: &'a [Job], url: &str) -> Option<&'a Job> {
-    jobs.iter().find(|job| {
-        job.url == url
-            && matches!(
-                job.state,
-                JobState::Queued | JobState::Starting | JobState::Downloading | JobState::Paused
-            )
-    })
 }
 
 async fn engine_enqueue(

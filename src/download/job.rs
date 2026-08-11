@@ -38,7 +38,6 @@ impl JobState {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_active(self) -> bool {
         matches!(
             self,

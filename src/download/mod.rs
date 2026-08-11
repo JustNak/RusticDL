@@ -1,4 +1,5 @@
 pub mod client;
+pub mod duplicates;
 pub mod engine;
 pub mod filesystem;
 pub mod handoff;
@@ -6,6 +7,7 @@ pub mod http;
 pub mod job;
 pub mod urls;
 
+pub use duplicates::find_active_duplicate;
 pub use engine::{
     open_path, reveal_in_folder, spawn_engine, EngineCommand, EngineEvent, EngineHandle,
 };
