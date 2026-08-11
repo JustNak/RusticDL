@@ -38,7 +38,7 @@ use crate::appearance::{
     vignette_enabled,
 };
 use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job, JobState};
-use crate::extension_settings::DownloadHandoffMode;
+use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
 use crate::persistence::{save_jobs, save_settings, AppPaths};
@@ -79,6 +79,12 @@ pub struct DownloadApp {
     excluded_hosts_input: Entity<InputState>,
     /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
     captured_extensions_input: Entity<InputState>,
+    /// Unsaved Browser capture toggles/enums (preview) not yet flushed via Save settings.
+    extension_settings_dirty: bool,
+    /// Last extension snapshot written to disk / IPC (or accepted from the bridge).
+    extension_committed: ExtensionIntegrationSettings,
+    /// When true, rewrite host/extension text drafts on the next frame that has a Window.
+    extension_text_inputs_stale: bool,
     noise_slider: Entity<SliderState>,
     opacity_slider: Entity<SliderState>,
     hue_slider: Entity<SliderState>,
@@ -154,7 +160,9 @@ impl DownloadApp {
         });
         let captured_extensions_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("zip, pdf, exe…")
+                .multi_line(true)
+                .rows(3)
+                .placeholder("zip, pdf, exe… (comma-separated)")
                 .default_value(settings.extension.captured_file_extensions.join(", "))
         });
 
@@ -350,6 +358,7 @@ impl DownloadApp {
             .detach();
         }
 
+        let extension_committed = settings.extension.clone();
         let app = Self {
             jobs,
             settings,
@@ -372,6 +381,9 @@ impl DownloadApp {
             speed_input,
             excluded_hosts_input,
             captured_extensions_input,
+            extension_settings_dirty: false,
+            extension_committed,
+            extension_text_inputs_stale: false,
             noise_slider,
             opacity_slider,
             hue_slider,
@@ -504,7 +516,8 @@ impl DownloadApp {
         }
         self.window_layout_dirty = false;
         self.last_window_layout_save = Instant::now();
-        let _ = save_settings(&self.paths, &self.settings);
+        // Do not flush unsaved Browser capture previews via incidental layout writes.
+        let _ = save_settings(&self.paths, &self.settings_for_disk());
     }
 
     fn flush_window_layout_now(&mut self) {
@@ -513,7 +526,7 @@ impl DownloadApp {
         }
         self.window_layout_dirty = false;
         self.last_window_layout_save = Instant::now();
-        let _ = save_settings(&self.paths, &self.settings);
+        let _ = save_settings(&self.paths, &self.settings_for_disk());
     }
 
     fn on_jobs_changed(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
@@ -535,12 +548,9 @@ impl DownloadApp {
             self.flush_jobs_save_if_due();
         }
         self.ipc.update_jobs(&self.jobs);
-        // Keep desktop extension settings in sync if the bridge wrote them.
-        if let Some(extension) = self.ipc.extension_settings() {
-            if self.settings.extension != extension {
-                self.settings.extension = extension;
-            }
-        }
+        // Adopt bridge extension settings only when the user has no local preview
+        // (unsaved toggles). Never clobber while extension_settings_dirty.
+        self.sync_extension_settings_from_bridge(false);
         if let Some(id) = &self.selected_id {
             if !self.jobs.iter().any(|j| &j.id == id) {
                 self.selected_id = None;
@@ -694,8 +704,52 @@ impl DownloadApp {
                 _ => SortDirection::Desc,
             };
         }
-        let _ = save_settings(&self.paths, &self.settings);
+        // Sort prefs only — do not flush unsaved Browser capture previews.
+        let _ = save_settings(&self.paths, &self.settings_for_disk());
         cx.notify();
+    }
+
+    /// Settings snapshot safe for incidental disk writes (layout, sort).
+    /// Keeps committed extension when the user has unsaved Browser capture previews.
+    fn settings_for_disk(&self) -> Settings {
+        let mut settings = self.settings.clone();
+        if self.extension_settings_dirty {
+            settings.extension = self.extension_committed.clone();
+        }
+        settings
+    }
+
+    /// Pull extension settings from the IPC bridge when safe.
+    ///
+    /// Skips when `extension_settings_dirty` so local Off/On / handoff previews
+    /// are not snapped back by frequent `JobsChanged` ticks.
+    fn sync_extension_settings_from_bridge(&mut self, force_text_refresh: bool) {
+        if self.extension_settings_dirty {
+            return;
+        }
+        let Some(extension) = self.ipc.extension_settings() else {
+            return;
+        };
+        if self.settings.extension == extension {
+            return;
+        }
+        self.settings.extension = extension.clone();
+        self.extension_committed = extension;
+        // When Settings is open, text drafts must follow the adopted snapshot
+        // (Issue 5); refresh on the next render frame that has a Window.
+        if force_text_refresh || self.filter == FilterKind::Settings {
+            self.extension_text_inputs_stale = true;
+        }
+    }
+
+    fn refresh_extension_text_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let excluded = self.settings.extension.excluded_hosts.join("\n");
+        let captured = self.settings.extension.captured_file_extensions.join(", ");
+        self.excluded_hosts_input
+            .update(cx, |i, cx| i.set_value(excluded, window, cx));
+        self.captured_extensions_input
+            .update(cx, |i, cx| i.set_value(captured, window, cx));
+        self.extension_text_inputs_stale = false;
     }
 
     fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -748,6 +802,10 @@ impl DownloadApp {
         self.settings.extension.captured_file_extensions = captured_extensions;
 
         self.settings.sanitize_appearance();
+        self.extension_settings_dirty = false;
+        self.extension_committed = self.settings.extension.clone();
+        // Show sanitized hosts/extensions in the drafts after Save.
+        self.refresh_extension_text_inputs(window, cx);
         let _ = save_settings(&self.paths, &self.settings);
         self.ipc.update_settings(&self.settings);
 
@@ -789,9 +847,10 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Browser capture toggles preview immediately; disk flush is "Save settings".
+    /// Browser capture toggles preview immediately; disk + IPC flush is "Save settings".
     fn set_extension_enabled(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.extension.enabled = on;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
@@ -802,16 +861,19 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         self.settings.extension.download_handoff_mode = mode;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
     fn set_context_menu_enabled(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.extension.context_menu_enabled = on;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
     fn set_show_badge_status(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.extension.show_badge_status = on;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
@@ -822,6 +884,7 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         self.settings.extension.show_progress_after_handoff = on;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
@@ -832,6 +895,7 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         self.settings.extension.download_capture_debug_logging = on;
+        self.extension_settings_dirty = true;
         cx.notify();
     }
 
@@ -967,12 +1031,11 @@ impl DownloadApp {
     fn select_filter(&mut self, filter: FilterKind, window: &mut Window, cx: &mut Context<Self>) {
         self.filter = filter;
         if filter == FilterKind::Settings {
-            // Prefer bridge copy if the extension saved settings while Settings was closed.
-            if let Some(extension) = self.ipc.extension_settings() {
-                if self.settings.extension != extension {
-                    self.settings.extension = extension;
-                }
-            }
+            // When the user has no local Browser capture preview, adopt any
+            // bridge updates made while Settings was closed. Dirty previews
+            // survive reopen (same idea as System toggles keeping in-memory
+            // values until Save).
+            self.sync_extension_settings_from_bridge(true);
             let dir = self
                 .settings
                 .download_directory
@@ -981,8 +1044,6 @@ impl DownloadApp {
             let concurrent = self.settings.max_concurrent_downloads.to_string();
             let retry = self.settings.auto_retry_attempts.to_string();
             let speed = self.settings.speed_limit_kib_per_second.to_string();
-            let excluded = self.settings.extension.excluded_hosts.join("\n");
-            let captured = self.settings.extension.captured_file_extensions.join(", ");
             self.dir_input
                 .update(cx, |i, cx| i.set_value(dir, window, cx));
             self.concurrent_input
@@ -991,10 +1052,7 @@ impl DownloadApp {
                 .update(cx, |i, cx| i.set_value(retry, window, cx));
             self.speed_input
                 .update(cx, |i, cx| i.set_value(speed, window, cx));
-            self.excluded_hosts_input
-                .update(cx, |i, cx| i.set_value(excluded, window, cx));
-            self.captured_extensions_input
-                .update(cx, |i, cx| i.set_value(captured, window, cx));
+            self.refresh_extension_text_inputs(window, cx);
         }
         cx.notify();
     }
@@ -1063,6 +1121,11 @@ impl Render for DownloadApp {
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);
+        }
+        // Bridge-adopted extension settings (while Settings is open) need a
+        // Window to rewrite text drafts; apply_jobs only sets the stale flag.
+        if self.extension_text_inputs_stale && self.filter == FilterKind::Settings {
+            self.refresh_extension_text_inputs(window, cx);
         }
         self.sync_window_chrome(window);
         let theme = cx.theme().clone();

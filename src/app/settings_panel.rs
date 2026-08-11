@@ -411,7 +411,7 @@ impl DownloadApp {
                                                     ),
                                             )
                                             .child(field_hint(
-                                                "When On, the companion extension can hand downloads to RusticDL.",
+                                                "When On, the companion extension can hand downloads to RusticDL. Options below apply only while capture is On.",
                                                 cx,
                                             )),
                                     )
@@ -426,6 +426,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("handoff-off")
                                                             .label("Off")
+                                                            .disabled(!ext_enabled)
                                                             .when(
                                                                 handoff_mode
                                                                     == DownloadHandoffMode::Off,
@@ -449,6 +450,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("handoff-ask")
                                                             .label("Ask")
+                                                            .disabled(!ext_enabled)
                                                             .when(
                                                                 handoff_mode
                                                                     == DownloadHandoffMode::Ask,
@@ -472,6 +474,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("handoff-auto")
                                                             .label("Auto")
+                                                            .disabled(!ext_enabled)
                                                             .when(
                                                                 handoff_mode
                                                                     == DownloadHandoffMode::Auto,
@@ -508,6 +511,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-ctx-off")
                                                             .label("Off")
+                                                            .disabled(!ext_enabled)
                                                             .when(!context_menu_enabled, |b| {
                                                                 b.primary()
                                                             })
@@ -525,6 +529,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-ctx-on")
                                                             .label("On")
+                                                            .disabled(!ext_enabled)
                                                             .when(context_menu_enabled, |b| {
                                                                 b.primary()
                                                             })
@@ -555,6 +560,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-badge-off")
                                                             .label("Off")
+                                                            .disabled(!ext_enabled)
                                                             .when(!show_badge_status, |b| {
                                                                 b.primary()
                                                             })
@@ -572,6 +578,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-badge-on")
                                                             .label("On")
+                                                            .disabled(!ext_enabled)
                                                             .when(show_badge_status, |b| {
                                                                 b.primary()
                                                             })
@@ -602,6 +609,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-progress-off")
                                                             .label("Off")
+                                                            .disabled(!ext_enabled)
                                                             .when(
                                                                 !show_progress_after_handoff,
                                                                 |b| b.primary(),
@@ -621,6 +629,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-progress-on")
                                                             .label("On")
+                                                            .disabled(!ext_enabled)
                                                             .when(
                                                                 show_progress_after_handoff,
                                                                 |b| b.primary(),
@@ -648,7 +657,9 @@ impl DownloadApp {
                                             .gap_1p5()
                                             .child(field_label("Excluded hosts", cx))
                                             .child(
-                                                Input::new(&self.excluded_hosts_input).w_full(),
+                                                Input::new(&self.excluded_hosts_input)
+                                                    .w_full()
+                                                    .disabled(!ext_enabled),
                                             )
                                             .child(field_hint(
                                                 "One host per line. Matching sites skip capture.",
@@ -661,7 +672,8 @@ impl DownloadApp {
                                             .child(field_label("Captured file extensions", cx))
                                             .child(
                                                 Input::new(&self.captured_extensions_input)
-                                                    .w_full(),
+                                                    .w_full()
+                                                    .disabled(!ext_enabled),
                                             )
                                             .child(field_hint(
                                                 "Comma-separated extensions the extension will intercept (e.g. zip, pdf, exe).",
@@ -678,6 +690,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-debug-off")
                                                             .label("Off")
+                                                            .disabled(!ext_enabled)
                                                             .when(!capture_debug_logging, |b| {
                                                                 b.primary()
                                                             })
@@ -695,6 +708,7 @@ impl DownloadApp {
                                                     .child(
                                                         Button::new("ext-debug-on")
                                                             .label("On")
+                                                            .disabled(!ext_enabled)
                                                             .when(capture_debug_logging, |b| {
                                                                 b.primary()
                                                             })
