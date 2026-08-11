@@ -101,12 +101,11 @@ pub(crate) fn render_job_row(
         })
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, _, cx| {
-            if this.selected_id.as_deref() == Some(id_for_select.as_str()) {
-                this.selected_id = None;
-            } else {
-                this.selected_id = Some(id_for_select.clone());
-            }
+            // Plain click: select only (no toggle-off). Stop bubble so empty
+            // queue chrome can clear selection on background click.
+            this.select_only(id_for_select.clone());
             cx.notify();
+            cx.stop_propagation();
         }))
         // Status as a color dot (tooltip = full label), then the filename.
         .child(status_dot(&id, status, accent, theme.muted_foreground))

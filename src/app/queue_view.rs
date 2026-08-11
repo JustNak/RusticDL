@@ -33,7 +33,6 @@ impl DownloadApp {
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let filtered = self.visible_jobs(cx);
-        let selected = self.selected_id.clone();
         let query = self.search_query(cx);
         let has_query = !query.trim().is_empty();
         if filtered.is_empty()
@@ -147,11 +146,18 @@ impl DownloadApp {
                     .when(detail_open, |el| el.min_h(px(LIST_MIN_H)))
                     .overflow_y_scroll()
                     .bg(theme.list)
+                    // Empty chrome / non-row background clears selection.
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.selected_ids.is_empty() {
+                            this.clear_selection();
+                            cx.notify();
+                        }
+                    }))
                     .when(filtered.is_empty(), |el| {
                         el.child(self.render_search_empty(cx))
                     })
                     .children(filtered.into_iter().enumerate().map(|(index, job)| {
-                        let is_selected = selected.as_deref() == Some(job.id.as_str());
+                        let is_selected = self.is_selected(job.id.as_str());
                         render_job_row(
                             job,
                             is_selected,
