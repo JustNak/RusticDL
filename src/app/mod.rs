@@ -64,7 +64,6 @@ use crate::tray::{
 };
 use crate::updater::UpdateInfo;
 use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
-use update_flow::spawn_update_check;
 use widgets::render_vignette_overlay;
 
 /// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
@@ -395,9 +394,6 @@ impl DownloadApp {
         ipc.update_settings(&settings);
         ipc.update_jobs(&jobs);
 
-        // Quiet startup check against GitHub Releases (toast only if an update exists).
-        spawn_update_check(false, cx);
-
         let started_minimized = launched_minimized();
         // Tray is needed for close-to-tray, startup-minimized, and OS balloons.
         let need_tray = settings.close_to_tray
@@ -424,7 +420,7 @@ impl DownloadApp {
         }
 
         let extension_committed = settings.extension.clone();
-        let app = Self {
+        let mut app = Self {
             jobs,
             settings,
             paths,
@@ -483,6 +479,10 @@ impl DownloadApp {
             settings_category: SettingsCategory::General,
             settings_return_filter: FilterKind::All,
         };
+
+        // Quiet startup check against GitHub Releases (toast only if an update exists).
+        // Route through begin_update_check so update_busy serializes with interactive checks.
+        app.begin_update_check(false, cx);
 
         // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
         let entity = cx.entity();

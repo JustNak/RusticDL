@@ -10,17 +10,23 @@
 
 use std::time::Duration;
 
-use gpui::{div, Context, ParentElement, Styled, Window};
+use gpui::{
+    div, px, Context, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+};
 use gpui_component::{
     button::ButtonVariant, dialog::DialogButtonProps, v_flex, ActiveTheme, WindowExt,
 };
 
 use super::DownloadApp;
 use crate::branding::{APP_NAME, APP_VERSION, UPDATER_NAME};
+use crate::download::JobState;
 use crate::format::format_bytes;
 use crate::updater::{
     check_for_update, launch_updater, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
+
+/// Cap release notes in the consent dialog so multi-line Markdown bodies stay readable.
+const DIALOG_NOTES_MAX_CHARS: usize = 280;
 
 impl DownloadApp {
     /// Label for the single update action (check or open cached release dialog).
@@ -84,20 +90,11 @@ impl DownloadApp {
                 self.update_busy = false;
                 if interactive {
                     // Open the version dialog on the next frame that has a Window.
+                    // No toast here: the dialog is the signal (menu label covers deferral).
                     self.pending_show_update_dialog = true;
-                    let size_hint = info
-                        .setup_size
-                        .map(|n| format!(" · {}", format_bytes(n)))
-                        .unwrap_or_default();
-                    self.show_toast(
-                        format!(
-                            "Update available: v{} (you have v{}){size_hint}.",
-                            info.latest_version, info.current_version
-                        ),
-                        cx,
-                    );
                 } else {
-                    self.pending_show_update_dialog = false;
+                    // Never clear a pending interactive dialog here: a late silent
+                    // completion must not suppress consent after the user checked.
                     let size_hint = info
                         .setup_size
                         .map(|n| format!(" · {}", format_bytes(n)))
@@ -130,7 +127,8 @@ impl DownloadApp {
         if !self.pending_show_update_dialog {
             return;
         }
-        // Don't stack over an already-open dialog (e.g. About).
+        // Don't stack over an already-open dialog (e.g. About). Menu label still
+        // switches to “Install update v…”, and this dialog opens when About closes.
         if window.has_active_dialog(cx) {
             return;
         }
@@ -152,10 +150,11 @@ impl DownloadApp {
         // User is looking at the dialog; cancel any deferred open.
         self.pending_show_update_dialog = false;
 
-        let active_count = self
+        // Only warn for transfers that will actually stop mid-flight.
+        let transferring_count = self
             .jobs
             .iter()
-            .filter(|j| j.state.is_active())
+            .filter(|j| matches!(j.state, JobState::Starting | JobState::Downloading))
             .count();
         let size_line = info
             .setup_size
@@ -166,7 +165,7 @@ impl DownloadApp {
             .as_ref()
             .map(|n| n.trim())
             .filter(|n| !n.is_empty())
-            .map(|n| n.to_string());
+            .map(|n| truncate_dialog_notes(n, DIALOG_NOTES_MAX_CHARS));
         let title = format!("Update to v{}?", info.latest_version);
         let release_name = info.release_name.clone();
         let current = if info.current_version.trim().is_empty() {
@@ -180,7 +179,9 @@ impl DownloadApp {
 
         window.open_dialog(cx, move |dialog, _, cx| {
             // `open_dialog` builder is `Fn` (may rebuild); clone owned strings each time.
-            let muted = cx.theme().muted_foreground;
+            let theme = cx.theme();
+            let muted = theme.muted_foreground;
+            let warning = theme.warning;
             let app_view = app_view.clone();
             let info_for_ok = info_for_ok.clone();
             let title = title.clone();
@@ -203,6 +204,9 @@ impl DownloadApp {
             if let Some(notes) = notes {
                 body = body.child(
                     div()
+                        .id("update-notes")
+                        .max_h(px(96.))
+                        .overflow_y_scroll()
                         .text_xs()
                         .text_color(muted)
                         .child(format!("Notes: {notes}")),
@@ -218,13 +222,13 @@ impl DownloadApp {
                     )),
             );
 
-            if active_count > 0 {
+            if transferring_count > 0 {
                 body = body.child(
                     div()
                         .text_xs()
-                        .text_color(muted)
+                        .text_color(warning)
                         .child(format!(
-                            "{active_count} active download(s) will be interrupted. Resume is supported where possible after restart."
+                            "Warning: {transferring_count} download(s) in progress will be interrupted. Resume is supported where possible after restart."
                         )),
                 );
             }
@@ -234,6 +238,7 @@ impl DownloadApp {
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(420.))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Install and restart")
@@ -330,4 +335,20 @@ pub(crate) fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp
         });
     })
     .detach();
+}
+
+fn truncate_dialog_notes(notes: &str, max_chars: usize) -> String {
+    // Collapse Markdown-ish whitespace so headers/lists don't inflate the dialog.
+    let compact: String = notes
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut out: String = compact.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
