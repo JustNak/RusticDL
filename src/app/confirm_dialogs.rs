@@ -6,7 +6,7 @@ use gpui_component::{
 };
 
 use super::DownloadApp;
-use crate::download::EngineCommand;
+use crate::download::{EngineCommand, JobState};
 
 impl DownloadApp {
     pub(crate) fn confirm_remove(
@@ -51,6 +51,61 @@ impl DownloadApp {
                         id: id.clone(),
                         delete_partial: true,
                     });
+                    true
+                })
+        });
+    }
+
+    /// Multi-select remove: one confirm listing count; only removable jobs
+    /// (terminal or paused) are deleted. Active jobs are left alone.
+    pub(crate) fn confirm_remove_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|j| {
+                self.selected_ids.iter().any(|id| id == &j.id)
+                    && (j.state.is_terminal() || j.state == JobState::Paused)
+            })
+            .map(|j| j.id.clone())
+            .collect();
+
+        if ids.is_empty() {
+            self.show_toast("No removable items in the selection.", cx);
+            return;
+        }
+
+        let engine = self.engine.clone();
+        let count = ids.len();
+        let muted = cx.theme().muted_foreground;
+        let body = format!("Remove {count} selected item(s) from the queue?");
+        let note = "Any partial .part files will also be deleted. Active downloads are left alone.";
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let engine = engine.clone();
+            let ids = ids.clone();
+            dialog
+                .title("Remove selected downloads?")
+                .confirm()
+                .overlay_closable(true)
+                .keyboard(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Remove")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(body.clone()))
+                        .child(div().text_xs().text_color(muted).child(note)),
+                )
+                .on_ok(move |_, _, _| {
+                    for id in &ids {
+                        engine.send(EngineCommand::Remove {
+                            id: id.clone(),
+                            delete_partial: true,
+                        });
+                    }
                     true
                 })
         });

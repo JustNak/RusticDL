@@ -1,5 +1,8 @@
 //! Queue list, toolbar, and empty states extracted from `DownloadApp`.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use gpui::{
     div, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
     ParentElement, StatefulInteractiveElement, Styled, Window,
@@ -21,9 +24,12 @@ use super::layout::{
 };
 use super::widgets::{empty_state_badge, sortable_header};
 use super::DownloadApp;
-use crate::download::{EngineCommand, JobState};
+use crate::download::{reveal_in_folder, EngineCommand, Job, JobState};
 use crate::format::filter_jobs;
 use crate::settings::SortColumn;
+
+/// Cap how many distinct folders multi-reveal opens before toasting the rest.
+const BATCH_REVEAL_DIR_CAP: usize = 5;
 
 impl DownloadApp {
     pub(crate) fn render_queue(
@@ -53,8 +59,13 @@ impl DownloadApp {
             let vh = viewport.height.to_f64() as f32;
             (vh * 0.36).clamp(DETAIL_MIN_CAP, DETAIL_MAX_H)
         };
-        let detail = self.selected_job().cloned();
-        let detail_open = detail.is_some();
+        let multi_selected = self.selected_ids.len() > 1;
+        let detail = if multi_selected {
+            None
+        } else {
+            self.selected_job().cloned()
+        };
+        let bottom_open = multi_selected || detail.is_some();
         let sort_col = self.settings.sort_column;
         let sort_dir = self.settings.sort_direction;
 
@@ -143,7 +154,7 @@ impl DownloadApp {
                     .id("queue-scroll")
                     .flex_1()
                     .min_h_0()
-                    .when(detail_open, |el| el.min_h(px(LIST_MIN_H)))
+                    .when(bottom_open, |el| el.min_h(px(LIST_MIN_H)))
                     .overflow_y_scroll()
                     .bg(theme.list)
                     // Empty chrome / non-row background clears selection.
@@ -170,10 +181,205 @@ impl DownloadApp {
                         )
                     })),
             )
+            .when(multi_selected, |el| el.child(self.render_batch_bar(cx)))
             .when_some(detail, |el, job| {
                 el.child(render_detail(&job, detail_max_h, cx))
             })
             .into_any_element()
+    }
+
+    /// Batch action bar when more than one job is selected (replaces detail).
+    pub(crate) fn render_batch_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let count = self.selected_ids.len();
+        let selected = self.selected_jobs();
+
+        let can_pause = selected.iter().any(|j| {
+            matches!(
+                j.state,
+                JobState::Queued | JobState::Starting | JobState::Downloading
+            )
+        });
+        let can_resume = selected.iter().any(|j| j.state == JobState::Paused);
+        let can_retry = selected
+            .iter()
+            .any(|j| matches!(j.state, JobState::Failed | JobState::Canceled));
+        let can_remove = selected
+            .iter()
+            .any(|j| j.state.is_terminal() || j.state == JobState::Paused);
+
+        h_flex()
+            .id("batch-action-bar")
+            .w_full()
+            .flex_shrink_0()
+            .px_4()
+            .py_2p5()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.28))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child(format!("{count} selected")),
+            )
+            .child(div().flex_1())
+            .when(can_pause, |el| {
+                el.child(
+                    Button::new("batch-pause")
+                        .outline()
+                        .small()
+                        .icon(IconName::Minus)
+                        .label("Pause")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_pause_selected();
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(can_resume, |el| {
+                el.child(
+                    Button::new("batch-resume")
+                        .outline()
+                        .small()
+                        .icon(IconName::Redo2)
+                        .label("Resume")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_resume_selected();
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(can_retry, |el| {
+                el.child(
+                    Button::new("batch-retry")
+                        .outline()
+                        .small()
+                        .icon(IconName::Redo)
+                        .label("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_retry_selected();
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                Button::new("batch-reveal")
+                    .outline()
+                    .small()
+                    .icon(IconName::FolderOpen)
+                    .label("Open folder")
+                    .tooltip("Open containing folder(s)")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.batch_reveal_selected(cx);
+                    })),
+            )
+            .when(can_remove, |el| {
+                el.child(
+                    Button::new("batch-remove")
+                        .danger()
+                        .small()
+                        .icon(IconName::Delete)
+                        .label("Remove…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_remove_selected(window, cx);
+                        })),
+                )
+            })
+            .child(
+                Button::new("batch-clear-selection")
+                    .ghost()
+                    .small()
+                    .label("Clear selection")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_selection();
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn selected_jobs(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| self.selected_ids.iter().any(|id| id == &j.id))
+            .collect()
+    }
+
+    fn batch_pause_selected(&self) {
+        for job in self.selected_jobs() {
+            if matches!(
+                job.state,
+                JobState::Queued | JobState::Starting | JobState::Downloading
+            ) {
+                self.engine.send(EngineCommand::Pause(job.id.clone()));
+            }
+        }
+    }
+
+    fn batch_resume_selected(&self) {
+        for job in self.selected_jobs() {
+            if job.state == JobState::Paused {
+                self.engine.send(EngineCommand::Resume(job.id.clone()));
+            }
+        }
+    }
+
+    fn batch_retry_selected(&self) {
+        for job in self.selected_jobs() {
+            if matches!(job.state, JobState::Failed | JobState::Canceled) {
+                self.engine.send(EngineCommand::Retry(job.id.clone()));
+            }
+        }
+    }
+
+    /// Reveal unique parent folders for the selection; cap opens and toast if many.
+    fn batch_reveal_selected(&mut self, cx: &mut Context<Self>) {
+        let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
+        for job in self.selected_jobs() {
+            let path = if job.target_path.exists() {
+                job.target_path.clone()
+            } else {
+                job.temp_path.clone()
+            };
+            if let Some(parent) = path.parent() {
+                parents.insert(parent.to_path_buf());
+            } else {
+                parents.insert(path);
+            }
+        }
+
+        if parents.is_empty() {
+            self.show_toast("No folders to open.", cx);
+            return;
+        }
+
+        let total = parents.len();
+        let mut opened = 0usize;
+        let mut last_err: Option<String> = None;
+        for (i, dir) in parents.into_iter().enumerate() {
+            if i >= BATCH_REVEAL_DIR_CAP {
+                break;
+            }
+            match reveal_in_folder(&dir) {
+                Ok(()) => opened += 1,
+                Err(msg) => last_err = Some(msg),
+            }
+        }
+
+        if opened == 0 {
+            self.show_toast(
+                last_err.unwrap_or_else(|| "Could not open folder.".into()),
+                cx,
+            );
+        } else if total > BATCH_REVEAL_DIR_CAP {
+            self.show_toast(format!("Opened {opened} of {total} folders (capped)."), cx);
+        } else if total > 1 {
+            self.show_toast(format!("Opened {opened} folders."), cx);
+        }
     }
 
     pub(crate) fn render_queue_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
