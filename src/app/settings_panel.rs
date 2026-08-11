@@ -18,8 +18,8 @@ use gpui_component::{
 use super::settings_category::SettingsCategory;
 use super::widgets::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, browse_directory,
-    field_hint, field_label, settings_choice_row, settings_field_label, settings_nav_item,
-    settings_subgroup, styled_progress,
+    field_hint, settings_choice_row, settings_field_label, settings_nav_item, settings_subgroup,
+    styled_progress,
 };
 use super::DownloadApp;
 use crate::appearance::{accent_swatch_color, custom_accent_hsla, resolve_theme_mode};
@@ -714,16 +714,16 @@ impl DownloadApp {
         let accent_light = self.settings.accent_lightness;
         let custom_color = custom_accent_hsla(accent_hue, accent_sat, accent_light);
         let resolved_mode = resolve_theme_mode(theme_choice, None, cx);
+        // Sparse hints: only System needs a live mode note; Light/Dark covered by footer line.
         let mode_hint = match theme_choice {
             AppTheme::System => {
                 if resolved_mode.is_dark() {
-                    "Following system (currently dark)."
+                    Some("Following system (currently dark).")
                 } else {
-                    "Following system (currently light)."
+                    Some("Following system (currently light).")
                 }
             }
-            AppTheme::Light => "Preview applies immediately; save to keep it.",
-            AppTheme::Dark => "Preview applies immediately; save to keep it.",
+            AppTheme::Light | AppTheme::Dark => None,
         };
 
         GroupBox::new()
@@ -731,57 +731,47 @@ impl DownloadApp {
             .title(self.settings_group_title(SettingsCategory::Appearance, cx))
             .child(
                 v_flex()
-                    .gap_4()
-                    // Theme
-                    .child(
-                        v_flex()
+                    .gap_3()
+                    // ── Theme & color ──
+                    .child(settings_subgroup("Theme & color", false, cx))
+                    .child(settings_choice_row(
+                        "Theme",
+                        mode_hint,
+                        h_flex()
                             .gap_2()
-                            .child(field_label("Theme", cx))
+                            .flex_wrap()
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(
-                                        Button::new("theme-light")
-                                            .icon(IconName::Sun)
-                                            .label("Light")
-                                            .when(theme_choice == AppTheme::Light, |b| b.primary())
-                                            .when(theme_choice != AppTheme::Light, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_theme_draft(AppTheme::Light, window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("theme-dark")
-                                            .icon(IconName::Moon)
-                                            .label("Dark")
-                                            .when(theme_choice == AppTheme::Dark, |b| b.primary())
-                                            .when(theme_choice != AppTheme::Dark, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_theme_draft(AppTheme::Dark, window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("theme-system")
-                                            .icon(IconName::Settings)
-                                            .label("System")
-                                            .when(theme_choice == AppTheme::System, |b| {
-                                                b.primary()
-                                            })
-                                            .when(theme_choice != AppTheme::System, |b| {
-                                                b.outline()
-                                            })
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_theme_draft(
-                                                    AppTheme::System,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
+                                Button::new("theme-light")
+                                    .icon(IconName::Sun)
+                                    .label("Light")
+                                    .when(theme_choice == AppTheme::Light, |b| b.primary())
+                                    .when(theme_choice != AppTheme::Light, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_theme_draft(AppTheme::Light, window, cx);
+                                    })),
                             )
-                            .child(field_hint(mode_hint, cx)),
-                    )
+                            .child(
+                                Button::new("theme-dark")
+                                    .icon(IconName::Moon)
+                                    .label("Dark")
+                                    .when(theme_choice == AppTheme::Dark, |b| b.primary())
+                                    .when(theme_choice != AppTheme::Dark, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_theme_draft(AppTheme::Dark, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("theme-system")
+                                    .icon(IconName::Settings)
+                                    .label("System")
+                                    .when(theme_choice == AppTheme::System, |b| b.primary())
+                                    .when(theme_choice != AppTheme::System, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_theme_draft(AppTheme::System, window, cx);
+                                    })),
+                            ),
+                        cx,
+                    ))
                     // Accent — preset dots + distinct Custom (rainbow ring)
                     .child(
                         v_flex()
@@ -790,7 +780,7 @@ impl DownloadApp {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(field_label("Color accent", cx))
+                                    .child(settings_field_label("Color accent", cx))
                                     .child(
                                         div()
                                             .text_xs()
@@ -903,17 +893,13 @@ impl DownloadApp {
                                             &theme,
                                         )),
                                 )
-                            })
-                            .child(field_hint(
-                                "Tints buttons, progress, selection, and links. Custom uses full HSL.",
-                                cx,
-                            )),
+                            }),
                     )
-                    // Live preview strip
+                    // Live preview strip — near theme/accent so color changes are obvious
                     .child(
                         v_flex()
                             .gap_2()
-                            .child(field_label("Preview", cx))
+                            .child(settings_field_label("Preview", cx))
                             .child(
                                 h_flex()
                                     .gap_3()
@@ -952,14 +938,15 @@ impl DownloadApp {
                                     ),
                             ),
                     )
-                    // Transparency
+                    // ── Glass & texture ──
+                    .child(settings_subgroup("Glass & texture", true, cx))
                     .child(
                         v_flex()
                             .gap_1p5()
                             .child(
                                 h_flex()
                                     .justify_between()
-                                    .child(field_label("Transparency", cx))
+                                    .child(settings_field_label("Transparency", cx))
                                     .child(
                                         div()
                                             .text_xs()
@@ -968,51 +955,44 @@ impl DownloadApp {
                                     ),
                             )
                             .child(Slider::new(&self.opacity_slider).horizontal().w_full())
+                            // One glass-interaction note for the whole sub-group
                             .child(field_hint(
-                                "0% solid (default). Higher values glass the window.",
+                                "0% solid. Higher values glass the window; blur softens the backdrop.",
                                 cx,
                             )),
                     )
-                    // Backdrop blur
-                    .child(
-                        v_flex()
+                    .child(settings_choice_row(
+                        "Backdrop blur",
+                        None,
+                        h_flex()
                             .gap_2()
-                            .child(field_label("Backdrop blur", cx))
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("blur-off")
-                                            .label("Off")
-                                            .when(!backdrop_blur, |b| b.primary())
-                                            .when(backdrop_blur, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_backdrop_blur(false, window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("blur-on")
-                                            .label("On")
-                                            .when(backdrop_blur, |b| b.primary())
-                                            .when(!backdrop_blur, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_backdrop_blur(true, window, cx);
-                                            })),
-                                    ),
+                                Button::new("blur-off")
+                                    .label("Off")
+                                    .when(!backdrop_blur, |b| b.primary())
+                                    .when(backdrop_blur, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_backdrop_blur(false, window, cx);
+                                    })),
                             )
-                            .child(field_hint(
-                                "Acrylic-style blur behind glass (when transparent).",
-                                cx,
-                            )),
-                    )
-                    // Noise
+                            .child(
+                                Button::new("blur-on")
+                                    .label("On")
+                                    .when(backdrop_blur, |b| b.primary())
+                                    .when(!backdrop_blur, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_backdrop_blur(true, window, cx);
+                                    })),
+                            ),
+                        cx,
+                    ))
                     .child(
                         v_flex()
                             .gap_1p5()
                             .child(
                                 h_flex()
                                     .justify_between()
-                                    .child(field_label("Noise (film grain)", cx))
+                                    .child(settings_field_label("Noise (film grain)", cx))
                                     .child(
                                         div()
                                             .text_xs()
@@ -1020,106 +1000,15 @@ impl DownloadApp {
                                             .child(format!("{noise_pct}%")),
                                     ),
                             )
-                            .child(Slider::new(&self.noise_slider).horizontal().w_full())
-                            .child(field_hint(
-                                "Dense film grit; strength scales with the slider. 0% off.",
-                                cx,
-                            )),
+                            .child(Slider::new(&self.noise_slider).horizontal().w_full()),
                     )
-                    // Density
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(field_label("UI density", cx))
-                            .child(
-                                h_flex().gap_2().children(UiDensity::ALL.into_iter().map(
-                                    |d| {
-                                        let selected = ui_density == d;
-                                        Button::new(SharedString::from(format!(
-                                            "density-{}",
-                                            d.label()
-                                        )))
-                                        .label(d.label())
-                                        .when(selected, |b| b.primary())
-                                        .when(!selected, |b| b.outline())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.set_ui_density(d, window, cx);
-                                        }))
-                                    },
-                                )),
-                            )
-                            .child(field_hint(
-                                "Compact tightens rows, sidebar, and settings padding.",
-                                cx,
-                            )),
-                    )
-                    // Corner radius
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(field_label("Corner radius", cx))
-                            .child(
-                                h_flex().gap_2().children(
-                                    CornerRadiusScale::ALL.into_iter().map(|scale| {
-                                        let selected = corner_radius == scale;
-                                        Button::new(SharedString::from(format!(
-                                            "radius-{}",
-                                            scale.label()
-                                        )))
-                                        .label(scale.label())
-                                        .when(selected, |b| b.primary())
-                                        .when(!selected, |b| b.outline())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.set_corner_radius(scale, window, cx);
-                                        }))
-                                    }),
-                                ),
-                            )
-                            .child(field_hint(
-                                "Sharp, default, or soft rounding on controls and cards.",
-                                cx,
-                            )),
-                    )
-                    // Reduce motion
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(field_label("Reduce motion", cx))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("motion-off")
-                                            .label("Off")
-                                            .when(!reduce_motion, |b| b.primary())
-                                            .when(reduce_motion, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_reduce_motion(false, window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("motion-on")
-                                            .label("On")
-                                            .when(reduce_motion, |b| b.primary())
-                                            .when(!reduce_motion, |b| b.outline())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_reduce_motion(true, window, cx);
-                                            })),
-                                    ),
-                            )
-                            .child(field_hint(
-                                "Prefer calmer empty states and less decorative motion.",
-                                cx,
-                            )),
-                    )
-                    // Vignette
                     .child(
                         v_flex()
                             .gap_1p5()
                             .child(
                                 h_flex()
                                     .justify_between()
-                                    .child(field_label("Vignette", cx))
+                                    .child(settings_field_label("Vignette", cx))
                                     .child(
                                         div()
                                             .text_xs()
@@ -1127,39 +1016,95 @@ impl DownloadApp {
                                             .child(format!("{vignette_pct}%")),
                                     ),
                             )
-                            .child(Slider::new(&self.vignette_slider).horizontal().w_full())
-                            .child(field_hint(
-                                "Soft dark edges around the window. 0% off.",
-                                cx,
-                            )),
+                            .child(Slider::new(&self.vignette_slider).horizontal().w_full()),
                     )
-                    // Progress style
-                    .child(
-                        v_flex()
+                    // ── Layout & motion ──
+                    .child(settings_subgroup("Layout & motion", true, cx))
+                    .child(settings_choice_row(
+                        "UI density",
+                        Some("Compact tightens rows, sidebar, and settings padding."),
+                        h_flex().gap_2().flex_wrap().children(UiDensity::ALL.into_iter().map(
+                            |d| {
+                                let selected = ui_density == d;
+                                Button::new(SharedString::from(format!("density-{}", d.label())))
+                                    .label(d.label())
+                                    .when(selected, |b| b.primary())
+                                    .when(!selected, |b| b.outline())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_ui_density(d, window, cx);
+                                    }))
+                            },
+                        )),
+                        cx,
+                    ))
+                    .child(settings_choice_row(
+                        "Corner radius",
+                        None,
+                        h_flex().gap_2().flex_wrap().children(
+                            CornerRadiusScale::ALL.into_iter().map(|scale| {
+                                let selected = corner_radius == scale;
+                                Button::new(SharedString::from(format!(
+                                    "radius-{}",
+                                    scale.label()
+                                )))
+                                .label(scale.label())
+                                .when(selected, |b| b.primary())
+                                .when(!selected, |b| b.outline())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_corner_radius(scale, window, cx);
+                                }))
+                            }),
+                        ),
+                        cx,
+                    ))
+                    .child(settings_choice_row(
+                        "Reduce motion",
+                        Some("Calmer empty states and less decorative motion."),
+                        h_flex()
                             .gap_2()
-                            .child(field_label("Progress style", cx))
                             .child(
-                                h_flex().gap_2().flex_wrap().children(
-                                    ProgressStyle::ALL.into_iter().map(|style| {
-                                        let selected = progress_style == style;
-                                        Button::new(SharedString::from(format!(
-                                            "progress-{}",
-                                            style.label()
-                                        )))
-                                        .label(style.label())
-                                        .when(selected, |b| b.primary())
-                                        .when(!selected, |b| b.outline())
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.set_progress_style(style, window, cx);
-                                        }))
-                                    }),
-                                ),
+                                Button::new("motion-off")
+                                    .label("Off")
+                                    .when(!reduce_motion, |b| b.primary())
+                                    .when(reduce_motion, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_reduce_motion(false, window, cx);
+                                    })),
                             )
-                            .child(field_hint(
-                                "How download progress bars look in the queue.",
-                                cx,
-                            )),
-                    )
+                            .child(
+                                Button::new("motion-on")
+                                    .label("On")
+                                    .when(reduce_motion, |b| b.primary())
+                                    .when(!reduce_motion, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_reduce_motion(true, window, cx);
+                                    })),
+                            ),
+                        cx,
+                    ))
+                    // ── Progress ──
+                    .child(settings_subgroup("Progress", true, cx))
+                    .child(settings_choice_row(
+                        "Progress style",
+                        None,
+                        h_flex().gap_2().flex_wrap().children(
+                            ProgressStyle::ALL.into_iter().map(|style| {
+                                let selected = progress_style == style;
+                                Button::new(SharedString::from(format!(
+                                    "progress-{}",
+                                    style.label()
+                                )))
+                                .label(style.label())
+                                .when(selected, |b| b.primary())
+                                .when(!selected, |b| b.outline())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_progress_style(style, window, cx);
+                                }))
+                            }),
+                        ),
+                        cx,
+                    ))
+                    // Section-local reset (kept one-click; draft-only until Save)
                     .child(
                         h_flex().child(
                             Button::new("reset-appearance")
