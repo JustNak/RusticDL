@@ -12,9 +12,9 @@ use crate::branding::APP_NAME;
 
 /// Severity icon for a tray balloon (`NIIF_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed by notification policy (follow-up PR)
 pub enum NotifyLevel {
     Info,
+    #[allow(dead_code)] // reserved for future policy levels
     Warning,
     Error,
 }
@@ -32,16 +32,13 @@ pub enum TrayEvent {
 }
 
 /// Maximum UTF-16 code units for balloon title (`szInfoTitle` is 64 including NUL).
-#[allow(dead_code)] // used by show_notification + tests; policy PR may re-export
 pub const BALLOON_TITLE_MAX_UTF16: usize = 63;
 /// Maximum UTF-16 code units for balloon body (`szInfo` is 256 including NUL).
-#[allow(dead_code)] // used by show_notification + tests; policy PR may re-export
 pub const BALLOON_BODY_MAX_UTF16: usize = 255;
 
 /// Truncate `s` so its UTF-16 encoding fits in `max_units` code units.
 ///
 /// Used for `NOTIFYICONDATAW` string fields that require a trailing NUL.
-#[allow(dead_code)] // used by show_notification + tests; policy PR may call directly
 pub fn truncate_utf16_units(s: &str, max_units: usize) -> &str {
     if max_units == 0 {
         return "";
@@ -94,7 +91,6 @@ impl SystemTray {
     ///
     /// `context_id` is stored for the active balloon (after a successful
     /// `NIM_MODIFY`) and echoed on [`TrayEvent::BalloonUserClick`].
-    #[allow(dead_code)] // called by notification policy (follow-up PR)
     pub fn show_notification(&self, title: &str, body: &str, level: NotifyLevel, context_id: u64) {
         #[cfg(windows)]
         {
@@ -284,7 +280,6 @@ mod windows_impl {
         })
     }
 
-    #[allow(dead_code)] // entry from SystemTray::show_notification (policy PR)
     pub(super) fn show_notification(
         hwnd_slot: &AtomicIsize,
         pending: &PendingBalloons,

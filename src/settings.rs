@@ -294,6 +294,29 @@ impl SortDirection {
     }
 }
 
+/// When to show OS (tray balloon) notifications for terminal downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OsNotifyMode {
+    /// Only when the main window is hidden to the tray (recommended).
+    #[default]
+    WhenHiddenToTray,
+    /// Always fire OS notification (subject to tray availability).
+    Always,
+    /// Never use OS notifications.
+    Off,
+}
+
+impl OsNotifyMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::WhenHiddenToTray => "When hidden",
+            Self::Always => "Always",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -353,6 +376,15 @@ pub struct Settings {
     /// When launching at sign-in, start hidden in the tray (requires tray).
     #[serde(default)]
     pub startup_minimized: bool,
+    /// When to fire OS tray-balloon notifications for completed/failed downloads.
+    #[serde(default)]
+    pub os_notify_mode: OsNotifyMode,
+    /// Show notifications when a download completes successfully.
+    #[serde(default = "default_true")]
+    pub notify_on_complete: bool,
+    /// Show notifications when a download fails (after retries).
+    #[serde(default = "default_true")]
+    pub notify_on_fail: bool,
     /// Browser extension integration preferences (source of truth for the companion extension).
     #[serde(default)]
     pub extension: ExtensionIntegrationSettings,
@@ -388,6 +420,9 @@ impl Default for Settings {
             close_to_tray: true,
             launch_at_startup: false,
             startup_minimized: false,
+            os_notify_mode: OsNotifyMode::WhenHiddenToTray,
+            notify_on_complete: true,
+            notify_on_fail: true,
             extension: ExtensionIntegrationSettings::default(),
         }
     }
@@ -478,6 +513,9 @@ mod tests {
         assert!(s.close_to_tray);
         assert!(!s.launch_at_startup);
         assert!(!s.startup_minimized);
+        assert_eq!(s.os_notify_mode, OsNotifyMode::WhenHiddenToTray);
+        assert!(s.notify_on_complete);
+        assert!(s.notify_on_fail);
     }
 
     #[test]

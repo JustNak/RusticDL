@@ -8,6 +8,7 @@ mod download;
 mod extension_settings;
 mod format;
 mod ipc;
+mod notifications;
 mod persistence;
 mod prompt_window;
 mod settings;
