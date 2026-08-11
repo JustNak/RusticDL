@@ -8,6 +8,7 @@ mod layout;
 mod queue_view;
 mod selection;
 mod settings_panel;
+mod shortcuts;
 mod sidebar;
 mod status_bar;
 mod title_bar;
@@ -1328,23 +1329,9 @@ impl Render for DownloadApp {
             .size_full()
             .relative()
             .bg(theme.background)
-            // Capture Escape before focused inputs consume it:
-            // dialogs dismiss first; otherwise clear queue selection.
+            // Global shortcuts (capture): Escape always; others when no text focus / dialog.
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.modified()
-                {
-                    return;
-                }
-                if window.has_active_dialog(cx) {
-                    window.close_dialog(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                if !this.selected_ids.is_empty() {
-                    this.clear_selection();
-                    cx.notify();
-                    cx.stop_propagation();
-                }
+                this.handle_key_down(event, window, cx);
             }))
             // Mouse back (XButton1) dismisses the top dialog, like a browser modal.
             .capture_any_mouse_down(cx.listener(|_, event: &MouseDownEvent, window, cx| {
