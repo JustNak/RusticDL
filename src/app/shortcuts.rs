@@ -1,7 +1,8 @@
 //! Global keyboard shortcuts for queue productivity.
 //!
-//! Active when no modal dialog is open and no owned text input is focused
-//! (Escape is special: dialogs → leave Settings → clear selection — even with input focus).
+//! Active when no modal dialog is open and no owned text input is focused.
+//! Escape is owned by the keystroke interceptor in `DownloadApp::new` (must run
+//! before Input keybindings); see `handle_escape_keystroke`.
 
 use gpui::{App, Context, Focusable, KeyDownEvent, Window};
 use gpui_component::WindowExt;
@@ -11,8 +12,8 @@ use super::DownloadApp;
 use crate::download::JobState;
 
 impl DownloadApp {
-    /// Root key handler (capture phase). Returns after handling Escape or a
-    /// matched shortcut; stops propagation only when an action is taken.
+    /// Root key handler (capture phase). Escape is handled earlier via
+    /// `intercept_keystrokes` → `handle_escape_keystroke`.
     pub(crate) fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -21,27 +22,6 @@ impl DownloadApp {
     ) {
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
-
-        // Escape: dialogs → leave Settings → clear queue selection.
-        // Runs even when a text field is focused so Settings/selection stay escapable.
-        if key == "escape" && !modifiers.modified() {
-            if window.has_active_dialog(cx) {
-                window.close_dialog(cx);
-                cx.stop_propagation();
-                return;
-            }
-            if self.filter == FilterKind::Settings {
-                self.leave_settings(window, cx);
-                cx.stop_propagation();
-                return;
-            }
-            if !self.selected_ids.is_empty() {
-                self.clear_selection();
-                cx.notify();
-                cx.stop_propagation();
-            }
-            return;
-        }
 
         // Remaining shortcuts require an idle chrome (no modal, no text focus).
         if window.has_active_dialog(cx) || self.any_text_input_focused(window, cx) {

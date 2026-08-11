@@ -58,8 +58,11 @@ impl DownloadApp {
                     .child(
                         v_flex()
                             .gap_5()
-                            .max_w(px(720.))
-                            // Quiet wayfinding — left rail owns "Settings".
+                            // Wide enough for label + multi-segment control clusters
+                            // (handoff / density / radius) without crushing the control column.
+                            .max_w(px(880.))
+                            // Single page title — GroupBox cards are title-less so the
+                            // category name is not printed twice.
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -130,89 +133,63 @@ impl DownloadApp {
             )
     }
 
-    fn settings_group_title(
-        &self,
-        category: SettingsCategory,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(
-                Icon::new(category.icon())
-                    .with_size(px(14.))
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(theme.foreground)
-                    .child(category.panel_title()),
-            )
-    }
-
     fn render_settings_general(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        GroupBox::new()
-            .outline()
-            .title(self.settings_group_title(SettingsCategory::General, cx))
-            .child(
-                v_flex()
-                    .gap_4()
-                    .child(settings_subgroup("Downloads", false, cx))
-                    .child(
-                        v_flex()
-                            .gap_1p5()
-                            .child(settings_field_label("Download directory", cx))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(Input::new(&self.dir_input).w_full().flex_1())
-                                    .child(
-                                        Button::new("browse-settings-dir")
-                                            .label("Browse...")
-                                            .icon(IconName::FolderOpen)
-                                            .outline()
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                browse_directory(
-                                                    this.dir_input.clone(),
-                                                    cx.entity().clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(settings_subgroup("Limits", true, cx))
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1p5()
-                                    .child(settings_field_label("Max concurrent", cx))
-                                    .child(Input::new(&self.concurrent_input).w_full()),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1p5()
-                                    .child(settings_field_label("Auto-retry attempts", cx))
-                                    .child(Input::new(&self.retry_input).w_full()),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1p5()
-                                    .child(settings_field_label("Speed limit (KiB/s)", cx))
-                                    .child(Input::new(&self.speed_input).w_full())
-                                    .child(field_hint("0 means unlimited.", cx)),
-                            ),
-                    ),
-            )
+        GroupBox::new().outline().child(
+            v_flex()
+                .gap_4()
+                .child(settings_subgroup("Downloads", false, cx))
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(settings_field_label("Download directory", cx))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Input::new(&self.dir_input).w_full().flex_1())
+                                .child(
+                                    Button::new("browse-settings-dir")
+                                        .label("Browse...")
+                                        .icon(IconName::FolderOpen)
+                                        .outline()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            browse_directory(
+                                                this.dir_input.clone(),
+                                                cx.entity().clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        ),
+                )
+                .child(settings_subgroup("Limits", true, cx))
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Max concurrent", cx))
+                                .child(Input::new(&self.concurrent_input).w_full()),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Auto-retry attempts", cx))
+                                .child(Input::new(&self.retry_input).w_full()),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Speed limit (KiB/s)", cx))
+                                .child(Input::new(&self.speed_input).w_full())
+                                .child(field_hint("0 means unlimited.", cx)),
+                        ),
+                ),
+        )
     }
 
     fn render_settings_system(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -224,211 +201,208 @@ impl DownloadApp {
         let notify_on_fail = self.settings.notify_on_fail;
         let clipboard_watch_enabled = self.settings.clipboard_watch_enabled;
 
-        GroupBox::new()
-            .outline()
-            .title(self.settings_group_title(SettingsCategory::System, cx))
-            .child(
-                v_flex()
-                    .gap_3()
-                    .child(settings_subgroup("Window & startup", false, cx))
-                    .child(settings_choice_row(
-                        "Close to tray",
-                        Some("Hides to the tray instead of quitting."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("close-tray-off")
-                                    .label("Off")
-                                    .when(!close_to_tray, |b| b.primary())
-                                    .when(close_to_tray, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_close_to_tray(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("close-tray-on")
-                                    .label("On")
-                                    .when(close_to_tray, |b| b.primary())
-                                    .when(!close_to_tray, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_close_to_tray(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Launch at startup",
-                        None,
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("startup-off")
-                                    .label("Off")
-                                    .when(!launch_at_startup, |b| b.primary())
-                                    .when(launch_at_startup, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_launch_at_startup(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("startup-on")
-                                    .label("On")
-                                    .when(launch_at_startup, |b| b.primary())
-                                    .when(!launch_at_startup, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_launch_at_startup(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Start minimized",
-                        Some("Opens hidden in the tray when launch at startup is On."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("startup-min-off")
-                                    .label("Off")
-                                    .disabled(!launch_at_startup)
-                                    .when(!startup_minimized || !launch_at_startup, |b| b.primary())
-                                    .when(startup_minimized && launch_at_startup, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_startup_minimized(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("startup-min-on")
-                                    .label("On")
-                                    .disabled(!launch_at_startup)
-                                    .when(startup_minimized && launch_at_startup, |b| b.primary())
-                                    .when(!startup_minimized || !launch_at_startup, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_startup_minimized(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_subgroup("Notifications", true, cx))
-                    .child(settings_choice_row(
-                        "OS notifications",
-                        Some("Uses the tray icon even if Close to tray is Off."),
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(
-                                Button::new("os-notify-off")
-                                    .label(OsNotifyMode::Off.label())
-                                    .when(os_notify_mode == OsNotifyMode::Off, |b| b.primary())
-                                    .when(os_notify_mode != OsNotifyMode::Off, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_os_notify_mode(OsNotifyMode::Off, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("os-notify-when-hidden")
-                                    .label(OsNotifyMode::WhenHiddenToTray.label())
-                                    .when(os_notify_mode == OsNotifyMode::WhenHiddenToTray, |b| {
-                                        b.primary()
-                                    })
-                                    .when(os_notify_mode != OsNotifyMode::WhenHiddenToTray, |b| {
-                                        b.outline()
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_os_notify_mode(
-                                            OsNotifyMode::WhenHiddenToTray,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                Button::new("os-notify-always")
-                                    .label(OsNotifyMode::Always.label())
-                                    .when(os_notify_mode == OsNotifyMode::Always, |b| b.primary())
-                                    .when(os_notify_mode != OsNotifyMode::Always, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_os_notify_mode(OsNotifyMode::Always, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Notify on complete",
-                        None,
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("notify-complete-off")
-                                    .label("Off")
-                                    .when(!notify_on_complete, |b| b.primary())
-                                    .when(notify_on_complete, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_notify_on_complete(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("notify-complete-on")
-                                    .label("On")
-                                    .when(notify_on_complete, |b| b.primary())
-                                    .when(!notify_on_complete, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_notify_on_complete(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Notify on fail",
-                        None,
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("notify-fail-off")
-                                    .label("Off")
-                                    .when(!notify_on_fail, |b| b.primary())
-                                    .when(notify_on_fail, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_notify_on_fail(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("notify-fail-on")
-                                    .label("On")
-                                    .when(notify_on_fail, |b| b.primary())
-                                    .when(!notify_on_fail, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_notify_on_fail(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_subgroup("Clipboard", true, cx))
-                    .child(settings_choice_row(
-                        "Clipboard URL watch",
-                        Some("Offers clipboard HTTP(S) URLs on focus; never auto-downloads."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("clipboard-watch-off")
-                                    .label("Off")
-                                    .when(!clipboard_watch_enabled, |b| b.primary())
-                                    .when(clipboard_watch_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_clipboard_watch_enabled(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("clipboard-watch-on")
-                                    .label("On")
-                                    .when(clipboard_watch_enabled, |b| b.primary())
-                                    .when(!clipboard_watch_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_clipboard_watch_enabled(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    )),
-            )
+        GroupBox::new().outline().child(
+            v_flex()
+                .gap_3()
+                .child(settings_subgroup("Window & startup", false, cx))
+                .child(settings_choice_row(
+                    "Close to tray",
+                    Some("Hides to the tray instead of quitting."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("close-tray-off")
+                                .label("Off")
+                                .when(!close_to_tray, |b| b.primary())
+                                .when(close_to_tray, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_close_to_tray(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("close-tray-on")
+                                .label("On")
+                                .when(close_to_tray, |b| b.primary())
+                                .when(!close_to_tray, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_close_to_tray(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Launch at startup",
+                    None,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("startup-off")
+                                .label("Off")
+                                .when(!launch_at_startup, |b| b.primary())
+                                .when(launch_at_startup, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_launch_at_startup(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("startup-on")
+                                .label("On")
+                                .when(launch_at_startup, |b| b.primary())
+                                .when(!launch_at_startup, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_launch_at_startup(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Start minimized",
+                    Some("Opens hidden in the tray when launch at startup is On."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("startup-min-off")
+                                .label("Off")
+                                .disabled(!launch_at_startup)
+                                .when(!startup_minimized || !launch_at_startup, |b| b.primary())
+                                .when(startup_minimized && launch_at_startup, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_startup_minimized(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("startup-min-on")
+                                .label("On")
+                                .disabled(!launch_at_startup)
+                                .when(startup_minimized && launch_at_startup, |b| b.primary())
+                                .when(!startup_minimized || !launch_at_startup, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_startup_minimized(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_subgroup("Notifications", true, cx))
+                .child(settings_choice_row(
+                    "OS notifications",
+                    Some("Uses the tray icon even if Close to tray is Off."),
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(
+                            Button::new("os-notify-off")
+                                .label(OsNotifyMode::Off.label())
+                                .when(os_notify_mode == OsNotifyMode::Off, |b| b.primary())
+                                .when(os_notify_mode != OsNotifyMode::Off, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_os_notify_mode(OsNotifyMode::Off, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("os-notify-when-hidden")
+                                .label(OsNotifyMode::WhenHiddenToTray.label())
+                                .when(os_notify_mode == OsNotifyMode::WhenHiddenToTray, |b| {
+                                    b.primary()
+                                })
+                                .when(os_notify_mode != OsNotifyMode::WhenHiddenToTray, |b| {
+                                    b.outline()
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_os_notify_mode(
+                                        OsNotifyMode::WhenHiddenToTray,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("os-notify-always")
+                                .label(OsNotifyMode::Always.label())
+                                .when(os_notify_mode == OsNotifyMode::Always, |b| b.primary())
+                                .when(os_notify_mode != OsNotifyMode::Always, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_os_notify_mode(OsNotifyMode::Always, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Notify on complete",
+                    None,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("notify-complete-off")
+                                .label("Off")
+                                .when(!notify_on_complete, |b| b.primary())
+                                .when(notify_on_complete, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_notify_on_complete(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("notify-complete-on")
+                                .label("On")
+                                .when(notify_on_complete, |b| b.primary())
+                                .when(!notify_on_complete, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_notify_on_complete(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Notify on fail",
+                    None,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("notify-fail-off")
+                                .label("Off")
+                                .when(!notify_on_fail, |b| b.primary())
+                                .when(notify_on_fail, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_notify_on_fail(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("notify-fail-on")
+                                .label("On")
+                                .when(notify_on_fail, |b| b.primary())
+                                .when(!notify_on_fail, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_notify_on_fail(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_subgroup("Clipboard", true, cx))
+                .child(settings_choice_row(
+                    "Clipboard URL watch",
+                    Some("Offers clipboard HTTP(S) URLs on focus; never auto-downloads."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("clipboard-watch-off")
+                                .label("Off")
+                                .when(!clipboard_watch_enabled, |b| b.primary())
+                                .when(clipboard_watch_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_clipboard_watch_enabled(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("clipboard-watch-on")
+                                .label("On")
+                                .when(clipboard_watch_enabled, |b| b.primary())
+                                .when(!clipboard_watch_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_clipboard_watch_enabled(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                )),
+        )
     }
 
     fn render_settings_browser(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -439,237 +413,232 @@ impl DownloadApp {
         let show_progress_after_handoff = self.settings.extension.show_progress_after_handoff;
         let capture_debug_logging = self.settings.extension.download_capture_debug_logging;
 
-        GroupBox::new()
-            .outline()
-            .title(self.settings_group_title(SettingsCategory::Browser, cx))
-            .child(
-                v_flex()
-                    .gap_3()
-                    .child(field_hint(
-                        "Saved with Save settings. Synced to the browser extension when connected.",
-                        cx,
-                    ))
-                    .child(settings_subgroup("Capture", false, cx))
-                    .child(settings_choice_row(
-                        "Enable browser capture",
-                        Some("Options below apply only while capture is On."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("ext-enabled-off")
-                                    .label("Off")
-                                    .when(!ext_enabled, |b| b.primary())
-                                    .when(ext_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_extension_enabled(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("ext-enabled-on")
-                                    .label("On")
-                                    .when(ext_enabled, |b| b.primary())
-                                    .when(!ext_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_extension_enabled(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_subgroup("Handoff", true, cx))
-                    .child(settings_choice_row(
-                        "Download handoff",
-                        Some("Off skips; Ask prompts; Auto hands off silently."),
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(
-                                Button::new("handoff-off")
-                                    .label("Off")
-                                    .disabled(!ext_enabled)
-                                    .when(handoff_mode == DownloadHandoffMode::Off, |b| b.primary())
-                                    .when(handoff_mode != DownloadHandoffMode::Off, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_handoff_mode(
-                                            DownloadHandoffMode::Off,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                Button::new("handoff-ask")
-                                    .label("Ask")
-                                    .disabled(!ext_enabled)
-                                    .when(handoff_mode == DownloadHandoffMode::Ask, |b| b.primary())
-                                    .when(handoff_mode != DownloadHandoffMode::Ask, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_handoff_mode(
-                                            DownloadHandoffMode::Ask,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
-                            .child(
-                                Button::new("handoff-auto")
-                                    .label("Auto")
-                                    .disabled(!ext_enabled)
-                                    .when(handoff_mode == DownloadHandoffMode::Auto, |b| {
-                                        b.primary()
-                                    })
-                                    .when(handoff_mode != DownloadHandoffMode::Auto, |b| {
-                                        b.outline()
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_handoff_mode(
-                                            DownloadHandoffMode::Auto,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_subgroup("UI", true, cx))
-                    .child(settings_choice_row(
-                        "Context menu",
-                        None,
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("ext-ctx-off")
-                                    .label("Off")
-                                    .disabled(!ext_enabled)
-                                    .when(!context_menu_enabled, |b| b.primary())
-                                    .when(context_menu_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_context_menu_enabled(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("ext-ctx-on")
-                                    .label("On")
-                                    .disabled(!ext_enabled)
-                                    .when(context_menu_enabled, |b| b.primary())
-                                    .when(!context_menu_enabled, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_context_menu_enabled(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Toolbar badge status",
-                        Some("Connection / activity on the extension toolbar icon."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("ext-badge-off")
-                                    .label("Off")
-                                    .disabled(!ext_enabled)
-                                    .when(!show_badge_status, |b| b.primary())
-                                    .when(show_badge_status, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_show_badge_status(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("ext-badge-on")
-                                    .label("On")
-                                    .disabled(!ext_enabled)
-                                    .when(show_badge_status, |b| b.primary())
-                                    .when(!show_badge_status, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_show_badge_status(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_choice_row(
-                        "Show progress after handoff",
-                        Some("Focus or surface RusticDL after a browser handoff."),
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("ext-progress-off")
-                                    .label("Off")
-                                    .disabled(!ext_enabled)
-                                    .when(!show_progress_after_handoff, |b| b.primary())
-                                    .when(show_progress_after_handoff, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_show_progress_after_handoff(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("ext-progress-on")
-                                    .label("On")
-                                    .disabled(!ext_enabled)
-                                    .when(show_progress_after_handoff, |b| b.primary())
-                                    .when(!show_progress_after_handoff, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_show_progress_after_handoff(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    ))
-                    .child(settings_subgroup("Filters", true, cx))
-                    .child(
-                        v_flex()
-                            .gap_1p5()
-                            .child(settings_field_label("Excluded hosts", cx))
-                            .child(
-                                Input::new(&self.excluded_hosts_input)
-                                    .w_full()
-                                    .disabled(!ext_enabled),
-                            )
-                            .child(field_hint(
-                                "One host per line. Matching sites skip capture.",
-                                cx,
-                            )),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1p5()
-                            .child(settings_field_label("Captured file extensions", cx))
-                            .child(
-                                Input::new(&self.captured_extensions_input)
-                                    .w_full()
-                                    .disabled(!ext_enabled),
-                            )
-                            .child(field_hint(
-                                "Comma-separated extensions to intercept (e.g. zip, pdf, exe).",
-                                cx,
-                            )),
-                    )
-                    .child(settings_subgroup("Diagnostics", true, cx))
-                    .child(settings_choice_row(
-                        "Capture debug logging",
-                        None,
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("ext-debug-off")
-                                    .label("Off")
-                                    .disabled(!ext_enabled)
-                                    .when(!capture_debug_logging, |b| b.primary())
-                                    .when(capture_debug_logging, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_capture_debug_logging(false, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("ext-debug-on")
-                                    .label("On")
-                                    .disabled(!ext_enabled)
-                                    .when(capture_debug_logging, |b| b.primary())
-                                    .when(!capture_debug_logging, |b| b.outline())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_download_capture_debug_logging(true, window, cx);
-                                    })),
-                            ),
-                        cx,
-                    )),
-            )
+        GroupBox::new().outline().child(
+            v_flex()
+                .gap_3()
+                .child(field_hint(
+                    "Saved with Save settings. Synced to the browser extension when connected.",
+                    cx,
+                ))
+                .child(settings_subgroup("Capture", false, cx))
+                .child(settings_choice_row(
+                    "Enable browser capture",
+                    Some("Options below apply only while capture is On."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ext-enabled-off")
+                                .label("Off")
+                                .when(!ext_enabled, |b| b.primary())
+                                .when(ext_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_extension_enabled(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ext-enabled-on")
+                                .label("On")
+                                .when(ext_enabled, |b| b.primary())
+                                .when(!ext_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_extension_enabled(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_subgroup("Handoff", true, cx))
+                .child(settings_choice_row(
+                    "Download handoff",
+                    Some("Off skips; Ask prompts; Auto hands off silently."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("handoff-off")
+                                .label("Off")
+                                .min_w(px(72.))
+                                .disabled(!ext_enabled)
+                                .when(handoff_mode == DownloadHandoffMode::Off, |b| b.primary())
+                                .when(handoff_mode != DownloadHandoffMode::Off, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_download_handoff_mode(
+                                        DownloadHandoffMode::Off,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("handoff-ask")
+                                .label("Ask")
+                                .min_w(px(72.))
+                                .disabled(!ext_enabled)
+                                .when(handoff_mode == DownloadHandoffMode::Ask, |b| b.primary())
+                                .when(handoff_mode != DownloadHandoffMode::Ask, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_download_handoff_mode(
+                                        DownloadHandoffMode::Ask,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("handoff-auto")
+                                .label("Auto")
+                                .min_w(px(72.))
+                                .disabled(!ext_enabled)
+                                .when(handoff_mode == DownloadHandoffMode::Auto, |b| b.primary())
+                                .when(handoff_mode != DownloadHandoffMode::Auto, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_download_handoff_mode(
+                                        DownloadHandoffMode::Auto,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_subgroup("UI", true, cx))
+                .child(settings_choice_row(
+                    "Context menu",
+                    None,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ext-ctx-off")
+                                .label("Off")
+                                .disabled(!ext_enabled)
+                                .when(!context_menu_enabled, |b| b.primary())
+                                .when(context_menu_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_context_menu_enabled(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ext-ctx-on")
+                                .label("On")
+                                .disabled(!ext_enabled)
+                                .when(context_menu_enabled, |b| b.primary())
+                                .when(!context_menu_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_context_menu_enabled(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Toolbar badge status",
+                    Some("Connection / activity on the extension toolbar icon."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ext-badge-off")
+                                .label("Off")
+                                .disabled(!ext_enabled)
+                                .when(!show_badge_status, |b| b.primary())
+                                .when(show_badge_status, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_show_badge_status(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ext-badge-on")
+                                .label("On")
+                                .disabled(!ext_enabled)
+                                .when(show_badge_status, |b| b.primary())
+                                .when(!show_badge_status, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_show_badge_status(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Show progress after handoff",
+                    Some("Focus or surface RusticDL after a browser handoff."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ext-progress-off")
+                                .label("Off")
+                                .disabled(!ext_enabled)
+                                .when(!show_progress_after_handoff, |b| b.primary())
+                                .when(show_progress_after_handoff, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_show_progress_after_handoff(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ext-progress-on")
+                                .label("On")
+                                .disabled(!ext_enabled)
+                                .when(show_progress_after_handoff, |b| b.primary())
+                                .when(!show_progress_after_handoff, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_show_progress_after_handoff(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_subgroup("Filters", true, cx))
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(settings_field_label("Excluded hosts", cx))
+                        .child(
+                            Input::new(&self.excluded_hosts_input)
+                                .w_full()
+                                .disabled(!ext_enabled),
+                        )
+                        .child(field_hint(
+                            "One host per line. Matching sites skip capture.",
+                            cx,
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(settings_field_label("Captured file extensions", cx))
+                        .child(
+                            Input::new(&self.captured_extensions_input)
+                                .w_full()
+                                .disabled(!ext_enabled),
+                        )
+                        .child(field_hint(
+                            "Comma-separated extensions to intercept (e.g. zip, pdf, exe).",
+                            cx,
+                        )),
+                )
+                .child(settings_subgroup("Diagnostics", true, cx))
+                .child(settings_choice_row(
+                    "Capture debug logging",
+                    None,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("ext-debug-off")
+                                .label("Off")
+                                .disabled(!ext_enabled)
+                                .when(!capture_debug_logging, |b| b.primary())
+                                .when(capture_debug_logging, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_download_capture_debug_logging(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ext-debug-on")
+                                .label("On")
+                                .disabled(!ext_enabled)
+                                .when(capture_debug_logging, |b| b.primary())
+                                .when(!capture_debug_logging, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_download_capture_debug_logging(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                )),
+        )
     }
 
     fn render_settings_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -703,7 +672,6 @@ impl DownloadApp {
 
         GroupBox::new()
             .outline()
-            .title(self.settings_group_title(SettingsCategory::Appearance, cx))
             .child(
                 v_flex()
                     .gap_3()
@@ -714,11 +682,11 @@ impl DownloadApp {
                         mode_hint,
                         h_flex()
                             .gap_2()
-                            .flex_wrap()
                             .child(
                                 Button::new("theme-light")
                                     .icon(IconName::Sun)
                                     .label("Light")
+                                    .min_w(px(100.))
                                     .when(theme_choice == AppTheme::Light, |b| b.primary())
                                     .when(theme_choice != AppTheme::Light, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -729,6 +697,7 @@ impl DownloadApp {
                                 Button::new("theme-dark")
                                     .icon(IconName::Moon)
                                     .label("Dark")
+                                    .min_w(px(100.))
                                     .when(theme_choice == AppTheme::Dark, |b| b.primary())
                                     .when(theme_choice != AppTheme::Dark, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -739,6 +708,7 @@ impl DownloadApp {
                                 Button::new("theme-system")
                                     .icon(IconName::Settings)
                                     .label("System")
+                                    .min_w(px(100.))
                                     .when(theme_choice == AppTheme::System, |b| b.primary())
                                     .when(theme_choice != AppTheme::System, |b| b.outline())
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -999,38 +969,38 @@ impl DownloadApp {
                     .child(settings_choice_row(
                         "UI density",
                         Some("Compact tightens rows, sidebar, and settings padding."),
-                        h_flex().gap_2().flex_wrap().children(UiDensity::ALL.into_iter().map(
-                            |d| {
-                                let selected = ui_density == d;
-                                Button::new(SharedString::from(format!("density-{}", d.label())))
-                                    .label(d.label())
-                                    .when(selected, |b| b.primary())
-                                    .when(!selected, |b| b.outline())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.set_ui_density(d, window, cx);
-                                    }))
-                            },
-                        )),
+                        h_flex().gap_2().children(UiDensity::ALL.into_iter().map(|d| {
+                            let selected = ui_density == d;
+                            Button::new(SharedString::from(format!("density-{}", d.label())))
+                                .label(d.label())
+                                .min_w(px(108.))
+                                .when(selected, |b| b.primary())
+                                .when(!selected, |b| b.outline())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_ui_density(d, window, cx);
+                                }))
+                        })),
                         cx,
                     ))
                     .child(settings_choice_row(
                         "Corner radius",
                         None,
-                        h_flex().gap_2().flex_wrap().children(
-                            CornerRadiusScale::ALL.into_iter().map(|scale| {
+                        h_flex().gap_2().children(CornerRadiusScale::ALL.into_iter().map(
+                            |scale| {
                                 let selected = corner_radius == scale;
                                 Button::new(SharedString::from(format!(
                                     "radius-{}",
                                     scale.label()
                                 )))
                                 .label(scale.label())
+                                .min_w(px(88.))
                                 .when(selected, |b| b.primary())
                                 .when(!selected, |b| b.outline())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.set_corner_radius(scale, window, cx);
                                 }))
-                            }),
-                        ),
+                            },
+                        )),
                         cx,
                     ))
                     .child(settings_choice_row(
@@ -1063,21 +1033,20 @@ impl DownloadApp {
                     .child(settings_choice_row(
                         "Progress style",
                         None,
-                        h_flex().gap_2().flex_wrap().children(
-                            ProgressStyle::ALL.into_iter().map(|style| {
-                                let selected = progress_style == style;
-                                Button::new(SharedString::from(format!(
-                                    "progress-{}",
-                                    style.label()
-                                )))
-                                .label(style.label())
-                                .when(selected, |b| b.primary())
-                                .when(!selected, |b| b.outline())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.set_progress_style(style, window, cx);
-                                }))
-                            }),
-                        ),
+                        h_flex().gap_2().children(ProgressStyle::ALL.into_iter().map(|style| {
+                            let selected = progress_style == style;
+                            Button::new(SharedString::from(format!(
+                                "progress-{}",
+                                style.label()
+                            )))
+                            .label(style.label())
+                            .min_w(px(80.))
+                            .when(selected, |b| b.primary())
+                            .when(!selected, |b| b.outline())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_progress_style(style, window, cx);
+                            }))
+                        })),
                         cx,
                     ))
                     // Section-local reset (kept one-click; draft-only until Save)
@@ -1102,50 +1071,46 @@ impl DownloadApp {
         let theme = cx.theme().clone();
         let data_dir = self.paths.root.display().to_string();
 
-        GroupBox::new()
-            .outline()
-            .title(self.settings_group_title(SettingsCategory::Data, cx))
-            .child(
-                v_flex()
-                    .gap_3()
-                    .child(settings_subgroup("App data", false, cx))
-                    .child(
-                        v_flex()
-                            .gap_1p5()
-                            .child(settings_field_label("App data directory", cx))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_x_hidden()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(data_dir.clone()),
-                                    )
-                                    .child(
-                                        Clipboard::new("copy-data-dir")
-                                            .value(SharedString::from(data_dir)),
-                                    )
-                                    .child(
-                                        Button::new("open-data-dir")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::FolderOpen)
-                                            .label("Open")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Err(msg) = reveal_in_folder(&this.paths.root)
-                                                {
-                                                    this.show_toast(msg, cx);
-                                                }
-                                            })),
-                                    ),
-                            )
-                            .child(field_hint("settings.json and state.json live here.", cx)),
-                    ),
-            )
+        GroupBox::new().outline().child(
+            v_flex()
+                .gap_3()
+                .child(settings_subgroup("App data", false, cx))
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(settings_field_label("App data directory", cx))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_x_hidden()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(data_dir.clone()),
+                                )
+                                .child(
+                                    Clipboard::new("copy-data-dir")
+                                        .value(SharedString::from(data_dir)),
+                                )
+                                .child(
+                                    Button::new("open-data-dir")
+                                        .outline()
+                                        .small()
+                                        .icon(IconName::FolderOpen)
+                                        .label("Open")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Err(msg) = reveal_in_folder(&this.paths.root) {
+                                                this.show_toast(msg, cx);
+                                            }
+                                        })),
+                                ),
+                        )
+                        .child(field_hint("settings.json and state.json live here.", cx)),
+                ),
+        )
     }
 }

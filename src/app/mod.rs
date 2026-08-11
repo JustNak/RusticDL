@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     canvas, div, point, prelude::FluentBuilder, px, size, App, AppContext, Bounds, Context,
-    Corners, ElementId, Entity, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, NavigationDirection, ParentElement, Render, SharedString, Styled, Window,
-    WindowBounds,
+    Corners, ElementId, Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    KeystrokeEvent, MouseButton, MouseDownEvent, NavigationDirection, ParentElement, Render,
+    SharedString, Styled, Window, WindowBounds,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -302,6 +302,24 @@ impl DownloadApp {
         .detach();
 
         apply_appearance(&settings, Some(window), cx);
+
+        // Escape must run *before* widget keybindings (Input binds Escape).
+        // Root `capture_key_down` only runs after actions, so Esc was swallowed
+        // while mouse-back (separate path) still left Settings correctly.
+        let escape_view = cx.weak_entity();
+        cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
+            if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.modified() {
+                return;
+            }
+            let Some(entity) = escape_view.upgrade() else {
+                return;
+            };
+            let handled = entity.update(cx, |app, cx| app.handle_escape_keystroke(window, cx));
+            if handled {
+                cx.stop_propagation();
+            }
+        })
+        .detach();
 
         // Persist size / position / maximized across launches.
         cx.observe_window_bounds(window, |this, window, _cx| {
@@ -1416,6 +1434,36 @@ impl DownloadApp {
             other => other,
         };
         self.select_filter(dest, window, cx);
+    }
+
+    /// Escape owner (keystroke interceptor): dialogs → leave Settings → clear selection.
+    /// Returns true when the keystroke was handled (caller stops propagation).
+    ///
+    /// Runs before Input/dialog keybindings so Settings Esc matches mouse-back.
+    /// Leaves search-field `clean_on_escape` alone when not in Settings.
+    pub(crate) fn handle_escape_keystroke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+            return true;
+        }
+        if self.filter == FilterKind::Settings {
+            self.leave_settings(window, cx);
+            return true;
+        }
+        // Queue search clears on Escape via InputState::clean_on_escape.
+        if self.search_input.focus_handle(cx).is_focused(window) {
+            return false;
+        }
+        if !self.selected_ids.is_empty() {
+            self.clear_selection();
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     /// Detail panel job: only when exactly one id is selected.
