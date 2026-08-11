@@ -7,6 +7,7 @@ mod job_row;
 mod layout;
 mod queue_view;
 mod selection;
+mod settings_category;
 mod settings_panel;
 mod shortcuts;
 mod sidebar;
@@ -17,7 +18,7 @@ mod update_flow;
 mod widgets;
 
 pub use filter::FilterKind;
-pub(crate) use settings_panel::SettingsCategory;
+pub(crate) use settings_category::SettingsCategory;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

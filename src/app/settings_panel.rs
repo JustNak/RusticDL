@@ -15,6 +15,7 @@ use gpui_component::{
     v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
 };
 
+use super::settings_category::SettingsCategory;
 use super::widgets::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, browse_directory,
     field_hint, field_label, settings_nav_item, styled_progress,
@@ -27,61 +28,12 @@ use crate::settings::{
     AccentPreset, AppTheme, CornerRadiusScale, OsNotifyMode, ProgressStyle, UiDensity,
 };
 
-/// Settings mini-nav categories. Switching does not discard the draft.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum SettingsCategory {
-    #[default]
-    General,
-    System,
-    Browser,
-    Appearance,
-    Data,
-}
-
-impl SettingsCategory {
-    pub(crate) const ALL: [Self; 5] = [
-        Self::General,
-        Self::System,
-        Self::Browser,
-        Self::Appearance,
-        Self::Data,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::General => "General",
-            Self::System => "System",
-            Self::Browser => "Browser",
-            Self::Appearance => "Appearance",
-            Self::Data => "Data",
-        }
-    }
-
-    pub(crate) fn icon(self) -> IconName {
-        match self {
-            Self::General => IconName::Folder,
-            Self::System => IconName::Settings,
-            Self::Browser => IconName::ExternalLink,
-            Self::Appearance => IconName::Palette,
-            Self::Data => IconName::File,
-        }
-    }
-
-    /// GroupBox title (Browser keeps the longer “Browser capture” name).
-    fn panel_title(self) -> &'static str {
-        match self {
-            Self::Browser => "Browser capture",
-            other => other.label(),
-        }
-    }
-}
-
 impl DownloadApp {
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings_pad = self.settings.ui_density.settings_pad();
         let category = self.settings_category;
-        // Mini-nav ~148–168px; slightly tighter in Compact density.
+        // Mini-nav 148–160px; slightly tighter in Compact density.
         let nav_w = match self.settings.ui_density {
             UiDensity::Comfortable => 160.0,
             UiDensity::Compact => 148.0,
@@ -113,7 +65,12 @@ impl DownloadApp {
                     )
                     .child(
                         div()
-                            .id("settings-content-scroll")
+                            // Key id by category so GPUI does not reuse scroll offset
+                            // when switching from a tall panel (Appearance) to a short one.
+                            .id(SharedString::from(format!(
+                                "settings-content-scroll-{}",
+                                category.label()
+                            )))
                             .flex_1()
                             .min_w_0()
                             .h_full()

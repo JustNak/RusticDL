@@ -13,7 +13,7 @@ use super::filter::FilterKind;
 use super::layout::{
     QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, STATUS_DOT,
 };
-use super::settings_panel::SettingsCategory;
+use super::settings_category::SettingsCategory;
 use super::DownloadApp;
 use crate::settings::{AccentPreset, ProgressStyle, SortColumn, SortDirection};
 
