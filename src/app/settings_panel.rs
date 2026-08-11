@@ -59,9 +59,11 @@ impl DownloadApp {
                             .border_color(theme.sidebar_border)
                             .p_2()
                             .gap_0p5()
-                            .children(SettingsCategory::ALL.into_iter().map(|cat| {
-                                settings_nav_item(cat, category == cat, cx)
-                            })),
+                            .children(
+                                SettingsCategory::ALL
+                                    .into_iter()
+                                    .map(|cat| settings_nav_item(cat, category == cat, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -1302,8 +1304,7 @@ impl DownloadApp {
                                     .child(data_dir.clone()),
                             )
                             .child(
-                                Clipboard::new("copy-data-dir")
-                                    .value(SharedString::from(data_dir)),
+                                Clipboard::new("copy-data-dir").value(SharedString::from(data_dir)),
                             )
                             .child(
                                 Button::new("open-data-dir")
