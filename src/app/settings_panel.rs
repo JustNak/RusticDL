@@ -956,8 +956,9 @@ impl DownloadApp {
                             )
                             .child(Slider::new(&self.opacity_slider).horizontal().w_full())
                             // One glass-interaction note for the whole sub-group
+                            // (blur constraint kept here so Backdrop blur can stay hint-free).
                             .child(field_hint(
-                                "0% solid. Higher values glass the window; blur softens the backdrop.",
+                                "0% solid. Higher values glass the window; blur softens the backdrop when transparent.",
                                 cx,
                             )),
                     )
