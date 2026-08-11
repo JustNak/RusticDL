@@ -295,40 +295,158 @@ pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
         std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
     let pid = std::process::id();
 
-    let mut cmd = std::process::Command::new(&updater);
-    cmd.arg("--app-exe")
-        .arg(&app_exe)
-        .arg("--download-url")
-        .arg(&opts.download_url)
-        .arg("--wait-pid")
-        .arg(pid.to_string())
-        .arg("--from-version")
-        .arg(&opts.from_version)
-        .arg("--to-version")
-        .arg(&opts.to_version)
-        .arg("--release-page")
-        .arg(&opts.release_page);
+    let mut args: Vec<String> = vec![
+        "--app-exe".into(),
+        app_exe.to_string_lossy().into_owned(),
+        "--download-url".into(),
+        opts.download_url.clone(),
+        "--wait-pid".into(),
+        pid.to_string(),
+        "--from-version".into(),
+        opts.from_version.clone(),
+        "--to-version".into(),
+        opts.to_version.clone(),
+        "--release-page".into(),
+        opts.release_page.clone(),
+    ];
     if let Some(size) = opts.setup_size {
-        cmd.arg("--expected-size").arg(size.to_string());
+        args.push("--expected-size".into());
+        args.push(size.to_string());
     }
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS so the updater outlives us when we quit for the update.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-            .map_err(|e| format!("Could not start {UPDATER_NAME}: {e}"))?;
-        Ok(())
+        spawn_detached_windows(&updater, &args)
+            .map_err(|e| format!("Could not start {UPDATER_NAME}: {e}"))
     }
     #[cfg(not(windows))]
     {
+        let mut cmd = std::process::Command::new(&updater);
+        cmd.args(&args);
         cmd.spawn()
             .map_err(|e| format!("Could not start {UPDATER_NAME}: {e}"))?;
         Ok(())
     }
+}
+
+/// Detached spawn that survives app quit, with UAC-safe fallback.
+///
+/// `CreateProcess` cannot elevate. If the target still needs elevation (missing
+/// asInvoker manifest, AppCompat "Run as administrator", etc.), Windows returns
+/// ERROR_ELEVATION_REQUIRED (740). Retry via `ShellExecuteEx`, which can show UAC.
+#[cfg(windows)]
+fn spawn_detached_windows(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    // DETACHED_PROCESS: outlive the parent when it quits for the update.
+    // CREATE_NEW_PROCESS_GROUP: independent console/signal group.
+    // CREATE_BREAKAWAY_FROM_JOB: leave the parent's job so KILL_ON_JOB_CLOSE
+    // does not tear the updater down when the main app exits (best-effort; the
+    // job must allow breakaway).
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const ERROR_ELEVATION_REQUIRED: i32 = 740;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    match cmd
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) => {
+            // Fall back without breakaway first (some jobs disallow it), then ShellExecute.
+            let mut retry = std::process::Command::new(exe);
+            retry.args(args);
+            match retry
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+            {
+                Ok(_) => Ok(()),
+                Err(e2) if e2.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) => {
+                    shell_execute_detached(exe, args)
+                }
+                Err(e2) => Err(e2.to_string()),
+            }
+        }
+        Err(e) => {
+            // Some restricted jobs reject CREATE_BREAKAWAY_FROM_JOB.
+            let mut retry = std::process::Command::new(exe);
+            retry.args(args);
+            match retry
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+            {
+                Ok(_) => Ok(()),
+                Err(e2) if e2.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) => {
+                    shell_execute_detached(exe, args)
+                }
+                Err(e2) => Err(format!("{e}; retry: {e2}")),
+            }
+        }
+    }
+}
+
+/// Launch via ShellExecuteEx so Windows can prompt for elevation when required.
+#[cfg(windows)]
+fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let file = wide(exe.as_os_str());
+    let params = {
+        let mut joined = String::new();
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                joined.push(' ');
+            }
+            // Quote args with spaces; updater paths/URLs are already simple.
+            if arg.chars().any(|c| c.is_whitespace()) {
+                joined.push('"');
+                joined.push_str(&arg.replace('"', "\\\""));
+                joined.push('"');
+            } else {
+                joined.push_str(arg);
+            }
+        }
+        wide(std::ffi::OsStr::new(&joined))
+    };
+
+    // Verb left null → "open". If the PE still requires elevation, Windows shows UAC.
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0 as i32,
+        ..Default::default()
+    };
+
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok.is_err() {
+        let err = std::io::Error::last_os_error();
+        return Err(format!(
+            "{err}\n\nIf Windows asks for Administrator permission, accept the prompt, or reinstall RusticDL with the latest setup."
+        ));
+    }
+
+    // Detach immediately — do not wait for the update to finish.
+    if !info.hProcess.is_invalid() {
+        unsafe {
+            let _ = CloseHandle(info.hProcess);
+        }
+    }
+    Ok(())
 }
 
 fn github_client() -> Result<reqwest::Client, String> {

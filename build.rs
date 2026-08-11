@@ -1,4 +1,8 @@
 //! Embed Windows version resources so Task Manager / Explorer show "RusticDL".
+//!
+//! UAC / DPI manifests for the main app come from GPUI (`windows-manifest`).
+//! The dedicated updater embeds its own asInvoker manifest — see
+//! `apps/updater/build.rs` and `assets/windows/app.manifest`.
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
