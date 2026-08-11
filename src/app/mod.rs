@@ -306,6 +306,10 @@ impl DownloadApp {
         // Escape must run *before* widget keybindings (Input binds Escape).
         // Root `capture_key_down` only runs after actions, so Esc was swallowed
         // while mouse-back (separate path) still left Settings correctly.
+        //
+        // `intercept_keystrokes` is app-global (every window). Scope to the main
+        // DownloadApp window so Esc in BrowserPromptWindow does not leave
+        // Settings / clear selection or stop propagation for the prompt.
         let escape_view = cx.weak_entity();
         cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
             if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.modified() {
@@ -314,7 +318,13 @@ impl DownloadApp {
             let Some(entity) = escape_view.upgrade() else {
                 return;
             };
-            let handled = entity.update(cx, |app, cx| app.handle_escape_keystroke(window, cx));
+            let handled = entity.update(cx, |app, cx| {
+                let event_hwnd = main_window_hwnd(window);
+                if app.main_hwnd != 0 && event_hwnd != 0 && event_hwnd != app.main_hwnd {
+                    return false;
+                }
+                app.handle_escape_keystroke(window, cx)
+            });
             if handled {
                 cx.stop_propagation();
             }
@@ -1561,7 +1571,9 @@ impl Render for DownloadApp {
             .size_full()
             .relative()
             .bg(theme.background)
-            // Global shortcuts (capture): Escape always; others when no text focus / dialog.
+            // Global shortcuts (capture phase): non-Escape bindings when no text
+            // focus / dialog. Escape is owned by `intercept_keystrokes` →
+            // `handle_escape_keystroke` (must run before Input keybindings).
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
