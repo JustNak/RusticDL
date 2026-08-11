@@ -44,36 +44,6 @@ impl FilterKind {
         }
     }
 
-    pub(crate) fn empty_title(self) -> &'static str {
-        match self {
-            Self::All => "No downloads yet",
-            Self::Active => "No active downloads",
-            Self::Completed => "No completed downloads",
-            Self::Failed => "No failed downloads",
-            Self::Settings => "Settings",
-        }
-    }
-
-    pub(crate) fn empty_body(self) -> &'static str {
-        match self {
-            Self::All => "Paste an HTTP or HTTPS link to start a transfer.",
-            Self::Active => "Queued and in-progress jobs will show up here.",
-            Self::Completed => "Finished files will appear in this list.",
-            Self::Failed => "Failed or canceled jobs will appear here for retry.",
-            Self::Settings => "",
-        }
-    }
-
-    pub(crate) fn empty_icon(self) -> IconName {
-        match self {
-            Self::All => IconName::Inbox,
-            Self::Active => IconName::LoaderCircle,
-            Self::Completed => IconName::CircleCheck,
-            Self::Failed => IconName::TriangleAlert,
-            Self::Settings => IconName::Settings,
-        }
-    }
-
     pub(crate) fn nav_icon(self) -> IconName {
         match self {
             Self::All => IconName::Inbox,

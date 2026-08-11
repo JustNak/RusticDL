@@ -20,7 +20,6 @@ use gpui_component::{
 
 use super::add_dialog::enqueue_urls;
 use super::detail::render_detail;
-use super::filter::FilterKind;
 use super::job_row::render_job_row;
 use super::layout::{
     QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, DETAIL_MAX_H,
@@ -583,10 +582,6 @@ impl DownloadApp {
 
     pub(crate) fn render_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let filter = self.filter;
-        let show_cta = matches!(filter, FilterKind::All | FilterKind::Active);
-        let reduce_motion = self.settings.reduce_motion;
-        let accent = theme.primary;
 
         // Same ExternalPaths drop path as #queue-scroll; empty area must also accept drops.
         div()
@@ -601,79 +596,24 @@ impl DownloadApp {
                 this.handle_external_paths_drop(paths, cx);
             }))
             .child(
+                // Content cluster: label above a large empty-box SVG, centered as a unit.
                 v_flex()
-                    .w(px(420.))
-                    .p_8()
-                    .gap_3()
                     .items_center()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.border.opacity(0.4))
-                    .bg(theme.secondary.opacity(0.28))
-                    // Soft accent wash behind the card content.
-                    .child(
-                        div().relative().mb_1().child(
-                            // Outer decorative ring
-                            div()
-                                .w(px(88.))
-                                .h(px(88.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(accent.opacity(if reduce_motion {
-                                    0.12
-                                } else {
-                                    0.22
-                                }))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .w(px(64.))
-                                        .h(px(64.))
-                                        .rounded_full()
-                                        .bg(accent.opacity(0.12))
-                                        .border_1()
-                                        .border_color(accent.opacity(0.2))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::new(filter.empty_icon())
-                                                .with_size(px(28.))
-                                                .text_color(accent.opacity(0.95)),
-                                        ),
-                                ),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_bold()
-                            .text_color(theme.foreground)
-                            .child(filter.empty_title()),
-                    )
+                    .justify_center()
+                    .gap_3()
                     .child(
                         div()
                             .text_sm()
-                            .text_center()
+                            .font_semibold()
                             .text_color(theme.muted_foreground)
-                            .max_w(px(300.))
-                            .child(filter.empty_body()),
+                            .child("Empty"),
                     )
-                    .when(show_cta, |el| {
-                        el.child(
-                            div().pt_1().child(
-                                Button::new("empty-add")
-                                    .primary()
-                                    .icon(IconName::Plus)
-                                    .label("Add download")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_add_dialog(window, cx);
-                                    })),
-                            ),
-                        )
-                    }),
+                    .child(
+                        Icon::empty()
+                            .path("icons/empty-box.svg")
+                            .with_size(px(96.))
+                            .text_color(theme.muted_foreground.opacity(0.55)),
+                    ),
             )
     }
 }

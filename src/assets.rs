@@ -105,6 +105,7 @@ mod tests {
             "icons/circle-x.svg",
             "icons/settings.svg",
             "icons/plus.svg",
+            "icons/empty-box.svg",
         ] {
             let bytes = Assets::load_embedded(path)
                 .unwrap_or_else(|| panic!("missing embedded asset: {path}"));
