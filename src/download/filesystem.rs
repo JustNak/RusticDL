@@ -392,12 +392,28 @@ pub fn allocate_unique_download_paths(
     (name, target, temp)
 }
 
-pub fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+/// Parse `Content-Range: bytes START-END/TOTAL`.
+///
+/// `TOTAL` may be `*` (unknown length) → third field is `None`.
+/// Unsatisfied forms (`bytes */1234`) and non-`bytes` units return `None`.
+pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let value = value.trim();
     let range_and_total = value.strip_prefix("bytes ")?;
     let (range, total) = range_and_total.split_once('/')?;
+    // 416 unsatisfied-range form: `bytes */TOTAL` — no start/end to resume from.
+    if range.trim() == "*" {
+        return None;
+    }
     let (start, end) = range.split_once('-')?;
-    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+    let start = start.trim().parse().ok()?;
+    let end = end.trim().parse().ok()?;
+    let total = total.trim();
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse().ok()?)
+    };
+    Some((start, end, total))
 }
 
 #[cfg(test)]
@@ -506,7 +522,27 @@ mod tests {
     #[test]
     fn parses_content_range_header() {
         let (start, end, total) = parse_content_range("bytes 100-199/1000").unwrap();
-        assert_eq!((start, end, total), (100, 199, 1000));
+        assert_eq!((start, end, total), (100, 199, Some(1000)));
+    }
+
+    #[test]
+    fn parses_content_range_star_total() {
+        // CDN probe / open-ended: `bytes 0-0/*`
+        let (start, end, total) = parse_content_range("bytes 0-0/*").unwrap();
+        assert_eq!((start, end, total), (0, 0, None));
+
+        let (start, end, total) = parse_content_range("bytes 500-999/*").unwrap();
+        assert_eq!((start, end, total), (500, 999, None));
+    }
+
+    #[test]
+    fn parse_content_range_rejects_unsatisfied_and_garbage() {
+        assert!(parse_content_range("bytes */1000").is_none());
+        assert!(parse_content_range("bytes */*").is_none());
+        assert!(parse_content_range("items 0-1/2").is_none());
+        assert!(parse_content_range("bytes abc-def/10").is_none());
+        assert!(parse_content_range("bytes 0-1/nope").is_none());
+        assert!(parse_content_range("").is_none());
     }
 
     #[test]

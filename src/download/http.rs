@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use reqwest::header::{
-    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
-    REFERER,
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, IF_RANGE,
+    LAST_MODIFIED, RANGE, REFERER,
 };
 use reqwest::{Client, StatusCode, Version};
 use std::error::Error as StdError;
@@ -203,6 +203,7 @@ pub async fn run_http_download(
         &job.url,
         &current_url,
         existing_bytes,
+        &job.validators,
         &control,
         handoff_auth,
     )
@@ -214,8 +215,8 @@ pub async fn run_http_download(
     }
 
     let status = response.status();
+    // 416 Range Not Satisfiable — non-retryable without Restart.
     if status == StatusCode::RANGE_NOT_SATISFIABLE && existing_bytes > 0 {
-        // Partial already complete or invalid; try without range if file is full.
         return Err(download_error(
             FailureCategory::Resume,
             format!(
@@ -250,30 +251,46 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
 
+    // 200 with partial on disk: full replace (Range ignored or If-Range entity changed).
+    let mut full_replace = false;
     if existing_bytes > 0 && status != StatusCode::PARTIAL_CONTENT {
-        // Server ignored Range and sent full body — restart from zero.
         existing_bytes = 0;
+        full_replace = true;
         let _ = tokio::fs::remove_file(&job.temp_path).await;
     }
 
+    // Parse Content-Range once (206 resume + optional * total).
+    let parsed_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range);
+
+    // 206: Content-Range start must match expected offset.
     if existing_bytes > 0 {
-        if let Some(content_range) = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Some((start, _end, _total)) = parse_content_range(content_range) {
-                if start != existing_bytes {
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        format!(
-                            "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
-                        ),
-                        false,
-                    ));
-                }
+        if let Some((start, _end, _total)) = parsed_range {
+            if start != existing_bytes {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    format!(
+                        "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
+                    ),
+                    false,
+                ));
             }
         }
+    }
+
+    // Numeric Content-Range total vs stored expected_size (ignore * totals).
+    let range_total = parsed_range.and_then(|(_s, _e, total)| total);
+    if let Some((total, expected)) =
+        content_range_size_mismatch(range_total, job.validators.expected_size)
+    {
+        return Err(download_error(
+            FailureCategory::Resume,
+            format!("Remote size changed ({total} bytes vs expected {expected}). Use Restart."),
+            false,
+        ));
     }
 
     let mut total_bytes = response
@@ -287,18 +304,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         })
         .unwrap_or(0);
 
-    if let Some(content_range) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some((_start, _end, total)) = parse_content_range(content_range) {
-            total_bytes = total;
-        }
+    // Prefer numeric Content-Range total when present; `*` leaves content-length math.
+    if let Some((_start, _end, Some(total))) = parsed_range {
+        total_bytes = total;
     }
 
     // Empty capture → None so apply leaves stored validators alone (CDN 206 without
-    // identity headers). Non-empty Some is field-wise merged on apply (never wipes).
+    // identity headers but size matches → continue). Non-empty Some is field-wise merged.
     let validators = content_validators_patch(response.headers(), total_bytes);
 
     let mut target_path = job.target_path.clone();
@@ -337,7 +349,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
-    on_progress(ProgressUpdate::starting_tick(
+    let mut starting = ProgressUpdate::starting_tick(
         existing_bytes,
         total_bytes,
         Some(filename.clone()),
@@ -345,7 +357,12 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         Some(temp_path.clone()),
         Some(resume_supported),
         validators,
-    ));
+    );
+    // Full replace after 200-on-partial: drop multi-map version (map lands PR 8).
+    if full_replace && job.transfer_format_version != 0 {
+        starting.transfer_format_version = Some(0);
+    }
+    on_progress(starting);
 
     ensure_parent_directory(&temp_path)
         .await
@@ -521,6 +538,7 @@ async fn fetch_with_redirects(
     job_url: &str,
     url: &str,
     existing_bytes: u64,
+    validators: &ContentValidators,
     control: &AtomicU8,
     handoff_auth: Option<&HandoffAuth>,
 ) -> Result<(reqwest::Response, String), DownloadError> {
@@ -540,8 +558,15 @@ async fn fetch_with_redirects(
             ));
         }
 
-        let response =
-            send_download_request(client, job_url, &current, existing_bytes, handoff_auth).await?;
+        let response = send_download_request(
+            client,
+            job_url,
+            &current,
+            existing_bytes,
+            validators,
+            handoff_auth,
+        )
+        .await?;
 
         if response.status().is_redirection() {
             let location = response
@@ -594,12 +619,13 @@ async fn fetch_with_redirects(
     }
 }
 
-/// Build a GET for the download transfer (identity encoding, optional Range, browser-like Referer).
+/// Build a GET for the download transfer (identity encoding, optional Range/If-Range, Referer).
 fn build_download_request(
     client: &Client,
     job_url: &str,
     url: &str,
     existing_bytes: u64,
+    validators: &ContentValidators,
     handoff_auth: Option<&HandoffAuth>,
 ) -> reqwest::RequestBuilder {
     let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
@@ -630,6 +656,12 @@ fn build_download_request(
 
     if existing_bytes > 0 {
         request = request.header(RANGE, format!("bytes={existing_bytes}-"));
+        // Strong ETag preferred; weak → Last-Modified; else bare Range (no If-Range).
+        if let Some(if_range) = if_range_header_value(validators) {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
+                request = request.header(IF_RANGE, value);
+            }
+        }
     }
 
     request
@@ -642,19 +674,34 @@ async fn send_download_request(
     job_url: &str,
     url: &str,
     existing_bytes: u64,
+    validators: &ContentValidators,
     handoff_auth: Option<&HandoffAuth>,
 ) -> Result<reqwest::Response, DownloadError> {
-    let primary = build_download_request(client, job_url, url, existing_bytes, handoff_auth)
-        .send()
-        .await;
+    let primary = build_download_request(
+        client,
+        job_url,
+        url,
+        existing_bytes,
+        validators,
+        handoff_auth,
+    )
+    .send()
+    .await;
 
     match primary {
         Ok(response) => Ok(response),
         Err(error) if should_try_http3(&error) && url.starts_with("https://") => {
-            match build_download_request(client, job_url, url, existing_bytes, handoff_auth)
-                .version(Version::HTTP_3)
-                .send()
-                .await
+            match build_download_request(
+                client,
+                job_url,
+                url,
+                existing_bytes,
+                validators,
+                handoff_auth,
+            )
+            .version(Version::HTTP_3)
+            .send()
+            .await
             {
                 Ok(response) => Ok(response),
                 Err(http3_error) => {
@@ -790,6 +837,43 @@ fn resume_offset(job: &Job, disk_len: u64) -> u64 {
         job.downloaded_bytes
     } else {
         disk_len
+    }
+}
+
+/// Strong ETags are usable for If-Range. Weak form is `W/"…"` (RFC 7232).
+fn is_strong_etag(etag: &str) -> bool {
+    let t = etag.trim();
+    !t.is_empty() && !t.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("W/"))
+}
+
+/// If-Range value selection (normative):
+/// - strong ETag → prefer it
+/// - weak ETag only → prefer Last-Modified if present, else bare Range (`None`)
+/// - Last-Modified (no strong ETag) → use it
+/// - none → bare Range
+fn if_range_header_value(validators: &ContentValidators) -> Option<&str> {
+    if let Some(etag) = validators.etag.as_deref() {
+        let etag = etag.trim();
+        if is_strong_etag(etag) {
+            return Some(etag);
+        }
+        // Weak ETag: do not use for If-Range; fall through to Last-Modified.
+    }
+    validators
+        .last_modified
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Size mismatch when both stored expected_size and a numeric Content-Range total are known.
+fn content_range_size_mismatch(
+    content_range_total: Option<u64>,
+    expected_size: Option<u64>,
+) -> Option<(u64, u64)> {
+    match (content_range_total, expected_size) {
+        (Some(total), Some(expected)) if total != expected => Some((total, expected)),
+        _ => None,
     }
 }
 
@@ -1102,5 +1186,125 @@ mod tests {
         assert!(!should_sync_data_on_exit(true, DownloadOutcome::Canceled));
         assert!(!should_sync_data_on_exit(true, DownloadOutcome::Completed));
         assert!(!should_sync_data_on_exit(false, DownloadOutcome::Canceled));
+    }
+
+    #[test]
+    fn is_strong_etag_rejects_weak() {
+        assert!(is_strong_etag("\"abc123\""));
+        assert!(is_strong_etag("\"cdn-opaque-v2\""));
+        assert!(!is_strong_etag("W/\"abc123\""));
+        assert!(!is_strong_etag("w/\"weak\""));
+        assert!(!is_strong_etag(""));
+        assert!(!is_strong_etag("   "));
+    }
+
+    #[test]
+    fn if_range_prefers_strong_etag_over_last_modified() {
+        let v = ContentValidators {
+            etag: Some("\"strong-1\"".into()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            expected_size: Some(1_048_576),
+        };
+        assert_eq!(if_range_header_value(&v), Some("\"strong-1\""));
+    }
+
+    #[test]
+    fn if_range_weak_etag_falls_back_to_last_modified() {
+        // CDN-like: weak ETag + Last-Modified → If-Range uses LM only.
+        let v = ContentValidators {
+            etag: Some("W/\"5f4dcc3b\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            expected_size: Some(999),
+        };
+        assert_eq!(
+            if_range_header_value(&v),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn if_range_weak_etag_only_uses_bare_range() {
+        let v = ContentValidators {
+            etag: Some("W/\"only-weak\"".into()),
+            last_modified: None,
+            expected_size: Some(100),
+        };
+        assert_eq!(if_range_header_value(&v), None);
+    }
+
+    #[test]
+    fn if_range_last_modified_only() {
+        let v = ContentValidators {
+            etag: None,
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: None,
+        };
+        assert_eq!(
+            if_range_header_value(&v),
+            Some("Tue, 15 Nov 1994 12:45:26 GMT")
+        );
+    }
+
+    #[test]
+    fn if_range_none_when_empty_validators() {
+        assert_eq!(if_range_header_value(&ContentValidators::default()), None);
+    }
+
+    #[test]
+    fn content_range_size_mismatch_numeric_only() {
+        assert_eq!(
+            content_range_size_mismatch(Some(1000), Some(2000)),
+            Some((1000, 2000))
+        );
+        assert_eq!(content_range_size_mismatch(Some(1000), Some(1000)), None);
+        // `*` total → None total → no mismatch.
+        assert_eq!(content_range_size_mismatch(None, Some(1000)), None);
+        assert_eq!(content_range_size_mismatch(Some(1000), None), None);
+    }
+
+    #[test]
+    fn cdn_like_206_star_total_and_strong_etag_selection() {
+        // CloudFront-style probe: Content-Range bytes 0-0/* + strong ETag.
+        let (start, end, total) = parse_content_range("bytes 0-0/*").unwrap();
+        assert_eq!((start, end, total), (0, 0, None));
+        assert!(content_range_size_mismatch(total, Some(5_000_000)).is_none());
+
+        let v = ContentValidators {
+            etag: Some("\"cf-etag-abc\"".into()),
+            last_modified: Some("Wed, 12 Aug 2026 08:00:00 GMT".into()),
+            expected_size: Some(5_000_000),
+        };
+        assert_eq!(if_range_header_value(&v), Some("\"cf-etag-abc\""));
+
+        // Resume mid-file with numeric total matching expected_size.
+        let (start, end, total) = parse_content_range("bytes 1000-4999/5000").unwrap();
+        assert_eq!(start, 1000);
+        assert_eq!(end, 4999);
+        assert_eq!(total, Some(5000));
+        assert!(content_range_size_mismatch(total, Some(5000)).is_none());
+        assert_eq!(
+            content_range_size_mismatch(total, Some(4096)),
+            Some((5000, 4096))
+        );
+    }
+
+    #[test]
+    fn cdn_like_weak_etag_with_accept_ranges() {
+        // Fastly/Akamai often emit weak ETags; prefer bare Range over weak If-Range.
+        let v = ContentValidators {
+            etag: Some("W/\"1a2b3c\"".into()),
+            last_modified: None,
+            expected_size: Some(2_048_576),
+        };
+        assert!(!is_strong_etag(v.etag.as_deref().unwrap()));
+        assert_eq!(if_range_header_value(&v), None);
+
+        // Same object with LM present — use LM for If-Range.
+        let mut with_lm = v.clone();
+        with_lm.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
+        assert_eq!(
+            if_range_header_value(&with_lm),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
     }
 }
