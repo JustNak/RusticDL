@@ -10,10 +10,9 @@ use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::filesystem::{apply_partial_progress_from_disk, metadata_len, remove_partial};
 use super::handoff::{EnqueueOutcome, HandoffAuth};
-use super::http::{
-    run_http_download, store_control, ProgressCallback, ProgressHint, ProgressUpdate,
-};
+use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
+use super::transfer::run_transfer;
 use crate::settings::Settings;
 
 mod commands;
@@ -334,17 +333,27 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 let _ = progress_tx.send(update);
             });
 
+            // Re-read live multi knobs so UpdateSettings applies to the next attempt.
             // Mid-transfer reconnect (short backoff, max 5) is nested inside
-            // `run_http_download`; worker `RETRY_DELAYS` only run after that budget is spent.
-            let attempt_result = run_http_download(
-                &attempt_job,
-                limiter.clone(),
+            // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
+            let (multi_enabled, multi_min) = {
+                let guard = inner.lock().await;
+                (
+                    guard.config.multi_connection_enabled,
+                    guard.config.multi_min_bytes,
+                )
+            };
+            let mut ctx = TransferContext::new(
+                attempt_job.clone(),
                 control.clone(),
                 on_progress.clone(),
-                handoff_auth.as_ref(),
-                fsync_on_pause,
-            )
-            .await;
+                handoff_auth.clone(),
+                limiter.clone(),
+            );
+            ctx.multi_connection_enabled = multi_enabled;
+            ctx.multi_min_bytes = multi_min;
+            ctx.fsync_on_pause = fsync_on_pause;
+            let attempt_result = run_transfer(ctx).await;
 
             // Flush remaining patches before any post-attempt state mutation.
             drop(on_progress);
