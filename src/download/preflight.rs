@@ -9,9 +9,7 @@ use reqwest::header::{
 use reqwest::{Client, StatusCode};
 use std::sync::atomic::AtomicU8;
 
-use super::filesystem::{
-    derive_filename_from_url, parse_content_disposition_filename, parse_content_range,
-};
+use super::filesystem::{parse_content_disposition_filename, parse_content_range};
 use super::handoff::HandoffAuth;
 use super::http::{
     build_transfer_request, control_outcome, resolve_redirect_location, TransferRequestKind,
@@ -35,6 +33,10 @@ pub struct PreflightInfo {
 ///
 /// Uses the shared transfer request builder (handoff + referer + identity). Returns
 /// `None` on network/HTTP failure so the transfer can still start without preflight.
+///
+/// HEAD transport failure still attempts a Range probe from `start_url` (some CDNs
+/// mishandle HEAD while Range GET works). Filename is only from Content-Disposition
+/// when present — never URL-derived (GET path owns rename + path update).
 pub async fn run_preflight(
     client: &Client,
     job_url: &str,
@@ -42,7 +44,7 @@ pub async fn run_preflight(
     handoff_auth: Option<&HandoffAuth>,
     control: &AtomicU8,
 ) -> Option<PreflightInfo> {
-    let (head_response, final_url) = send_with_redirects(
+    let head_result = send_with_redirects(
         client,
         TransferRequestKind::Head,
         job_url,
@@ -50,50 +52,44 @@ pub async fn run_preflight(
         handoff_auth,
         control,
     )
-    .await?;
+    .await;
 
     if control_outcome(control).is_some() {
         return None;
     }
 
-    let status = head_response.status();
-    // Some CDNs reject HEAD; fall through to Range probe from the last URL.
-    let head_ok = status.is_success();
-
     // Prefer Content-Length header: `Response::content_length()` is body size_hint
     // (empty/unknown for HEAD), not the advertised entity length.
-    let mut total_bytes = if head_ok {
-        content_length_header(head_response.headers())
-    } else {
-        None
-    };
-    let mut accept_ranges = if head_ok {
-        parse_accept_ranges(head_response.headers())
-    } else {
-        None
-    };
-    let mut etag = if head_ok {
-        header_string(head_response.headers(), ETAG)
-    } else {
-        None
-    };
-    let mut last_modified = if head_ok {
-        header_string(head_response.headers(), LAST_MODIFIED)
-    } else {
-        None
-    };
-    let mut filename = if head_ok {
-        head_response
-            .headers()
-            .get(CONTENT_DISPOSITION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_content_disposition_filename)
-    } else {
-        None
-    };
+    let mut total_bytes = None;
+    let mut accept_ranges = None;
+    let mut etag = None;
+    let mut last_modified = None;
+    // CD only — never URL-derive (would clobber uniquified / user-chosen names).
+    let mut filename = None;
+    let mut resolved = start_url.to_string();
+    let mut head_ok = false;
+
+    if let Some((head_response, final_url)) = head_result {
+        resolved = final_url;
+        let status = head_response.status();
+        // Some CDNs reject HEAD; fall through to Range probe from the last URL.
+        head_ok = status.is_success();
+        if head_ok {
+            total_bytes = content_length_header(head_response.headers());
+            accept_ranges = parse_accept_ranges(head_response.headers());
+            etag = header_string(head_response.headers(), ETAG);
+            last_modified = header_string(head_response.headers(), LAST_MODIFIED);
+            filename = head_response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_disposition_filename);
+        }
+        drop(head_response);
+    }
+    // HEAD transport failure: still try Range 0-0 from start_url (resolved unchanged).
 
     let need_probe = total_bytes.is_none() || accept_ranges.is_none();
-    let mut resolved = final_url;
 
     if need_probe {
         if let Some((probe_response, probe_url)) = send_with_redirects(
@@ -154,15 +150,9 @@ pub async fn run_preflight(
             // Drop body (1 byte or more); we only needed headers.
             drop(probe_response);
         } else if !head_ok {
-            // Neither HEAD nor probe succeeded.
+            // Neither HEAD (success or transport) nor probe succeeded.
             return None;
         }
-    } else {
-        drop(head_response);
-    }
-
-    if filename.is_none() {
-        filename = derive_filename_from_url(&resolved);
     }
 
     Some(PreflightInfo {
@@ -518,7 +508,7 @@ ETag: \"probe\"\r\n\
     }
 
     #[tokio::test]
-    async fn transfer_context_pins_resolved_url_from_preflight() {
+    async fn preflight_final_url_equals_start_when_no_redirect() {
         let head = "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
 Accept-Ranges: bytes\r\n\
@@ -526,7 +516,6 @@ Content-Length: 10\r\n\
 \r\n"
             .to_string();
         let (base, _reqs, _handle) = spawn_scripted_server(vec![head]).await;
-        // Redirect-less; pin still equals final.
         let url = format!("{base}/x.bin");
         let client = download_client().unwrap();
         let control = Arc::new(AtomicU8::new(0));
@@ -541,5 +530,216 @@ Content-Length: 10\r\n\
         control.store(1, Ordering::Relaxed);
         let aborted = run_preflight(&client, &url, &url, None, &control).await;
         assert!(aborted.is_none());
+    }
+
+    /// HEAD transport failure (peer closes without response) still tries Range 0-0.
+    #[tokio::test]
+    async fn head_transport_fail_still_tries_range_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+        let _handle = tokio::spawn(async move {
+            // First connection: HEAD — close without writing (transport failure).
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&collected).to_string());
+                // Drop without response.
+                drop(socket);
+            }
+            // Second connection: Range probe GET → 206.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&collected).to_string());
+                let probe = "HTTP/1.1 206 Partial Content\r\n\
+Connection: close\r\n\
+Content-Range: bytes 0-0/2048\r\n\
+Content-Length: 1\r\n\
+Accept-Ranges: bytes\r\n\
+\r\nx";
+                let _ = socket.write_all(probe.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let url = format!("{base}/cdn.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("Range probe after HEAD transport fail");
+
+        assert_eq!(info.total_bytes, Some(2048));
+        assert_eq!(info.accept_ranges, Some(true));
+        assert_eq!(info.final_url, url);
+
+        let head_req = rx.recv().await.expect("HEAD");
+        assert!(head_req.starts_with("HEAD "), "got: {head_req}");
+        let get_req = rx.recv().await.expect("Range GET");
+        assert!(get_req.starts_with("GET "), "got: {get_req}");
+        assert!(get_req.to_ascii_lowercase().contains("range: bytes=0-0"));
+    }
+
+    /// Full preflight soft-fail (nothing answers) returns None — caller must not hard-error.
+    #[tokio::test]
+    async fn preflight_transport_fail_returns_none() {
+        // Nothing listening — connection refused.
+        let url = "http://127.0.0.1:1/nope.bin";
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, url, url, None, &control).await;
+        assert!(info.is_none(), "preflight must soft-fail, not panic");
+    }
+
+    /// Soft-fail path: preflight None, then transfer GET still completes.
+    #[tokio::test]
+    async fn preflight_soft_fail_does_not_abort_transfer() {
+        use crate::download::http::{run_http_download, ProgressUpdate};
+        use crate::download::job::Job;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let body = b"hello-soft-fail";
+
+        let _handle = tokio::spawn(async move {
+            // Serve a few requests: preflight HEAD (drop), Range probe (drop), then GET body.
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected).to_string();
+                if req.starts_with("HEAD ") {
+                    // Transport fail for HEAD.
+                    drop(socket);
+                    continue;
+                }
+                if req.to_ascii_lowercase().contains("range: bytes=0-0") {
+                    // Fail Range probe too → full preflight None.
+                    drop(socket);
+                    continue;
+                }
+                // Full download GET.
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\
+Accept-Ranges: bytes\r\n\
+\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-pf-soft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+
+        let control = Arc::new(AtomicU8::new(0));
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+
+        let outcome = run_http_download(&job, None, control, on_progress, None)
+            .await
+            .expect("transfer should succeed after preflight soft-fail");
+        assert!(matches!(
+            outcome,
+            crate::download::job::DownloadOutcome::Completed
+        ));
+
+        let data = std::fs::read(&target).expect("final file");
+        assert_eq!(data, body);
+
+        // Preflight produced no patch (None); transfer still emitted progress.
+        let seen = patches.lock().unwrap();
+        assert!(
+            !seen.is_empty(),
+            "download path should still publish progress"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn transfer_context_pins_resolved_url_from_preflight_info() {
+        use crate::download::http::{ProgressUpdate, TransferContext};
+        use crate::download::job::Job;
+        use std::path::PathBuf;
+
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 99\r\n\
+\r\n"
+            .to_string();
+        let (base, _reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let url = format!("{base}/pin.bin");
+        let client = download_client().unwrap();
+        let control = Arc::new(AtomicU8::new(0));
+        let on_progress: crate::download::http::ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+
+        let job = Job::new(
+            url.clone(),
+            "pin.bin".into(),
+            PathBuf::from("C:\\dl\\pin.bin"),
+            PathBuf::from("C:\\dl\\pin.bin.part"),
+        );
+        let mut ctx = TransferContext::new(job, control.clone(), on_progress, None, None);
+        assert_eq!(ctx.resolved_url, url);
+
+        let info = run_preflight(&client, &ctx.job.url, &ctx.resolved_url, None, &ctx.control)
+            .await
+            .expect("preflight");
+        // Same assignment path as run_http_download_with_ctx.
+        ctx.resolved_url = info.final_url.clone();
+        assert_eq!(ctx.resolved_url, url);
+        assert_eq!(info.total_bytes, Some(99));
     }
 }

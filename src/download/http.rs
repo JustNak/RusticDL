@@ -275,7 +275,7 @@ pub async fn run_http_download_with_ctx(
     .await
     {
         ctx.resolved_url = info.final_url.clone();
-        (ctx.on_progress)(preflight_progress_patch(&info));
+        (ctx.on_progress)(preflight_progress_patch(&ctx.job, &info));
     }
 
     if let Some(outcome) = control_outcome(&ctx.control) {
@@ -838,9 +838,11 @@ pub(crate) fn resolve_redirect_location(
     }
 }
 
-/// Early ProgressUpdate from preflight (size / validators / resume hint). Sparse fields
-/// only — coalesce-safe so a later GET starting_tick can fill paths/filename.
-fn preflight_progress_patch(info: &super::preflight::PreflightInfo) -> ProgressUpdate {
+/// Early ProgressUpdate from preflight (size / validators / resume hint).
+///
+/// Sparse only: never forces `progress` (would zero a resume job) or overwrites a
+/// user/uniquified `filename` — GET `starting_tick` owns rename + path updates.
+fn preflight_progress_patch(job: &Job, info: &super::preflight::PreflightInfo) -> ProgressUpdate {
     let total = info.total_bytes.filter(|&n| n > 0);
     let validators = {
         let captured = ContentValidators {
@@ -854,12 +856,23 @@ fn preflight_progress_patch(info: &super::preflight::PreflightInfo) -> ProgressU
             Some(captured)
         }
     };
+    // Filename only from Content-Disposition, and only when the job still has a
+    // generic fallback name (matches GET CD rename caution). Never URL-derive here.
+    let filename = info.filename.as_ref().and_then(|cd_name| {
+        let generic = job.filename.is_empty()
+            || job.filename == "download.bin"
+            || filename_from_url_fallback(&job.url).as_deref() == Some(job.filename.as_str());
+        if generic {
+            Some(cd_name.clone())
+        } else {
+            None
+        }
+    });
     ProgressUpdate {
         total_bytes: total,
-        speed: Some(0),
-        eta_secs: Some(0),
-        progress: total.map(|t| progress_percent(0, t)),
-        filename: info.filename.clone(),
+        // Leave progress / downloaded_bytes / speed / eta None so resume partials
+        // and coalesce do not flash 0%.
+        filename,
         resume_supported: info.accept_ranges,
         state_hint: Some(ProgressHint::Starting),
         validators,
@@ -1384,6 +1397,35 @@ mod tests {
     }
 
     #[test]
+    fn preflight_patch_leaves_progress_none_on_known_total() {
+        let job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        let info = super::super::preflight::PreflightInfo {
+            total_bytes: Some(1_000_000),
+            filename: None,
+            accept_ranges: Some(true),
+            etag: Some("\"e\"".into()),
+            last_modified: None,
+            final_url: job.url.clone(),
+        };
+        let patch = preflight_progress_patch(&job, &info);
+        assert_eq!(patch.total_bytes, Some(1_000_000));
+        assert!(patch.progress.is_none(), "must not force 0% on resume");
+        assert!(patch.downloaded_bytes.is_none());
+        assert!(patch.speed.is_none());
+        assert!(patch.eta_secs.is_none());
+        assert_eq!(patch.resume_supported, Some(true));
+        assert_eq!(
+            patch.validators.as_ref().and_then(|v| v.etag.as_deref()),
+            Some("\"e\"")
+        );
+    }
+
+    #[test]
     fn if_range_weak_etag_only_uses_bare_range() {
         let v = ContentValidators {
             etag: Some("W/\"only-weak\"".into()),
@@ -1559,5 +1601,33 @@ mod tests {
             .expect("build");
         assert!(req.headers().get(RANGE).is_none());
         assert!(req.headers().get(IF_RANGE).is_none());
+    }
+
+    #[test]
+    fn preflight_patch_preserves_user_and_uniquified_filename() {
+        let mut job = Job::new(
+            "https://example.com/file.zip".into(),
+            "file (1).zip".into(),
+            PathBuf::from("C:\\dl\\file (1).zip"),
+            PathBuf::from("C:\\dl\\file (1).zip.part"),
+        );
+        let info = super::super::preflight::PreflightInfo {
+            total_bytes: Some(10),
+            filename: Some("server-name.zip".into()),
+            accept_ranges: Some(true),
+            etag: None,
+            last_modified: None,
+            final_url: job.url.clone(),
+        };
+        let patch = preflight_progress_patch(&job, &info);
+        assert!(
+            patch.filename.is_none(),
+            "uniquified name must not be overwritten"
+        );
+
+        // Generic fallback still allows CD rename hint.
+        job.filename = "download.bin".into();
+        let patch = preflight_progress_patch(&job, &info);
+        assert_eq!(patch.filename.as_deref(), Some("server-name.zip"));
     }
 }
