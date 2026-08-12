@@ -547,16 +547,23 @@ fn coalesce_push(pending: &mut Option<ProgressUpdate>, update: ProgressUpdate) {
 }
 
 async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: ProgressUpdate) {
-    let mut guard = inner.lock().await;
-    let Some(job) = find_job_mut(&mut guard.jobs, id) else {
-        return;
-    };
+    let toast = update.toast.clone();
+    {
+        let mut guard = inner.lock().await;
+        let Some(job) = find_job_mut(&mut guard.jobs, id) else {
+            return;
+        };
 
-    if !apply_progress_patch(job, update) {
-        return;
+        if !apply_progress_patch(job, update) {
+            return;
+        }
+
+        emit_jobs_locked(&guard);
     }
-
-    emit_jobs_locked(&guard);
+    // One-shot notice (e.g. full-replace after 200-on-partial). Outside the jobs lock.
+    if let Some(message) = toast {
+        emit_toast(inner, message).await;
+    }
 }
 
 /// Apply a partial progress patch. `None` fields leave the job value unchanged.
@@ -609,8 +616,11 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if let Some(resume) = update.resume_supported {
         job.resume_supported = resume;
     }
-    // Field-wise merge: sparse captures must not wipe stored ETag/LM (CDN 206 quirk).
-    if let Some(validators) = update.validators {
+    // replace_validators: full identity snapshot (200 full-replace).
+    // Otherwise field-wise merge so sparse CDN captures never wipe stored ETag/LM.
+    if update.replace_validators == Some(true) {
+        job.validators = update.validators.unwrap_or_default();
+    } else if let Some(validators) = update.validators {
         job.validators.merge_present(validators);
     }
     if let Some(version) = update.transfer_format_version {
@@ -918,6 +928,45 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
         assert_eq!(job.validators.expected_size, Some(999));
+    }
+
+    /// Full-replace path: replace_validators clears stale ETag even when 200 omits it.
+    #[test]
+    fn apply_progress_replace_validators_clears_stale_identity() {
+        let mut job = sample_job(JobState::Downloading);
+        job.validators = ContentValidators {
+            etag: Some("\"stale-strong\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            expected_size: Some(1000),
+        };
+        job.transfer_format_version = 1;
+
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                validators: Some(ContentValidators {
+                    etag: None,
+                    last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
+                    expected_size: Some(2000),
+                }),
+                replace_validators: Some(true),
+                transfer_format_version: Some(0),
+                fallback_reason: Some(
+                    "Remote file changed or server ignored resume; restarting download from the beginning."
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        );
+
+        assert!(job.validators.etag.is_none());
+        assert_eq!(
+            job.validators.last_modified.as_deref(),
+            Some("Tue, 02 Jan 2024 00:00:00 GMT")
+        );
+        assert_eq!(job.validators.expected_size, Some(2000));
+        assert_eq!(job.transfer_format_version, 0);
+        assert!(job.fallback_reason.is_some());
     }
 
     #[test]

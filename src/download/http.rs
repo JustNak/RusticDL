@@ -50,12 +50,20 @@ pub struct ProgressUpdate {
     pub resume_supported: Option<bool>,
     pub state_hint: Option<ProgressHint>,
     pub validators: Option<ContentValidators>,
+    /// When `Some(true)`, `validators` **replaces** job identity (not `merge_present`).
+    /// Used on 200 full-replace so stale ETags cannot thrash subsequent resumes.
+    pub replace_validators: Option<bool>,
     pub transfer_format_version: Option<u32>,
     pub active_connections: Option<u32>,
     pub reconnect_count: Option<u32>,
     pub transfer_mode: Option<TransferMode>,
     pub fallback_reason: Option<String>,
+    /// One-shot UI toast (engine emits `EngineEvent::Toast`; not stored on Job).
+    pub toast: Option<String>,
 }
+
+const FULL_REPLACE_NOTICE: &str =
+    "Remote file changed or server ignored resume; restarting download from the beginning.";
 
 impl ProgressUpdate {
     /// Merge two patches in order: `later` wins on `Some` fields (`later.or(self)`).
@@ -72,6 +80,7 @@ impl ProgressUpdate {
             resume_supported: later.resume_supported.or(self.resume_supported),
             state_hint: later.state_hint.or(self.state_hint),
             validators: later.validators.or(self.validators),
+            replace_validators: later.replace_validators.or(self.replace_validators),
             transfer_format_version: later
                 .transfer_format_version
                 .or(self.transfer_format_version),
@@ -79,6 +88,7 @@ impl ProgressUpdate {
             reconnect_count: later.reconnect_count.or(self.reconnect_count),
             transfer_mode: later.transfer_mode.or(self.transfer_mode),
             fallback_reason: later.fallback_reason.or(self.fallback_reason),
+            toast: later.toast.or(self.toast),
         }
     }
 
@@ -104,11 +114,13 @@ impl ProgressUpdate {
             resume_supported,
             state_hint: Some(ProgressHint::Starting),
             validators,
+            replace_validators: None,
             transfer_format_version: None,
             active_connections: None,
             reconnect_count: None,
             transfer_mode: None,
             fallback_reason: None,
+            toast: None,
         }
     }
 
@@ -132,11 +144,13 @@ impl ProgressUpdate {
             resume_supported: None,
             state_hint: Some(ProgressHint::Downloading),
             validators: None,
+            replace_validators: None,
             transfer_format_version: None,
             active_connections: None,
             reconnect_count: None,
             transfer_mode: None,
             fallback_reason: None,
+            toast: None,
         }
     }
 
@@ -161,11 +175,13 @@ impl ProgressUpdate {
             resume_supported,
             state_hint: Some(ProgressHint::Downloading),
             validators: None,
+            replace_validators: None,
             transfer_format_version: None,
             active_connections: None,
             reconnect_count: None,
             transfer_mode: None,
             fallback_reason: None,
+            toast: None,
         }
     }
 }
@@ -266,10 +282,12 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range);
 
-    // 206: Content-Range start must match expected offset.
-    if existing_bytes > 0 {
-        if let Some((start, _end, _total)) = parsed_range {
-            if start != existing_bytes {
+    // 206 resume: require parseable Content-Range whose start matches expected offset
+    // (fail-closed — RFC requires Content-Range on 206; misaligned append is worse).
+    if status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
+        match parsed_range {
+            Some((start, _end, _total)) if start == existing_bytes => {}
+            Some((start, _end, _total)) => {
                 return Err(download_error(
                     FailureCategory::Resume,
                     format!(
@@ -278,19 +296,29 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                     false,
                 ));
             }
+            None => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    "Missing or invalid Content-Range on partial response. Use Restart.".into(),
+                    false,
+                ));
+            }
         }
     }
 
     // Numeric Content-Range total vs stored expected_size (ignore * totals).
+    // Skip expected_size check after full replace — identity is being rebuilt.
     let range_total = parsed_range.and_then(|(_s, _e, total)| total);
-    if let Some((total, expected)) =
-        content_range_size_mismatch(range_total, job.validators.expected_size)
-    {
-        return Err(download_error(
-            FailureCategory::Resume,
-            format!("Remote size changed ({total} bytes vs expected {expected}). Use Restart."),
-            false,
-        ));
+    if !full_replace {
+        if let Some((total, expected)) =
+            content_range_size_mismatch(range_total, job.validators.expected_size)
+        {
+            return Err(download_error(
+                FailureCategory::Resume,
+                format!("Remote size changed ({total} bytes vs expected {expected}). Use Restart."),
+                false,
+            ));
+        }
     }
 
     let mut total_bytes = response
@@ -309,9 +337,17 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         total_bytes = total;
     }
 
-    // Empty capture → None so apply leaves stored validators alone (CDN 206 without
-    // identity headers but size matches → continue). Non-empty Some is field-wise merged.
-    let validators = content_validators_patch(response.headers(), total_bytes);
+    // Normal path: empty capture → None so apply leaves stored validators alone
+    // (CDN 206 without identity headers but size matches → continue).
+    // Full replace: snapshot from 200 and *replace* (not merge) so stale ETags clear.
+    let validators = if full_replace {
+        Some(content_validators_from_headers(
+            response.headers(),
+            total_bytes,
+        ))
+    } else {
+        content_validators_patch(response.headers(), total_bytes)
+    };
 
     let mut target_path = job.target_path.clone();
     let mut temp_path = job.temp_path.clone();
@@ -358,9 +394,12 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         Some(resume_supported),
         validators,
     );
-    // Full replace after 200-on-partial: drop multi-map version (map lands PR 8).
-    if full_replace && job.transfer_format_version != 0 {
+    if full_replace {
+        // Replace identity + clear multi version; surface a non-fatal user notice.
+        starting.replace_validators = Some(true);
         starting.transfer_format_version = Some(0);
+        starting.fallback_reason = Some(FULL_REPLACE_NOTICE.into());
+        starting.toast = Some(FULL_REPLACE_NOTICE.into());
     }
     on_progress(starting);
 
@@ -1306,5 +1345,62 @@ mod tests {
             if_range_header_value(&with_lm),
             Some("Sun, 06 Nov 1994 08:49:37 GMT")
         );
+    }
+
+    #[test]
+    fn build_download_request_attaches_range_and_strong_if_range() {
+        let client = download_client().expect("client");
+        let url = "https://cdn.example.com/file.bin";
+        let strong = ContentValidators {
+            etag: Some("\"strong-etag\"".into()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            expected_size: Some(4096),
+        };
+        let req = build_download_request(&client, url, url, 512, &strong, None)
+            .build()
+            .expect("build");
+        assert_eq!(
+            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
+            Some("bytes=512-")
+        );
+        assert_eq!(
+            req.headers().get(IF_RANGE).and_then(|v| v.to_str().ok()),
+            Some("\"strong-etag\"")
+        );
+    }
+
+    #[test]
+    fn build_download_request_weak_only_omits_if_range() {
+        let client = download_client().expect("client");
+        let url = "https://cdn.example.com/file.bin";
+        let weak_only = ContentValidators {
+            etag: Some("W/\"weak\"".into()),
+            last_modified: None,
+            expected_size: Some(100),
+        };
+        let req = build_download_request(&client, url, url, 100, &weak_only, None)
+            .build()
+            .expect("build");
+        assert_eq!(
+            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
+            Some("bytes=100-")
+        );
+        assert!(req.headers().get(IF_RANGE).is_none());
+    }
+
+    #[test]
+    fn build_download_request_no_range_when_offset_zero() {
+        let client = download_client().expect("client");
+        let url = "https://cdn.example.com/file.bin";
+        let strong = ContentValidators {
+            etag: Some("\"x\"".into()),
+            last_modified: None,
+            expected_size: None,
+        };
+        let req = build_download_request(&client, url, url, 0, &strong, None)
+            .build()
+            .expect("build");
+        assert!(req.headers().get(RANGE).is_none());
+        assert!(req.headers().get(IF_RANGE).is_none());
     }
 }

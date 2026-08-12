@@ -394,11 +394,17 @@ pub fn allocate_unique_download_paths(
 
 /// Parse `Content-Range: bytes START-END/TOTAL`.
 ///
+/// Unit is matched case-insensitively (`bytes` / `Bytes`).
 /// `TOTAL` may be `*` (unknown length) → third field is `None`.
 /// Unsatisfied forms (`bytes */1234`) and non-`bytes` units return `None`.
 pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let value = value.trim();
-    let range_and_total = value.strip_prefix("bytes ")?;
+    // RFC 9110: range unit is case-insensitive.
+    let (unit, rest) = value.split_once(char::is_whitespace)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let range_and_total = rest.trim();
     let (range, total) = range_and_total.split_once('/')?;
     // 416 unsatisfied-range form: `bytes */TOTAL` — no start/end to resume from.
     if range.trim() == "*" {
@@ -523,6 +529,14 @@ mod tests {
     fn parses_content_range_header() {
         let (start, end, total) = parse_content_range("bytes 100-199/1000").unwrap();
         assert_eq!((start, end, total), (100, 199, Some(1000)));
+    }
+
+    #[test]
+    fn parses_content_range_unit_case_insensitive() {
+        let (start, end, total) = parse_content_range("Bytes 100-199/1000").unwrap();
+        assert_eq!((start, end, total), (100, 199, Some(1000)));
+        let (start, end, total) = parse_content_range("BYTES 0-0/*").unwrap();
+        assert_eq!((start, end, total), (0, 0, None));
     }
 
     #[test]
