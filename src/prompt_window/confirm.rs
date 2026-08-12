@@ -1,5 +1,6 @@
 //! Confirm phase: construct, accept/dismiss, browse, and render.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use gpui::{
@@ -71,6 +72,8 @@ impl BrowserPromptWindow {
             resolved: false,
             waiting_url_noted: false,
             canceling: false,
+            speed_samples: VecDeque::new(),
+            reduce_motion: settings.reduce_motion,
         }
     }
 

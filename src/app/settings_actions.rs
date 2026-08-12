@@ -83,7 +83,7 @@ impl DownloadApp {
             .read(cx)
             .value()
             .parse::<u32>()
-            .unwrap_or(3);
+            .unwrap_or(6);
         let speed_limit = self
             .speed_input
             .read(cx)

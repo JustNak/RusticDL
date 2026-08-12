@@ -128,7 +128,9 @@ where
             }),
             window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(size(px(400.0), px(260.0))),
-            kind: WindowKind::PopUp,
+            // Normal (not PopUp/tool-window): survives focus switches; only X closes.
+            // Closing Progress/Complete releases HUD ownership — download keeps running.
+            kind: WindowKind::Normal,
             focus: true,
             show: true,
             is_resizable: false,

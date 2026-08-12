@@ -4,16 +4,15 @@ use gpui::{prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styl
 use gpui_component::{
     button::{Button, ButtonVariants},
     group_box::{GroupBox, GroupBoxVariants},
-    h_flex,
-    input::Input,
-    v_flex, Disableable,
+    h_flex, v_flex, Disableable,
 };
 
 use super::super::widgets::{
-    field_hint, settings_choice_row, settings_field_label, settings_subgroup,
+    field_hint, settings_choice_row, settings_field_label, settings_input_with_reset,
+    settings_subgroup,
 };
 use super::super::DownloadApp;
-use crate::extension_settings::DownloadHandoffMode;
+use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 
 impl DownloadApp {
     pub(super) fn render_settings_browser(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -193,34 +192,50 @@ impl DownloadApp {
                     cx,
                 ))
                 .child(settings_subgroup("Filters", true, cx))
-                .child(
+                .child({
+                    let defaults = ExtensionIntegrationSettings::default();
+                    let hosts_def = defaults.excluded_hosts.join("\n");
+                    let hosts_val = self.excluded_hosts_input.read(cx).value().to_string();
+                    let app = cx.entity();
                     v_flex()
                         .gap_1p5()
                         .child(settings_field_label("Excluded hosts", cx))
-                        .child(
-                            Input::new(&self.excluded_hosts_input)
-                                .w_full()
-                                .disabled(!ext_enabled),
-                        )
+                        .child(settings_input_with_reset(
+                            "reset-excluded-hosts",
+                            &self.excluded_hosts_input,
+                            &hosts_val,
+                            &hosts_def,
+                            "factory list",
+                            app,
+                            !ext_enabled,
+                        ))
                         .child(field_hint(
                             "One host per line. Matching sites skip capture.",
                             cx,
-                        )),
-                )
-                .child(
+                        ))
+                })
+                .child({
+                    let defaults = ExtensionIntegrationSettings::default();
+                    let ext_def = defaults.captured_file_extensions.join(", ");
+                    let ext_val = self.captured_extensions_input.read(cx).value().to_string();
+                    let app = cx.entity();
                     v_flex()
                         .gap_1p5()
                         .child(settings_field_label("Captured file extensions", cx))
-                        .child(
-                            Input::new(&self.captured_extensions_input)
-                                .w_full()
-                                .disabled(!ext_enabled),
-                        )
+                        .child(settings_input_with_reset(
+                            "reset-captured-extensions",
+                            &self.captured_extensions_input,
+                            &ext_val,
+                            &ext_def,
+                            "factory list",
+                            app,
+                            !ext_enabled,
+                        ))
                         .child(field_hint(
                             "Comma-separated extensions to intercept (e.g. zip, pdf, exe).",
                             cx,
-                        )),
-                )
+                        ))
+                })
                 .child(settings_subgroup("Diagnostics", true, cx))
                 .child(settings_choice_row(
                     "Capture debug logging",
