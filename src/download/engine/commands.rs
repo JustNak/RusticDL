@@ -223,10 +223,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             emit_jobs_locked(&guard);
             guard.wake.notify_one();
         }
-        EngineCommand::Cancel {
-            id,
-            delete_partial,
-        } => {
+        EngineCommand::Cancel { id, delete_partial } => {
             let immediate_partial = {
                 let mut guard = inner.lock().await;
                 if let Some(ctrl) = guard.controls.get(&id) {
@@ -260,6 +257,12 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                         job.eta_secs = 0;
                     }
 
+                    // Always drop handoff auth when canceling a non-running job.
+                    // In-flight workers clear it in their finalizer.
+                    if !worker_running {
+                        guard.handoff_auth.remove(&id);
+                    }
+
                     if delete_partial {
                         if worker_running {
                             if let Some(path) = temp_path {
@@ -267,7 +270,6 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                             }
                             None
                         } else {
-                            guard.handoff_auth.remove(&id);
                             temp_path
                         }
                     } else {
@@ -819,7 +821,10 @@ mod tests {
             Some(JobState::Canceled)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(part.exists(), "partial retained when delete_partial is false");
+        assert!(
+            part.exists(),
+            "partial retained when delete_partial is false"
+        );
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

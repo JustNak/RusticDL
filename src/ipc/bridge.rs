@@ -288,11 +288,13 @@ impl IpcBridge {
             if guard.progress_hud_owned_jobs.contains(&id) {
                 continue;
             }
-            let waiting = jobs
-                .iter()
-                .find(|j| j.id == id)
-                .is_some_and(|j| guard.progress_hud_waiting_urls.contains(&j.url));
-            if waiting {
+            // Job not in snapshot yet (JobsChanged lag): retry next poll so we do not
+            // open a Progress HUD while Confirm morph still waits with job_id: None.
+            let Some(job) = jobs.iter().find(|j| j.id == id) else {
+                keep.push_back(id);
+                continue;
+            };
+            if guard.progress_hud_waiting_urls.contains(&job.url) {
                 // Confirm morph will bind; leave id for a later claim if morph abandons.
                 keep.push_back(id);
                 continue;
@@ -365,6 +367,13 @@ impl IpcBridge {
         }
         guard.complete_hud_shown.insert(job_id.to_string());
         true
+    }
+
+    /// Undo a Complete claim when the window failed to open.
+    pub fn release_complete_hud(&self, job_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.complete_hud_shown.remove(job_id);
+        }
     }
 
     pub fn show_progress_after_handoff(&self) -> bool {

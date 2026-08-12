@@ -137,14 +137,8 @@ impl BrowserPromptWindow {
         apply_appearance(settings, Some(window), cx);
         apply_app_icon(window);
 
-        let job = ipc
-            .jobs_snapshot()
-            .into_iter()
-            .find(|j| j.id == job_id);
-        let url = job
-            .as_ref()
-            .map(|j| j.url.clone())
-            .unwrap_or_default();
+        let job = ipc.jobs_snapshot().into_iter().find(|j| j.id == job_id);
+        let url = job.as_ref().map(|j| j.url.clone()).unwrap_or_default();
 
         // Promote to Complete immediately if already finished.
         let phase = if let Some(j) = job.as_ref() {
@@ -228,9 +222,7 @@ impl BrowserPromptWindow {
         }
         self.resolved = true;
         if let Some(prompt) = &self.prompt {
-            let _ = self
-                .ipc
-                .resolve_prompt(&prompt.id, PromptDecision::Dismiss);
+            let _ = self.ipc.resolve_prompt(&prompt.id, PromptDecision::Dismiss);
         }
         window.remove_window();
         cx.notify();
@@ -241,9 +233,7 @@ impl BrowserPromptWindow {
         if matches!(self.phase, CapturePhase::Confirm) && !self.resolved {
             self.resolved = true;
             if let Some(prompt) = &self.prompt {
-                let _ = self
-                    .ipc
-                    .resolve_prompt(&prompt.id, PromptDecision::Dismiss);
+                let _ = self.ipc.resolve_prompt(&prompt.id, PromptDecision::Dismiss);
             }
         }
         self.release_ownership();
@@ -350,7 +340,7 @@ impl BrowserPromptWindow {
                 self.dismiss_confirm(window, cx);
             }
             CapturePhase::Progress { .. } | CapturePhase::Complete { .. } => {
-                // Progress close ≠ cancel; Complete close just dismisses.
+                // Release so Complete can re-open if Progress closed mid-download.
                 self.release_ownership();
                 window.remove_window();
                 cx.notify();
@@ -397,9 +387,10 @@ impl BrowserPromptWindow {
         } = &self.phase
         {
             self.canceling = true;
+            // Match main-queue cancel: keep .part so resume/retry remains possible.
             self.engine.send(EngineCommand::Cancel {
                 id: id.clone(),
-                delete_partial: true,
+                delete_partial: false,
             });
             self.release_ownership();
             window.remove_window();
@@ -448,19 +439,13 @@ impl BrowserPromptWindow {
             CapturePhase::Progress { job_id, url } => {
                 let mut bound_id = job_id.clone();
                 if bound_id.is_none() {
-                    // Match newly enqueued active job for this URL.
-                    if let Some(j) = jobs.iter().find(|j| {
-                        j.url == *url
-                            && matches!(
-                                j.state,
-                                JobState::Queued
-                                    | JobState::Starting
-                                    | JobState::Downloading
-                                    | JobState::Paused
-                                    | JobState::Completed
-                                    | JobState::Failed
-                            )
-                    }) {
+                    // Bind only active jobs; prefer newest so same-URL re-downloads
+                    // do not attach to an older Completed/Failed row.
+                    if let Some(j) = jobs
+                        .iter()
+                        .filter(|j| j.url == *url && j.state.is_active())
+                        .max_by_key(|j| j.created_at)
+                    {
                         if self.ipc.try_own_progress_job(&j.id) {
                             bound_id = Some(j.id.clone());
                             if self.waiting_url_noted {
@@ -485,14 +470,15 @@ impl BrowserPromptWindow {
                             cx.notify();
                             return;
                         }
-                        if j.state == JobState::Canceled {
-                            // Cancelled elsewhere — close HUD.
-                            // Caller may remove window; signal via phase clear on next close.
-                        }
+                        // Canceled/Failed: keep HUD open so Retry stays available.
                     }
                 }
 
-                if let CapturePhase::Progress { job_id: ref mut slot, .. } = self.phase {
+                if let CapturePhase::Progress {
+                    job_id: ref mut slot,
+                    ..
+                } = self.phase
+                {
                     *slot = bound_id;
                 }
                 cx.notify();
@@ -530,21 +516,19 @@ impl BrowserPromptWindow {
 }
 
 fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
-    cx.spawn(async move |this, cx| {
-        loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
-            if this
-                .update(cx, |this, cx| {
-                    if !matches!(this.phase, CapturePhase::Confirm) {
-                        this.sync_from_bridge(cx);
-                    }
-                })
-                .is_err()
-            {
-                break;
-            }
+    cx.spawn(async move |this, cx| loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+        if this
+            .update(cx, |this, cx| {
+                if !matches!(this.phase, CapturePhase::Confirm) {
+                    this.sync_from_bridge(cx);
+                }
+            })
+            .is_err()
+        {
+            break;
         }
     })
     .detach();
@@ -574,15 +558,7 @@ impl Render for BrowserPromptWindow {
                 }),
                 cx,
             ))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .gap_3()
-                    .child(body),
-            )
+            .child(v_flex().flex_1().w_full().px_4().py_3().gap_3().child(body))
             .children(dialog_layer)
     }
 }
@@ -599,13 +575,7 @@ impl BrowserPromptWindow {
             .map(format_bytes)
             .unwrap_or_else(|| "Unknown size".into());
         let source_label = prompt
-            .map(|p| {
-                format!(
-                    "{} · {}",
-                    p.browser,
-                    p.entry_point.replace('_', " ")
-                )
-            })
+            .map(|p| format!("{} · {}", p.browser, p.entry_point.replace('_', " ")))
             .unwrap_or_default();
         let title_line = prompt
             .and_then(|p| p.page_title.as_deref())
@@ -627,12 +597,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .child(title_line),
-                    )
+                    .child(div().text_sm().font_medium().child(title_line))
                     .child(div().text_xs().text_color(muted).child(source_label))
                     .child(
                         div()
@@ -709,49 +674,66 @@ impl BrowserPromptWindow {
         let muted = theme.muted_foreground;
         let progress_style = self.progress_style;
 
-        let (filename, progress, size_line, speed_line, state_label, can_pause, can_resume, can_retry, error) =
-            if let Some(job) = &self.job {
-                let progress = job.progress as f32;
-                let size_line = format_size(job);
-                let speed_line = format!(
-                    "{} · ETA {}",
-                    format_speed(job.speed),
-                    format_eta(job.eta_secs)
-                );
-                let can_pause = matches!(
-                    job.state,
-                    JobState::Queued | JobState::Starting | JobState::Downloading
-                );
-                let can_resume = job.state == JobState::Paused;
-                let can_retry = matches!(job.state, JobState::Failed | JobState::Canceled);
-                (
-                    job.filename.clone(),
-                    progress,
-                    size_line,
-                    speed_line,
-                    job.state.label().to_string(),
-                    can_pause,
-                    can_resume,
-                    can_retry,
-                    job.error.clone(),
-                )
-            } else {
-                (
-                    "Starting…".into(),
-                    0.0_f32,
-                    "—".into(),
-                    "—".into(),
-                    "Starting".into(),
-                    false,
-                    false,
-                    false,
-                    None,
-                )
-            };
+        let (
+            filename,
+            progress,
+            size_line,
+            speed_line,
+            state_label,
+            can_pause,
+            can_resume,
+            can_retry,
+            error,
+        ) = if let Some(job) = &self.job {
+            let progress = job.progress as f32;
+            let size_line = format_size(job);
+            let speed_line = format!(
+                "{} · ETA {}",
+                format_speed(job.speed),
+                format_eta(job.eta_secs)
+            );
+            let can_pause = matches!(
+                job.state,
+                JobState::Queued | JobState::Starting | JobState::Downloading
+            );
+            let can_resume = job.state == JobState::Paused;
+            let can_retry = matches!(job.state, JobState::Failed | JobState::Canceled);
+            (
+                job.filename.clone(),
+                progress,
+                size_line,
+                speed_line,
+                job.state.label().to_string(),
+                can_pause,
+                can_resume,
+                can_retry,
+                job.error.clone(),
+            )
+        } else {
+            (
+                "Starting…".into(),
+                0.0_f32,
+                "—".into(),
+                "—".into(),
+                "Starting".into(),
+                false,
+                false,
+                false,
+                None,
+            )
+        };
 
-        let progress_color = if self.job.as_ref().is_some_and(|j| j.state == JobState::Paused) {
+        let progress_color = if self
+            .job
+            .as_ref()
+            .is_some_and(|j| j.state == JobState::Paused)
+        {
             theme.warning
-        } else if self.job.as_ref().is_some_and(|j| j.state == JobState::Failed) {
+        } else if self
+            .job
+            .as_ref()
+            .is_some_and(|j| j.state == JobState::Failed)
+        {
             theme.danger
         } else {
             theme.progress_bar
@@ -763,12 +745,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .child(filename),
-                    )
+                    .child(div().text_sm().font_medium().child(filename))
                     .child(
                         div()
                             .text_xs()
@@ -779,7 +756,11 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1p5()
-                    .child(capture_progress_bar(progress, progress_color, progress_style))
+                    .child(capture_progress_bar(
+                        progress,
+                        progress_color,
+                        progress_style,
+                    ))
                     .child(
                         h_flex()
                             .w_full()
@@ -794,12 +775,7 @@ impl BrowserPromptWindow {
                     ),
             )
             .when_some(error, |el, msg| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(msg),
-                )
+                el.child(div().text_xs().text_color(theme.danger).child(msg))
             })
             .child(
                 h_flex()
@@ -901,24 +877,14 @@ impl BrowserPromptWindow {
                     .child(
                         v_flex()
                             .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(filename),
-                            )
+                            .child(div().text_sm().font_medium().child(filename))
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(muted)
                                     .child(format!("{size_label} · finished")),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(path_preview),
-                            ),
+                            .child(div().text_xs().text_color(muted).child(path_preview)),
                     ),
             )
             .when_some(action_error, |el, msg| {
@@ -1024,7 +990,7 @@ pub fn open_browser_complete_window(
     }
     let _ = ipc.try_own_progress_job(&job.id);
     let job_id = job.id.clone();
-    open_capture_window(
+    let opened = open_capture_window(
         format!("{APP_NAME} — Download complete"),
         {
             let ipc = ipc.clone();
@@ -1034,10 +1000,15 @@ pub fn open_browser_complete_window(
                 BrowserPromptWindow::new_complete(job, ipc, engine, &settings, window, cx)
             }
         },
-        ipc,
+        ipc.clone(),
         &job_id,
         cx,
-    )
+    );
+    if opened.is_none() {
+        ipc.release_progress_job(&job_id);
+        ipc.release_complete_hud(&job_id);
+    }
+    opened
 }
 
 fn open_capture_window<F>(

@@ -1268,12 +1268,17 @@ impl DownloadApp {
     fn poll_browser_progress(&mut self, cx: &mut Context<Self>) {
         // Always adopt watch ids so Complete re-open works for Confirm morph too.
         for job_id in self.ipc.take_progress_watch_jobs() {
-            if !self.browser_watch_complete_ids.iter().any(|id| id == &job_id) {
+            if !self
+                .browser_watch_complete_ids
+                .iter()
+                .any(|id| id == &job_id)
+            {
                 self.browser_watch_complete_ids.push(job_id);
             }
         }
 
-        if !self.settings.extension.show_progress_after_handoff {
+        // Use committed bridge setting (same source as enqueue), not draft UI toggles.
+        if !self.ipc.show_progress_after_handoff() {
             // Drain open-queue so ids do not pile up while the setting is off.
             let _ = self.ipc.take_pending_progress_jobs();
             return;
@@ -1292,7 +1297,8 @@ impl DownloadApp {
 
     /// If Progress was closed early, re-open a Complete HUD when the job finishes.
     fn poll_browser_complete(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.extension.show_progress_after_handoff {
+        // Match enqueue / progress poll: committed bridge setting only.
+        if !self.ipc.show_progress_after_handoff() {
             self.browser_watch_complete_ids.clear();
             return;
         }
@@ -1312,13 +1318,17 @@ impl DownloadApp {
                     if self.ipc.is_progress_hud_owned(&job_id) {
                         still_watch.push(job_id);
                     } else {
-                        let _ = open_browser_complete_window(
+                        let opened = open_browser_complete_window(
                             job.clone(),
                             self.ipc.clone(),
                             self.engine.clone(),
                             &self.settings,
                             cx,
                         );
+                        // Keep watching on open failure so Complete can retry.
+                        if opened.is_none() {
+                            still_watch.push(job_id);
+                        }
                     }
                 }
                 JobState::Failed | JobState::Canceled => {
