@@ -171,8 +171,8 @@ impl DownloadApp {
     }
 }
 
-/// Persist immediately on membership, state, transfer-format, or segment-map changes.
-/// Pure progress ticks (same map/version/state) stay on the 1s debounce.
+/// Persist immediately on membership, state, version, or structural map changes.
+/// `written`-only map ticks stay on the 1s debounce (§2.8 accepted lag).
 fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     if previous.len() != next.len() {
         return true;
@@ -185,7 +185,7 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
             Some(prev_job)
                 if prev_job.state != job.state
                     || prev_job.transfer_format_version != job.transfer_format_version
-                    || prev_job.segment_map != job.segment_map =>
+                    || segment_map_structure_changed(&prev_job.segment_map, &job.segment_map) =>
             {
                 return true;
             }
@@ -195,6 +195,18 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     previous
         .iter()
         .any(|job| !next.iter().any(|n| n.id == job.id))
+}
+
+/// Force persist on Some/None or bounds/state/preallocated diffs — not `written`.
+fn segment_map_structure_changed(
+    previous: &Option<crate::download::segment::SegmentMap>,
+    next: &Option<crate::download::segment::SegmentMap>,
+) -> bool {
+    match (previous, next) {
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(a), Some(b)) => !a.structure_eq(b),
+    }
 }
 
 #[cfg(test)]
@@ -273,7 +285,14 @@ mod tests {
         let mut next = prev.clone();
         assert!(!jobs_need_immediate_persist(&prev, &next));
 
+        // written-only tick: debounce (same bounds/state/preallocated).
         next[0].segment_map = Some(two_seg_map(20, 0));
+        assert!(!jobs_need_immediate_persist(&prev, &next));
+
+        // SegmentState change with same written: structural — force persist.
+        let mut state_changed = two_seg_map(10, 0);
+        state_changed.segments[0].state = SegmentState::Completed;
+        next[0].segment_map = Some(state_changed);
         assert!(jobs_need_immediate_persist(&prev, &next));
 
         next[0].segment_map = None;

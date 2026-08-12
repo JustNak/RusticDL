@@ -9,9 +9,10 @@ pub const DEFAULT_SEGMENT_COUNT: u32 = 8;
 #[allow(dead_code)] // Used by `partition` (PR 11).
 pub const MIN_SEGMENT_SIZE: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentState {
+    #[default]
     Pending,
     Active,
     Completed,
@@ -27,13 +28,20 @@ pub struct Segment {
     /// Inclusive byte offset.
     pub end: u64,
     /// Bytes successfully written inside `[start, end]`.
+    #[serde(default)]
     pub written: u64,
+    #[serde(default)]
     pub state: SegmentState,
 }
 
 impl Segment {
     pub fn length(&self) -> u64 {
         self.end.saturating_sub(self.start).saturating_add(1)
+    }
+
+    /// Next Range start for this segment (`start + written`).
+    pub fn remaining_start(&self) -> u64 {
+        self.start.saturating_add(self.written)
     }
 }
 
@@ -51,6 +59,17 @@ pub struct SegmentMap {
 impl SegmentMap {
     pub fn written_sum(&self) -> u64 {
         self.segments.iter().map(|segment| segment.written).sum()
+    }
+
+    /// Bounds / segment `state` / `preallocated` — ignores `written` (§2.8 accepted lag).
+    pub fn structure_eq(&self, other: &Self) -> bool {
+        self.total_bytes == other.total_bytes
+            && self.segment_count == other.segment_count
+            && self.preallocated == other.preallocated
+            && self.segments.len() == other.segments.len()
+            && self.segments.iter().zip(&other.segments).all(|(a, b)| {
+                a.index == b.index && a.start == b.start && a.end == b.end && a.state == b.state
+            })
     }
 
     /// Contiguous coverage of `total_bytes`, no gaps/overlaps, written within bounds.
@@ -223,5 +242,32 @@ mod tests {
 
         map.segments[1].start = 0;
         assert!(!map.is_consistent());
+    }
+
+    #[test]
+    fn structure_eq_ignores_written() {
+        let mut a = partition(2 * MIN_SEGMENT_SIZE, 2);
+        let mut b = a.clone();
+        a.segments[0].written = 10;
+        b.segments[0].written = 99;
+        assert!(a.structure_eq(&b));
+        b.segments[0].state = SegmentState::Completed;
+        assert!(!a.structure_eq(&b));
+        b.segments[0].state = a.segments[0].state;
+        b.preallocated = true;
+        assert!(!a.structure_eq(&b));
+    }
+
+    #[test]
+    fn segment_serde_defaults_written_and_state() {
+        let json = r#"{
+            "index": 0,
+            "start": 0,
+            "end": 99
+        }"#;
+        let segment: Segment = serde_json::from_str(json).expect("defaults");
+        assert_eq!(segment.written, 0);
+        assert_eq!(segment.state, SegmentState::Pending);
+        assert_eq!(segment.remaining_start(), 0);
     }
 }

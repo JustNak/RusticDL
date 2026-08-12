@@ -470,13 +470,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                                     }
                                 }
                                 _ => {
-                                    // Failed multi: retain map + version for resume reuse.
-                                    job.state = JobState::Failed;
-                                    job.error = Some(error.message);
-                                    job.failure_category = Some(error.category);
-                                    job.speed = 0;
-                                    job.eta_secs = 0;
-                                    job.active_connections = 0;
+                                    apply_failed_lifecycle(job, error);
                                 }
                             }
                         }
@@ -653,8 +647,22 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if let Some(reason) = update.fallback_reason {
         job.fallback_reason = Some(reason);
     }
+    // None = unchanged; lifecycle (Restart / Cancel+delete / Completed) clears.
+    if let Some(map) = update.segment_map {
+        job.segment_map = Some(map);
+    }
 
     true
+}
+
+/// Failed multi: retain map + version for resume reuse. Do not call `on_completed`.
+fn apply_failed_lifecycle(job: &mut Job, error: super::job::DownloadError) {
+    job.state = JobState::Failed;
+    job.error = Some(error.message);
+    job.failure_category = Some(error.category);
+    job.speed = 0;
+    job.eta_secs = 0;
+    job.active_connections = 0;
 }
 
 pub(super) fn find_job_mut<'a>(jobs: &'a mut [Job], id: &str) -> Option<&'a mut Job> {
@@ -708,7 +716,8 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::job::{ContentValidators, TransferMode};
+    use super::super::job::{download_error, ContentValidators, FailureCategory, TransferMode};
+    use super::super::segment::{Segment, SegmentMap, SegmentState};
     use super::*;
     use std::path::PathBuf;
 
@@ -999,6 +1008,72 @@ mod tests {
         assert_eq!(job.reconnect_count, 2);
         assert_eq!(job.transfer_mode, Some(TransferMode::Multi));
         assert_eq!(job.fallback_reason.as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn apply_progress_sets_segment_map_and_preserves_on_none() {
+        let mut job = sample_job(JobState::Downloading);
+        let map = SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 10,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        };
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                segment_map: Some(map.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.segment_map, Some(map.clone()));
+
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(20, 100, 5, 16, 20.0),
+        );
+        assert_eq!(job.segment_map, Some(map));
+    }
+
+    #[test]
+    fn apply_failed_lifecycle_retains_map() {
+        let mut job = sample_job(JobState::Downloading);
+        let map = SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 40,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        };
+        job.transfer_format_version = 1;
+        job.segment_map = Some(map.clone());
+        job.reconnect_count = 4;
+        job.validators.etag = Some("\"keep\"".into());
+
+        apply_failed_lifecycle(
+            &mut job,
+            download_error(FailureCategory::Network, "boom".into(), true),
+        );
+
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.segment_map, Some(map));
+        assert_eq!(job.transfer_format_version, 1);
+        assert_eq!(job.reconnect_count, 4);
+        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.error.as_deref(), Some("boom"));
+        assert_eq!(job.failure_category, Some(FailureCategory::Network));
     }
 
     /// Multiple patches merge into one pending; take drains once.

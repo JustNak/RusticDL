@@ -227,11 +227,12 @@ impl Job {
         self.clear_transfer_identity();
     }
 
-    /// Completed: slim state.json — drop map, version 0; keep validators / reconnects.
+    /// Completed: slim state.json — drop map, version 0, mode; keep validators / reconnects.
     pub fn on_completed(&mut self) {
         self.segment_map = None;
         self.transfer_format_version = 0;
         self.active_connections = 0;
+        self.transfer_mode = None;
     }
 }
 
@@ -336,35 +337,16 @@ mod tests {
         job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         job.active_connections = 4;
         job.reconnect_count = 3;
+        job.transfer_mode = Some(TransferMode::Multi);
 
         job.on_completed();
 
         assert!(job.segment_map.is_none());
         assert_eq!(job.transfer_format_version, 0);
         assert_eq!(job.active_connections, 0);
+        assert!(job.transfer_mode.is_none());
         assert_eq!(job.reconnect_count, 3);
         assert_eq!(job.validators.etag.as_deref(), Some("\"abc\""));
-    }
-
-    #[test]
-    fn failed_multi_retains_map() {
-        // Failed path must not call clear_transfer_identity / on_completed.
-        let mut job = Job::new(
-            "https://example.com/f.bin".into(),
-            "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
-        );
-        let map = crate::download::segment::partition(2 * 1024 * 1024, 2);
-        job.transfer_format_version = 1;
-        job.segment_map = Some(map.clone());
-        job.reconnect_count = 4;
-        job.state = JobState::Failed;
-        job.active_connections = 0;
-
-        assert_eq!(job.segment_map, Some(map));
-        assert_eq!(job.transfer_format_version, 1);
-        assert_eq!(job.reconnect_count, 4);
     }
 
     #[test]
