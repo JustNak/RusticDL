@@ -10,7 +10,11 @@ use gpui_component::progress::Progress;
 
 use crate::settings::ProgressStyle;
 
-pub(super) fn capture_progress_bar(value: f32, color: Hsla, style: ProgressStyle) -> impl IntoElement {
+pub(super) fn capture_progress_bar(
+    value: f32,
+    color: Hsla,
+    style: ProgressStyle,
+) -> impl IntoElement {
     let value = value.clamp(0.0, 100.0);
     let height = match style {
         ProgressStyle::Soft => px(4.),

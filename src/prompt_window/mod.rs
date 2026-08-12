@@ -19,9 +19,7 @@ use std::time::Duration;
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled, Window,
 };
-use gpui_component::{
-    input::InputState, v_flex, ActiveTheme, Root,
-};
+use gpui_component::{input::InputState, v_flex, ActiveTheme, Root};
 
 use crate::browser_popup_chrome::themed_popup_title_bar;
 use crate::download::{EngineHandle, Job};

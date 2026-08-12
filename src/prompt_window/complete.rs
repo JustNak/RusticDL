@@ -1,12 +1,9 @@
 //! Complete phase: construct, open/reveal actions, and render.
 
-use gpui::{
-    div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window,
-};
+use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
-    h_flex,
-    v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
+    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
 };
 
 use super::helpers::shorten_path;

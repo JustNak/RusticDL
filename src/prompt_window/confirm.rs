@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::FluentBuilder, AppContext, Context, IntoElement, ParentElement, PathPromptOptions,
-    SharedString, Styled, Window,
+    div, prelude::FluentBuilder, AppContext, Context, IntoElement, ParentElement,
+    PathPromptOptions, SharedString, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -87,7 +87,11 @@ impl BrowserPromptWindow {
     }
 
     /// Dismiss without `remove_window` — used from `on_window_should_close`.
-    pub(super) fn dismiss_confirm_on_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn dismiss_confirm_on_close(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.phase, CapturePhase::Confirm) && !self.resolved {
             self.resolved = true;
             if let Some(prompt) = &self.prompt {

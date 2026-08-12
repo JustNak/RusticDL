@@ -1,8 +1,6 @@
 //! Progress phase: construct, engine controls, sync, and render.
 
-use gpui::{
-    div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window,
-};
+use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex, v_flex, ActiveTheme, StyledExt,
