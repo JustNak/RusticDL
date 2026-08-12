@@ -280,79 +280,11 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             (job, control, limiter, auth)
         };
 
-        // Coalesce progress patches (merge Option fields) then apply at most ~every 200 ms.
-        // Immediate flush when the channel closes (before terminal finalizer).
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
-        let progress_inner = inner.clone();
-        let progress_job_id = job_id.clone();
-        let progress_pump = tokio::spawn(async move {
-            let mut pending: Option<ProgressUpdate> = None;
-            let mut flush_at: Option<TokioInstant> = None;
-
-            loop {
-                match flush_at {
-                    None => match progress_rx.recv().await {
-                        Some(update) => {
-                            pending = Some(match pending.take() {
-                                Some(prev) => prev.merge(update),
-                                None => update,
-                            });
-                            flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
-                        }
-                        None => {
-                            if let Some(update) = pending.take() {
-                                apply_progress(&progress_inner, &progress_job_id, update).await;
-                            }
-                            break;
-                        }
-                    },
-                    Some(deadline) => {
-                        tokio::select! {
-                            item = progress_rx.recv() => {
-                                match item {
-                                    Some(update) => {
-                                        pending = Some(match pending.take() {
-                                            Some(prev) => prev.merge(update),
-                                            None => update,
-                                        });
-                                        // Keep existing deadline so the first patch opens the window.
-                                    }
-                                    None => {
-                                        if let Some(update) = pending.take() {
-                                            apply_progress(
-                                                &progress_inner,
-                                                &progress_job_id,
-                                                update,
-                                            )
-                                            .await;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = sleep_until(deadline) => {
-                                if let Some(update) = pending.take() {
-                                    apply_progress(
-                                        &progress_inner,
-                                        &progress_job_id,
-                                        update,
-                                    )
-                                    .await;
-                                }
-                                flush_at = None;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        let on_progress: ProgressCallback = Arc::new(move |update: ProgressUpdate| {
-            let _ = progress_tx.send(update);
-        });
-
         let mut attempt_job = job_snapshot;
         let mut retry_attempts = attempt_job.retry_attempts;
 
+        // Per-attempt progress pump: drain (flush pending) after each attempt so
+        // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
             {
                 let mut guard = inner.lock().await;
@@ -371,15 +303,26 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 store_control(&control, WorkerControl::Continue);
             }
 
-            match run_http_download(
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+            let progress_pump = spawn_progress_pump(inner.clone(), job_id.clone(), progress_rx);
+            let on_progress: ProgressCallback = Arc::new(move |update: ProgressUpdate| {
+                let _ = progress_tx.send(update);
+            });
+
+            let attempt_result = run_http_download(
                 &attempt_job,
                 limiter.clone(),
                 control.clone(),
                 on_progress.clone(),
                 handoff_auth.as_ref(),
             )
-            .await
-            {
+            .await;
+
+            // Flush remaining patches before any post-attempt state mutation.
+            drop(on_progress);
+            let _ = progress_pump.await;
+
+            match attempt_result {
                 Ok(outcome) => break Ok(outcome),
                 Err(error) => {
                     // Restart requested mid-flight: stop retrying and exit as canceled.
@@ -429,10 +372,6 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 }
             }
         };
-
-        // Stop accepting progress before applying the terminal state.
-        drop(on_progress);
-        let _ = progress_pump.await;
 
         let partial_to_delete = {
             let mut guard = inner.lock().await;
@@ -519,6 +458,69 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     });
 }
 
+/// Coalesce progress patches (merge Option fields) then apply at most every
+/// `PROGRESS_COALESCE`. Immediate flush when the channel closes.
+fn spawn_progress_pump(
+    inner: Arc<Mutex<EngineInner>>,
+    job_id: String,
+    mut progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut pending: Option<ProgressUpdate> = None;
+        let mut flush_at: Option<TokioInstant> = None;
+
+        loop {
+            match flush_at {
+                None => match progress_rx.recv().await {
+                    Some(update) => {
+                        coalesce_push(&mut pending, update);
+                        flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
+                    }
+                    None => {
+                        if let Some(update) = pending.take() {
+                            apply_progress(&inner, &job_id, update).await;
+                        }
+                        break;
+                    }
+                },
+                Some(deadline) => {
+                    tokio::select! {
+                        item = progress_rx.recv() => {
+                            match item {
+                                Some(update) => {
+                                    // Deadline already set ⇒ pending is Some.
+                                    coalesce_push(&mut pending, update);
+                                    // Keep existing deadline so the first patch opens the window.
+                                }
+                                None => {
+                                    if let Some(update) = pending.take() {
+                                        apply_progress(&inner, &job_id, update).await;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        _ = sleep_until(deadline) => {
+                            if let Some(update) = pending.take() {
+                                apply_progress(&inner, &job_id, update).await;
+                            }
+                            flush_at = None;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Merge `update` into the coalesce buffer (later wins on Some).
+fn coalesce_push(pending: &mut Option<ProgressUpdate>, update: ProgressUpdate) {
+    *pending = Some(match pending.take() {
+        Some(prev) => prev.merge(update),
+        None => update,
+    });
+}
+
 async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: ProgressUpdate) {
     let mut guard = inner.lock().await;
     let Some(job) = find_job_mut(&mut guard.jobs, id) else {
@@ -533,12 +535,13 @@ async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: Progr
 }
 
 /// Apply a partial progress patch. `None` fields leave the job value unchanged.
-/// Returns false if the job is terminal (no mutation).
+/// Returns false if the job is not in an in-flight transfer state (no mutation).
+///
+/// Only `Starting` / `Downloading` accept progress: rejects `Queued` (restart),
+/// `Paused`, and terminal states so deferred coalesce cannot resurrect progress
+/// after external lifecycle writes.
 fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
-    if matches!(
-        job.state,
-        JobState::Completed | JobState::Canceled | JobState::Failed
-    ) {
+    if !matches!(job.state, JobState::Starting | JobState::Downloading) {
         return false;
     }
 
@@ -546,14 +549,10 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if let Some(hint) = update.state_hint {
         match hint {
             ProgressHint::Starting => {
-                if job.state != JobState::Paused {
-                    job.state = JobState::Starting;
-                }
+                job.state = JobState::Starting;
             }
             ProgressHint::Downloading => {
-                if !matches!(job.state, JobState::Paused | JobState::Canceled) {
-                    job.state = JobState::Downloading;
-                }
+                job.state = JobState::Downloading;
             }
         }
     }
@@ -726,6 +725,37 @@ mod tests {
         assert_eq!(job.state, JobState::Completed);
     }
 
+    /// Restart zeros job to Queued; deferred coalesce must not resurrect progress.
+    #[test]
+    fn apply_progress_skips_queued_jobs() {
+        let mut job = sample_job(JobState::Queued);
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 0.0;
+        let ok = apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(50, 100, 10, 5, 50.0),
+        );
+        assert!(!ok);
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(job.total_bytes, 0);
+        assert_eq!(job.progress, 0.0);
+    }
+
+    #[test]
+    fn apply_progress_skips_paused_jobs() {
+        let mut job = sample_job(JobState::Paused);
+        let before = job.downloaded_bytes;
+        let ok = apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(99, 100, 1, 0, 99.0),
+        );
+        assert!(!ok);
+        assert_eq!(job.downloaded_bytes, before);
+        assert_eq!(job.state, JobState::Paused);
+    }
+
     #[test]
     fn option_none_scalars_leave_job_unchanged() {
         let mut job = sample_job(JobState::Downloading);
@@ -743,5 +773,138 @@ mod tests {
         assert_eq!(job.eta_secs, 90);
         assert_eq!(job.progress, 10.0);
         assert_eq!(job.state, JobState::Downloading);
+    }
+
+    /// Multiple patches merge into one pending; take drains once.
+    #[test]
+    fn coalesce_push_merges_then_take_flushes_once() {
+        let mut pending: Option<ProgressUpdate> = None;
+        coalesce_push(
+            &mut pending,
+            ProgressUpdate {
+                downloaded_bytes: Some(10),
+                total_bytes: Some(100),
+                filename: Some("a.bin".into()),
+                state_hint: Some(ProgressHint::Starting),
+                ..Default::default()
+            },
+        );
+        coalesce_push(
+            &mut pending,
+            ProgressUpdate::downloading_tick(50, 100, 5, 10, 50.0),
+        );
+        coalesce_push(
+            &mut pending,
+            ProgressUpdate {
+                speed: Some(9),
+                ..Default::default()
+            },
+        );
+
+        let flushed = pending.take().expect("pending after pushes");
+        assert!(pending.is_none());
+        assert_eq!(flushed.downloaded_bytes, Some(50));
+        assert_eq!(flushed.total_bytes, Some(100));
+        assert_eq!(flushed.speed, Some(9)); // latest wins
+        assert_eq!(flushed.eta_secs, Some(10));
+        assert_eq!(flushed.progress, Some(50.0));
+        assert_eq!(flushed.filename.as_deref(), Some("a.bin")); // preserved
+        assert_eq!(flushed.state_hint, Some(ProgressHint::Downloading));
+    }
+
+    /// Pump applies pending when the channel closes, then stops (terminal flush).
+    #[tokio::test]
+    async fn progress_pump_flushes_pending_on_channel_close() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Downloading);
+        job.id = "pump-test".into();
+        let job_id = job.id.clone();
+
+        let inner = Arc::new(Mutex::new(EngineInner {
+            jobs: vec![job],
+            controls: HashMap::new(),
+            active: HashMap::new(),
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: EngineConfig {
+                max_concurrent: 1,
+                auto_retry: 0,
+                speed_limit_kib: 0,
+            },
+            event_tx,
+            wake: Arc::new(Notify::new()),
+        }));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
+
+        // Buffer two patches then close: merge + flush-on-close (no wait for deadline).
+        tx.send(ProgressUpdate::downloading_tick(10, 100, 1, 90, 10.0))
+            .unwrap();
+        tx.send(ProgressUpdate::downloading_tick(40, 100, 4, 15, 40.0))
+            .unwrap();
+        drop(tx);
+
+        pump.await.expect("pump join");
+
+        let guard = inner.lock().await;
+        let job = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        // Final values from merged pending (later tick wins scalars).
+        assert_eq!(job.downloaded_bytes, 40);
+        assert_eq!(job.speed, 4);
+        assert_eq!(job.progress, 40.0);
+        assert_eq!(job.state, JobState::Downloading);
+        drop(guard);
+
+        // At least one JobsChanged from the flush path.
+        let mut emits = 0;
+        while event_rx.try_recv().is_ok() {
+            emits += 1;
+        }
+        assert!(emits >= 1, "expected flush emit(s), got {emits}");
+    }
+
+    /// Deferred patch after restart zeroed the job must not clobber Queued.
+    #[tokio::test]
+    async fn progress_pump_does_not_apply_when_job_queued() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "queued-test".into();
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 0.0;
+        job.speed = 0;
+        let job_id = job.id.clone();
+
+        let inner = Arc::new(Mutex::new(EngineInner {
+            jobs: vec![job],
+            controls: HashMap::new(),
+            active: HashMap::new(),
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: EngineConfig {
+                max_concurrent: 1,
+                auto_retry: 0,
+                speed_limit_kib: 0,
+            },
+            event_tx,
+            wake: Arc::new(Notify::new()),
+        }));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
+        tx.send(ProgressUpdate::downloading_tick(80, 100, 10, 2, 80.0))
+            .unwrap();
+        drop(tx);
+        pump.await.expect("pump join");
+
+        let guard = inner.lock().await;
+        let job = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(job.progress, 0.0);
+        assert_eq!(job.speed, 0);
     }
 }

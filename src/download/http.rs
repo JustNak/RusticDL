@@ -108,6 +108,29 @@ impl ProgressUpdate {
             state_hint: Some(ProgressHint::Downloading),
         }
     }
+
+    /// Final completion patch (100%, zero speed, final paths).
+    pub fn completed_tick(
+        downloaded: u64,
+        total: u64,
+        filename: Option<String>,
+        target_path: Option<std::path::PathBuf>,
+        temp_path: Option<std::path::PathBuf>,
+        resume_supported: Option<bool>,
+    ) -> Self {
+        Self {
+            downloaded_bytes: Some(downloaded),
+            total_bytes: Some(total),
+            speed: Some(0),
+            eta_secs: Some(0),
+            progress: Some(100.0),
+            filename,
+            target_path,
+            temp_path,
+            resume_supported,
+            state_hint: Some(ProgressHint::Downloading),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,25 +461,21 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-    on_progress(ProgressUpdate {
-        downloaded_bytes: Some(downloaded),
-        total_bytes: Some(if total_bytes == 0 {
+    on_progress(ProgressUpdate::completed_tick(
+        downloaded,
+        if total_bytes == 0 {
             downloaded
         } else {
             total_bytes
-        }),
-        speed: Some(0),
-        eta_secs: Some(0),
-        progress: Some(100.0),
-        filename: final_path
+        },
+        final_path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string()),
-        target_path: Some(final_path),
-        temp_path: Some(temp_path),
-        resume_supported: Some(resume_supported),
-        state_hint: Some(ProgressHint::Downloading),
-    });
+        Some(final_path),
+        Some(temp_path),
+        Some(resume_supported),
+    ));
 
     Ok(DownloadOutcome::Completed)
 }
