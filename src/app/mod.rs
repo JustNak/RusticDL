@@ -124,6 +124,9 @@ pub struct DownloadApp {
     last_jobs_save: Instant,
     /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
+    /// Bumped when a check starts or is invalidated (e.g. channel switch).
+    /// Completions whose generation no longer matches are dropped.
+    update_check_gen: u64,
     /// Cached latest release when an update is available (Install update menu label).
     available_update: Option<UpdateInfo>,
     /// Interactive check found an update; open the dialog on the next frame with a Window.
@@ -471,6 +474,7 @@ impl DownloadApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             update_busy: false,
+            update_check_gen: 0,
             available_update: None,
             pending_show_update_dialog: false,
             system_tray,
@@ -1095,7 +1099,7 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Draft update channel; clears any cached available update from the other stream.
+    /// Draft update channel; clears cached results and invalidates in-flight checks.
     fn set_update_channel(
         &mut self,
         channel: crate::settings::UpdateChannel,
@@ -1108,6 +1112,9 @@ impl DownloadApp {
         self.settings.update_channel = channel;
         self.available_update = None;
         self.pending_show_update_dialog = false;
+        // Drop any in-flight check for the previous channel (late result is ignored).
+        self.update_check_gen = self.update_check_gen.wrapping_add(1);
+        self.update_busy = false;
         cx.notify();
     }
 
