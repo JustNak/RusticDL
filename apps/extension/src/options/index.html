@@ -7,96 +7,373 @@
     <script src="./appearance-preload.js"></script>
     <link rel="stylesheet" href="./theme.css" />
     <style>
-      body { margin: 0; background: var(--color-background); color: var(--color-foreground); }
-      main { max-width: 720px; margin: 0 auto; padding: 28px 20px 48px; display: flex; flex-direction: column; gap: 16px; }
-      h1 { margin: 0; font-size: 22px; }
-      h2 { margin: 0; font-size: 15px; font-weight: 650; }
-      p { margin: 0; color: var(--color-muted-foreground); }
-      section { border: 1px solid var(--color-border); border-radius: 12px; padding: 16px; background: var(--color-card); display: flex; flex-direction: column; gap: 10px; }
-      label { font-weight: 600; font-size: 13px; }
-      textarea, input[type="text"] { width: 100%; min-height: 96px; border-radius: 8px; border: 1px solid var(--color-border); background: var(--color-background); color: var(--color-foreground); padding: 10px; font: inherit; box-sizing: border-box; }
-      input[type="text"] { min-height: auto; }
-      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-      .button { border: 0; border-radius: 8px; padding: 10px 14px; font-weight: 600; cursor: pointer; background: var(--color-primary); color: var(--color-primary-foreground); }
-      .button.secondary { background: var(--color-muted); color: var(--color-foreground); border: 1px solid var(--color-border); }
-      .hint { font-size: 12px; color: var(--color-muted-foreground); }
-      #status { min-height: 1.2em; font-size: 13px; }
-      .theme-options { display: flex; gap: 8px; flex-wrap: wrap; }
-      .theme-options label {
-        display: inline-flex; align-items: center; gap: 6px;
-        font-weight: 500; padding: 8px 12px; border-radius: 8px;
-        border: 1px solid var(--color-border); background: var(--color-background); cursor: pointer;
+      /* Page-local refinements on top of theme.css */
+      body.options-page {
+        margin: 0;
+        background: var(--color-background);
+        color: var(--color-foreground);
       }
-      .theme-options input { margin: 0; }
-      .swatches { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-      .swatch {
-        width: 28px; height: 28px; border-radius: 999px; border: 2px solid transparent;
-        cursor: pointer; padding: 0; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12);
+
+      .tag-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 14px 18px 18px;
       }
-      .swatch[aria-pressed="true"] {
-        border-color: var(--color-foreground);
-        box-shadow: 0 0 0 2px var(--color-background), 0 0 0 4px var(--color-primary);
+
+      .tag-editor-toolbar {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
       }
-      .custom-accent { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-      .custom-accent input[type="color"] {
-        width: 40px; height: 32px; padding: 0; border: 1px solid var(--color-border);
-        border-radius: 8px; background: transparent; cursor: pointer;
+
+      .tag-editor-toolbar input[type="search"] {
+        width: 100%;
+        height: 36px;
+        border: 1px solid var(--color-input);
+        border-radius: var(--radius-md);
+        background: var(--color-background);
+        color: var(--color-foreground);
+        padding: 0 10px;
+        font: inherit;
+        font-size: 13px;
       }
-      .custom-accent input[type="text"] { width: 110px; font-family: ui-monospace, Consolas, monospace; }
+
+      .tag-editor-toolbar input[type="search"]:focus {
+        border-color: var(--color-primary);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-ring) 20%, transparent);
+        outline: none;
+      }
+
+      .tag-editor-add {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+      }
+
+      .tag-editor-add.with-secondary {
+        grid-template-columns: minmax(0, 1fr) auto auto;
+      }
+
+      .tag-list {
+        list-style: none;
+        margin: 0;
+        padding: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-content: flex-start;
+        min-height: 72px;
+        max-height: 240px;
+        overflow: auto;
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        background: var(--color-background);
+        scrollbar-gutter: stable;
+      }
+
+      .tag-list:focus-within {
+        border-color: color-mix(in oklch, var(--color-primary) 45%, var(--color-border));
+      }
+
+      .tag-list-empty,
+      .tag-empty {
+        width: 100%;
+        margin: 0;
+        padding: 12px 4px;
+        color: var(--color-muted-foreground);
+        font-size: 12px;
+        line-height: 1.4;
+        text-align: center;
+      }
+
+      .tag-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        max-width: 100%;
+        min-height: 30px;
+        padding: 0 4px 0 10px;
+        border: 1px solid color-mix(in oklch, var(--color-primary) 40%, var(--color-border));
+        border-radius: 999px;
+        background: var(--color-primary-soft);
+        color: var(--color-foreground);
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .tag-chip-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 28ch;
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .tag-chip-remove {
+        display: grid;
+        place-items: center;
+        width: 24px;
+        min-height: 24px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--color-muted-foreground);
+        cursor: pointer;
+      }
+
+      .tag-chip-remove svg {
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .tag-chip-remove:hover,
+      .tag-chip-remove:focus-visible {
+        background: var(--color-destructive-soft);
+        color: var(--color-destructive);
+      }
+
+      .tag-chip-remove:focus-visible {
+        outline: 2px solid color-mix(in oklch, var(--color-ring) 70%, transparent);
+        outline-offset: 1px;
+      }
+
+      .panel-note {
+        font-variant-numeric: tabular-nums;
+      }
+
+      .feedback {
+        min-height: 1.2em;
+        font-size: 12px;
+        color: var(--color-muted-foreground);
+      }
+
+      .toggle-stack {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .toggle-stack .setting-row:last-child {
+        border-bottom: 0;
+      }
+
+      .toggle-stack .setting-row {
+        cursor: pointer;
+      }
+
+      .toggle-stack input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        margin: 0;
+        accent-color: var(--color-primary);
+        cursor: pointer;
+        flex: 0 0 auto;
+      }
+
+      .toggle-stack .label {
+        display: block;
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 18px;
+      }
+
+      .button.secondary {
+        border: 1px solid var(--color-border);
+        background: var(--color-muted);
+        color: var(--color-foreground);
+      }
+
+      .button.secondary:hover {
+        background: var(--color-row-hover);
+      }
+
+      .connection-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 8px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--color-border);
+        background: var(--color-muted);
+        color: var(--color-muted-foreground);
+        font-size: 11px;
+        font-weight: 650;
+      }
+
+      .connection-pill .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: #94a3b8;
+      }
+
+      .connection-pill.connected .dot { background: var(--color-success); }
+      .connection-pill.checking .dot { background: var(--color-warning); }
+      .connection-pill.error .dot,
+      .connection-pill.host_missing .dot,
+      .connection-pill.app_missing .dot,
+      .connection-pill.app_unreachable .dot { background: var(--color-destructive); }
     </style>
   </head>
-  <body>
-    <main>
-      <div>
-        <h1>RusticDL</h1>
-        <p>Browser capture rules and extension appearance. Capture settings sync to RusticDL when connected; theme and accent stay local to this extension.</p>
-      </div>
-
-      <section>
-        <h2>Appearance</h2>
-        <p class="hint">Looks apply only to this extension’s popup and options pages. They do not follow RusticDL.</p>
-
-        <label>Theme</label>
-        <div class="theme-options" role="radiogroup" aria-label="Theme">
-          <label><input type="radio" name="theme" value="system" /> System</label>
-          <label><input type="radio" name="theme" value="light" /> Light</label>
-          <label><input type="radio" name="theme" value="dark" /> Dark</label>
+  <body class="options-page">
+    <div class="options-shell">
+      <header class="options-topbar">
+        <div class="title-block">
+          <div class="eyebrow">Extension</div>
+          <h1>Capture settings</h1>
+          <p class="subtitle">
+            Capture rules sync to RusticDL when connected. Theme and accent follow the desktop app.
+          </p>
+          <div id="connection-pill" class="connection-pill checking" aria-live="polite">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="connection-label">Checking connection…</span>
+          </div>
+          <div id="status" class="save-state" role="status" aria-live="polite"></div>
         </div>
-
-        <label>Accent color</label>
-        <div id="accent-swatches" class="swatches" role="listbox" aria-label="Accent presets"></div>
-        <div class="custom-accent">
-          <input id="accent-color" type="color" value="#3b82f6" aria-label="Custom accent color" />
-          <input id="accent-hex" type="text" maxlength="7" spellcheck="false" placeholder="#3b82f6" aria-label="Accent hex" />
+        <div class="header-actions">
+          <button id="save" class="button primary" type="button">Save settings</button>
         </div>
-      </section>
+      </header>
 
-      <section>
-        <h2>Capture</h2>
-        <label class="row"><input id="enabled" type="checkbox" /> Enable browser capture</label>
-        <label class="row"><input id="context-menu" type="checkbox" /> Context menu on links</label>
-        <label class="row"><input id="badge" type="checkbox" /> Show toolbar badge</label>
-        <label class="row"><input id="silent" type="checkbox" /> Silent (auto) handoff</label>
-      </section>
+      <main class="content">
+        <div class="sections">
+          <section class="panel" aria-labelledby="capture-heading">
+            <div class="panel-header">
+              <h2 id="capture-heading">Capture</h2>
+            </div>
+            <div class="toggle-stack">
+              <label class="setting-row switch-row" for="enabled">
+                <span>
+                  <span class="label">Enable browser capture</span>
+                  <span class="hint">Hand browser downloads off to RusticDL</span>
+                </span>
+                <input id="enabled" type="checkbox" />
+              </label>
+              <label class="setting-row switch-row" for="context-menu">
+                <span>
+                  <span class="label">Context menu on links</span>
+                  <span class="hint">Show “Download with RusticDL” on right-click</span>
+                </span>
+                <input id="context-menu" type="checkbox" />
+              </label>
+              <label class="setting-row switch-row" for="badge">
+                <span>
+                  <span class="label">Show toolbar badge</span>
+                  <span class="hint">Active downloads and connection warnings</span>
+                </span>
+                <input id="badge" type="checkbox" />
+              </label>
+              <label class="setting-row switch-row" for="silent">
+                <span>
+                  <span class="label">Silent (auto) handoff</span>
+                  <span class="hint">Skip the desktop confirm prompt</span>
+                </span>
+                <input id="silent" type="checkbox" />
+              </label>
+            </div>
+          </section>
 
-      <section>
-        <label for="excluded-hosts">Excluded hosts (one per line)</label>
-        <textarea id="excluded-hosts" spellcheck="false"></textarea>
-        <div class="hint">Downloads from these hosts stay in the browser.</div>
-      </section>
+          <section class="panel" aria-labelledby="hosts-heading">
+            <div class="panel-header">
+              <h2 id="hosts-heading">Excluded hosts</h2>
+              <span id="hosts-count" class="panel-note" aria-live="polite">0 hosts</span>
+            </div>
+            <div class="tag-editor">
+              <p class="hint" id="hosts-hint">
+                Downloads from these hosts stay in the browser. Use exact hosts or wildcards like
+                <code>*.cdn.example.com</code>.
+              </p>
+              <div class="tag-editor-toolbar">
+                <input
+                  id="hosts-filter"
+                  type="search"
+                  placeholder="Filter hosts…"
+                  autocomplete="off"
+                  aria-label="Filter excluded hosts"
+                />
+              </div>
+              <div class="tag-editor-add">
+                <input
+                  id="hosts-input"
+                  type="text"
+                  placeholder="Add host — e.g. web.telegram.org"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Add excluded host"
+                  aria-describedby="hosts-hint hosts-feedback"
+                />
+                <button id="hosts-add" class="button secondary" type="button">Add</button>
+              </div>
+              <ul
+                id="hosts-list"
+                class="tag-list"
+                role="list"
+                aria-label="Excluded hosts"
+                aria-describedby="hosts-hint"
+              ></ul>
+              <p id="hosts-empty" class="tag-empty" hidden>No excluded hosts. All matching downloads are captured.</p>
+              <div id="hosts-feedback" class="feedback" role="status" aria-live="polite"></div>
+            </div>
+          </section>
 
-      <section>
-        <label for="captured-extensions">Captured file extensions (comma or space separated)</label>
-        <input id="captured-extensions" type="text" />
-        <div class="hint">Used as a strong signal for automatic capture.</div>
-      </section>
-
-      <div class="row">
-        <button id="save" class="button" type="button">Save settings</button>
-        <button id="reset-appearance" class="button secondary" type="button">Reset appearance</button>
-        <div id="status"></div>
-      </div>
-    </main>
+          <section class="panel" aria-labelledby="exts-heading">
+            <div class="panel-header">
+              <h2 id="exts-heading">Captured file extensions</h2>
+              <span id="exts-count" class="panel-note" aria-live="polite">0 extensions</span>
+            </div>
+            <div class="tag-editor">
+              <p class="hint" id="exts-hint">
+                Strong signal for automatic capture. Paste many at once (comma or space separated).
+              </p>
+              <div class="tag-editor-toolbar">
+                <input
+                  id="exts-filter"
+                  type="search"
+                  placeholder="Filter extensions…"
+                  autocomplete="off"
+                  aria-label="Filter captured file extensions"
+                />
+              </div>
+              <div class="tag-editor-add with-secondary">
+                <input
+                  id="exts-input"
+                  type="text"
+                  placeholder="Add extension — e.g. zip"
+                  autocomplete="off"
+                  spellcheck="false"
+                  aria-label="Add captured file extension"
+                  aria-describedby="exts-hint exts-feedback"
+                />
+                <button id="exts-add" class="button secondary" type="button">Add</button>
+                <button id="exts-reset" class="button secondary" type="button" title="Restore the default extension list">
+                  Defaults
+                </button>
+              </div>
+              <ul
+                id="exts-list"
+                class="tag-list"
+                role="list"
+                aria-label="Captured file extensions"
+                aria-describedby="exts-hint"
+              ></ul>
+              <p id="exts-empty" class="tag-empty" hidden>No extensions listed. Capture will rely on MIME hints only.</p>
+              <div id="exts-feedback" class="feedback" role="status" aria-live="polite"></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
     <script type="module" src="./options.js"></script>
   </body>
 </html>

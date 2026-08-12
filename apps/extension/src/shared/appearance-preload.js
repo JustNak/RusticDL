@@ -1,7 +1,7 @@
 /**
  * Synchronous FOUC guard for popup/options pages.
  * Reads the same localStorage key written by applyExtensionAppearance().
- * Does not talk to the desktop app — extension appearance is local-only.
+ * Cache is last-known desktop appearance (no network / native messaging here).
  */
 (function () {
   const CACHE_KEY = 'rusticdl-appearance';

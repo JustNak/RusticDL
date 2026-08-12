@@ -48,6 +48,13 @@ export async function setAppearanceSettings(
   settings: Partial<AppearanceSettings> | AppearanceSettings,
 ): Promise<AppearanceSettings> {
   const normalized = normalizeAppearanceSettings(settings);
+  const current = await getAppearanceSettings();
+  if (
+    current.theme === normalized.theme
+    && current.accentColor === normalized.accentColor
+  ) {
+    return current;
+  }
   await browser.storage.local.set({ [APPEARANCE_STORAGE_KEY]: normalized });
   await updatePopupState({ appearanceSettings: normalized });
   return normalized;
@@ -72,7 +79,7 @@ export async function updatePopupState(
   const nextState: PopupStateResponse = {
     ...current,
     ...update,
-    // Appearance is local-only; never leave it undefined.
+    // Cached desktop appearance (or defaults when never connected).
     appearanceSettings: normalizeAppearanceSettings(
       update.appearanceSettings ?? current.appearanceSettings,
     ),
@@ -123,9 +130,11 @@ export async function setLastResult(
     ? await setExtensionSettings(payload.extensionSettings)
     : await getExtensionSettings();
 
-  // Intentionally ignore payload.appearanceSettings — extension theme/accent
-  // are owned by the extension, not mirrored from the desktop app.
-  const appearanceSettings = await getAppearanceSettings();
+  // Desktop is authoritative for theme/accent. Piggyback on pong (ping, settings
+  // save, open-app) — no dedicated appearance polling.
+  const appearanceSettings = payload?.appearanceSettings
+    ? await setAppearanceSettings(payload.appearanceSettings)
+    : await getAppearanceSettings();
 
   return updatePopupState({
     connection: payload?.connectionState ?? connection,

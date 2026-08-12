@@ -26,7 +26,6 @@ import {
   getAppearanceSettings,
   getExtensionSettings,
   getPopupState,
-  setAppearanceSettings,
   setExtensionSettings,
   setHostError,
   setLastResult,
@@ -479,10 +478,6 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupStateResp
     case 'appearance_settings_get': {
       const appearanceSettings = await getAppearanceSettings();
       return updatePopupState({ appearanceSettings });
-    }
-    case 'appearance_settings_update': {
-      await setAppearanceSettings(message.settings);
-      return getPopupState();
     }
     default:
       return getPopupState();
