@@ -138,6 +138,35 @@ pub enum TransferMode {
     Multi,
 }
 
+impl TransferMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "Single",
+            Self::Multi => "Multi",
+        }
+    }
+}
+
+/// Human label for planner / multi-fallback reason keys (detail panel).
+pub fn fallback_reason_label(reason: &str) -> &str {
+    match reason {
+        "multi_disabled" => "Multi-connection disabled",
+        "size_unknown" => "File size unknown",
+        "ranges_unknown" => "Range support unknown",
+        "ranges_unsupported" => "Server does not support ranges",
+        "below_multi_min_bytes" => "Below multi-connection size",
+        "multi_qualified" => "Multi-connection",
+        "legacy_contiguous_partial" => "Existing single-stream partial",
+        "multi_start_failed" => "Multi-connection start failed",
+        "multi_http_fallback" => "HTTP error during multi-connection",
+        "multi_network_fallback" => "Network error during multi-connection",
+        "multi_resume_fallback" => "Resume error during multi-connection",
+        "multi_disk_fallback" => "Disk error during multi-connection",
+        "multi_internal_fallback" => "Internal error during multi-connection",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
@@ -423,6 +452,28 @@ mod tests {
             Some("Mon, 01 Jan 2024 00:00:00 GMT")
         );
         assert_eq!(stored.expected_size, Some(200));
+    }
+
+    #[test]
+    fn transfer_mode_labels() {
+        assert_eq!(TransferMode::Single.label(), "Single");
+        assert_eq!(TransferMode::Multi.label(), "Multi");
+    }
+
+    #[test]
+    fn fallback_reason_labels_known_keys() {
+        assert_eq!(
+            fallback_reason_label("ranges_unsupported"),
+            "Server does not support ranges"
+        );
+        assert_eq!(
+            fallback_reason_label("legacy_contiguous_partial"),
+            "Existing single-stream partial"
+        );
+        assert_eq!(
+            fallback_reason_label("unknown_custom_reason"),
+            "unknown_custom_reason"
+        );
     }
 }
 

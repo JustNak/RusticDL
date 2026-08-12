@@ -11,7 +11,9 @@ use gpui_component::{
 use super::job_row::restart_icon;
 use super::widgets::{ellipsize_name, soft_tooltip, status_color, status_tag};
 use super::DownloadApp;
-use crate::download::{open_path, reveal_in_folder, EngineCommand, Job, JobState};
+use crate::download::{
+    fallback_reason_label, open_path, reveal_in_folder, EngineCommand, Job, JobState,
+};
 use crate::format::{format_eta, format_size, format_speed};
 
 /// Inline “Label value” pair used in the detail meta row (no card chrome).
@@ -83,6 +85,13 @@ pub(crate) fn render_detail(
     };
     let progress = format!("{:.1}%", job.progress);
     let retries = job.retry_attempts.to_string();
+    let mode = job
+        .transfer_mode
+        .map(|m| m.label().to_string())
+        .unwrap_or_else(|| "—".into());
+    let connections = job.active_connections.to_string();
+    let reconnects = job.reconnect_count.to_string();
+    let fallback = job.fallback_reason.clone();
     let path = job.target_path.to_string_lossy().to_string();
     let path_tip: SharedString = path.clone().into();
     let tip_color = theme.muted_foreground;
@@ -231,8 +240,38 @@ pub(crate) fn render_detail(
                                 .child(detail_meta_sep(&theme))
                                 .child(detail_pair("Resume", resume, &theme))
                                 .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Retries", retries, &theme)),
+                                .child(detail_pair("Retries", retries, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("Mode", mode, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("Connections", connections, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("Reconnects", reconnects, &theme)),
                         )
+                        .when_some(fallback, |el, reason| {
+                            el.child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Fallback"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(theme.foreground)
+                                            .child(fallback_reason_label(&reason).to_string()),
+                                    ),
+                            )
+                        })
                         // ── Path ──
                         .child(
                             h_flex()

@@ -36,6 +36,10 @@ pub enum TransferPlanReason {
     MultiQualified,
 }
 
+/// One-shot toast when a large file cannot use multi (ranges unknown/unsupported).
+pub const LARGE_FILE_MULTI_UNAVAILABLE_TOAST: &str =
+    "Multi-connection unavailable for this large file; using a single connection.";
+
 impl TransferPlanReason {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -91,6 +95,25 @@ impl TransferPlan {
             TransferPlanReason::MultiQualified => None,
             other => Some(other.as_str()),
         }
+    }
+
+    /// Planner patch plus connections and a one-shot toast for large files.
+    ///
+    /// Toast only when ranges are unknown/unsupported on a file at or above
+    /// `multi_min_bytes`. Disabled multi records the reason without toasting.
+    pub fn to_visibility_update(self, size: Option<u64>, multi_min_bytes: u64) -> ProgressUpdate {
+        let mut patch = self.to_progress_update();
+        if self.chosen == TransferMode::Single {
+            patch.active_connections = Some(1);
+        }
+        if matches!(
+            self.reason,
+            TransferPlanReason::RangesUnknown | TransferPlanReason::RangesUnsupported
+        ) && size.is_some_and(|n| n >= multi_min_bytes)
+        {
+            patch.toast = Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST.into());
+        }
+        patch
     }
 }
 
@@ -199,7 +222,8 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
     if let Some(reason) = plan.fallback_reason() {
         ctx.job.fallback_reason = Some(reason.to_string());
     }
-    (ctx.on_progress)(plan.to_progress_update());
+    let size = known_size(&ctx.job, preflight.as_ref());
+    (ctx.on_progress)(plan.to_visibility_update(size, ctx.multi_min_bytes));
 
     // v1 map missing/inconsistent: never invent Range from metadata_len or a fresh partition.
     if plan.reason.is_resume_required() {
@@ -483,6 +507,120 @@ Accept-Ranges: bytes\r\n\
         assert_eq!(
             mode_patch.fallback_reason.as_deref(),
             Some("multi_disabled")
+        );
+        assert!(mode_patch.toast.is_none(), "disabled multi must not toast");
+        assert_eq!(mode_patch.active_connections, Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visibility_large_file_ranges_unsupported_toasts_once() {
+        let job = sample_job();
+        let pf = preflight(Some(8 * 1024 * 1024), Some(false));
+        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let patch = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024);
+        assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
+        assert_eq!(patch.transfer_mode, Some(TransferMode::Single));
+        assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
+        assert_eq!(
+            patch.toast.as_deref(),
+            Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST)
+        );
+        assert_eq!(patch.active_connections, Some(1));
+    }
+
+    #[test]
+    fn visibility_small_file_ranges_unsupported_no_toast() {
+        let job = sample_job();
+        let pf = preflight(Some(1024), Some(false));
+        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024);
+        assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
+        assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
+        assert!(patch.toast.is_none());
+    }
+
+    #[test]
+    fn visibility_large_file_multi_disabled_reason_without_toast() {
+        let job = sample_job();
+        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), false, 5 * 1024 * 1024);
+        let patch = plan.to_visibility_update(Some(10 * 1024 * 1024), 5 * 1024 * 1024);
+        assert_eq!(plan.reason, TransferPlanReason::MultiDisabled);
+        assert_eq!(patch.fallback_reason.as_deref(), Some("multi_disabled"));
+        assert!(patch.toast.is_none());
+    }
+
+    #[test]
+    fn visibility_below_min_no_fallback_reason() {
+        let job = sample_job();
+        let pf = preflight(Some(1024), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024);
+        assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
+        assert_eq!(
+            patch.fallback_reason.as_deref(),
+            Some("below_multi_min_bytes")
+        );
+        assert!(patch.toast.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_transfer_large_file_without_ranges_toasts_once() {
+        let body = vec![b'x'; 64];
+        // Explicit none so preflight does not fire a Range probe (which would
+        // consume the scripted GET). Planner still sees ranges_unsupported.
+        let head = format!(
+            "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: none\r\n\
+Content-Length: {}\r\n\
+\r\n",
+            8 * 1024 * 1024
+        );
+        let get = format!(
+            "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\
+\r\n",
+            body.len()
+        );
+        let (base, _handle) = spawn_scripted_server(vec![head, get]).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-xfer-nr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/big.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp);
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+
+        let ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        let outcome = run_transfer(ctx).await.expect("transfer");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+
+        let seen = patches.lock().unwrap();
+        let toasts: Vec<_> = seen.iter().filter(|p| p.toast.is_some()).collect();
+        assert_eq!(toasts.len(), 1, "toast must be one-shot, got {toasts:?}");
+        assert_eq!(
+            toasts[0].toast.as_deref(),
+            Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST)
+        );
+        assert_eq!(
+            toasts[0].fallback_reason.as_deref(),
+            Some("ranges_unsupported")
         );
 
         let _ = std::fs::remove_dir_all(&dir);

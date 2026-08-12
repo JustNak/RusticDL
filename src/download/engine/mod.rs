@@ -445,8 +445,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                     if !matches!(job.state, JobState::Queued) {
                         job.state = JobState::Queued;
                     }
-                    job.speed = 0;
-                    job.eta_secs = 0;
+                    clear_live_metrics(job);
                 }
             } else {
                 match final_result {
@@ -454,28 +453,23 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                         if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                             job.state = JobState::Completed;
                             job.progress = 100.0;
-                            job.speed = 0;
-                            job.eta_secs = 0;
                             job.error = None;
                             // Slim state.json: drop map, version 0; keep validators.
                             job.on_completed();
+                            clear_live_metrics(job);
                         }
                         guard.handoff_auth.remove(&job_id);
                     }
                     Ok(DownloadOutcome::Paused) => {
                         if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                             job.state = JobState::Paused;
-                            job.speed = 0;
-                            job.eta_secs = 0;
-                            job.active_connections = 0;
+                            clear_live_metrics(job);
                         }
                     }
                     Ok(DownloadOutcome::Canceled) => {
                         if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                             job.state = JobState::Canceled;
-                            job.speed = 0;
-                            job.eta_secs = 0;
-                            job.active_connections = 0;
+                            clear_live_metrics(job);
                             if partial_to_delete.is_some() {
                                 job.clear_partial_and_identity();
                             }
@@ -492,13 +486,11 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                             match control.load(Ordering::Relaxed) {
                                 1 => {
                                     job.state = JobState::Paused;
-                                    job.speed = 0;
-                                    job.active_connections = 0;
+                                    clear_live_metrics(job);
                                 }
                                 2 => {
                                     job.state = JobState::Canceled;
-                                    job.speed = 0;
-                                    job.active_connections = 0;
+                                    clear_live_metrics(job);
                                     if partial_to_delete.is_some() {
                                         job.clear_partial_and_identity();
                                     }
@@ -715,14 +707,19 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     true
 }
 
+/// Zero live transfer metrics when a worker leaves the job (every finalizer path).
+fn clear_live_metrics(job: &mut Job) {
+    job.speed = 0;
+    job.eta_secs = 0;
+    job.active_connections = 0;
+}
+
 /// Failed multi: retain map + version for resume reuse. Do not call `on_completed`.
 fn apply_failed_lifecycle(job: &mut Job, error: super::job::DownloadError) {
     job.state = JobState::Failed;
     job.error = Some(error.message);
     job.failure_category = Some(error.category);
-    job.speed = 0;
-    job.eta_secs = 0;
-    job.active_connections = 0;
+    clear_live_metrics(job);
 }
 
 pub(super) fn find_job_mut<'a>(jobs: &'a mut [Job], id: &str) -> Option<&'a mut Job> {
@@ -1164,6 +1161,18 @@ mod tests {
         assert_eq!(job.active_connections, 0);
         assert_eq!(job.error.as_deref(), Some("boom"));
         assert_eq!(job.failure_category, Some(FailureCategory::Network));
+    }
+
+    #[test]
+    fn worker_finalizer_zeros_active_connections() {
+        let mut job = sample_job(JobState::Downloading);
+        job.active_connections = 4;
+        job.speed = 1200;
+        job.eta_secs = 30;
+        clear_live_metrics(&mut job);
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.speed, 0);
+        assert_eq!(job.eta_secs, 0);
     }
 
     /// Multiple patches merge into one pending; take drains once.

@@ -387,7 +387,10 @@ fn persist_map_exit(ctx: &mut TransferContext, map: &SegmentMap, active: u32) {
     emit_force_persist(ctx, map, active, None, None);
 }
 
-fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str) {
+/// One-shot toast when multi actually converts to single-stream.
+const MULTI_FALLBACK_TOAST: &str = "Fell back to a single connection.";
+
+fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str, toast: bool) {
     ctx.job.transfer_format_version = 0;
     ctx.job.segment_map = None;
     ctx.job.transfer_mode = Some(TransferMode::Single);
@@ -399,6 +402,7 @@ fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str) {
         transfer_mode: Some(TransferMode::Single),
         fallback_reason: Some(reason.to_string()),
         active_connections: Some(0),
+        toast: toast.then(|| MULTI_FALLBACK_TOAST.to_string()),
         ..Default::default()
     });
 }
@@ -414,7 +418,7 @@ async fn fail_before_workers(
             // No writer handle yet (open failed or never opened).
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         }
-        rollback_multi_identity(ctx, "multi_start_failed");
+        rollback_multi_identity(ctx, "multi_start_failed", false);
     }
     Err(error)
 }
@@ -423,7 +427,7 @@ async fn fallback_to_single(
     ctx: &mut TransferContext,
     reason: &str,
 ) -> Result<DownloadOutcome, DownloadError> {
-    rollback_multi_identity(ctx, reason);
+    rollback_multi_identity(ctx, reason, true);
     run_http_download_with_ctx(ctx).await
 }
 
