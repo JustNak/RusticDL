@@ -1,16 +1,15 @@
 import {
   isErrorResponse,
-  isUrlHostExcludedByPatterns,
   toUserFacingMessage,
   type DownloadRequestMetadata,
   type ExtensionIntegrationSettings,
   type HostToExtensionResponse,
 } from '@rusticdl/protocol';
 import browser from './browser';
+import { shouldCaptureDownloadItem } from './captureFilter';
 import {
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
-  MIN_CAPTURE_BYTES,
   type FirefoxCaptureCandidate,
   type FirefoxHeadersReceivedDetails,
 } from './firefoxCapture';
@@ -132,113 +131,11 @@ function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
   return status === 'queued' || status === 'duplicate_existing_job';
 }
 
-function filenameExtension(filename: string | undefined): string | undefined {
-  if (!filename) return undefined;
-  const base = filename.split(/[\\/]/).pop() ?? filename;
-  const dot = base.lastIndexOf('.');
-  if (dot < 0 || dot === base.length - 1) return undefined;
-  const ext = base.slice(dot + 1).toLowerCase();
-  if (!/^[a-z0-9]{1,10}$/.test(ext)) return undefined;
-  return ext;
-}
-
-function filenameLooksCaptured(filename: string | undefined, extensions: string[]): boolean {
-  const ext = filenameExtension(filename);
-  return Boolean(ext && extensions.includes(ext));
-}
-
-/** MIME types that mean "this is a real file the browser is saving". */
-const DOWNLOAD_ITEM_MIME_HINTS = [
-  'octet-stream',
-  'zip',
-  'x-rar',
-  'x-7z',
-  'x-tar',
-  'gzip',
-  'x-bzip',
-  'x-xz',
-  'pdf',
-  'msdownload',
-  'x-msi',
-  'java-archive',
-  'android.package',
-  'x-iso9660',
-  'x-apple-diskimage',
-  'x-debian',
-  'x-redhat-package',
-  'vnd.ms-excel',
-  'vnd.ms-powerpoint',
-  'msword',
-  'officedocument',
-];
-
 /** Firefox DownloadItem + optional Chromium fields used when capturing. */
 type CapturedDownloadItem = browser.downloads.DownloadItem & {
   finalUrl?: string;
   byExtensionId?: string;
 };
-
-/**
- * downloads.onCreated filter (Firefox fallback + Chromium primary).
- *
- * Never capture just because a filename exists — Firefox always supplies one.
- * Require a captured extension and/or a download MIME, and skip tiny junk bodies.
- */
-function shouldCaptureDownload(
-  item: CapturedDownloadItem,
-  settings: ExtensionIntegrationSettings,
-): boolean {
-  if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
-  const url = item.finalUrl || item.url;
-  if (!url || !(url.startsWith('http://') || url.startsWith('https://'))) return false;
-  if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
-  if (item.byExtensionId) return false;
-
-  // Skip non-http schemes already handled; also skip blob:/data: noise if present.
-  if (url.startsWith('blob:') || url.startsWith('data:')) return false;
-
-  const mime = (item.mime || '').toLowerCase();
-  if (
-    mime.startsWith('text/html') ||
-    mime === 'application/xhtml+xml' ||
-    mime === 'application/json'
-  ) {
-    return false;
-  }
-
-  const ext = filenameExtension(item.filename);
-  const ignored = new Set(
-    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
-  );
-  if (ext && ignored.has(ext)) return false;
-
-  const strongName = filenameLooksCaptured(item.filename, settings.capturedFileExtensions);
-  const dispositionHint = DOWNLOAD_ITEM_MIME_HINTS.some((hint) => mime.includes(hint));
-
-  // Media MIME types are usually page assets; allow only when the filename matches
-  // a user-configured captured extension (e.g. user added mp3/mp4/png).
-  if (
-    (mime.startsWith('image/') ||
-      mime.startsWith('audio/') ||
-      mime.startsWith('video/') ||
-      mime.startsWith('font/')) &&
-    !strongName
-  ) {
-    return false;
-  }
-
-  // Known-size micro responses are never real archives/installers.
-  const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
-  if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES && !strongName) {
-    return false;
-  }
-
-  // Require a strong signal — do NOT fall back to "any filename".
-  // A non-captured extension (e.g. f.txt + octet-stream) is a veto for MIME-only capture.
-  if (strongName) return true;
-  if (ext) return false;
-  return dispositionHint;
-}
 
 async function handOffUrl(
   url: string,
@@ -317,7 +214,7 @@ async function handoffBrowserDownload(
 
 async function onDownloadCreated(item: CapturedDownloadItem) {
   const settings = await getCachedSettings();
-  if (!shouldCaptureDownload(item, settings)) return;
+  if (!shouldCaptureDownloadItem(item, settings)) return;
   await handoffBrowserDownload(item, settings);
 }
 

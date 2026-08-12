@@ -11,6 +11,11 @@ import {
   isUrlHostExcludedByPatterns,
   type ExtensionIntegrationSettings,
 } from '@rusticdl/protocol';
+import {
+  MIN_CAPTURE_BYTES,
+  isPageOrApiMime,
+  isWeakCaptureExtension,
+} from './captureFilter';
 import browser from './browser';
 
 export type FirefoxWebRequestHeader = { name: string; value?: string };
@@ -37,8 +42,7 @@ export type FirefoxCaptureCandidate = {
   reason: string;
 };
 
-/** Skip known-size responses smaller than this unless they look like a real file. */
-export const MIN_CAPTURE_BYTES = 1024;
+export { MIN_CAPTURE_BYTES, shouldCaptureDownloadItem } from './captureFilter';
 
 const DOWNLOAD_MIME = new Set([
   'application/zip',
@@ -168,6 +172,7 @@ export function extensionOf(name: string | undefined): string | undefined {
 function isNonDownloadMime(mime: string): boolean {
   if (!mime) return false;
   if (NON_DOWNLOAD_MIME.has(mime)) return true;
+  if (isPageOrApiMime(mime)) return true;
   if (mime.startsWith('text/')) return true;
   if (mime.startsWith('image/')) return true;
   if (mime.startsWith('audio/')) return true;
@@ -175,6 +180,10 @@ function isNonDownloadMime(mime: string): boolean {
   if (mime.startsWith('font/')) return true;
   if (mime.endsWith('+json') || mime.endsWith('+xml')) return true;
   return false;
+}
+
+function hasCorsAllowOrigin(headers: FirefoxWebRequestHeader[] | undefined): boolean {
+  return Boolean(headerValue(headers, 'access-control-allow-origin'));
 }
 
 function looksLikeNonDownloadUrl(url: string): boolean {
@@ -254,17 +263,22 @@ export function firefoxWebRequestDownloadCandidate(
   }
 
   const hasAttachment = /\battachment\b/i.test(disposition);
-  const strongExt = Boolean(ext && captured.has(ext));
+  // Weak data extensions (csv/json/…) must never count as a "strong" filename.
+  const strongExt = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
   const strongMime = DOWNLOAD_MIME.has(mime);
   // Present but non-captured extension is a veto for MIME-only capture (e.g. f.txt + octet-stream).
   const knownNonCapturedExt = Boolean(ext && !captured.has(ext));
-  const navType =
-    resourceType === 'main_frame' ||
-    resourceType === 'object' ||
-    resourceType === 'other';
+  const isMainFrame = resourceType === 'main_frame';
+  const navType = isMainFrame || resourceType === 'object' || resourceType === 'other';
+
+  // CORS-enabled responses without attachment are page data fetches (Nexus stats CSVs,
+  // autocomplete, etc.), not user downloads. Real file CDNs still hit downloads.onCreated.
+  if (hasCorsAllowOrigin(headers) && !hasAttachment) {
+    return null;
+  }
 
   // Page documents / API payloads are never downloads unless the server forces
-  // a saved file with a recognized captured extension.
+  // a saved file with a recognized *strong* captured extension.
   if (isNonDownloadMime(mime)) {
     if (!(hasAttachment && strongExt && dispositionName)) {
       return null;
@@ -293,11 +307,12 @@ export function firefoxWebRequestDownloadCandidate(
   } else if (strongMime && navType && !knownNonCapturedExt) {
     // Direct navigation / plugin / opaque hit on a binary MIME (e.g. clicking a .zip / .pdf link).
     reason = 'download_mime_navigation';
-  } else if (strongExt && navType && dispositionName) {
-    // Navigation with disposition filename matching a captured extension.
+  } else if (strongExt && isMainFrame && dispositionName) {
+    // Top-level navigation with disposition filename matching a captured extension.
     reason = 'strong_filename_navigation';
-  } else if (strongExt && navType && !mime) {
-    // Some CDNs omit Content-Type on file links; trust main/object/other navigations only.
+  } else if (strongExt && isMainFrame && !mime) {
+    // Some CDNs omit Content-Type on file links; only trust top-level navigations.
+    // type=other is too noisy (stats CSVs, pixels) even when the path ends in .zip/.csv.
     reason = 'strong_filename_navigation';
   }
 
