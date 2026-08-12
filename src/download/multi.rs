@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::client::download_client;
@@ -98,7 +99,10 @@ pub async fn run_multi_segment_download(
     // Disk check only for v0 / no-map (single-stream semantics).
     if ctx.job.segment_map.is_none() && ctx.job.transfer_format_version == 0 {
         let on_disk = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
-        if on_disk > 0 {
+        if looks_like_preallocate_hole(ctx.job.downloaded_bytes, on_disk, ctx.job.total_bytes) {
+            // Crash window after set_len, before map persist — do not metadata_len resume.
+            let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
+        } else if on_disk > 0 {
             return fallback_to_single(ctx, "legacy_contiguous_partial").await;
         }
     }
@@ -110,8 +114,9 @@ pub async fn run_multi_segment_download(
         PreparedMap::Reuse(map) | PreparedMap::Fresh(map) => map,
     };
 
+    // version=1 on the in-memory job *before* any set_len so same-process resume is safe.
     apply_multi_identity(ctx, &map, total);
-    emit_force_persist(ctx, &map, 0);
+    emit_force_persist_and_wait(ctx, &map, 0).await;
 
     if let Err(message) = ensure_parent_directory(&ctx.job.target_path).await {
         return fail_before_workers(
@@ -119,7 +124,8 @@ pub async fn run_multi_segment_download(
             reused,
             false,
             download_error(FailureCategory::Disk, message, false),
-        );
+        )
+        .await;
     }
     if let Err(message) = ensure_parent_directory(&ctx.job.temp_path).await {
         return fail_before_workers(
@@ -127,7 +133,8 @@ pub async fn run_multi_segment_download(
             reused,
             false,
             download_error(FailureCategory::Disk, message, false),
-        );
+        )
+        .await;
     }
 
     let remaining = total.saturating_sub(map.written_sum());
@@ -138,7 +145,7 @@ pub async fn run_multi_segment_download(
             Ok(true) => {
                 map.preallocated = true;
                 ctx.job.segment_map = Some(map.clone());
-                emit_force_persist(ctx, &map, 0);
+                emit_force_persist_and_wait(ctx, &map, 0).await;
                 true
             }
             Ok(false) => false,
@@ -148,7 +155,8 @@ pub async fn run_multi_segment_download(
                     reused,
                     false,
                     download_error(FailureCategory::Disk, message, false),
-                );
+                )
+                .await;
             }
         }
     };
@@ -167,7 +175,8 @@ pub async fn run_multi_segment_download(
                         format!("Could not open multi-segment file: {error}"),
                         false,
                     ),
-                );
+                )
+                .await;
             }
             Err(error) => {
                 return fail_before_workers(
@@ -179,7 +188,8 @@ pub async fn run_multi_segment_download(
                         format!("Could not open multi-segment file: {error}"),
                         false,
                     ),
-                );
+                )
+                .await;
             }
         };
 
@@ -194,24 +204,40 @@ pub async fn run_multi_segment_download(
         Ok((outcome, map)) => {
             persist_map_exit(ctx, &map, 0);
             if ctx.fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
-                let writer = writer.clone();
-                let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
+                let flush = writer.clone();
+                let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
             }
+            drop(writer);
             Ok(outcome)
         }
         Err((error, map)) => {
             persist_map_exit(ctx, &map, 0);
             if all_written_zero(&map) {
+                // Windows: DeleteFile fails while SegmentFileWriter still holds the handle.
+                drop(writer);
                 if map.preallocated {
-                    // Sparse/zero preallocate would lie to single-stream metadata_len.
-                    let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
+                    if let Err(io_err) = tokio::fs::remove_file(&ctx.job.temp_path).await {
+                        return Err(download_error(
+                            FailureCategory::Disk,
+                            format!(
+                                "Could not remove preallocated file before single-stream fallback: {io_err}"
+                            ),
+                            false,
+                        ));
+                    }
                 }
                 fallback_to_single(ctx, fallback_reason_for(&error)).await
             } else {
+                drop(writer);
                 Err(error)
             }
         }
     }
+}
+
+/// `downloaded == 0` + file already `total` and no map: crash after set_len, not a contiguous partial.
+pub(crate) fn looks_like_preallocate_hole(downloaded: u64, on_disk: u64, total: u64) -> bool {
+    downloaded == 0 && total > 0 && on_disk >= total
 }
 
 fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
@@ -245,27 +271,52 @@ fn apply_multi_identity(ctx: &mut TransferContext, map: &SegmentMap, total: u64)
     ctx.job.progress = progress_percent(ctx.job.downloaded_bytes, total);
 }
 
-fn emit_force_persist(ctx: &TransferContext, map: &SegmentMap, active: u32) {
+fn emit_force_persist(
+    ctx: &TransferContext,
+    map: &SegmentMap,
+    active: u32,
+    hint: Option<ProgressHint>,
+    persist_ack: Option<Arc<Notify>>,
+) {
     let downloaded = map.written_sum();
     (ctx.on_progress)(ProgressUpdate {
         downloaded_bytes: Some(downloaded),
         total_bytes: Some(map.total_bytes),
         progress: Some(progress_percent(downloaded, map.total_bytes)),
         resume_supported: Some(true),
-        state_hint: Some(ProgressHint::Starting),
+        state_hint: hint,
         transfer_format_version: Some(1),
         segment_map: Some(map.clone()),
         transfer_mode: Some(TransferMode::Multi),
         active_connections: Some(active),
+        persist_ack,
         ..Default::default()
     });
+}
+
+/// Emit map+version and wait for engine `apply_progress` (timeout if no pump).
+async fn emit_force_persist_and_wait(ctx: &TransferContext, map: &SegmentMap, active: u32) {
+    let ack = Arc::new(Notify::new());
+    emit_force_persist(
+        ctx,
+        map,
+        active,
+        Some(ProgressHint::Starting),
+        Some(ack.clone()),
+    );
+    tokio::select! {
+        _ = ack.notified() => {}
+        // Direct tests have no engine pump; ctx.job already has version=1.
+        _ = sleep(Duration::from_millis(100)) => {}
+    }
 }
 
 fn persist_map_exit(ctx: &mut TransferContext, map: &SegmentMap, active: u32) {
     ctx.job.segment_map = Some(map.clone());
     ctx.job.downloaded_bytes = map.written_sum();
     ctx.job.progress = progress_percent(map.written_sum(), map.total_bytes);
-    emit_force_persist(ctx, map, active);
+    // No Starting hint — pause-exit must not flip the job back to Starting.
+    emit_force_persist(ctx, map, active, None, None);
 }
 
 fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str) {
@@ -284,7 +335,7 @@ fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str) {
     });
 }
 
-fn fail_before_workers(
+async fn fail_before_workers(
     ctx: &mut TransferContext,
     reused: bool,
     did_preallocate: bool,
@@ -292,9 +343,8 @@ fn fail_before_workers(
 ) -> Result<DownloadOutcome, DownloadError> {
     if !reused {
         if did_preallocate {
-            // Best-effort: do not leave a v1-sized hole file as v0.
-            let path = ctx.job.temp_path.clone();
-            let _ = std::fs::remove_file(path);
+            // No writer handle yet (open failed or never opened).
+            let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         }
         rollback_multi_identity(ctx, "multi_start_failed");
     }
@@ -323,6 +373,38 @@ struct SharedMulti {
     map: Mutex<SegmentMap>,
     active: AtomicU32,
     reconnects: AtomicU32,
+    window: Mutex<SpeedWindow>,
+}
+
+struct SpeedWindow {
+    start: Instant,
+    bytes: u64,
+}
+
+fn lock_map(map: &Mutex<SegmentMap>) -> std::sync::MutexGuard<'_, SegmentMap> {
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_window_bytes(shared: &SharedMulti, n: u64) {
+    let mut window = shared
+        .window
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    window.bytes = window.bytes.saturating_add(n);
+}
+
+fn take_aggregate_speed(shared: &SharedMulti) -> u64 {
+    let mut window = shared
+        .window
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let elapsed = window.start.elapsed().as_secs_f64().max(0.001);
+    let speed = (window.bytes as f64 / elapsed) as u64;
+    if window.start.elapsed() >= PROGRESS_INTERVAL {
+        window.start = Instant::now();
+        window.bytes = 0;
+    }
+    speed
 }
 
 struct SegmentTask {
@@ -356,6 +438,10 @@ async fn run_segment_workers(
         map: Mutex::new(map.clone()),
         active: AtomicU32::new(0),
         reconnects: AtomicU32::new(ctx.job.reconnect_count),
+        window: Mutex::new(SpeedWindow {
+            start: Instant::now(),
+            bytes: 0,
+        }),
     });
 
     let mut handles = Vec::new();
@@ -387,7 +473,7 @@ async fn run_segment_workers(
     }
 
     let results = futures_util::future::join_all(handles).await;
-    let map = shared.map.lock().map(|guard| guard.clone()).unwrap_or(map);
+    let map = lock_map(&shared.map).clone();
     ctx.job.reconnect_count = shared.reconnects.load(Ordering::Relaxed);
     ctx.job.segment_map = Some(map.clone());
     ctx.job.downloaded_bytes = map.written_sum();
@@ -477,7 +563,7 @@ async fn run_segment_loop(
         }
 
         let (start, end, written) = {
-            let map = task.shared.map.lock().unwrap();
+            let map = lock_map(&task.shared.map);
             let segment = map.segments.get(task.index as usize).ok_or_else(|| {
                 download_error(
                     FailureCategory::Internal,
@@ -496,7 +582,7 @@ async fn run_segment_loop(
         }
 
         {
-            let mut map = task.shared.map.lock().unwrap();
+            let mut map = lock_map(&task.shared.map);
             if let Some(segment) = map.segments.get_mut(task.index as usize) {
                 if segment.state != SegmentState::Completed {
                     segment.state = SegmentState::Active;
@@ -578,8 +664,9 @@ async fn run_segment_loop(
             ));
         }
 
-        if status == StatusCode::OK && range_start > start {
-            // Full body at a non-zero offset would corrupt the segment.
+        if status == StatusCode::OK && range_start > 0 {
+            // 200 is a full entity. Never write file-from-zero at a non-zero offset
+            // (non-first segment, mid-segment resume, or If-Range mismatch).
             mark_segment(&task.shared, task.index, |s| {
                 s.state = SegmentState::Failed;
             });
@@ -689,8 +776,6 @@ async fn stream_segment_body(
 ) -> Result<bool, DownloadError> {
     let mut stream = response.bytes_stream();
     let mut last_progress = Instant::now();
-    let mut window_start = Instant::now();
-    let mut window_bytes: u64 = 0;
 
     loop {
         if let Some(outcome) = control_outcome(&task.control) {
@@ -740,6 +825,7 @@ async fn stream_segment_body(
 
         let writer = task.writer.clone();
         let data = chunk.to_vec();
+        let data_len = data.len();
         let write_offset = offset;
         let n = tokio::task::spawn_blocking(move || writer.write_at(write_offset, &data, end))
             .await
@@ -763,29 +849,37 @@ async fn stream_segment_body(
         }
 
         offset = offset.saturating_add(n as u64);
-        window_bytes = window_bytes.saturating_add(n as u64);
+        record_window_bytes(&task.shared, n as u64);
 
-        {
-            let mut map = task.shared.map.lock().unwrap();
+        let (written, length, capped) = {
+            let mut map = lock_map(&task.shared.map);
             if let Some(segment) = map.segments.get_mut(task.index as usize) {
                 segment.written = offset.saturating_sub(segment.start).min(segment.length());
                 if segment.written >= segment.length() {
                     segment.state = SegmentState::Completed;
                 }
+                (
+                    segment.written,
+                    segment.length(),
+                    n < data_len || segment.written >= segment.length(),
+                )
+            } else {
+                (0, 0, n < data_len)
             }
-        }
+        };
 
         if !acquired {
             emit_progress(task, None);
             return Ok(false);
         }
 
+        // End-cap truncated the chunk (or segment is full) — do not write_at past end.
+        if capped || written >= length {
+            break;
+        }
+
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
-            let speed = (window_bytes as f64 / elapsed) as u64;
-            window_start = Instant::now();
-            window_bytes = 0;
-            emit_progress(task, Some(speed));
+            emit_progress(task, Some(take_aggregate_speed(&task.shared)));
             last_progress = Instant::now();
         }
     }
@@ -800,7 +894,7 @@ async fn stream_segment_body(
     }
 
     let (written, needed) = {
-        let map = task.shared.map.lock().unwrap();
+        let map = lock_map(&task.shared.map);
         map.segments
             .get(task.index as usize)
             .map(|segment| (segment.written, segment.length()))
@@ -851,22 +945,20 @@ async fn try_segment_reconnect(
 }
 
 fn mark_segment(shared: &SharedMulti, index: u32, f: impl FnOnce(&mut super::segment::Segment)) {
-    if let Ok(mut map) = shared.map.lock() {
-        if let Some(segment) = map.segments.get_mut(index as usize) {
-            f(segment);
-        }
+    let mut map = lock_map(&shared.map);
+    if let Some(segment) = map.segments.get_mut(index as usize) {
+        f(segment);
     }
 }
 
 fn emit_progress(task: &SegmentTask, speed: Option<u64>) {
     let (map, downloaded, total) = {
-        let Ok(map) = task.shared.map.lock() else {
-            return;
-        };
+        let map = lock_map(&task.shared.map);
         let downloaded = map.written_sum();
         let total = map.total_bytes;
         (map.clone(), downloaded, total)
     };
+    let speed = speed.or_else(|| Some(take_aggregate_speed(&task.shared)));
     let eta = match speed {
         Some(s) if s > 0 && total > downloaded => Some((total - downloaded) / s),
         Some(_) => Some(0),
@@ -1151,7 +1243,7 @@ mod tests {
         let body: Vec<u8> = (0..2 * MIN_SEGMENT_SIZE as usize)
             .map(|i| (i % 251) as u8)
             .collect();
-        let (base, seen, _handle) = spawn_range_server(body.clone(), None).await;
+        let (base, seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
 
         let dir = std::env::temp_dir().join(format!("rusticdl-multi-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1202,8 +1294,19 @@ mod tests {
             .iter()
             .any(|p| p.transfer_format_version == Some(1) && p.segment_map.is_some()));
         // Progress must never jump to full file len before completion.
-        let mid = published.iter().filter_map(|p| p.downloaded_bytes).max();
-        assert!(mid.is_some());
+        let mid_downloading = published.iter().filter(|p| {
+            p.state_hint == Some(ProgressHint::Downloading)
+                && p.progress.is_some_and(|pct| pct < 100.0)
+        });
+        for patch in mid_downloading {
+            if let Some(bytes) = patch.downloaded_bytes {
+                assert!(
+                    bytes < body.len() as u64,
+                    "pre-complete tick must not use file len ({bytes} >= {})",
+                    body.len()
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1212,7 +1315,7 @@ mod tests {
     async fn resume_reuses_map_and_skips_completed_segment() {
         let total = 2 * MIN_SEGMENT_SIZE as usize;
         let body: Vec<u8> = (0..total).map(|i| (i % 199) as u8).collect();
-        let (base, seen, _handle) = spawn_range_server(body.clone(), None).await;
+        let (base, seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
 
         let dir = std::env::temp_dir().join(format!("rusticdl-multi-rs-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1280,7 +1383,7 @@ mod tests {
     #[tokio::test]
     async fn handoff_cookie_applied_to_segment_gets() {
         let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 17) as u8).collect();
-        let (base, seen, _handle) = spawn_range_server(body.clone(), None).await;
+        let (base, seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
 
         let dir = std::env::temp_dir().join(format!("rusticdl-multi-ho-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1329,9 +1432,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn preallocate_hole_is_not_legacy_partial() {
+        assert!(looks_like_preallocate_hole(0, 10_000, 10_000));
+        assert!(!looks_like_preallocate_hole(100, 10_000, 10_000));
+        assert!(!looks_like_preallocate_hole(0, 50, 10_000));
+        assert!(!looks_like_preallocate_hole(0, 10_000, 0));
+    }
+
+    #[tokio::test]
+    async fn two_hundred_on_nonzero_segment_does_not_corrupt() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = (0..total).map(|i| (i % 211) as u8).collect();
+        let (base, _seen, _handle) =
+            spawn_range_server(body.clone(), RangeServeMode::FullBodyOnNonzeroRange).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-200-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target, temp.clone());
+
+        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let err = run_transfer(ctx)
+            .await
+            .expect_err("200 on non-first segment must fail");
+        assert_eq!(err.category, FailureCategory::Resume);
+
+        // Second half must not be the start of the full body (file-from-zero write).
+        if temp.exists() {
+            let part = std::fs::read(&temp).unwrap_or_default();
+            if part.len() >= MIN_SEGMENT_SIZE as usize + 64 {
+                let second = &part[MIN_SEGMENT_SIZE as usize..MIN_SEGMENT_SIZE as usize + 64];
+                assert_ne!(
+                    second,
+                    &body[..64],
+                    "200 body was written at non-zero offset"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn convert_to_single_only_when_written_zero_removes_prealloc() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = vec![0xABu8; total];
+        let (base, _seen, _handle) = spawn_range_server(body, RangeServeMode::ForbiddenBody).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-403-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target, temp.clone());
+
+        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let result = run_transfer(ctx).await;
+        assert!(result.is_err(), "403 should fail after fallback");
+        if temp.exists() {
+            let len = std::fs::metadata(&temp).map(|m| m.len()).unwrap_or(0);
+            assert_ne!(
+                len, total as u64,
+                "preallocated hole must not remain for single-stream metadata_len"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone, Copy)]
+    enum RangeServeMode {
+        Honest,
+        /// 200 + full entity when Range start > 0 (ignored Range / If-Range mismatch).
+        FullBodyOnNonzeroRange,
+        /// Body GETs return 403 (convert-to-single path).
+        ForbiddenBody,
+    }
+
     async fn spawn_range_server(
         body: Vec<u8>,
-        _unused: Option<()>,
+        mode: RangeServeMode,
     ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1376,6 +1579,16 @@ Content-Length: {}\r\n\
                     continue;
                 }
 
+                if matches!(mode, RangeServeMode::ForbiddenBody) {
+                    let reply = "HTTP/1.1 403 Forbidden\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+
                 let range = parse_test_range(&req);
                 let (start, end) = match range {
                     Some((start, Some(end))) => (start as usize, end as usize),
@@ -1384,6 +1597,21 @@ Content-Length: {}\r\n\
                 };
                 let end = end.min(body.len().saturating_sub(1));
                 let start = start.min(end + 1);
+
+                if matches!(mode, RangeServeMode::FullBodyOnNonzeroRange) && start > 0 {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\
+\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+
                 let slice = if start < body.len() {
                     &body[start..=end]
                 } else {

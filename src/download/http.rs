@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
@@ -71,6 +72,8 @@ pub struct ProgressUpdate {
     pub segment_map: Option<SegmentMap>,
     /// When `Some(true)`, clear `job.segment_map` (multi→single rollback).
     pub clear_segment_map: Option<bool>,
+    /// Engine `apply_progress` notifies this after the patch is applied (or skipped).
+    pub persist_ack: Option<Arc<Notify>>,
 }
 
 const FULL_REPLACE_NOTICE: &str =
@@ -102,6 +105,7 @@ impl ProgressUpdate {
             toast: later.toast.or(self.toast),
             segment_map: later.segment_map.or(self.segment_map),
             clear_segment_map: later.clear_segment_map.or(self.clear_segment_map),
+            persist_ack: later.persist_ack.or(self.persist_ack),
         }
     }
 
@@ -136,6 +140,7 @@ impl ProgressUpdate {
             toast: None,
             segment_map: None,
             clear_segment_map: None,
+            persist_ack: None,
         }
     }
 
@@ -168,6 +173,7 @@ impl ProgressUpdate {
             toast: None,
             segment_map: None,
             clear_segment_map: None,
+            persist_ack: None,
         }
     }
 
@@ -201,6 +207,7 @@ impl ProgressUpdate {
             toast: None,
             segment_map: None,
             clear_segment_map: None,
+            persist_ack: None,
         }
     }
 }

@@ -320,7 +320,21 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 if !restarting {
                     if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                         if let Some(on_disk) = on_disk {
-                            apply_partial_progress_from_disk(job, on_disk);
+                            // Preallocate hole (v0, no map, 0 downloaded, file already total):
+                            // do not treat metadata_len as contiguous progress.
+                            let hole = job.downloaded_bytes == 0
+                                && job.total_bytes > 0
+                                && on_disk >= job.total_bytes
+                                && job.segment_map.is_none()
+                                && job.transfer_format_version == 0;
+                            if !hole {
+                                apply_partial_progress_from_disk(job, on_disk);
+                            }
+                        } else if let Some(map) = job.segment_map.as_ref() {
+                            if map.is_consistent() {
+                                let sum = map.written_sum();
+                                apply_progress_from_sum(job, sum);
+                            }
                         }
                         job.state = JobState::Downloading;
                         job.error = None;
@@ -588,6 +602,7 @@ fn spawn_progress_pump(
 fn should_flush_immediately(update: &ProgressUpdate) -> bool {
     (update.segment_map.is_some() && update.transfer_format_version.is_some())
         || update.clear_segment_map == Some(true)
+        || update.persist_ack.is_some()
 }
 
 /// Merge `update` into the coalesce buffer (later wins on Some).
@@ -600,17 +615,19 @@ fn coalesce_push(pending: &mut Option<ProgressUpdate>, update: ProgressUpdate) {
 
 async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: ProgressUpdate) {
     let toast = update.toast.clone();
+    let ack = update.persist_ack.clone();
     {
         let mut guard = inner.lock().await;
-        let Some(job) = find_job_mut(&mut guard.jobs, id) else {
-            return;
-        };
-
-        if !apply_progress_patch(job, update) {
-            return;
+        if let Some(job) = find_job_mut(&mut guard.jobs, id) {
+            if apply_progress_patch(job, update) {
+                emit_jobs_locked(&guard);
+            }
         }
-
-        emit_jobs_locked(&guard);
+    }
+    // Always ack so multi-start does not wait out the timeout when the job
+    // is missing or not in-flight.
+    if let Some(ack) = ack {
+        ack.notify_one();
     }
     // One-shot notice (e.g. full-replace after 200-on-partial). Outside the jobs lock.
     if let Some(message) = toast {

@@ -57,6 +57,7 @@ impl TransferPlan {
 }
 
 /// Decide transfer mode. Multi when enabled, size known, ranges supported, size ≥ min.
+/// A present consistent `segment_map` always forces Multi so resume reuses bounds/`written`.
 pub fn plan_transfer(
     job: &Job,
     preflight: Option<&PreflightInfo>,
@@ -74,12 +75,23 @@ pub fn plan_transfer(
     }
 }
 
+fn job_has_resumable_map(job: &Job) -> bool {
+    job.segment_map
+        .as_ref()
+        .is_some_and(|map| map.is_consistent())
+}
+
 fn plan_reason(
     job: &Job,
     preflight: Option<&PreflightInfo>,
     multi_connection_enabled: bool,
     multi_min_bytes: u64,
 ) -> TransferPlanReason {
+    // In-progress map must not fall through to single-stream (MultiMap / Restart).
+    if job_has_resumable_map(job) {
+        return TransferPlanReason::MultiQualified;
+    }
+
     if !multi_connection_enabled {
         return TransferPlanReason::MultiDisabled;
     }
@@ -273,6 +285,23 @@ mod tests {
         let pf = preflight(Some(9 * 1024 * 1024), None);
         let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+        assert_eq!(plan.chosen, TransferMode::Multi);
+    }
+
+    #[test]
+    fn planner_existing_map_forces_multi_even_when_preflight_unqualifies() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 2 * 1024 * 1024;
+        job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
+        // Flaky preflight: unknown size / ranges, and min-size raised above total.
+        let pf = preflight(None, None);
+        let plan = plan_transfer(&job, Some(&pf), true, 50 * 1024 * 1024);
+        assert_eq!(plan.chosen, TransferMode::Multi);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+
+        // Even if the master switch is off, resume must keep the map path.
+        let plan = plan_transfer(&job, Some(&pf), false, 50 * 1024 * 1024);
         assert_eq!(plan.chosen, TransferMode::Multi);
     }
 

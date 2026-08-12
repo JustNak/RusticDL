@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use super::super::super::conn_budget::ConnectionBudget;
 use super::super::super::job::Job;
 use super::super::{emit_jobs_locked, EngineInner, EngineRuntimeConfig};
 
@@ -15,6 +16,11 @@ pub(super) async fn update_settings(
     let limiter = {
         let mut guard = inner.lock().await;
         let limit = config.speed_limit_bytes_per_second();
+        // In-flight permits stay on the previous Arc and drain on drop.
+        guard.conn_budget = ConnectionBudget::new(
+            config.max_total_connections,
+            config.max_connections_per_host,
+        );
         guard.config = config;
         let limiter = guard.limiter.clone();
         guard.wake.notify_one();
