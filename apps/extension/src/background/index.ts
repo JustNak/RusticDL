@@ -10,6 +10,7 @@ import browser from './browser';
 import {
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
+  MIN_CAPTURE_BYTES,
   type FirefoxCaptureCandidate,
   type FirefoxHeadersReceivedDetails,
 } from './firefoxCapture';
@@ -132,14 +133,45 @@ function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
   return status === 'queued' || status === 'duplicate_existing_job';
 }
 
-function filenameLooksCaptured(filename: string | undefined, extensions: string[]): boolean {
-  if (!filename) return false;
+function filenameExtension(filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
   const base = filename.split(/[\\/]/).pop() ?? filename;
   const dot = base.lastIndexOf('.');
-  if (dot < 0) return false;
+  if (dot < 0 || dot === base.length - 1) return undefined;
   const ext = base.slice(dot + 1).toLowerCase();
-  return extensions.includes(ext);
+  if (!/^[a-z0-9]{1,10}$/.test(ext)) return undefined;
+  return ext;
 }
+
+function filenameLooksCaptured(filename: string | undefined, extensions: string[]): boolean {
+  const ext = filenameExtension(filename);
+  return Boolean(ext && extensions.includes(ext));
+}
+
+/** MIME types that mean "this is a real file the browser is saving". */
+const DOWNLOAD_ITEM_MIME_HINTS = [
+  'octet-stream',
+  'zip',
+  'x-rar',
+  'x-7z',
+  'x-tar',
+  'gzip',
+  'x-bzip',
+  'x-xz',
+  'pdf',
+  'msdownload',
+  'x-msi',
+  'java-archive',
+  'android.package',
+  'x-iso9660',
+  'x-apple-diskimage',
+  'x-debian',
+  'x-redhat-package',
+  'vnd.ms-excel',
+  'vnd.ms-powerpoint',
+  'msword',
+  'officedocument',
+];
 
 /** Firefox DownloadItem + optional Chromium fields used when capturing. */
 type CapturedDownloadItem = browser.downloads.DownloadItem & {
@@ -147,6 +179,12 @@ type CapturedDownloadItem = browser.downloads.DownloadItem & {
   byExtensionId?: string;
 };
 
+/**
+ * downloads.onCreated filter (Firefox fallback + Chromium primary).
+ *
+ * Never capture just because a filename exists — Firefox always supplies one.
+ * Require a captured extension and/or a download MIME, and skip tiny junk bodies.
+ */
 function shouldCaptureDownload(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
@@ -157,13 +195,39 @@ function shouldCaptureDownload(
   if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
   if (item.byExtensionId) return false;
 
-  const mime = (item.mime || '').toLowerCase();
-  if (mime.startsWith('text/html') || mime === 'application/xhtml+xml') return false;
+  // Skip non-http schemes already handled; also skip blob:/data: noise if present.
+  if (url.startsWith('blob:') || url.startsWith('data:')) return false;
 
-  const dispositionHint =
-    mime.includes('octet-stream') || mime.includes('zip') || mime.includes('pdf');
+  const mime = (item.mime || '').toLowerCase();
+  if (
+    mime.startsWith('text/html') ||
+    mime === 'application/xhtml+xml' ||
+    mime === 'application/json' ||
+    mime.startsWith('image/') ||
+    mime.startsWith('audio/') ||
+    mime.startsWith('video/') ||
+    mime.startsWith('font/')
+  ) {
+    return false;
+  }
+
+  const ext = filenameExtension(item.filename);
+  const ignored = new Set(
+    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
+  );
+  if (ext && ignored.has(ext)) return false;
+
   const strongName = filenameLooksCaptured(item.filename, settings.capturedFileExtensions);
-  return dispositionHint || strongName || Boolean(item.filename);
+  const dispositionHint = DOWNLOAD_ITEM_MIME_HINTS.some((hint) => mime.includes(hint));
+
+  // Known-size micro responses are never real archives/installers.
+  const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
+  if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES && !strongName) {
+    return false;
+  }
+
+  // Require a strong signal — do NOT fall back to "any filename".
+  return strongName || dispositionHint;
 }
 
 async function handOffUrl(
@@ -272,7 +336,11 @@ function registerFirefoxWebRequestInterception() {
     },
     {
       urls: ['http://*/*', 'https://*/*'],
-      types: ['main_frame', 'sub_frame', 'xmlhttprequest', 'object', 'other'],
+      // Intentionally omit xmlhttprequest + sub_frame: those are full of false positives
+      // (YouTube suggestqueries, beacons, ads). Real file navigations use main_frame /
+      // object / other; everything else still hits downloads.onCreated when Firefox
+      // treats the response as a download.
+      types: ['main_frame', 'object', 'other'],
     },
     ['blocking', 'responseHeaders'],
   );
@@ -286,6 +354,15 @@ async function handleFirefoxHeadersReceived(
     const candidate = firefoxWebRequestDownloadCandidate(details, settings);
     if (!candidate) {
       return {};
+    }
+    if (settings.downloadCaptureDebugLogging) {
+      console.info('[RusticDL] capture candidate', {
+        reason: candidate.reason,
+        url: candidate.url,
+        filename: candidate.filename,
+        totalBytes: candidate.totalBytes,
+        type: details.type,
+      });
     }
     // Blocking listeners must decide cancel synchronously-ish; we still only cancel
     // after claiming, and handOffUrl releases the claim if the desktop rejects.

@@ -1,6 +1,11 @@
 /**
  * Firefox primary download capture via blocking webRequest.
  * Cancels eligible responses before the browser commits the file, then hands off.
+ *
+ * Heuristics intentionally err on the side of *not* capturing. False positives
+ * (e.g. YouTube suggestqueries / analytics junk with Content-Disposition) are
+ * far more annoying than missing an exotic download — those still fall through
+ * to downloads.onCreated or the context menu.
  */
 import {
   isUrlHostExcludedByPatterns,
@@ -32,57 +37,8 @@ export type FirefoxCaptureCandidate = {
   reason: string;
 };
 
-function headerValue(headers: FirefoxWebRequestHeader[] | undefined, name: string): string | undefined {
-  const lower = name.toLowerCase();
-  return headers?.find((h) => h.name.toLowerCase() === lower)?.value;
-}
-
-function contentType(headers: FirefoxWebRequestHeader[] | undefined): string {
-  return (headerValue(headers, 'content-type') ?? '').split(';')[0].trim().toLowerCase();
-}
-
-function contentDisposition(headers: FirefoxWebRequestHeader[] | undefined): string {
-  return headerValue(headers, 'content-disposition') ?? '';
-}
-
-function contentLength(headers: FirefoxWebRequestHeader[] | undefined): number | undefined {
-  const raw = headerValue(headers, 'content-length');
-  if (!raw) return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-}
-
-function filenameFromContentDisposition(value: string): string | undefined {
-  const star = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)/i);
-  if (star?.[1]) {
-    try {
-      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
-    } catch {
-      // fall through
-    }
-  }
-  const plain = value.match(/filename\s*=\s*("?)([^";]+)\1/i);
-  return plain?.[2]?.trim() || undefined;
-}
-
-function basenameFromUrl(url: string): string | undefined {
-  try {
-    const path = new URL(url).pathname;
-    const base = path.split('/').filter(Boolean).pop();
-    if (!base || !base.includes('.')) return undefined;
-    return decodeURIComponent(base);
-  } catch {
-    return undefined;
-  }
-}
-
-function extensionOf(name: string | undefined): string | undefined {
-  if (!name) return undefined;
-  const base = name.split(/[\\/]/).pop() ?? name;
-  const dot = base.lastIndexOf('.');
-  if (dot < 0) return undefined;
-  return base.slice(dot + 1).toLowerCase();
-}
+/** Skip known-size responses smaller than this unless they look like a real file. */
+export const MIN_CAPTURE_BYTES = 1024;
 
 const DOWNLOAD_MIME = new Set([
   'application/zip',
@@ -104,7 +60,132 @@ const DOWNLOAD_MIME = new Set([
   'application/x-apple-diskimage',
   'application/x-debian-package',
   'application/x-redhat-package-manager',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]);
+
+/** MIME types that are almost never intentional file downloads. */
+const NON_DOWNLOAD_MIME = new Set([
+  'application/json',
+  'application/javascript',
+  'application/ecmascript',
+  'application/xml',
+  'application/xhtml+xml',
+  'application/x-javascript',
+  'application/ld+json',
+  'application/manifest+json',
+  'application/x-www-form-urlencoded',
+  'application/graphql',
+  'application/grpc',
+  'application/grpc+proto',
+  'application/x-protobuf',
+  'application/wasm',
+  'text/event-stream',
+  'multipart/form-data',
+]);
+
+/**
+ * Host/path patterns that commonly emit tiny attachment-like responses but are
+ * never user downloads (autocomplete, telemetry, ads beacons, etc.).
+ */
+const NON_DOWNLOAD_URL_RE = [
+  /suggestqueries/i,
+  /\/complete\/search\b/i,
+  /\/gen_204\b/i,
+  /\/generate_204\b/i,
+  /\/pagead\//i,
+  /\/ptracking\b/i,
+  /\/api\/stats\b/i,
+  /\/log[_-]?event\b/i,
+  /\/beacon\b/i,
+  /\/telemetry\b/i,
+  /google-analytics\.com/i,
+  /\/collect\?/i,
+  /doubleclick\.net/i,
+  /\/safebrowsing\//i,
+  /client[_-]?s\.google\.com/i,
+];
+
+function headerValue(headers: FirefoxWebRequestHeader[] | undefined, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  return headers?.find((h) => h.name.toLowerCase() === lower)?.value;
+}
+
+function contentType(headers: FirefoxWebRequestHeader[] | undefined): string {
+  return (headerValue(headers, 'content-type') ?? '').split(';')[0].trim().toLowerCase();
+}
+
+function contentDisposition(headers: FirefoxWebRequestHeader[] | undefined): string {
+  return headerValue(headers, 'content-disposition') ?? '';
+}
+
+function contentLength(headers: FirefoxWebRequestHeader[] | undefined): number | undefined {
+  const raw = headerValue(headers, 'content-length');
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+export function filenameFromContentDisposition(value: string): string | undefined {
+  const star = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)/i);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
+    } catch {
+      // fall through
+    }
+  }
+  const plain = value.match(/filename\s*=\s*("?)([^";]+)\1/i);
+  return plain?.[2]?.trim() || undefined;
+}
+
+export function basenameFromUrl(url: string): string | undefined {
+  try {
+    const path = new URL(url).pathname;
+    const base = path.split('/').filter(Boolean).pop();
+    if (!base || !base.includes('.')) return undefined;
+    return decodeURIComponent(base);
+  } catch {
+    return undefined;
+  }
+}
+
+export function extensionOf(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const base = name.split(/[\\/]/).pop() ?? name;
+  const dot = base.lastIndexOf('.');
+  if (dot < 0 || dot === base.length - 1) return undefined;
+  // Ignore multi-dot noise like "v1.2" version-only segments without a real extension.
+  const ext = base.slice(dot + 1).toLowerCase();
+  if (!/^[a-z0-9]{1,10}$/.test(ext)) return undefined;
+  return ext;
+}
+
+function isNonDownloadMime(mime: string): boolean {
+  if (!mime) return false;
+  if (NON_DOWNLOAD_MIME.has(mime)) return true;
+  if (mime.startsWith('text/')) return true;
+  if (mime.startsWith('image/')) return true;
+  if (mime.startsWith('audio/')) return true;
+  if (mime.startsWith('video/')) return true;
+  if (mime.startsWith('font/')) return true;
+  if (mime.endsWith('+json') || mime.endsWith('+xml')) return true;
+  return false;
+}
+
+function looksLikeNonDownloadUrl(url: string): boolean {
+  return NON_DOWNLOAD_URL_RE.some((re) => re.test(url));
+}
+
+function isSuccessfulDownloadStatus(statusCode: number | undefined): boolean {
+  // 206 Partial Content is common for resumable downloads / range requests.
+  if (statusCode == null) return true;
+  return statusCode === 200 || statusCode === 206;
+}
 
 /**
  * Decide if a Firefox response looks like a real download worth intercepting.
@@ -124,13 +205,33 @@ export function firefoxWebRequestDownloadCandidate(
   if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) {
     return null;
   }
+  if (looksLikeNonDownloadUrl(url)) {
+    return null;
+  }
+  if (!isSuccessfulDownloadStatus(details.statusCode)) {
+    return null;
+  }
 
-  // Skip typical page asset types.
+  // Only navigation / plugin / opaque "other" responses. XHR/fetch and sub-frame
+  // traffic is full of attachment-ish noise (autocomplete, beacons, ads) that is
+  // not a user download. Real save-as downloads still surface via downloads.onCreated.
   const resourceType = (details.type ?? '').toLowerCase();
   if (
-    ['stylesheet', 'script', 'image', 'font', 'media', 'websocket', 'ping', 'csp_report'].includes(
-      resourceType,
-    )
+    [
+      'stylesheet',
+      'script',
+      'image',
+      'font',
+      'media',
+      'websocket',
+      'ping',
+      'csp_report',
+      'xmlhttprequest',
+      'sub_frame',
+      'imageset',
+      'web_manifest',
+      'speculative',
+    ].includes(resourceType)
   ) {
     return null;
   }
@@ -138,31 +239,63 @@ export function firefoxWebRequestDownloadCandidate(
   const headers = details.responseHeaders;
   const disposition = contentDisposition(headers);
   const mime = contentType(headers);
-  const filename =
-    filenameFromContentDisposition(disposition) ?? basenameFromUrl(url);
+  const totalBytes = contentLength(headers);
+  const dispositionName = filenameFromContentDisposition(disposition);
+  const urlName = basenameFromUrl(url);
+  // Prefer server-provided disposition name; URL basename is a weaker signal.
+  const filename = dispositionName ?? urlName;
   const ext = extensionOf(filename);
   const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
+  const ignored = new Set(
+    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
+  );
+  if (ext && ignored.has(ext)) {
+    return null;
+  }
+
   const hasAttachment = /\battachment\b/i.test(disposition);
   const strongExt = Boolean(ext && captured.has(ext));
-  const strongMime = DOWNLOAD_MIME.has(mime) && !mime.startsWith('text/html');
+  const strongMime = DOWNLOAD_MIME.has(mime);
 
-  if (mime.startsWith('text/html') || mime === 'application/xhtml+xml' || mime === 'application/json') {
-    // HTML/JSON pages are not downloads unless disposition is attachment with a file name.
-    if (!(hasAttachment && strongExt)) {
+  // Page documents / API payloads are never downloads unless the server forces
+  // a saved file with a recognized captured extension.
+  if (isNonDownloadMime(mime)) {
+    if (!(hasAttachment && strongExt && dispositionName)) {
       return null;
     }
   }
 
+  // Tiny bodies are almost always trackers / autocomplete / error stubs.
+  // Allow only when both MIME and extension scream "real file" with attachment.
+  if (
+    totalBytes != null &&
+    totalBytes > 0 &&
+    totalBytes < MIN_CAPTURE_BYTES &&
+    !(hasAttachment && strongMime && strongExt)
+  ) {
+    return null;
+  }
+
   let reason: string | null = null;
-  if (hasAttachment && (strongExt || strongMime || filename)) {
+
+  // Attachment must pair with a *strong* signal. A bare
+  // `Content-Disposition: attachment; filename=f.txt` (YouTube/ads noise) is not enough.
+  if (hasAttachment && dispositionName && (strongExt || strongMime)) {
     reason = 'attachment_disposition';
-  } else if (strongExt) {
-    reason = 'strong_filename';
   } else if (strongMime && hasAttachment) {
     reason = 'download_mime';
-  } else if (strongMime && (resourceType === 'main_frame' || resourceType === 'other')) {
-    // Direct navigation to a binary MIME (e.g. clicking a .zip link).
+  } else if (
+    strongMime &&
+    (resourceType === 'main_frame' || resourceType === 'object' || resourceType === 'other')
+  ) {
+    // Direct navigation / plugin hit on a binary MIME (e.g. clicking a .zip / .pdf link).
     reason = 'download_mime_navigation';
+  } else if (strongExt && resourceType === 'main_frame' && dispositionName) {
+    // Top-level navigation with disposition filename matching a captured extension.
+    reason = 'strong_filename_navigation';
+  } else if (strongExt && resourceType === 'main_frame' && !mime) {
+    // Some CDNs omit Content-Type on file links; only trust top-level navigations.
+    reason = 'strong_filename_navigation';
   }
 
   if (!reason) {
@@ -172,7 +305,7 @@ export function firefoxWebRequestDownloadCandidate(
   return {
     url,
     filename: filename?.split(/[\\/]/).pop(),
-    totalBytes: contentLength(headers),
+    totalBytes,
     pageUrl: details.documentUrl || details.originUrl,
     referrer: details.originUrl || details.documentUrl,
     incognito: details.incognito,
@@ -183,7 +316,9 @@ export function firefoxWebRequestDownloadCandidate(
 type BlockingWebRequest = {
   onHeadersReceived: {
     addListener(
-      listener: (details: FirefoxHeadersReceivedDetails) => { cancel?: boolean } | Promise<{ cancel?: boolean }>,
+      listener: (
+        details: FirefoxHeadersReceivedDetails,
+      ) => { cancel?: boolean } | Promise<{ cancel?: boolean }>,
       filter: { urls: string[]; types?: string[] },
       extraInfoSpec: string[],
     ): void;
