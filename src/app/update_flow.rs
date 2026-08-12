@@ -296,11 +296,8 @@ impl DownloadApp {
             return;
         }
 
-        // Bypass close-to-tray so quit actually tears down the process.
-        self.force_quit = true;
-        self.stop_tray();
-        cx.notify();
-        cx.quit();
+        // Bypass close-to-tray / hidden-window paint so quit actually tears down.
+        self.force_quit_app(cx);
     }
 }
 

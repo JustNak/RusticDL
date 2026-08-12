@@ -139,8 +139,6 @@ pub struct DownloadApp {
     main_hwnd: isize,
     /// Tray "Show" was requested; applied on the next render (has Window).
     pending_tray_show: bool,
-    /// Tray "Exit" was requested; applied on the next render.
-    pending_tray_exit: bool,
     /// Balloon click context id to resolve after showing the main window.
     pending_balloon_click: Option<u64>,
     /// OS balloon burst-coalesce buffer (Pipeline B).
@@ -478,7 +476,6 @@ impl DownloadApp {
             window_hidden_to_tray: started_minimized,
             main_hwnd: main_window_hwnd(window),
             pending_tray_show: false,
-            pending_tray_exit: false,
             pending_balloon_click: None,
             os_notify_buffer: OsNotifyBuffer::default(),
             balloon_contexts: BalloonContextMap::default(),
@@ -552,6 +549,30 @@ impl DownloadApp {
         self.system_tray = None;
     }
 
+    /// Drop the tray icon without joining its message thread on the UI thread.
+    ///
+    /// Exit is often delivered while the tray thread is still nested in
+    /// `TrackPopupMenu`; a synchronous join there can stall quit.
+    fn stop_tray_nonblocking(&mut self) {
+        if let Some(tray) = self.system_tray.take() {
+            let _ = std::thread::Builder::new()
+                .name("rusticdl-tray-shutdown".into())
+                .spawn(move || drop(tray));
+        }
+    }
+
+    /// Fully quit: flush state, tear down tray, and exit the app process loop.
+    ///
+    /// Must not wait on main-window `Render` — when hidden to tray the HWND
+    /// often stops painting, so a deferred "pending exit" never runs.
+    pub(crate) fn force_quit_app(&mut self, cx: &mut Context<Self>) {
+        self.force_quit = true;
+        self.flush_window_layout_now();
+        self.flush_jobs_save_now();
+        self.stop_tray_nonblocking();
+        cx.quit();
+    }
+
     /// Keep tray alive when close-to-tray, currently hidden, or OS notify is enabled.
     fn sync_tray_lifetime(&mut self, cx: &mut Context<Self>) {
         let needed = self.settings.close_to_tray
@@ -573,9 +594,8 @@ impl DownloadApp {
                 cx.notify();
             }
             TrayEvent::Exit => {
-                self.force_quit = true;
-                self.pending_tray_exit = true;
-                cx.notify();
+                // Quit immediately (same reason Show restores HWND without render).
+                self.force_quit_app(cx);
             }
             TrayEvent::BalloonUserClick { context_id } => {
                 // Always restore/focus the main window; open-file resolved on render.
@@ -617,14 +637,6 @@ impl DownloadApp {
         }
         if let Some(context_id) = self.pending_balloon_click.take() {
             self.handle_balloon_click(context_id, cx);
-        }
-        if self.pending_tray_exit {
-            self.pending_tray_exit = false;
-            self.force_quit = true;
-            self.flush_window_layout_now();
-            self.flush_jobs_save_now();
-            self.stop_tray();
-            cx.quit();
         }
     }
 
