@@ -34,6 +34,8 @@ pub fn latest_release_page() -> String {
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// Max release-body characters retained for update UI / post-update What’s new.
+const NOTES_MAX_CHARS: usize = 4_000;
 
 /// Result of comparing the running build to GitHub's latest release.
 #[derive(Debug, Clone)]
@@ -125,12 +127,14 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
             )
         })?;
 
+    // Keep enough body for the post-update What’s new dialog; the pre-install
+    // consent dialog applies its own shorter truncation when rendering.
     let notes = release
         .body
         .as_ref()
         .map(|b| b.trim())
         .filter(|b| !b.is_empty())
-        .map(|b| truncate_notes(b, 600));
+        .map(|b| truncate_notes(b, NOTES_MAX_CHARS));
 
     Ok(UpdateCheck::Available(UpdateInfo {
         current_version: current,
