@@ -166,17 +166,13 @@ impl DownloadApp {
                 })
                 .when(show_queue_chrome, |el| {
                     el.child(
-                        div()
-                            .flex_1()
-                            .min_w(px(180.))
-                            .max_w(px(420.))
-                            .child(
-                                Input::new(&self.search_input).w_full().prefix(
-                                    Icon::new(IconName::Search)
-                                        .with_size(px(14.))
-                                        .text_color(theme.muted_foreground),
-                                ),
+                        div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
+                            Input::new(&self.search_input).w_full().prefix(
+                                Icon::new(IconName::Search)
+                                    .with_size(px(14.))
+                                    .text_color(theme.muted_foreground),
                             ),
+                        ),
                     )
                     .child(
                         Button::new("queue-overflow")

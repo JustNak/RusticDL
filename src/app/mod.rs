@@ -717,7 +717,6 @@ impl DownloadApp {
         let id = self.primary_selected_id()?;
         self.jobs.iter().find(|j| j.id == id)
     }
-
 }
 
 impl Drop for DownloadApp {
