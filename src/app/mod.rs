@@ -67,7 +67,7 @@ use crate::tray::{
     TrayEvent,
 };
 use crate::updater::UpdateInfo;
-use toast::{Toast, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
+use toast::{Toast, ToastAction, ToastActionKind, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
 use widgets::render_vignette_overlay;
 
 /// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
@@ -126,10 +126,10 @@ pub struct DownloadApp {
     last_jobs_save: Instant,
     /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
-    /// Cached latest release when an update is available (Install update menu label).
+    /// Cached latest release when an update is available (menu label + toast actions).
     available_update: Option<UpdateInfo>,
-    /// Interactive check found an update; open the dialog on the next frame with a Window.
-    pending_show_update_dialog: bool,
+    /// Id of the staged update-flow toast so check → result replaces instead of stacking.
+    update_toast_id: Option<u64>,
     /// Post-update changelog snapshot (from `pending_whats_new.json` after relaunch).
     pending_whats_new: Option<PendingWhatsNew>,
     /// Open the What’s new dialog once a Window is free (no stacking over About/etc.).
@@ -145,8 +145,6 @@ pub struct DownloadApp {
     main_hwnd: isize,
     /// Tray "Show" was requested; applied on the next render (has Window).
     pending_tray_show: bool,
-    /// Tray "Exit" was requested; applied on the next render.
-    pending_tray_exit: bool,
     /// Balloon click context id to resolve after showing the main window.
     pending_balloon_click: Option<u64>,
     /// OS balloon burst-coalesce buffer (Pipeline B).
@@ -478,7 +476,7 @@ impl DownloadApp {
                 .unwrap_or_else(Instant::now),
             update_busy: false,
             available_update: None,
-            pending_show_update_dialog: false,
+            update_toast_id: None,
             pending_whats_new: None,
             pending_show_whats_new: false,
             system_tray,
@@ -486,7 +484,6 @@ impl DownloadApp {
             window_hidden_to_tray: started_minimized,
             main_hwnd: main_window_hwnd(window),
             pending_tray_show: false,
-            pending_tray_exit: false,
             pending_balloon_click: None,
             os_notify_buffer: OsNotifyBuffer::default(),
             balloon_contexts: BalloonContextMap::default(),
@@ -566,6 +563,30 @@ impl DownloadApp {
         self.system_tray = None;
     }
 
+    /// Drop the tray icon without joining its message thread on the UI thread.
+    ///
+    /// Exit is often delivered while the tray thread is still nested in
+    /// `TrackPopupMenu`; a synchronous join there can stall quit.
+    fn stop_tray_nonblocking(&mut self) {
+        if let Some(tray) = self.system_tray.take() {
+            let _ = std::thread::Builder::new()
+                .name("rusticdl-tray-shutdown".into())
+                .spawn(move || drop(tray));
+        }
+    }
+
+    /// Fully quit: flush state, tear down tray, and exit the app process loop.
+    ///
+    /// Must not wait on main-window `Render` — when hidden to tray the HWND
+    /// often stops painting, so a deferred "pending exit" never runs.
+    pub(crate) fn force_quit_app(&mut self, cx: &mut Context<Self>) {
+        self.force_quit = true;
+        self.flush_window_layout_now();
+        self.flush_jobs_save_now();
+        self.stop_tray_nonblocking();
+        cx.quit();
+    }
+
     /// Keep tray alive when close-to-tray, currently hidden, or OS notify is enabled.
     fn sync_tray_lifetime(&mut self, cx: &mut Context<Self>) {
         let needed = self.settings.close_to_tray
@@ -587,9 +608,8 @@ impl DownloadApp {
                 cx.notify();
             }
             TrayEvent::Exit => {
-                self.force_quit = true;
-                self.pending_tray_exit = true;
-                cx.notify();
+                // Quit immediately (same reason Show restores HWND without render).
+                self.force_quit_app(cx);
             }
             TrayEvent::BalloonUserClick { context_id } => {
                 // Always restore/focus the main window; open-file resolved on render.
@@ -631,14 +651,6 @@ impl DownloadApp {
         }
         if let Some(context_id) = self.pending_balloon_click.take() {
             self.handle_balloon_click(context_id, cx);
-        }
-        if self.pending_tray_exit {
-            self.pending_tray_exit = false;
-            self.force_quit = true;
-            self.flush_window_layout_now();
-            self.flush_jobs_save_now();
-            self.stop_tray();
-            cx.quit();
         }
     }
 
@@ -846,45 +858,91 @@ impl DownloadApp {
 
     fn flush_toast(&mut self, cx: &mut Context<Self>) {
         if let Some(message) = self.pending_toast.take() {
-            self.push_toast(message, ToastKind::Info, cx);
+            self.push_toast(message, ToastKind::Info, None, cx);
         }
     }
 
     fn show_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.push_toast(message, ToastKind::Info, cx);
+        self.push_toast(message, ToastKind::Info, None, cx);
     }
 
     fn show_error_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.push_toast(message, ToastKind::Error, cx);
+        self.push_toast(message, ToastKind::Error, None, cx);
     }
 
-    fn push_toast(&mut self, message: impl Into<String>, kind: ToastKind, cx: &mut Context<Self>) {
+    /// Replace the staged update-flow toast (check → result) so stages do not stack.
+    pub(crate) fn replace_update_toast(
+        &mut self,
+        message: impl Into<String>,
+        kind: ToastKind,
+        action: Option<(&str, ToastActionKind)>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.update_toast_id.take() {
+            self.toasts.retain(|t| t.id != id);
+        }
+        let id = self.push_toast(message, kind, action, cx);
+        self.update_toast_id = Some(id);
+    }
+
+    pub(crate) fn clear_update_toast(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.update_toast_id.take() {
+            self.dismiss_toast(id, cx);
+        }
+    }
+
+    fn push_toast(
+        &mut self,
+        message: impl Into<String>,
+        kind: ToastKind,
+        action: Option<(&str, ToastActionKind)>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let id = self.next_toast_id;
         self.next_toast_id = self.next_toast_id.wrapping_add(1);
+        let action = action.map(|(label, action_kind)| ToastAction {
+            label: SharedString::from(label.to_string()),
+            kind: action_kind,
+        });
+        let has_action = action.is_some();
         self.toasts.push(Toast {
             id,
             message: SharedString::from(message.into()),
             kind,
+            action,
         });
         if self.toasts.len() > TOAST_MAX_STACK {
             let overflow = self.toasts.len() - TOAST_MAX_STACK;
-            self.toasts.drain(0..overflow);
+            // Drop oldest; keep update_toast_id coherent if it was drained.
+            let drained: Vec<u64> = self.toasts.drain(0..overflow).map(|t| t.id).collect();
+            if let Some(uid) = self.update_toast_id {
+                if drained.contains(&uid) {
+                    self.update_toast_id = None;
+                }
+            }
         }
 
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TOAST_AUTO_HIDE).await;
-            let _ = this.update(cx, |app, cx| {
-                app.dismiss_toast(id, cx);
-            });
-        })
-        .detach();
+        // Action toasts stay until dismissed or the action is taken.
+        if !has_action {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TOAST_AUTO_HIDE).await;
+                let _ = this.update(cx, |app, cx| {
+                    app.dismiss_toast(id, cx);
+                });
+            })
+            .detach();
+        }
 
         cx.notify();
+        id
     }
 
     fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.toasts.len();
         self.toasts.retain(|t| t.id != id);
+        if self.update_toast_id == Some(id) {
+            self.update_toast_id = None;
+        }
         if self.toasts.len() != before {
             cx.notify();
         }
@@ -906,6 +964,7 @@ impl DownloadApp {
                     .gap_3()
                     .children(toasts.into_iter().map(|toast| {
                         let id = toast.id;
+                        let action = toast.action.clone();
                         let (icon, icon_color) = match toast.kind {
                             ToastKind::Info => (IconName::Info, theme.info),
                             ToastKind::Error => (IconName::CircleX, theme.danger),
@@ -913,7 +972,7 @@ impl DownloadApp {
                         h_flex()
                             .id(ElementId::from(("toast", id)))
                             .occlude()
-                            .items_start()
+                            .items_center()
                             .gap_3()
                             .w_112()
                             .max_w(px(420.))
@@ -926,6 +985,19 @@ impl DownloadApp {
                             .px_4()
                             .child(div().pt_0p5().child(Icon::new(icon).text_color(icon_color)))
                             .child(div().flex_1().min_w_0().text_sm().child(toast.message))
+                            .when_some(action, |this, action| {
+                                let kind = action.kind;
+                                this.child(
+                                    Button::new(ElementId::from(("toast-action", id)))
+                                        .primary()
+                                        .xsmall()
+                                        .label(action.label.to_string())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.dismiss_toast(id, cx);
+                                            this.on_update_toast_action(kind, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new(ElementId::from(("toast-close", id)))
                                     .icon(IconName::Close)
@@ -1651,9 +1723,8 @@ impl Render for DownloadApp {
         self.poll_browser_progress(cx);
         self.poll_browser_complete(cx);
         self.apply_pending_tray_actions(window, cx);
-        // What’s new first (just updated) before any deferred “update available” dialog.
+        // Post-update changelog after relaunch (once a Window is free).
         self.apply_pending_whats_new(window, cx);
-        self.apply_pending_update_dialog(window, cx);
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);

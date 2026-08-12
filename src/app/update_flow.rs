@@ -1,13 +1,12 @@
 //! Staged self-update flow extracted from `DownloadApp`.
 //!
-//! 1. **Check** — query GitHub Releases in-process.
-//! 2. **Available** — show version / notes dialog (no auto-install).
-//! 3. **Install and restart** — user confirms handoff.
-//! 4. Flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
-//! 5. Updater downloads, runs NSIS `/S`, relaunches the main app.
-//! 6. **What’s new** — post-relaunch dialog with the release changelog.
-//!
-//! Silent startup checks only toast + cache; they never open a dialog.
+//! Toast stages (interactive + silent when an update exists):
+//! 1. **Checking for update…**
+//! 2a. **You're up to date** — or —
+//! 2b. **Update available vX.Y.Z** `[Update]` → **Restart to update** `[Restart]`
+//! 3. On Restart: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
+//! 4. Updater downloads, runs NSIS `/S`, relaunches the main app.
+//! 5. **What’s new** — post-relaunch dialog with the release changelog.
 
 use std::time::Duration;
 
@@ -15,43 +14,44 @@ use gpui::{
     div, px, Context, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
-    button::{Button, ButtonVariant, ButtonVariants},
+    button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex, v_flex, ActiveTheme, Sizable, WindowExt,
 };
 
+use super::toast::{ToastActionKind, ToastKind};
 use super::DownloadApp;
-use crate::branding::{APP_NAME, APP_VERSION, UPDATER_NAME};
-use crate::download::JobState;
-use crate::format::format_bytes;
+use crate::branding::{APP_VERSION, UPDATER_NAME};
 use crate::persistence::{clear_pending_whats_new, save_pending_whats_new, PendingWhatsNew};
 use crate::updater::{
     check_for_update, launch_updater, open_url, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
 
-/// Cap release notes in the consent dialog so multi-line Markdown bodies stay readable.
-const DIALOG_NOTES_MAX_CHARS: usize = 280;
 /// Scroll height for the post-update changelog body.
 const WHATS_NEW_NOTES_MAX_H: f32 = 200.0;
 
 impl DownloadApp {
-    /// Label for the single update action (check or open cached release dialog).
+    /// Label for the single update action (check or advance cached release).
     pub(crate) fn update_action_label(&self) -> String {
         if let Some(info) = &self.available_update {
-            format!("Install update v{}", info.latest_version)
+            format!("Update available v{}", info.latest_version)
         } else {
             "Check for updates".into()
         }
     }
 
-    /// Brand menu / About: check when unknown, else reopen the available-update dialog.
-    pub(crate) fn begin_update_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Brand menu / About: check when unknown, else show restart confirmation toast.
+    pub(crate) fn begin_update_action(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.update_busy {
             self.show_toast("An update is already in progress…", cx);
             return;
         }
-        if let Some(info) = self.available_update.clone() {
-            self.open_update_available_dialog(info, window, cx);
+        if self.available_update.is_some() {
+            self.show_restart_to_update_toast(cx);
             return;
         }
         self.begin_update_check(true, cx);
@@ -67,7 +67,7 @@ impl DownloadApp {
         }
         self.update_busy = true;
         if interactive {
-            self.show_toast("Checking GitHub for updates…", cx);
+            self.replace_update_toast("Checking for update…", ToastKind::Info, None, cx);
         }
         cx.notify();
         spawn_update_check(interactive, cx);
@@ -80,74 +80,78 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(UpdateCheck::UpToDate { current, latest }) => {
+            Ok(UpdateCheck::UpToDate { .. }) => {
                 self.available_update = None;
-                self.pending_show_update_dialog = false;
                 self.update_busy = false;
                 if interactive {
-                    self.show_toast(
-                        format!("You're up to date (v{current}; latest is v{latest})."),
-                        cx,
-                    );
+                    self.replace_update_toast("You're up to date", ToastKind::Info, None, cx);
+                } else {
+                    // Drop the checking toast if a silent check somehow set one.
+                    self.clear_update_toast(cx);
                 }
             }
             Ok(UpdateCheck::Available(info)) => {
                 self.available_update = Some(info.clone());
                 self.update_busy = false;
-                if interactive {
-                    // Open the version dialog on the next frame that has a Window.
-                    // No toast here: the dialog is the signal (menu label covers deferral).
-                    self.pending_show_update_dialog = true;
-                } else {
-                    // Never clear a pending interactive dialog here: a late silent
-                    // completion must not suppress consent after the user checked.
-                    let size_hint = info
-                        .setup_size
-                        .map(|n| format!(" · {}", format_bytes(n)))
-                        .unwrap_or_default();
-                    self.show_toast(
-                        format!(
-                            "Update available: v{} (you have v{}){size_hint}. Click “Install update” in the {} menu.",
-                            info.latest_version, info.current_version, APP_NAME
-                        ),
-                        cx,
-                    );
-                }
+                // Interactive and silent: toast with [Update] so the user can continue
+                // without hunting the brand menu.
+                self.show_update_available_toast(&info, cx);
             }
             Err(message) => {
                 self.update_busy = false;
                 if interactive {
-                    self.show_error_toast(message, cx);
+                    self.replace_update_toast(message, ToastKind::Error, None, cx);
+                } else {
+                    self.clear_update_toast(cx);
                 }
             }
         }
         cx.notify();
     }
 
-    /// Apply any deferred “update available” dialog once a `Window` is available.
-    pub(crate) fn apply_pending_update_dialog(
+    /// “Update available vX.Y.Z” with an Update action button.
+    pub(crate) fn show_update_available_toast(
         &mut self,
-        window: &mut Window,
+        info: &UpdateInfo,
         cx: &mut Context<Self>,
     ) {
-        if !self.pending_show_update_dialog {
+        self.replace_update_toast(
+            format!("Update available v{}", info.latest_version),
+            ToastKind::Info,
+            Some(("Update", ToastActionKind::ConfirmUpdate)),
+            cx,
+        );
+    }
+
+    /// “Restart to update” with a Restart action button.
+    pub(crate) fn show_restart_to_update_toast(&mut self, cx: &mut Context<Self>) {
+        if self.available_update.is_none() {
             return;
         }
-        // Don't stack over an already-open dialog (e.g. About). Menu label still
-        // switches to “Install update v…”, and this dialog opens when About closes.
-        if window.has_active_dialog(cx) {
-            return;
+        self.replace_update_toast(
+            "Restart to update",
+            ToastKind::Info,
+            Some(("Restart", ToastActionKind::RestartToUpdate)),
+            cx,
+        );
+    }
+
+    /// Handle primary actions from update toasts.
+    pub(crate) fn on_update_toast_action(&mut self, kind: ToastActionKind, cx: &mut Context<Self>) {
+        match kind {
+            ToastActionKind::ConfirmUpdate => {
+                if self.available_update.is_some() {
+                    self.show_restart_to_update_toast(cx);
+                }
+            }
+            ToastActionKind::RestartToUpdate => {
+                let Some(info) = self.available_update.clone() else {
+                    self.show_toast("No update is ready to install.", cx);
+                    return;
+                };
+                self.begin_apply_update(info, cx);
+            }
         }
-        // Prefer post-update What’s new when both are somehow pending.
-        if self.pending_show_whats_new {
-            return;
-        }
-        let Some(info) = self.available_update.clone() else {
-            self.pending_show_update_dialog = false;
-            return;
-        };
-        self.pending_show_update_dialog = false;
-        self.open_update_available_dialog(info, window, cx);
     }
 
     /// Open the post-update changelog once a `Window` is free.
@@ -164,120 +168,6 @@ impl DownloadApp {
         };
         self.pending_show_whats_new = false;
         self.open_whats_new_dialog(pending, window, cx);
-    }
-
-    /// Single dialog: version details + consent to close, install, and reopen.
-    pub(crate) fn open_update_available_dialog(
-        &mut self,
-        info: UpdateInfo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // User is looking at the dialog; cancel any deferred open.
-        self.pending_show_update_dialog = false;
-
-        // Only warn for transfers that will actually stop mid-flight.
-        let transferring_count = self
-            .jobs
-            .iter()
-            .filter(|j| matches!(j.state, JobState::Starting | JobState::Downloading))
-            .count();
-        let size_line = info
-            .setup_size
-            .map(|n| format!("Installer size: {}.", format_bytes(n)))
-            .unwrap_or_else(|| "Installer size: unknown.".into());
-        let notes = info
-            .notes
-            .as_ref()
-            .map(|n| n.trim())
-            .filter(|n| !n.is_empty())
-            .map(|n| truncate_dialog_notes(n, DIALOG_NOTES_MAX_CHARS));
-        let title = format!("Update to v{}?", info.latest_version);
-        let release_name = info.release_name.clone();
-        let current = if info.current_version.trim().is_empty() {
-            APP_VERSION.to_string()
-        } else {
-            info.current_version.clone()
-        };
-        let latest = info.latest_version.clone();
-        let app_view = cx.entity().clone();
-        let info_for_ok = info;
-
-        window.open_dialog(cx, move |dialog, _, cx| {
-            // `open_dialog` builder is `Fn` (may rebuild); clone owned strings each time.
-            let theme = cx.theme();
-            let muted = theme.muted_foreground;
-            let warning = theme.warning;
-            let app_view = app_view.clone();
-            let info_for_ok = info_for_ok.clone();
-            let title = title.clone();
-            let release_name = release_name.clone();
-            let current = current.clone();
-            let latest = latest.clone();
-            let size_line = size_line.clone();
-            let notes = notes.clone();
-
-            let mut body = v_flex()
-                .gap_2()
-                .child(div().text_sm().child(release_name))
-                .child(
-                    div().text_sm().child(format!(
-                        "You have v{current}. Version v{latest} is available."
-                    )),
-                )
-                .child(div().text_xs().text_color(muted).child(size_line));
-
-            if let Some(notes) = notes {
-                body = body.child(
-                    div()
-                        .id("update-notes")
-                        .max_h(px(96.))
-                        .overflow_y_scroll()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("Notes: {notes}")),
-                );
-            }
-
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!(
-                        "{APP_NAME} will close, {UPDATER_NAME} will install the update, and the app will reopen."
-                    )),
-            );
-
-            if transferring_count > 0 {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(warning)
-                        .child(format!(
-                            "Warning: {transferring_count} download(s) in progress will be interrupted. Resume is supported where possible after restart."
-                        )),
-                );
-            }
-
-            dialog
-                .title(title)
-                .confirm()
-                .overlay_closable(true)
-                .keyboard(true)
-                .w(px(420.))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Install and restart")
-                        .ok_variant(ButtonVariant::Primary),
-                )
-                .child(body)
-                .on_ok(move |_, _window, cx| {
-                    app_view.update(cx, |app, cx| {
-                        app.begin_apply_update(info_for_ok.clone(), cx);
-                    });
-                    true
-                })
-        });
     }
 
     /// Tasteful post-update changelog (Esc / mouse-back / outside / Close).
@@ -402,8 +292,10 @@ impl DownloadApp {
 
     /// Persist state, snapshot What’s new, spawn RusticDL Updater, then quit.
     pub(crate) fn begin_apply_update_inner(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
-        self.show_toast(
-            format!("Handing off to {UPDATER_NAME} — RusticDL will restart…"),
+        self.replace_update_toast(
+            format!("Handing off to {UPDATER_NAME}…"),
+            ToastKind::Info,
+            None,
             cx,
         );
         cx.notify();
@@ -441,16 +333,13 @@ impl DownloadApp {
             // claim an update that never applied.
             let _ = clear_pending_whats_new(&self.paths);
             self.update_busy = false;
-            self.show_error_toast(message, cx);
+            self.replace_update_toast(message, ToastKind::Error, None, cx);
             cx.notify();
             return;
         }
 
-        // Bypass close-to-tray so quit actually tears down the process.
-        self.force_quit = true;
-        self.stop_tray();
-        cx.notify();
-        cx.quit();
+        // Bypass close-to-tray / hidden-window paint so quit actually tears down.
+        self.force_quit_app(cx);
     }
 }
 
@@ -485,22 +374,6 @@ pub(crate) fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp
         });
     })
     .detach();
-}
-
-fn truncate_dialog_notes(notes: &str, max_chars: usize) -> String {
-    // Collapse Markdown-ish whitespace so headers/lists don't inflate the dialog.
-    let compact: String = notes
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut out: String = compact.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 /// Format GitHub release Markdown lightly for a readable plain-text changelog.
@@ -587,11 +460,5 @@ mod tests {
     fn format_changelog_skips_rules() {
         let out = format_changelog_notes("---\n- item\n***");
         assert_eq!(out, "• item");
-    }
-
-    #[test]
-    fn truncate_dialog_notes_collapses_lines() {
-        let raw = "Line one\n\nLine two";
-        assert_eq!(truncate_dialog_notes(raw, 100), "Line one Line two");
     }
 }

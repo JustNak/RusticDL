@@ -12,9 +12,25 @@ pub(crate) enum ToastKind {
     Error,
 }
 
+/// Optional primary action on a toast (e.g. update flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToastActionKind {
+    /// Advance from “Update available” → “Restart to update”.
+    ConfirmUpdate,
+    /// Hand off to the external updater and quit.
+    RestartToUpdate,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToastAction {
+    pub label: SharedString,
+    pub kind: ToastActionKind,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Toast {
     pub id: u64,
     pub message: SharedString,
     pub kind: ToastKind,
+    pub action: Option<ToastAction>,
 }

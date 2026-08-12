@@ -132,6 +132,20 @@ impl DownloadApp {
                                                     }
                                                 }),
                                             )
+                                            .separator()
+                                            .item(
+                                                PopupMenuItem::new("Exit")
+                                                    .icon(IconName::WindowClose)
+                                                    .on_click({
+                                                        let view = view.clone();
+                                                        move |_, _, cx| {
+                                                            view.update(cx, |app, cx| {
+                                                                // Full quit (close-to-tray must not intercept).
+                                                                app.force_quit_app(cx);
+                                                            });
+                                                        }
+                                                    }),
+                                            )
                                     },
                                 ),
                         )
