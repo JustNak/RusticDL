@@ -15,7 +15,10 @@ use tokio::time::sleep;
 
 use super::client::download_client;
 use super::conn_budget::ConnectionBudget;
-use super::filesystem::{ensure_parent_directory, metadata_len, move_to_final_path};
+use super::filesystem::{
+    ensure_parent_directory, is_untracked_preallocate_hole, looks_like_preallocate_hole,
+    metadata_len, move_to_final_path,
+};
 use super::http::{
     content_range_size_mismatch, control_outcome, progress_percent, reconnect_backoff,
     run_http_download_with_ctx, send_segment_get, should_retry_status, sleep_interruptible,
@@ -99,7 +102,7 @@ pub async fn run_multi_segment_download(
     // Disk check only for v0 / no-map (single-stream semantics).
     if ctx.job.segment_map.is_none() && ctx.job.transfer_format_version == 0 {
         let on_disk = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
-        if looks_like_preallocate_hole(ctx.job.downloaded_bytes, on_disk, ctx.job.total_bytes) {
+        if is_untracked_preallocate_hole(&ctx.job, on_disk) {
             // Crash window after set_len, before map persist — do not metadata_len resume.
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         } else if on_disk > 0 {
@@ -235,11 +238,6 @@ pub async fn run_multi_segment_download(
     }
 }
 
-/// `downloaded == 0` + file already `total` and no map: crash after set_len, not a contiguous partial.
-pub(crate) fn looks_like_preallocate_hole(downloaded: u64, on_disk: u64, total: u64) -> bool {
-    downloaded == 0 && total > 0 && on_disk >= total
-}
-
 fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
     if let Some(map) = job.segment_map.as_ref() {
         if map.total_bytes > 0 {
@@ -307,7 +305,8 @@ async fn emit_force_persist_and_wait(ctx: &TransferContext, map: &SegmentMap, ac
     tokio::select! {
         _ = ack.notified() => {}
         // Direct tests have no engine pump; ctx.job already has version=1.
-        _ = sleep(Duration::from_millis(100)) => {}
+        // 250ms covers the UI 80ms stash so JobsChanged is more likely flushed.
+        _ = sleep(Duration::from_millis(250)) => {}
     }
 }
 
@@ -1437,7 +1436,49 @@ mod tests {
         assert!(looks_like_preallocate_hole(0, 10_000, 10_000));
         assert!(!looks_like_preallocate_hole(100, 10_000, 10_000));
         assert!(!looks_like_preallocate_hole(0, 50, 10_000));
-        assert!(!looks_like_preallocate_hole(0, 10_000, 0));
+        // First-start crash: Add snapshot still has total=0.
+        assert!(looks_like_preallocate_hole(0, 10_000, 0));
+        assert!(!looks_like_preallocate_hole(0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn unknown_total_hole_is_deleted_not_completed_as_zeros() {
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 89) as u8).collect();
+        let (base, _seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-multi-hole-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        // First-start crash: set_len already applied, state.json still total=0 / downloaded=0 / v0.
+        std::fs::write(&temp, vec![0u8; body.len()]).unwrap();
+
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.total_bytes = 0;
+        job.downloaded_bytes = 0;
+        job.transfer_format_version = 0;
+
+        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 1;
+
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("hole must not complete as zeros");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        let data = std::fs::read(&target).expect("final");
+        assert_eq!(data, body, "must re-download after deleting the hole");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

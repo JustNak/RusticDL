@@ -167,6 +167,20 @@ pub(crate) fn apply_progress_from_sum(job: &mut Job, sum: u64) {
 /// Align `job.downloaded_bytes` (and progress) with a known on-disk length.
 ///
 /// Split from the async I/O so callers can `metadata_len` without holding locks.
+/// Crash after `set_len` with no recorded progress: do not treat file length as
+/// contiguous bytes. `total == 0` is the first-start persist miss (Add snapshot).
+pub fn looks_like_preallocate_hole(downloaded: u64, on_disk: u64, total: u64) -> bool {
+    downloaded == 0 && on_disk > 0 && (total == 0 || on_disk >= total)
+}
+
+/// v0, no map, no recorded progress, and on-disk length looks like a hole.
+pub fn is_untracked_preallocate_hole(job: &Job, on_disk: u64) -> bool {
+    job.downloaded_bytes == 0
+        && job.transfer_format_version == 0
+        && job.segment_map.is_none()
+        && looks_like_preallocate_hole(0, on_disk, job.total_bytes)
+}
+
 pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> ReconcileResult {
     let mut changed = job.downloaded_bytes != on_disk;
     if changed {
@@ -248,6 +262,19 @@ pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
     }
 
     let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
+    // Wait for preflight size when total is unknown; never promote a hole to progress.
+    if is_untracked_preallocate_hole(job, on_disk) {
+        return ReconcileResult {
+            downloaded_bytes: job.downloaded_bytes,
+            on_disk,
+            changed: false,
+            used_metadata_len: false,
+            version_gated: false,
+            used_map_sum: false,
+            map_consistent: false,
+            resume_required: false,
+        };
+    }
     apply_partial_progress_from_disk(job, on_disk)
 }
 
@@ -530,6 +557,43 @@ mod tests {
         assert!(!result.map_consistent);
         assert_eq!(result.downloaded_bytes, 42);
         assert_eq!(job.downloaded_bytes, 42); // unchanged — no metadata_len
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preallocate_hole_includes_unknown_total() {
+        assert!(looks_like_preallocate_hole(0, 10_000, 0));
+        assert!(looks_like_preallocate_hole(0, 10_000, 10_000));
+        assert!(!looks_like_preallocate_hole(0, 50, 10_000));
+        assert!(!looks_like_preallocate_hole(1, 10_000, 0));
+        assert!(!looks_like_preallocate_hole(0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_metadata_len_for_unknown_total_hole() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-hole-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0u8; 8_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 0;
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(!result.used_metadata_len);
+        assert!(!result.changed);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(result.on_disk, 8_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -856,9 +920,10 @@ mod tests {
         job.progress = 12.5;
 
         let result = reconcile_partial_progress(&mut job).await;
-        assert!(result.changed);
-        assert_eq!(job.downloaded_bytes, 50);
-        // No total → leave progress as-is (unknown size).
+        // Unknown total + no recorded progress: do not promote file len (preallocate hole).
+        assert!(!result.used_metadata_len);
+        assert!(!result.changed);
+        assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(job.progress, 12.5);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -10,7 +10,8 @@ use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
 use super::filesystem::{
-    apply_partial_progress_from_disk, apply_progress_from_sum, metadata_len, remove_partial,
+    apply_partial_progress_from_disk, apply_progress_from_sum, is_untracked_preallocate_hole,
+    metadata_len, remove_partial,
 };
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
@@ -320,14 +321,10 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 if !restarting {
                     if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                         if let Some(on_disk) = on_disk {
-                            // Preallocate hole (v0, no map, 0 downloaded, file already total):
-                            // do not treat metadata_len as contiguous progress.
-                            let hole = job.downloaded_bytes == 0
-                                && job.total_bytes > 0
-                                && on_disk >= job.total_bytes
-                                && job.segment_map.is_none()
-                                && job.transfer_format_version == 0;
-                            if !hole {
+                            // Hole / first-start crash: leave downloaded=0 so multi can
+                            // delete after preflight knows size. Single-stream still
+                            // uses its own metadata_len Range oracle.
+                            if !is_untracked_preallocate_hole(job, on_disk) {
                                 apply_partial_progress_from_disk(job, on_disk);
                             }
                         } else if let Some(map) = job.segment_map.as_ref() {
