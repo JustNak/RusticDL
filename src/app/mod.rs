@@ -42,7 +42,7 @@ use gpui_component::{
 use crate::appearance::{
     apply_appearance, film_grain_image, noise_enabled, vignette_edge_alpha, vignette_enabled,
 };
-use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job};
+use crate::download::{EngineEvent, EngineHandle, Job};
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
