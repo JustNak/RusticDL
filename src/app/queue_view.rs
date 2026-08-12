@@ -7,15 +7,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, Corner, ExternalPaths, InteractiveElement,
-    IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px, Context, ExternalPaths, InteractiveElement, IntoElement,
+    ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
-    h_flex,
-    input::Input,
-    menu::{DropdownMenu, PopupMenuItem},
-    v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
+    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
 };
 
 use super::add_dialog::enqueue_urls;
@@ -121,10 +118,10 @@ impl DownloadApp {
         v_flex()
             .size_full()
             .bg(theme.background)
-            .child(self.render_queue_toolbar(cx))
+            // Search + overflow live in the title bar — no separate toolbar strip.
             .child(
                 h_flex()
-                    .h(px(34.))
+                    .h(px(28.))
                     .px_4()
                     .gap_3()
                     .items_center()
@@ -132,7 +129,7 @@ impl DownloadApp {
                     .bg(theme.list_head)
                     .border_b_1()
                     .border_color(theme.border)
-                    // Match the status-dot + gap in each row so metrics stay aligned.
+                    // Match the file-type tile width in each row so metrics stay aligned.
                     .child(div().w(px(STATUS_DOT)).flex_shrink_0())
                     .child(sortable_header(
                         "Name",
@@ -434,102 +431,6 @@ impl DownloadApp {
         } else if total > 1 {
             self.show_toast(format!("Opened {opened} folders."), cx);
         }
-    }
-
-    pub(crate) fn render_queue_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let view = cx.entity();
-
-        h_flex()
-            .px_4()
-            .py_2p5()
-            .gap_2()
-            .items_center()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(
-                div().flex_1().min_w(px(320.)).pr_1().child(
-                    Input::new(&self.search_input).w_full().prefix(
-                        Icon::new(IconName::Inbox)
-                            .with_size(px(14.))
-                            .text_color(theme.muted_foreground),
-                    ),
-                ),
-            )
-            .child(
-                Button::new("queue-overflow")
-                    .ghost()
-                    .icon(IconName::EllipsisVertical)
-                    .tooltip("More actions")
-                    .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _window, menu_cx| {
-                        let app = view.read(menu_cx);
-                        let can_pause = app.jobs.iter().any(|j| {
-                            matches!(
-                                j.state,
-                                JobState::Queued | JobState::Starting | JobState::Downloading
-                            )
-                        });
-                        let can_resume = app.jobs.iter().any(|j| j.state == JobState::Paused);
-                        let can_retry = app
-                            .jobs
-                            .iter()
-                            .any(|j| matches!(j.state, JobState::Failed | JobState::Canceled));
-                        let can_clear = app.jobs.iter().any(|j| j.state.is_terminal());
-                        let engine = app.engine.clone();
-
-                        menu.min_w(px(196.))
-                            .item(
-                                PopupMenuItem::new("Pause all")
-                                    .icon(IconName::Minus)
-                                    .disabled(!can_pause)
-                                    .on_click({
-                                        let engine = engine.clone();
-                                        move |_, _, _| {
-                                            engine.send(EngineCommand::PauseAll);
-                                        }
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Resume all")
-                                    .icon(IconName::Redo2)
-                                    .disabled(!can_resume)
-                                    .on_click({
-                                        let engine = engine.clone();
-                                        move |_, _, _| {
-                                            engine.send(EngineCommand::ResumeAll);
-                                        }
-                                    }),
-                            )
-                            .separator()
-                            .item(
-                                PopupMenuItem::new("Retry all")
-                                    .icon(IconName::Redo)
-                                    .disabled(!can_retry)
-                                    .on_click({
-                                        let engine = engine.clone();
-                                        move |_, _, _| {
-                                            engine.send(EngineCommand::RetryAll);
-                                        }
-                                    }),
-                            )
-                            .separator()
-                            .item(
-                                PopupMenuItem::new("Clear all")
-                                    .icon(IconName::Delete)
-                                    .disabled(!can_clear)
-                                    .on_click({
-                                        let view = view.clone();
-                                        move |_, window, cx| {
-                                            let _ = view.update(cx, |app, cx| {
-                                                app.confirm_clear_all(window, cx);
-                                            });
-                                        }
-                                    }),
-                            )
-                    }),
-            )
     }
 
     pub(crate) fn render_search_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

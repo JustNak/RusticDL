@@ -2,10 +2,13 @@ use gpui::{
     div, prelude::FluentBuilder, px, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
     SharedString, StatefulInteractiveElement, Styled,
 };
-use gpui_component::{h_flex, tag::Tag, tooltip::Tooltip, Icon, IconName, Sizable, StyledExt};
+use gpui_component::{
+    h_flex, tag::Tag, tooltip::Tooltip, Icon, IconName, Sizable, StyledExt, Theme,
+};
 
 use super::super::layout::{
-    QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, STATUS_DOT,
+    QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, FILE_ICON_W,
+    STATUS_BADGE, STATUS_DOT,
 };
 use super::super::DownloadApp;
 use super::chrome::soft_tooltip;
@@ -147,10 +150,121 @@ pub(crate) fn status_dot(
         .tooltip(move |window, cx| soft_tooltip(label.clone(), tip_color, window, cx))
 }
 
+/// File-type group used for queue row icons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileTypeKind {
+    Archive,
+    Video,
+    Audio,
+    Image,
+    Program,
+    Document,
+    Generic,
+}
+
+impl FileTypeKind {
+    pub(crate) fn from_filename(filename: &str) -> Self {
+        let ext = std::path::Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "lz4" | "zst" | "cab"
+            | "iso" => Self::Archive,
+            "mkv" | "mp4" | "avi" | "webm" | "mov" | "m4v" | "wmv" | "flv" | "mpeg" | "mpg"
+            | "ts" | "m2ts" => Self::Video,
+            "mp3" | "flac" | "wav" | "aac" | "m4a" | "ogg" | "opus" | "wma" | "aiff" => Self::Audio,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tif" | "tiff"
+            | "heic" | "avif" => Self::Image,
+            "exe" | "msi" | "bat" | "cmd" | "com" | "appx" | "msix" | "dll" | "sys" | "scr"
+            | "ps1" | "sh" | "bin" | "run" | "app" | "dmg" | "pkg" | "deb" | "rpm" => Self::Program,
+            "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "ppt"
+            | "pptx" | "csv" | "json" | "xml" | "html" | "htm" | "epub" | "mobi" => Self::Document,
+            _ => Self::Generic,
+        }
+    }
+
+    pub(crate) fn icon_path(self) -> &'static str {
+        match self {
+            Self::Archive => "icons/file-archive.svg",
+            Self::Video => "icons/file-video.svg",
+            Self::Audio => "icons/file-audio.svg",
+            Self::Image => "icons/file-image.svg",
+            Self::Program => "icons/file-code.svg",
+            Self::Document => "icons/file-text.svg",
+            Self::Generic => "icons/file.svg",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Archive => "Archive",
+            Self::Video => "Video",
+            Self::Audio => "Audio",
+            Self::Image => "Image",
+            Self::Program => "Program",
+            Self::Document => "Document",
+            Self::Generic => "File",
+        }
+    }
+}
+
+/// File-type tile with a status badge overlaid at the bottom-right.
+pub(crate) fn file_type_status_tile(
+    job_id: &str,
+    filename: &str,
+    status: &'static str,
+    status_color: Hsla,
+    theme: &Theme,
+) -> impl IntoElement {
+    let kind = FileTypeKind::from_filename(filename);
+    let tip: SharedString = format!("{status} · {}", kind.label()).into();
+    let tip_color = theme.muted_foreground;
+    let tile = px(FILE_ICON_W);
+    let badge = px(STATUS_BADGE);
+    let icon_color = theme.muted_foreground;
+    let fill = theme.secondary.opacity(0.55);
+    let ring = theme.border.opacity(0.5);
+
+    div()
+        .id(SharedString::from(format!("file-type-{job_id}")))
+        .relative()
+        .flex_shrink_0()
+        .w(tile)
+        .h(tile)
+        .rounded(theme.radius)
+        .bg(fill)
+        .border_1()
+        .border_color(ring)
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |window, cx| soft_tooltip(tip.clone(), tip_color, window, cx))
+        .child(
+            Icon::empty()
+                .path(kind.icon_path())
+                .with_size(px(14.))
+                .text_color(icon_color),
+        )
+        .child(
+            div()
+                .absolute()
+                .right(px(-2.))
+                .bottom(px(-2.))
+                .w(badge)
+                .h(badge)
+                .rounded_full()
+                .bg(status_color)
+                .border_1()
+                .border_color(theme.background.opacity(0.9)),
+        )
+}
+
 /// Approximate how many characters fit in the Name column (text-sm / semibold).
 pub(crate) fn name_char_budget(main_w: f32, cols: QueueColumns) -> usize {
-    // Row chrome always present: padding + status dot + size + actions + gaps.
-    let mut used = 32.0 + STATUS_DOT + COL_SIZE_W + COL_ACTIONS_W + 12.0 * 5.0;
+    // Row chrome always present: padding + file icon tile + size + actions + gaps.
+    let mut used = 32.0 + FILE_ICON_W + COL_SIZE_W + COL_ACTIONS_W + 12.0 * 5.0;
     if cols.date {
         used += COL_DATE_W + 12.0;
     }
