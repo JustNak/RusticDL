@@ -354,6 +354,10 @@ pub async fn run_http_download_with_ctx(
         let (response, final_url) = match fetch_result {
             Ok(pair) => pair,
             Err(error) => {
+                // Pause/cancel during reconnect GET (fetch_with_redirects wraps as Internal).
+                if let Some(outcome) = control_outcome(&control) {
+                    return Ok(outcome);
+                }
                 // Connect errors on reconnect GET only (not the first attempt).
                 match prepare_reconnect(
                     &error,
@@ -415,6 +419,9 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             }
             // Retryable HTTP on reconnect GET can use short budget; first attempt bubbles.
             let error = download_error(FailureCategory::Http, message, retryable);
+            if let Some(outcome) = control_outcome(&control) {
+                return Ok(outcome);
+            }
             if retryable {
                 match prepare_reconnect(
                     &error,
@@ -593,6 +600,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         );
         if full_replace {
             // Replace identity + clear multi version; surface a non-fatal user notice.
+            // Keep local oracle in sync with the Job progress patch (v1+ → contiguous v0).
+            transfer_format_version = 0;
             starting.replace_validators = Some(true);
             starting.transfer_format_version = Some(0);
             starting.toast = Some(FULL_REPLACE_NOTICE.into());
@@ -780,10 +789,12 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         match body_result {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
+                // Pause/cancel observed after stream teardown (or remapped control path).
                 if let Some(outcome) = control_outcome(&control) {
                     return Ok(outcome);
                 }
                 // Keep local downloaded for oracle when version-gated (v1+).
+                // Disk errors from flush are non-retryable → prepare_reconnect GiveUps.
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
@@ -2125,10 +2136,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_interruptible_respects_pause() {
+        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
+        let control_sleep = control.clone();
+        let sleeper = tokio::spawn(async move {
+            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
+        });
+        sleep(Duration::from_millis(20)).await;
+        control.store(CONTROL_PAUSED, Ordering::Relaxed);
+        let outcome = sleeper.await.expect("join");
+        assert_eq!(outcome, Some(DownloadOutcome::Paused));
+    }
+
+    #[tokio::test]
     async fn sleep_interruptible_completes_without_control() {
         let control = AtomicU8::new(CONTROL_CONTINUE);
         let outcome = sleep_interruptible(&control, Duration::from_millis(30)).await;
         assert!(outcome.is_none());
+    }
+
+    /// Reconnect re-GET must re-apply Range + strong If-Range on the pinned URL
+    /// (same builder path as mid-transfer continue).
+    #[test]
+    fn reconnect_reget_attaches_range_if_range_on_pinned_url() {
+        let client = download_client().expect("client");
+        let job_url = "https://origin.example.com/dl/token";
+        let pinned = "https://cdn.example.com/file.bin?sig=1";
+        let validators = ContentValidators {
+            etag: Some("\"resume-etag\"".into()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            expected_size: Some(10_000),
+        };
+        let offset = 4096u64;
+        let req = build_download_request(&client, job_url, pinned, offset, &validators, None)
+            .build()
+            .expect("build");
+        assert_eq!(req.url().as_str(), pinned);
+        assert_eq!(
+            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
+            Some("bytes=4096-")
+        );
+        assert_eq!(
+            req.headers().get(IF_RANGE).and_then(|v| v.to_str().ok()),
+            Some("\"resume-etag\"")
+        );
+    }
+
+    #[test]
+    fn disk_flush_failure_is_not_reconnectable() {
+        let disk = disk_write_error(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "disk full",
+        ));
+        assert!(!is_reconnectable_error(&disk));
+        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 100, true));
+        assert_eq!(disk.category, FailureCategory::Disk);
+        assert!(!disk.retryable);
     }
 
     #[tokio::test]
