@@ -124,6 +124,9 @@ pub struct DownloadApp {
     last_jobs_save: Instant,
     /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
+    /// Bumped when a check starts or is invalidated (e.g. channel switch).
+    /// Completions whose generation no longer matches are dropped.
+    update_check_gen: u64,
     /// Cached latest release when an update is available (menu label + toast actions).
     available_update: Option<UpdateInfo>,
     /// Id of the staged update-flow toast so check → result replaces instead of stacking.
@@ -469,6 +472,7 @@ impl DownloadApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             update_busy: false,
+            update_check_gen: 0,
             available_update: None,
             update_toast_id: None,
             system_tray,
@@ -1164,6 +1168,25 @@ impl DownloadApp {
     fn set_close_to_tray(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.close_to_tray = on;
         self.sync_tray_lifetime(cx);
+        cx.notify();
+    }
+
+    /// Draft update channel; clears cached results and invalidates in-flight checks.
+    fn set_update_channel(
+        &mut self,
+        channel: crate::settings::UpdateChannel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.update_channel == channel {
+            return;
+        }
+        self.settings.update_channel = channel;
+        self.available_update = None;
+        // Drop any in-flight check for the previous channel (late result is ignored).
+        self.update_check_gen = self.update_check_gen.wrapping_add(1);
+        self.update_busy = false;
+        self.clear_update_toast(cx);
         cx.notify();
     }
 

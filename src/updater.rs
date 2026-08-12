@@ -1,10 +1,11 @@
 //! Auto-updater backed by GitHub Releases.
 //!
-//! Always targets the public latest release of this repository:
-//! `https://github.com/JustNak/RusticDL/releases/latest`
+//! Channel selection (`UpdateChannel`):
+//! - **Stable** — `GET …/releases/latest` (GitHub’s latest non-prerelease).
+//! - **Nightly** — list releases and pick the newest published prerelease with a setup asset.
 //!
 //! Staged flow (main app UI in `update_flow`):
-//! 1. Query the GitHub Releases API for the latest tag + assets.
+//! 1. Query the GitHub Releases API for the latest tag + assets on the chosen channel.
 //! 2. Compare against the built-in app version and surface toast stages:
 //!    Checking → You're up to date | Update available [Update] → Restart [Restart].
 //! 3. On Restart, flush app state, spawn **RusticDL Updater** with the setup
@@ -23,10 +24,16 @@ use crate::branding::{
     APP_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO, SETUP_ASSET_NAME, UPDATER_EXE_NAME,
     UPDATER_NAME,
 };
+use crate::settings::UpdateChannel;
 
-/// GitHub API: latest release for this project.
+/// GitHub API: latest stable (non-prerelease) release for this project.
 pub fn latest_release_api() -> String {
     format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest")
+}
+
+/// GitHub API: recent releases list (used to find nightly/prerelease builds).
+pub fn releases_list_api() -> String {
+    format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=30")
 }
 
 /// Human-facing releases page (opens in browser).
@@ -84,9 +91,17 @@ struct GhAsset {
     size: u64,
 }
 
-/// Query GitHub for the latest release and compare to this build.
-pub async fn check_for_update() -> Result<UpdateCheck, String> {
+/// Query GitHub for the latest release on `channel` and compare to this build.
+pub async fn check_for_update(channel: UpdateChannel) -> Result<UpdateCheck, String> {
     let client = github_client()?;
+    let release = match channel {
+        UpdateChannel::Stable => fetch_stable_release(&client).await?,
+        UpdateChannel::Nightly => fetch_nightly_release(&client).await?,
+    };
+    compare_release(release)
+}
+
+async fn fetch_stable_release(client: &reqwest::Client) -> Result<GhRelease, String> {
     let response = client
         .get(latest_release_api())
         .send()
@@ -111,13 +126,51 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
         return Err("Latest GitHub release is still a draft.".into());
     }
 
+    Ok(release)
+}
+
+async fn fetch_nightly_release(client: &reqwest::Client) -> Result<GhRelease, String> {
+    let response = client
+        .get(releases_list_api())
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach GitHub: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let snippet = body.chars().take(160).collect::<String>();
+        return Err(format!(
+            "GitHub returned {status} while checking for nightly updates. {snippet}"
+        ));
+    }
+
+    let releases: Vec<GhRelease> = response
+        .json()
+        .await
+        .map_err(|e| format!("Could not parse GitHub releases list: {e}"))?;
+
+    // GitHub returns newest first; take the first published prerelease with a setup asset.
+    releases
+        .into_iter()
+        .find(|r| {
+            !r.draft
+                && r.prerelease
+                && r.assets
+                    .iter()
+                    .any(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
+        })
+        .ok_or_else(|| {
+            "No Nightly (pre-release) build with a setup installer was found on GitHub.".into()
+        })
+}
+
+fn compare_release(release: GhRelease) -> Result<UpdateCheck, String> {
     let latest_raw = release.tag_name.trim();
     let latest = normalize_version(latest_raw);
     let current = normalize_version(APP_VERSION);
 
     if !is_newer(&latest, &current) {
-        // Still surface prerelease tags that aren't "newer" numerically as up-to-date.
-        let _ = release.prerelease;
         return Ok(UpdateCheck::UpToDate {
             current: current.clone(),
             latest,
@@ -130,7 +183,7 @@ pub async fn check_for_update() -> Result<UpdateCheck, String> {
         .find(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
         .ok_or_else(|| {
             format!(
-                "Latest release (v{latest}) has no “{SETUP_ASSET_NAME}” asset. Open the release page instead."
+                "Release (v{latest}) has no “{SETUP_ASSET_NAME}” asset. Open the release page instead."
             )
         })?;
 
