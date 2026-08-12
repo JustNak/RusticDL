@@ -47,7 +47,7 @@ use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job, JobState};
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
-use crate::notifications::{BalloonContextMap, BalloonOutcome, OsNotifyBuffer};
+use crate::notifications::{BalloonContextMap, OsNotifyBuffer};
 use crate::persistence::{load_pending_whats_new, save_settings, AppPaths, PendingWhatsNew};
 use crate::prompt_window::{
     open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
@@ -1542,3 +1542,4 @@ impl Render for DownloadApp {
             .child(toast_layer)
     }
 }
+
