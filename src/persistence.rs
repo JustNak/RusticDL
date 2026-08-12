@@ -57,10 +57,16 @@ impl PendingWhatsNew {
 
 /// Load a pending What’s new snapshot if present and valid for this build.
 ///
-/// Stale files (wrong `toVersion`) are deleted so they cannot reappear later.
+/// Corrupt or stale files (wrong `toVersion`) are deleted so they cannot reappear later.
 pub fn load_pending_whats_new(paths: &AppPaths) -> Option<PendingWhatsNew> {
     let bytes = fs::read(&paths.pending_whats_new).ok()?;
-    let pending: PendingWhatsNew = serde_json::from_slice(&bytes).ok()?;
+    let pending: PendingWhatsNew = match serde_json::from_slice(&bytes) {
+        Ok(pending) => pending,
+        Err(_) => {
+            let _ = clear_pending_whats_new(paths);
+            return None;
+        }
+    };
     if pending.matches_running_app() {
         Some(pending)
     } else {
@@ -209,6 +215,16 @@ mod tests {
             notes: None,
         };
         save_pending_whats_new(&paths, &pending).unwrap();
+        assert!(load_pending_whats_new(&paths).is_none());
+        assert!(!paths.pending_whats_new.is_file());
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn corrupt_pending_whats_new_is_discarded() {
+        let paths = temp_paths("corrupt");
+        ensure_app_dirs(&paths).unwrap();
+        fs::write(&paths.pending_whats_new, b"{not valid json").unwrap();
         assert!(load_pending_whats_new(&paths).is_none());
         assert!(!paths.pending_whats_new.is_file());
         let _ = fs::remove_dir_all(&paths.root);
