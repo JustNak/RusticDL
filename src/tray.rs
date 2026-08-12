@@ -126,7 +126,14 @@ impl Drop for SystemTray {
                 };
             }
             if let Some(handle) = self.thread.take() {
-                let _ = handle.join();
+                // Bounded wait: a stuck tray message loop must not freeze quit forever.
+                // Callers that must not block the UI use a detached drop thread instead.
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = handle.join();
+                    let _ = done_tx.send(());
+                });
+                let _ = done_rx.recv_timeout(std::time::Duration::from_millis(750));
             }
             // Thread exit drains any leftovers; belt-and-suspenders clear.
             if let Ok(mut q) = self.pending_balloons.lock() {
