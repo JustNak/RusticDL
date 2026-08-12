@@ -43,7 +43,7 @@ use crate::appearance::{
     apply_appearance, apply_window_opacity, film_grain_image, noise_enabled, vignette_edge_alpha,
     vignette_enabled,
 };
-use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job, JobState};
+use crate::download::{EngineCommand, EngineEvent, EngineHandle, Job};
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
