@@ -21,6 +21,7 @@ use super::DownloadApp;
 use crate::branding::{APP_NAME, APP_VERSION, UPDATER_NAME};
 use crate::download::JobState;
 use crate::format::format_bytes;
+use crate::settings::UpdateChannel;
 use crate::updater::{
     check_for_update, launch_updater, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
@@ -64,7 +65,8 @@ impl DownloadApp {
             self.show_toast("Checking GitHub for updates…", cx);
         }
         cx.notify();
-        spawn_update_check(interactive, cx);
+        let channel = self.settings.update_channel;
+        spawn_update_check(interactive, channel, cx);
     }
 
     pub(crate) fn on_update_check_finished(
@@ -305,7 +307,11 @@ impl DownloadApp {
 }
 
 /// Run a GitHub Releases update check on a background thread and deliver the result to the UI.
-pub(crate) fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp>) {
+pub(crate) fn spawn_update_check(
+    interactive: bool,
+    channel: UpdateChannel,
+    cx: &mut Context<DownloadApp>,
+) {
     let delay = if interactive {
         Duration::from_millis(0)
     } else {
@@ -321,7 +327,7 @@ pub(crate) fn spawn_update_check(interactive: bool, cx: &mut Context<DownloadApp
             .enable_all()
             .build()
             .map_err(|e| format!("Could not start update runtime: {e}"))
-            .and_then(|rt| rt.block_on(check_for_update()));
+            .and_then(|rt| rt.block_on(check_for_update(channel)));
         let _ = tx.send_blocking(result);
     });
 

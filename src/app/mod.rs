@@ -1095,6 +1095,22 @@ impl DownloadApp {
         cx.notify();
     }
 
+    /// Draft update channel; clears any cached available update from the other stream.
+    fn set_update_channel(
+        &mut self,
+        channel: crate::settings::UpdateChannel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.update_channel == channel {
+            return;
+        }
+        self.settings.update_channel = channel;
+        self.available_update = None;
+        self.pending_show_update_dialog = false;
+        cx.notify();
+    }
+
     /// Browser capture toggles preview immediately; disk + IPC flush is "Save settings".
     fn set_extension_enabled(&mut self, on: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.settings.extension.enabled = on;

@@ -318,6 +318,26 @@ impl OsNotifyMode {
     }
 }
 
+/// Which GitHub Releases stream the auto-updater follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    /// Latest non-prerelease (`/releases/latest`).
+    #[default]
+    Stable,
+    /// Newest published prerelease with a setup asset.
+    Nightly,
+}
+
+impl UpdateChannel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Nightly => "Nightly",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -325,6 +345,9 @@ pub struct Settings {
     pub max_concurrent_downloads: u32,
     pub auto_retry_attempts: u32,
     pub speed_limit_kib_per_second: u32,
+    /// Stable vs Nightly (prerelease) update stream.
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
     pub theme: AppTheme,
     /// Accent palette; `Default` keeps the stock theme primary.
     #[serde(default)]
@@ -406,6 +429,7 @@ impl Default for Settings {
             max_concurrent_downloads: 3,
             auto_retry_attempts: 6,
             speed_limit_kib_per_second: 0,
+            update_channel: UpdateChannel::Stable,
             theme: AppTheme::Light,
             accent_preset: AccentPreset::Default,
             accent_hue: default_accent_hue(),
@@ -527,6 +551,7 @@ mod tests {
         assert_eq!(s.vignette_intensity, 0);
         assert_eq!(s.progress_style, ProgressStyle::Solid);
         assert_eq!(s.window_layout, WindowLayout::default());
+        assert_eq!(s.update_channel, UpdateChannel::Stable);
         // New system prefs: close-to-tray defaults on for download-manager UX.
         assert!(s.close_to_tray);
         assert!(!s.launch_at_startup);
