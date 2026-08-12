@@ -29,6 +29,7 @@ use super::job::{
 };
 use super::segment::{partition, SegmentMap, SegmentState};
 use super::segment_io::{try_preallocate, SegmentFileWriter};
+use super::verify::verify_sha256_if_expected;
 
 const CONTROL_POLL: Duration = Duration::from_millis(200);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
@@ -1078,6 +1079,14 @@ async fn finalize_completed(
         })?;
     drop(writer);
 
+    if let Err(error) =
+        verify_sha256_if_expected(&ctx.job.temp_path, ctx.job.expected_sha256.as_deref()).await
+    {
+        // Hash fail is a Failed transfer: keep .part and retain the completed map.
+        persist_map_exit(ctx, map, 0);
+        return Err(error);
+    }
+
     let final_path = move_to_final_path(&ctx.job.temp_path, &ctx.job.target_path)
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
@@ -1121,6 +1130,7 @@ mod tests {
     use crate::download::job::Job;
     use crate::download::segment::{Segment, MIN_SEGMENT_SIZE};
     use crate::download::transfer::run_transfer;
+    use crate::download::verify::{sha256_hex, SHA256_EMPTY};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU8;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1589,6 +1599,92 @@ mod tests {
         assert!(matches!(outcome, DownloadOutcome::Completed));
         let data = std::fs::read(&target).expect("final");
         assert_eq!(data, body, "must re-download after deleting the hole");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multi_sha256_match_renames() {
+        let body: Vec<u8> = (0..2 * MIN_SEGMENT_SIZE as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let expected = sha256_hex(&body);
+        let (base, _seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-multi-sha-ok-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.expected_sha256 = Some(expected);
+
+        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let outcome = run_transfer(ctx).await.expect("hash match");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        assert!(!temp.exists(), "match must rename .part");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multi_sha256_mismatch_keeps_part_and_map() {
+        let body: Vec<u8> = (0..2 * MIN_SEGMENT_SIZE as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (base, _seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-multi-sha-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.expected_sha256 = Some(SHA256_EMPTY.into());
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let err = run_transfer(ctx)
+            .await
+            .expect_err("hash mismatch must fail");
+        assert_eq!(err.category, FailureCategory::Internal);
+        assert!(err.message.contains("SHA-256 mismatch"));
+        assert!(temp.exists(), "hash fail must keep .part");
+        assert!(!target.exists(), "hash fail must not rename");
+
+        let published = patches.lock().unwrap();
+        let last_map = published.iter().rev().find_map(|p| p.segment_map.as_ref());
+        let map = last_map.expect("hash fail must retain segment map");
+        assert_eq!(map.written_sum(), body.len() as u64);
+        assert!(published
+            .iter()
+            .any(|p| p.transfer_format_version == Some(1)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

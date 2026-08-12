@@ -26,6 +26,7 @@ use super::job::{
     TransferMode, WorkerControl,
 };
 use super::segment::SegmentMap;
+use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 const CONTROL_POLL: Duration = Duration::from_millis(200);
@@ -785,6 +786,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                     true,
                 ));
             }
+
+            verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
 
             let final_path = move_to_final_path(&temp_path, &target_path)
                 .await
