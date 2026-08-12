@@ -95,6 +95,32 @@ pub fn download_error(
     }
 }
 
+/// HTTP content validators captured from response headers for resume identity checks.
+/// Used later for If-Range (PR 5); stored now so jobs persist validators across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentValidators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub expected_size: Option<u64>,
+}
+
+impl ContentValidators {
+    /// True when no ETag / Last-Modified / expected_size is stored.
+    #[allow(dead_code)] // Used by tests and upcoming resume mismatch checks (PR 5).
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none() && self.expected_size.is_none()
+    }
+}
+
+/// Transfer strategy hint for UI / multi-connection planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    Single,
+    Multi,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
@@ -114,6 +140,24 @@ pub struct Job {
     pub temp_path: PathBuf,
     pub resume_supported: bool,
     pub retry_attempts: u32,
+    /// ETag / Last-Modified / size from successful responses.
+    #[serde(default)]
+    pub validators: ContentValidators,
+    /// 0 = single-stream contiguous `.part`; 1 = multi-segment map-authoritative.
+    #[serde(default)]
+    pub transfer_format_version: u32,
+    /// Live connection count (UI / metrics placeholder).
+    #[serde(default)]
+    pub active_connections: u32,
+    /// Cumulative short reconnects for this job until Restart.
+    #[serde(default)]
+    pub reconnect_count: u32,
+    /// Single vs multi transfer mode when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_mode: Option<TransferMode>,
+    /// Last multi→single or planner failure reason (UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 impl Job {
@@ -135,7 +179,104 @@ impl Job {
             temp_path,
             resume_supported: false,
             retry_attempts: 0,
+            validators: ContentValidators::default(),
+            transfer_format_version: 0,
+            active_connections: 0,
+            reconnect_count: 0,
+            transfer_mode: None,
+            fallback_reason: None,
         }
+    }
+
+    /// Clear validators, transfer format, and metrics placeholders (Restart / lifecycle).
+    pub fn clear_transfer_identity(&mut self) {
+        self.validators = ContentValidators::default();
+        self.transfer_format_version = 0;
+        self.active_connections = 0;
+        self.reconnect_count = 0;
+        self.transfer_mode = None;
+        self.fallback_reason = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn job_serde_defaults_legacy_payload() {
+        // Older state.json without validators / version fields must deserialize cleanly.
+        let json = r#"{
+            "id":"abc",
+            "url":"https://example.com/f.bin",
+            "filename":"f.bin",
+            "state":"queued",
+            "createdAt":1,
+            "progress":0.0,
+            "totalBytes":0,
+            "downloadedBytes":0,
+            "speed":0,
+            "etaSecs":0,
+            "error":null,
+            "failureCategory":null,
+            "targetPath":"C:\\dl\\f.bin",
+            "tempPath":"C:\\dl\\f.bin.part",
+            "resumeSupported":false,
+            "retryAttempts":0
+        }"#;
+        let job: Job = serde_json::from_str(json).expect("legacy Job deserializes");
+        assert!(job.validators.is_empty());
+        assert_eq!(job.transfer_format_version, 0);
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.reconnect_count, 0);
+        assert!(job.transfer_mode.is_none());
+        assert!(job.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn job_new_defaults_transfer_fields() {
+        let job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        assert!(job.validators.is_empty());
+        assert_eq!(job.transfer_format_version, 0);
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.reconnect_count, 0);
+        assert!(job.transfer_mode.is_none());
+        assert!(job.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn clear_transfer_identity_resets_validators_and_version() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.validators = ContentValidators {
+            etag: Some("\"abc\"".into()),
+            last_modified: Some("Wed, 01 Jan 2020 00:00:00 GMT".into()),
+            expected_size: Some(1024),
+        };
+        job.transfer_format_version = 1;
+        job.active_connections = 4;
+        job.reconnect_count = 2;
+        job.transfer_mode = Some(TransferMode::Multi);
+        job.fallback_reason = Some("test".into());
+
+        job.clear_transfer_identity();
+
+        assert!(job.validators.is_empty());
+        assert_eq!(job.transfer_format_version, 0);
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.reconnect_count, 0);
+        assert!(job.transfer_mode.is_none());
+        assert!(job.fallback_reason.is_none());
     }
 }
 

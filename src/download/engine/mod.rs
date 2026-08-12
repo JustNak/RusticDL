@@ -286,34 +286,39 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         // Per-attempt progress pump: drain (flush pending) after each attempt so
         // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
-            // Disk is authoritative for single-stream resume.
-            // Snapshot path under the lock, then await metadata without holding it.
-            let (temp_path, fsync_on_pause) = {
+            // Disk is authoritative for single-stream (v0) resume. Snapshot path
+            // under the lock, then await metadata without holding it. v1+ is
+            // map-authoritative — skip metadata_len so a sparse `.part` cannot lie.
+            let (temp_path, fsync_on_pause, skip_disk) = {
                 let guard = inner.lock().await;
-                let temp_path = guard
-                    .jobs
-                    .iter()
-                    .find(|j| j.id == job_id)
-                    .map(|j| j.temp_path.clone());
-                (temp_path, guard.config.fsync_on_pause)
+                let job = guard.jobs.iter().find(|j| j.id == job_id);
+                (
+                    job.map(|j| j.temp_path.clone()),
+                    guard.config.fsync_on_pause,
+                    job.map(|j| j.transfer_format_version >= 1).unwrap_or(false),
+                )
             };
-            let on_disk = match temp_path.as_ref() {
-                Some(path) => metadata_len(path).await.unwrap_or(0),
-                None => 0,
+            let on_disk = if skip_disk {
+                None
+            } else {
+                Some(match temp_path.as_ref() {
+                    Some(path) => metadata_len(path).await.unwrap_or(0),
+                    None => 0,
+                })
             };
             {
                 let mut guard = inner.lock().await;
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
-                // Restart already unlinked the .part and zeroed counters. Do not
-                // apply a metadata snapshot taken before that unlink.
-                if !restarting {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                    if let Some(on_disk) = on_disk {
                         apply_partial_progress_from_disk(job, on_disk);
+                    }
+                    if !restarting {
                         job.state = JobState::Downloading;
                         job.error = None;
-                        attempt_job = job.clone();
-                        emit_jobs_locked(&guard);
                     }
+                    attempt_job = job.clone();
+                    emit_jobs_locked(&guard);
                 }
             }
 
@@ -604,6 +609,24 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if let Some(resume) = update.resume_supported {
         job.resume_supported = resume;
     }
+    if let Some(validators) = update.validators {
+        job.validators = validators;
+    }
+    if let Some(version) = update.transfer_format_version {
+        job.transfer_format_version = version;
+    }
+    if let Some(n) = update.active_connections {
+        job.active_connections = n;
+    }
+    if let Some(n) = update.reconnect_count {
+        job.reconnect_count = n;
+    }
+    if let Some(mode) = update.transfer_mode {
+        job.transfer_mode = Some(mode);
+    }
+    if let Some(reason) = update.fallback_reason {
+        job.fallback_reason = Some(reason);
+    }
 
     true
 }
@@ -659,6 +682,7 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::job::{ContentValidators, TransferMode};
     use super::*;
     use std::path::PathBuf;
 
@@ -714,6 +738,7 @@ mod tests {
                 temp_path: None,
                 resume_supported: None,
                 state_hint: None,
+                ..Default::default()
             },
         );
         assert!(ok);
@@ -811,6 +836,54 @@ mod tests {
         assert_eq!(job.eta_secs, 90);
         assert_eq!(job.progress, 10.0);
         assert_eq!(job.state, JobState::Downloading);
+    }
+
+    #[test]
+    fn apply_progress_sets_validators_and_preserves_on_none() {
+        let mut job = sample_job(JobState::Starting);
+        let validators = ContentValidators {
+            etag: Some("\"etag-1\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            expected_size: Some(100),
+        };
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                validators: Some(validators.clone()),
+                state_hint: Some(ProgressHint::Starting),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.validators, validators);
+
+        // Speed tick with validators: None must not clear stored validators.
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(20, 100, 5, 16, 20.0),
+        );
+        assert_eq!(job.validators, validators);
+        assert_eq!(job.downloaded_bytes, 20);
+    }
+
+    #[test]
+    fn apply_progress_sets_metrics_placeholders() {
+        let mut job = sample_job(JobState::Downloading);
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                transfer_format_version: Some(1),
+                active_connections: Some(4),
+                reconnect_count: Some(2),
+                transfer_mode: Some(TransferMode::Multi),
+                fallback_reason: Some("planner".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.transfer_format_version, 1);
+        assert_eq!(job.active_connections, 4);
+        assert_eq!(job.reconnect_count, 2);
+        assert_eq!(job.transfer_mode, Some(TransferMode::Multi));
+        assert_eq!(job.fallback_reason.as_deref(), Some("planner"));
     }
 
     /// Multiple patches merge into one pending; take drains once.

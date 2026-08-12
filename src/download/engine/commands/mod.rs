@@ -64,7 +64,7 @@ mod tests {
     use super::*;
     use crate::download::engine::{spawn_engine, EngineEvent, EngineRuntimeConfig};
     use crate::download::handoff::EnqueueStatus;
-    use crate::download::job::{Job, JobState};
+    use crate::download::job::{ContentValidators, Job, JobState, TransferMode};
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -475,6 +475,52 @@ mod tests {
         if let Some(j) = jobs.iter().find(|j| j.id == id) {
             assert_eq!(j.state, JobState::Canceled);
         }
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_clears_validators_and_transfer_format_version() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/restart.bin", JobState::Paused, &dir);
+        job.downloaded_bytes = 500;
+        job.total_bytes = 1000;
+        job.progress = 50.0;
+        job.validators = ContentValidators {
+            etag: Some("\"x\"".into()),
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: Some(1000),
+        };
+        job.transfer_format_version = 1;
+        job.active_connections = 3;
+        job.reconnect_count = 2;
+        job.transfer_mode = Some(TransferMode::Multi);
+        job.fallback_reason = Some("test".into());
+        job.resume_supported = true;
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        engine.send(EngineCommand::Restart(id.clone()));
+
+        let jobs = next_jobs(&mut events).await;
+        let restarted = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(restarted.state, JobState::Queued);
+        assert_eq!(restarted.downloaded_bytes, 0);
+        assert_eq!(restarted.total_bytes, 0);
+        assert_eq!(restarted.progress, 0.0);
+        assert!(restarted.validators.is_empty());
+        assert_eq!(restarted.transfer_format_version, 0);
+        assert_eq!(restarted.active_connections, 0);
+        assert_eq!(restarted.reconnect_count, 0);
+        assert!(restarted.transfer_mode.is_none());
+        assert!(restarted.fallback_reason.is_none());
+        assert!(!restarted.resume_supported);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!part.exists(), "Restart deletes .part");
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

@@ -21,10 +21,16 @@ pub async fn metadata_len(path: &Path) -> Option<u64> {
 /// Result of aligning job progress with on-disk partial state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileResult {
-    /// Authoritative byte offset for single-stream Range resume.
+    /// Authoritative progress after reconcile (`job.downloaded_bytes`).
+    pub downloaded_bytes: u64,
+    /// Observed `.part` length (v0) or tracked bytes (v1+ version gate).
     pub on_disk: u64,
     /// True when `job.downloaded_bytes` / progress were updated.
     pub changed: bool,
+    /// True when single-stream `metadata_len` was applied.
+    pub used_metadata_len: bool,
+    /// True when `transfer_format_version >= 1` skipped the metadata_len path.
+    pub version_gated: bool,
 }
 
 /// Align `job.downloaded_bytes` (and progress) with a known on-disk length.
@@ -43,15 +49,37 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
             changed = true;
         }
     }
-    ReconcileResult { on_disk, changed }
+    ReconcileResult {
+        downloaded_bytes: job.downloaded_bytes,
+        on_disk,
+        changed,
+        used_metadata_len: true,
+        version_gated: false,
+    }
 }
 
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
-/// Disk is the single-stream source of truth. Prefer `metadata_len` plus
-/// `apply_partial_progress_from_disk` so the engine mutex is not held across I/O.
-#[allow(dead_code)]
+/// - `transfer_format_version >= 1`: **version gate** — do not use `metadata_len`
+///   for progress/Range (map-authoritative; full map-sum arrives in PR 8). Leaves
+///   `downloaded_bytes` unchanged (safe no-op when map is still absent).
+/// - version 0: single-stream — set `downloaded_bytes` from `.part` length.
+///
+/// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex
+/// is not held across filesystem I/O; this convenience wrapper remains for tests
+/// and call sites that already own the job exclusively.
+#[allow(dead_code)] // public API; engine prefers lock-split path
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
+    if job.transfer_format_version >= 1 {
+        return ReconcileResult {
+            downloaded_bytes: job.downloaded_bytes,
+            on_disk: job.downloaded_bytes,
+            changed: false,
+            used_metadata_len: false,
+            version_gated: true,
+        };
+    }
+
     let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
     apply_partial_progress_from_disk(job, on_disk)
 }
@@ -263,6 +291,64 @@ mod tests {
     #[test]
     fn sanitizes_unsafe_names() {
         assert_eq!(sanitize_filename("a/b\\c:d?.zip"), "a_b_c_d_.zip");
+    }
+
+    #[tokio::test]
+    async fn reconcile_version_gate_skips_metadata_len() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-v1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        // Sparse preallocated-style file would mislead metadata_len.
+        std::fs::write(&temp, vec![0u8; 10_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 1;
+        job.downloaded_bytes = 42; // map-authoritative placeholder
+        job.total_bytes = 10_000;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(result.version_gated);
+        assert!(!result.used_metadata_len);
+        assert_eq!(result.downloaded_bytes, 42);
+        assert_eq!(job.downloaded_bytes, 42); // unchanged — no metadata_len
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_v0_uses_metadata_len() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-v0-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![1u8; 1234]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 0;
+        job.downloaded_bytes = 0;
+        job.total_bytes = 5000;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(!result.version_gated);
+        assert!(result.used_metadata_len);
+        assert_eq!(result.downloaded_bytes, 1234);
+        assert_eq!(job.downloaded_bytes, 1234);
+        assert!((job.progress - 24.68).abs() < 0.1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
