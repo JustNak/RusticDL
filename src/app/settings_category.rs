@@ -10,17 +10,11 @@ pub(crate) enum SettingsCategory {
     System,
     Browser,
     Appearance,
-    Data,
 }
 
 impl SettingsCategory {
-    pub(crate) const ALL: [Self; 5] = [
-        Self::General,
-        Self::System,
-        Self::Browser,
-        Self::Appearance,
-        Self::Data,
-    ];
+    pub(crate) const ALL: [Self; 4] =
+        [Self::General, Self::System, Self::Browser, Self::Appearance];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -28,7 +22,6 @@ impl SettingsCategory {
             Self::System => "System",
             Self::Browser => "Browser",
             Self::Appearance => "Appearance",
-            Self::Data => "Data",
         }
     }
 
@@ -38,7 +31,6 @@ impl SettingsCategory {
             Self::System => IconName::Settings,
             Self::Browser => IconName::ExternalLink,
             Self::Appearance => IconName::Palette,
-            Self::Data => IconName::File,
         }
     }
 
