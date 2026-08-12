@@ -20,7 +20,10 @@ use crate::appearance::{accent_swatch_color, custom_accent_hsla, resolve_theme_m
 use crate::settings::{AccentPreset, AppTheme, CornerRadiusScale, ProgressStyle, UiDensity};
 
 impl DownloadApp {
-    pub(super) fn render_settings_appearance(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_settings_appearance(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let theme_choice = self.settings.theme;
         let accent_preset = self.settings.accent_preset;
