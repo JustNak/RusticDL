@@ -100,16 +100,32 @@ pub fn download_error(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentValidators {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_size: Option<u64>,
 }
 
 impl ContentValidators {
     /// True when no ETag / Last-Modified / expected_size is stored.
-    #[allow(dead_code)] // Used by tests and upcoming resume mismatch checks (PR 5).
     pub fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none() && self.expected_size.is_none()
+    }
+
+    /// Field-wise merge: only overwrite fields present as `Some` in `incoming`.
+    /// Never clears an existing field via a sparse capture (lifecycle clears only).
+    pub fn merge_present(&mut self, incoming: ContentValidators) {
+        if let Some(etag) = incoming.etag {
+            self.etag = Some(etag);
+        }
+        if let Some(lm) = incoming.last_modified {
+            self.last_modified = Some(lm);
+        }
+        if let Some(size) = incoming.expected_size {
+            self.expected_size = Some(size);
+        }
     }
 }
 
@@ -277,6 +293,78 @@ mod tests {
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn job_serde_roundtrip_validators_and_version() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.validators = ContentValidators {
+            etag: Some("\"abc\"".into()),
+            last_modified: Some("Wed, 01 Jan 2020 00:00:00 GMT".into()),
+            expected_size: Some(1024),
+        };
+        job.transfer_format_version = 1;
+        job.active_connections = 4;
+        job.reconnect_count = 2;
+        job.transfer_mode = Some(TransferMode::Multi);
+        job.fallback_reason = Some("planner".into());
+
+        let json = serde_json::to_string(&job).expect("serialize");
+        // camelCase keys for new fields
+        assert!(json.contains("\"transferFormatVersion\":1"));
+        assert!(json.contains("\"lastModified\""));
+        assert!(json.contains("\"expectedSize\":1024"));
+        assert!(json.contains("\"activeConnections\":4"));
+        assert!(json.contains("\"reconnectCount\":2"));
+        assert!(json.contains("\"transferMode\":\"multi\""));
+        assert!(json.contains("\"fallbackReason\":\"planner\""));
+        assert!(json.contains("\"etag\""));
+
+        let back: Job = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.validators, job.validators);
+        assert_eq!(back.transfer_format_version, 1);
+        assert_eq!(back.active_connections, 4);
+        assert_eq!(back.reconnect_count, 2);
+        assert_eq!(back.transfer_mode, Some(TransferMode::Multi));
+        assert_eq!(back.fallback_reason.as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn content_validators_skip_serializing_none_fields() {
+        let v = ContentValidators {
+            etag: Some("\"x\"".into()),
+            last_modified: None,
+            expected_size: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains("etag"));
+        assert!(!json.contains("lastModified"));
+        assert!(!json.contains("expectedSize"));
+    }
+
+    #[test]
+    fn content_validators_merge_present_never_clears() {
+        let mut stored = ContentValidators {
+            etag: Some("\"old\"".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            expected_size: Some(100),
+        };
+        stored.merge_present(ContentValidators {
+            etag: None,
+            last_modified: None,
+            expected_size: Some(200),
+        });
+        assert_eq!(stored.etag.as_deref(), Some("\"old\""));
+        assert_eq!(
+            stored.last_modified.as_deref(),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
+        assert_eq!(stored.expected_size, Some(200));
     }
 }
 

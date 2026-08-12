@@ -194,11 +194,8 @@ pub async fn run_http_download(
     let mut current_url = job.url.clone();
     // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
     // Range/progress (full map-sum lands in PR 8). v0 uses single-stream metadata_len.
-    let mut existing_bytes = if job.transfer_format_version >= 1 {
-        job.downloaded_bytes
-    } else {
-        metadata_len(&job.temp_path).await.unwrap_or(0)
-    };
+    let disk_len = metadata_len(&job.temp_path).await.unwrap_or(0);
+    let mut existing_bytes = resume_offset(job, disk_len);
 
     // Follow redirects manually (client has Policy::none).
     let (response, final_url) = fetch_with_redirects(
@@ -300,7 +297,9 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
-    let validators = content_validators_from_headers(response.headers(), total_bytes);
+    // Empty capture → None so apply leaves stored validators alone (CDN 206 without
+    // identity headers). Non-empty Some is field-wise merged on apply (never wipes).
+    let validators = content_validators_patch(response.headers(), total_bytes);
 
     let mut target_path = job.target_path.clone();
     let mut temp_path = job.temp_path.clone();
@@ -345,7 +344,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         Some(target_path.clone()),
         Some(temp_path.clone()),
         Some(resume_supported),
-        Some(validators),
+        validators,
     ));
 
     ensure_parent_directory(&temp_path)
@@ -785,6 +784,15 @@ fn progress_percent(downloaded: u64, total: u64) -> f64 {
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
 
+/// Resume Range start: v1+ is map-authoritative (`job.downloaded_bytes`); v0 uses `.part` length.
+fn resume_offset(job: &Job, disk_len: u64) -> u64 {
+    if job.transfer_format_version >= 1 {
+        job.downloaded_bytes
+    } else {
+        disk_len
+    }
+}
+
 /// Capture ETag / Last-Modified / expected size from a successful download response.
 fn content_validators_from_headers(
     headers: &reqwest::header::HeaderMap,
@@ -804,6 +812,19 @@ fn content_validators_from_headers(
         } else {
             None
         },
+    }
+}
+
+/// Progress patch value: `None` when capture is empty so apply does not replace stored identity.
+fn content_validators_patch(
+    headers: &reqwest::header::HeaderMap,
+    total_bytes: u64,
+) -> Option<ContentValidators> {
+    let captured = content_validators_from_headers(headers, total_bytes);
+    if captured.is_empty() {
+        None
+    } else {
+        Some(captured)
     }
 }
 
@@ -1019,6 +1040,42 @@ mod tests {
         let headers = reqwest::header::HeaderMap::new();
         let v = content_validators_from_headers(&headers, 0);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn content_validators_patch_none_when_empty() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(content_validators_patch(&headers, 0).is_none());
+    }
+
+    #[test]
+    fn content_validators_patch_some_when_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(ETAG, "\"x\"".parse().unwrap());
+        let patch = content_validators_patch(&headers, 0).expect("non-empty");
+        assert_eq!(patch.etag.as_deref(), Some("\"x\""));
+    }
+
+    #[test]
+    fn starting_tick_empty_validators_leave_none() {
+        let tick = ProgressUpdate::starting_tick(0, 0, None, None, None, Some(true), None);
+        assert!(tick.validators.is_none());
+    }
+
+    #[test]
+    fn resume_offset_version_gate() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
+        job.transfer_format_version = 0;
+        assert_eq!(resume_offset(&job, 999), 999);
+
+        job.transfer_format_version = 1;
+        assert_eq!(resume_offset(&job, 999), 42);
     }
 
     #[test]

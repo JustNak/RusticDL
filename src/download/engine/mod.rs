@@ -609,8 +609,10 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if let Some(resume) = update.resume_supported {
         job.resume_supported = resume;
     }
+    // Field-wise merge: sparse captures must not wipe stored ETag/LM (CDN 206 quirk).
+    // Full clear is lifecycle-only (Restart / Cancel+delete).
     if let Some(validators) = update.validators {
-        job.validators = validators;
+        job.validators.merge_present(validators);
     }
     if let Some(version) = update.transfer_format_version {
         job.transfer_format_version = version;
@@ -863,6 +865,60 @@ mod tests {
         );
         assert_eq!(job.validators, validators);
         assert_eq!(job.downloaded_bytes, 20);
+    }
+
+    /// Empty / sparse validator patches must not wipe persisted ETag/LM.
+    #[test]
+    fn apply_progress_empty_or_sparse_validators_preserve_identity() {
+        let mut job = sample_job(JobState::Downloading);
+        job.validators = ContentValidators {
+            etag: Some("\"keep\"".into()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+            expected_size: Some(100),
+        };
+
+        // None = unchanged
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                validators: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
+
+        // Empty Some (bug if wholesale replace) — field-wise merge is no-op
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                validators: Some(ContentValidators::default()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
+        assert_eq!(
+            job.validators.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+
+        // Size-only capture updates expected_size, keeps ETag/LM
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                validators: Some(ContentValidators {
+                    etag: None,
+                    last_modified: None,
+                    expected_size: Some(999),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
+        assert_eq!(
+            job.validators.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+        assert_eq!(job.validators.expected_size, Some(999));
     }
 
     #[test]
