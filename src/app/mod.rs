@@ -1542,4 +1542,3 @@ impl Render for DownloadApp {
             .child(toast_layer)
     }
 }
-
