@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::segment::SegmentMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -161,6 +163,9 @@ pub struct Job {
     /// 0 = single-stream contiguous `.part`; 1 = multi-segment map-authoritative.
     #[serde(default)]
     pub transfer_format_version: u32,
+    /// Multi-segment resume map. Authoritative for progress when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_map: Option<SegmentMap>,
     /// Live connection count (UI / metrics placeholder).
     #[serde(default)]
     pub active_connections: u32,
@@ -196,6 +201,7 @@ impl Job {
             retry_attempts: 0,
             validators: ContentValidators::default(),
             transfer_format_version: 0,
+            segment_map: None,
             active_connections: 0,
             reconnect_count: 0,
             transfer_mode: None,
@@ -203,14 +209,29 @@ impl Job {
         }
     }
 
-    /// Clear validators, transfer format, and metrics placeholders (Restart / lifecycle).
+    /// Clear validators, map, transfer format, and metrics (Restart / Cancel+delete).
     pub fn clear_transfer_identity(&mut self) {
         self.validators = ContentValidators::default();
         self.transfer_format_version = 0;
+        self.segment_map = None;
         self.active_connections = 0;
         self.reconnect_count = 0;
         self.transfer_mode = None;
         self.fallback_reason = None;
+    }
+
+    /// Cancel+delete: drop map/identity and zero downloaded progress.
+    pub fn clear_partial_and_identity(&mut self) {
+        self.downloaded_bytes = 0;
+        self.progress = 0.0;
+        self.clear_transfer_identity();
+    }
+
+    /// Completed: slim state.json — drop map, version 0; keep validators / reconnects.
+    pub fn on_completed(&mut self) {
+        self.segment_map = None;
+        self.transfer_format_version = 0;
+        self.active_connections = 0;
     }
 }
 
@@ -243,6 +264,7 @@ mod tests {
         let job: Job = serde_json::from_str(json).expect("legacy Job deserializes");
         assert!(job.validators.is_empty());
         assert_eq!(job.transfer_format_version, 0);
+        assert!(job.segment_map.is_none());
         assert_eq!(job.active_connections, 0);
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
@@ -259,6 +281,7 @@ mod tests {
         );
         assert!(job.validators.is_empty());
         assert_eq!(job.transfer_format_version, 0);
+        assert!(job.segment_map.is_none());
         assert_eq!(job.active_connections, 0);
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
@@ -279,6 +302,7 @@ mod tests {
             expected_size: Some(1024),
         };
         job.transfer_format_version = 1;
+        job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         job.active_connections = 4;
         job.reconnect_count = 2;
         job.transfer_mode = Some(TransferMode::Multi);
@@ -288,10 +312,59 @@ mod tests {
 
         assert!(job.validators.is_empty());
         assert_eq!(job.transfer_format_version, 0);
+        assert!(job.segment_map.is_none());
         assert_eq!(job.active_connections, 0);
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn on_completed_clears_map_keeps_validators() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.validators = ContentValidators {
+            etag: Some("\"abc\"".into()),
+            last_modified: None,
+            expected_size: Some(1024),
+        };
+        job.transfer_format_version = 1;
+        job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
+        job.active_connections = 4;
+        job.reconnect_count = 3;
+
+        job.on_completed();
+
+        assert!(job.segment_map.is_none());
+        assert_eq!(job.transfer_format_version, 0);
+        assert_eq!(job.active_connections, 0);
+        assert_eq!(job.reconnect_count, 3);
+        assert_eq!(job.validators.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn failed_multi_retains_map() {
+        // Failed path must not call clear_transfer_identity / on_completed.
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        let map = crate::download::segment::partition(2 * 1024 * 1024, 2);
+        job.transfer_format_version = 1;
+        job.segment_map = Some(map.clone());
+        job.reconnect_count = 4;
+        job.state = JobState::Failed;
+        job.active_connections = 0;
+
+        assert_eq!(job.segment_map, Some(map));
+        assert_eq!(job.transfer_format_version, 1);
+        assert_eq!(job.reconnect_count, 4);
     }
 
     #[test]
@@ -308,6 +381,7 @@ mod tests {
             expected_size: Some(1024),
         };
         job.transfer_format_version = 1;
+        job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         job.active_connections = 4;
         job.reconnect_count = 2;
         job.transfer_mode = Some(TransferMode::Multi);
@@ -316,6 +390,8 @@ mod tests {
         let json = serde_json::to_string(&job).expect("serialize");
         // camelCase keys for new fields
         assert!(json.contains("\"transferFormatVersion\":1"));
+        assert!(json.contains("\"segmentMap\""));
+        assert!(json.contains("\"preallocated\""));
         assert!(json.contains("\"lastModified\""));
         assert!(json.contains("\"expectedSize\":1024"));
         assert!(json.contains("\"activeConnections\":4"));
@@ -327,6 +403,7 @@ mod tests {
         let back: Job = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.validators, job.validators);
         assert_eq!(back.transfer_format_version, 1);
+        assert_eq!(back.segment_map, job.segment_map);
         assert_eq!(back.active_connections, 4);
         assert_eq!(back.reconnect_count, 2);
         assert_eq!(back.transfer_mode, Some(TransferMode::Multi));

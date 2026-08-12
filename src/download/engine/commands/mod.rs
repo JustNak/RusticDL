@@ -65,6 +65,7 @@ mod tests {
     use crate::download::engine::{spawn_engine, EngineEvent, EngineRuntimeConfig};
     use crate::download::handoff::EnqueueStatus;
     use crate::download::job::{ContentValidators, Job, JobState, TransferMode};
+    use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -93,6 +94,30 @@ mod tests {
         );
         job.state = state;
         job
+    }
+
+    fn sample_map() -> SegmentMap {
+        SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                Segment {
+                    index: 0,
+                    start: 0,
+                    end: 499,
+                    written: 100,
+                    state: SegmentState::Active,
+                },
+                Segment {
+                    index: 1,
+                    start: 500,
+                    end: 999,
+                    written: 0,
+                    state: SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        }
     }
 
     async fn next_toast(events: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>) -> String {
@@ -493,6 +518,7 @@ mod tests {
             expected_size: Some(1000),
         };
         job.transfer_format_version = 1;
+        job.segment_map = Some(sample_map());
         job.active_connections = 3;
         job.reconnect_count = 2;
         job.transfer_mode = Some(TransferMode::Multi);
@@ -513,6 +539,7 @@ mod tests {
         assert_eq!(restarted.progress, 0.0);
         assert!(restarted.validators.is_empty());
         assert_eq!(restarted.transfer_format_version, 0);
+        assert!(restarted.segment_map.is_none());
         assert_eq!(restarted.active_connections, 0);
         assert_eq!(restarted.reconnect_count, 0);
         assert!(restarted.transfer_mode.is_none());
@@ -521,6 +548,86 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), "Restart deletes .part");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_with_delete_partial_clears_map_and_reconnects() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/map.bin", JobState::Paused, &dir);
+        job.downloaded_bytes = 100;
+        job.total_bytes = 1000;
+        job.progress = 10.0;
+        job.validators = ContentValidators {
+            etag: Some("\"keep-unless-delete\"".into()),
+            last_modified: None,
+            expected_size: Some(1000),
+        };
+        job.transfer_format_version = 1;
+        job.segment_map = Some(sample_map());
+        job.active_connections = 4;
+        job.reconnect_count = 7;
+        job.transfer_mode = Some(TransferMode::Multi);
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: true,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        let canceled = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(canceled.state, JobState::Canceled);
+        assert!(canceled.segment_map.is_none());
+        assert_eq!(canceled.transfer_format_version, 0);
+        assert_eq!(canceled.reconnect_count, 0);
+        assert_eq!(canceled.downloaded_bytes, 0);
+        assert_eq!(canceled.progress, 0.0);
+        assert!(canceled.validators.is_empty());
+        assert_eq!(canceled.active_connections, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!part.exists(), "Cancel+delete removes .part");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_keep_partial_retains_map() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/keep-map.bin", JobState::Paused, &dir);
+        job.downloaded_bytes = 100;
+        job.transfer_format_version = 1;
+        job.segment_map = Some(sample_map());
+        job.reconnect_count = 3;
+        job.validators = ContentValidators {
+            etag: Some("\"keep\"".into()),
+            last_modified: None,
+            expected_size: Some(1000),
+        };
+        let id = job.id.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: false,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        let canceled = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(canceled.state, JobState::Canceled);
+        assert!(canceled.segment_map.is_some());
+        assert_eq!(canceled.transfer_format_version, 1);
+        assert_eq!(canceled.reconnect_count, 3);
+        assert_eq!(canceled.downloaded_bytes, 100);
+        assert_eq!(canceled.validators.etag.as_deref(), Some("\"keep\""));
+        assert_eq!(canceled.active_connections, 0);
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

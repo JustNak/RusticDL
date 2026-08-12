@@ -295,7 +295,8 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 (
                     job.map(|j| j.temp_path.clone()),
                     guard.config.fsync_on_pause,
-                    job.map(|j| j.transfer_format_version >= 1).unwrap_or(false),
+                    job.map(|j| j.transfer_format_version >= 1 || j.segment_map.is_some())
+                        .unwrap_or(false),
                 )
             };
             let on_disk = if skip_disk {
@@ -422,6 +423,8 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                             job.speed = 0;
                             job.eta_secs = 0;
                             job.error = None;
+                            // Slim state.json: drop map, version 0; keep validators.
+                            job.on_completed();
                         }
                         guard.handoff_auth.remove(&job_id);
                     }
@@ -430,6 +433,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                             job.state = JobState::Paused;
                             job.speed = 0;
                             job.eta_secs = 0;
+                            job.active_connections = 0;
                         }
                     }
                     Ok(DownloadOutcome::Canceled) => {
@@ -437,6 +441,10 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                             job.state = JobState::Canceled;
                             job.speed = 0;
                             job.eta_secs = 0;
+                            job.active_connections = 0;
+                            if partial_to_delete.is_some() {
+                                job.clear_partial_and_identity();
+                            }
                         }
                         guard.handoff_auth.remove(&job_id);
                     }
@@ -451,17 +459,24 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                                 1 => {
                                     job.state = JobState::Paused;
                                     job.speed = 0;
+                                    job.active_connections = 0;
                                 }
                                 2 => {
                                     job.state = JobState::Canceled;
                                     job.speed = 0;
+                                    job.active_connections = 0;
+                                    if partial_to_delete.is_some() {
+                                        job.clear_partial_and_identity();
+                                    }
                                 }
                                 _ => {
+                                    // Failed multi: retain map + version for resume reuse.
                                     job.state = JobState::Failed;
                                     job.error = Some(error.message);
                                     job.failure_category = Some(error.category);
                                     job.speed = 0;
                                     job.eta_secs = 0;
+                                    job.active_connections = 0;
                                 }
                             }
                         }

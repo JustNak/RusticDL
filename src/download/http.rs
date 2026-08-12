@@ -282,8 +282,8 @@ pub async fn run_http_download_with_ctx(
         return Ok(outcome);
     }
 
-    // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
-    // Range/progress. v0 uses single-stream metadata_len.
+    // Map or v1+: never use sparse `.part` length (preallocate would lie).
+    // v0 without a map: single-stream metadata_len.
     let disk_len = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
     let mut existing_bytes = resume_offset(&ctx.job, disk_len);
 
@@ -1044,10 +1044,13 @@ fn progress_percent(downloaded: u64, total: u64) -> f64 {
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
 
-/// Resume Range start: v1+ is map-authoritative (`job.downloaded_bytes`); v0 uses `.part` length.
+/// Resume Range start: map or v1+ is map-authoritative; v0 without a map uses `.part` length.
 fn resume_offset(job: &Job, disk_len: u64) -> u64 {
-    if job.transfer_format_version >= 1 {
-        job.downloaded_bytes
+    if job.segment_map.is_some() || job.transfer_format_version >= 1 {
+        job.segment_map
+            .as_ref()
+            .map(|map| map.written_sum())
+            .unwrap_or(job.downloaded_bytes)
     } else {
         disk_len
     }
@@ -1334,6 +1337,40 @@ mod tests {
 
         job.transfer_format_version = 1;
         assert_eq!(resume_offset(&job, 999), 42);
+    }
+
+    #[test]
+    fn resume_offset_map_sum_wins_even_at_version_0() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
+        job.transfer_format_version = 0;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 499,
+                    written: 100,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 500,
+                    end: 999,
+                    written: 25,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        });
+        assert_eq!(resume_offset(&job, 999), 125);
     }
 
     #[test]

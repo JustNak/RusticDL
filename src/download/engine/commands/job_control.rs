@@ -64,8 +64,11 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             return;
         };
 
-        // Already terminal: optional leftover .part cleanup only.
+        // Already terminal: optional leftover .part cleanup + identity wipe.
         let immediate = if job.state.is_terminal() {
+            if delete_partial {
+                job.clear_partial_and_identity();
+            }
             if delete_partial && !worker_running {
                 temp_path
             } else {
@@ -78,6 +81,11 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
                 job.state = JobState::Canceled;
                 job.speed = 0;
                 job.eta_secs = 0;
+            }
+            job.active_connections = 0;
+            if delete_partial {
+                // reconnect_count = 0, map/version/validators cleared.
+                job.clear_partial_and_identity();
             }
 
             // Always drop handoff auth when canceling a non-running job.

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use gpui::Context;
 
 use super::DownloadApp;
-use crate::download::{Job, JobState};
+use crate::download::Job;
 use crate::notifications::{
     compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
     in_app_summary_messages, soft_os_eligible, terminal_edges, InAppToastKind, PendingOsTerminal,
@@ -171,24 +171,122 @@ impl DownloadApp {
     }
 }
 
-/// Persist immediately on queue membership or terminal-state changes; debounce pure progress.
+/// Persist immediately on membership, state, transfer-format, or segment-map changes.
+/// Pure progress ticks (same map/version/state) stay on the 1s debounce.
 fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     if previous.len() != next.len() {
         return true;
     }
     use std::collections::HashMap;
-    let prev: HashMap<&str, JobState> = previous
-        .iter()
-        .map(|job| (job.id.as_str(), job.state))
-        .collect();
+    let prev: HashMap<&str, &Job> = previous.iter().map(|job| (job.id.as_str(), job)).collect();
     for job in next {
         match prev.get(job.id.as_str()) {
             None => return true,
-            Some(state) if *state != job.state => return true,
+            Some(prev_job)
+                if prev_job.state != job.state
+                    || prev_job.transfer_format_version != job.transfer_format_version
+                    || prev_job.segment_map != job.segment_map =>
+            {
+                return true;
+            }
             _ => {}
         }
     }
     previous
         .iter()
         .any(|job| !next.iter().any(|n| n.id == job.id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jobs_need_immediate_persist;
+    use crate::download::segment::{Segment, SegmentMap, SegmentState};
+    use crate::download::{Job, JobState};
+    use std::path::PathBuf;
+
+    fn sample_job(id: &str, state: JobState) -> Job {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.id = id.into();
+        job.state = state;
+        job
+    }
+
+    fn two_seg_map(written0: u64, written1: u64) -> SegmentMap {
+        SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                Segment {
+                    index: 0,
+                    start: 0,
+                    end: 499,
+                    written: written0,
+                    state: SegmentState::Active,
+                },
+                Segment {
+                    index: 1,
+                    start: 500,
+                    end: 999,
+                    written: written1,
+                    state: SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        }
+    }
+
+    #[test]
+    fn persist_skips_pure_progress_ticks() {
+        let prev = vec![sample_job("a", JobState::Downloading)];
+        let mut next = vec![sample_job("a", JobState::Downloading)];
+        next[0].downloaded_bytes = 50;
+        next[0].progress = 5.0;
+        assert!(!jobs_need_immediate_persist(&prev, &next));
+    }
+
+    #[test]
+    fn persist_forces_on_state_change() {
+        let prev = vec![sample_job("a", JobState::Downloading)];
+        let next = vec![sample_job("a", JobState::Paused)];
+        assert!(jobs_need_immediate_persist(&prev, &next));
+    }
+
+    #[test]
+    fn persist_forces_on_transfer_format_version_change() {
+        let prev = vec![sample_job("a", JobState::Downloading)];
+        let mut next = vec![sample_job("a", JobState::Downloading)];
+        next[0].transfer_format_version = 1;
+        assert!(jobs_need_immediate_persist(&prev, &next));
+    }
+
+    #[test]
+    fn persist_forces_on_segment_map_structural_diff() {
+        let mut prev = vec![sample_job("a", JobState::Downloading)];
+        prev[0].transfer_format_version = 1;
+        prev[0].segment_map = Some(two_seg_map(10, 0));
+
+        let mut next = prev.clone();
+        assert!(!jobs_need_immediate_persist(&prev, &next));
+
+        next[0].segment_map = Some(two_seg_map(20, 0));
+        assert!(jobs_need_immediate_persist(&prev, &next));
+
+        next[0].segment_map = None;
+        assert!(jobs_need_immediate_persist(&prev, &next));
+    }
+
+    #[test]
+    fn persist_forces_on_membership_change() {
+        let prev = vec![sample_job("a", JobState::Queued)];
+        let next = vec![
+            sample_job("a", JobState::Queued),
+            sample_job("b", JobState::Queued),
+        ];
+        assert!(jobs_need_immediate_persist(&prev, &next));
+    }
 }

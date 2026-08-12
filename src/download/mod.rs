@@ -9,6 +9,7 @@ pub mod handoff;
 pub mod http;
 pub mod job;
 pub mod preflight;
+pub mod segment;
 pub mod segment_io;
 pub mod urls;
 
