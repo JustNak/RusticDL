@@ -58,6 +58,10 @@ impl EngineRuntimeConfig {
         self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
         self.max_total_connections = self.max_total_connections.clamp(1, 256);
         self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
+        // Per-host cannot exceed process-wide total (multi orchestrator will rely on this).
+        self.max_connections_per_host = self
+            .max_connections_per_host
+            .min(self.max_total_connections);
     }
 
     pub fn speed_limit_bytes_per_second(&self) -> Option<u64> {

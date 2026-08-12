@@ -29,10 +29,29 @@ impl DownloadApp {
         let update_label = self.update_action_label();
         let multi_enabled = self.settings.multi_connection_enabled;
         let fsync_on_pause = self.settings.fsync_on_pause;
+        // Derive from live drafts (same parse fallbacks as Save), not last-committed only.
         let budget_hint = {
-            let concurrent = self.settings.max_concurrent_downloads;
-            let segs = self.settings.multi_max_segments;
-            let total = self.settings.max_total_connections;
+            let concurrent = self
+                .concurrent_input
+                .read(cx)
+                .value()
+                .parse::<u32>()
+                .unwrap_or(self.settings.max_concurrent_downloads)
+                .clamp(1, 64);
+            let segs = self
+                .multi_max_segments_input
+                .read(cx)
+                .value()
+                .parse::<u32>()
+                .unwrap_or(self.settings.multi_max_segments)
+                .clamp(1, 16);
+            let total = self
+                .max_total_connections_input
+                .read(cx)
+                .value()
+                .parse::<u32>()
+                .unwrap_or(self.settings.max_total_connections)
+                .clamp(1, 256);
             if concurrent.saturating_mul(segs) > total {
                 Some(
                     "Max concurrent × multi segments exceeds total connections — segments will queue on budget.",
@@ -130,7 +149,7 @@ impl DownloadApp {
                         )
                 })
                 .child(field_hint(
-                    "Speed limit: 0 means unlimited (shared across all downloads).",
+                    "Speed limit: 0 = unlimited, shared across all downloads. Brief bursts up to ~2× the rate (min 64 KiB) are normal after idle.",
                     cx,
                 ))
                 .child(settings_choice_row(

@@ -306,13 +306,14 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             continue;
         }
 
-        // Pre-write: charge the shared limiter so concurrent jobs share one budget.
-        limiter.acquire(chunk.len()).await;
+        // Pre-write: charge the shared limiter (may burst up to bucket capacity).
+        // Abort promptly on pause/cancel instead of waiting out a long throttle.
+        if !limiter.acquire(chunk.len(), Some(&control)).await {
+            writer.flush().await.map_err(disk_write_error)?;
+            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
+        }
 
-        writer
-            .write_all(&chunk)
-            .await
-            .map_err(|error| disk_write_error(error))?;
+        writer.write_all(&chunk).await.map_err(disk_write_error)?;
 
         let n = chunk.len() as u64;
         downloaded = downloaded.saturating_add(n);

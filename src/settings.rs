@@ -507,6 +507,10 @@ impl Settings {
         self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
         self.max_total_connections = self.max_total_connections.clamp(1, 256);
         self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
+        // Per-host cannot exceed process-wide total.
+        self.max_connections_per_host = self
+            .max_connections_per_host
+            .min(self.max_total_connections);
     }
 
     /// Clamp appearance fields to safe ranges (call after load / before save).
@@ -636,6 +640,13 @@ mod tests {
         assert_eq!(s.multi_min_bytes, 1024 * 1024);
         assert_eq!(s.max_total_connections, 1);
         assert_eq!(s.max_connections_per_host, 1);
+
+        // Per-host is clamped to total.
+        s.max_total_connections = 4;
+        s.max_connections_per_host = 32;
+        s.sanitize_download_limits();
+        assert_eq!(s.max_total_connections, 4);
+        assert_eq!(s.max_connections_per_host, 4);
     }
 
     #[test]
