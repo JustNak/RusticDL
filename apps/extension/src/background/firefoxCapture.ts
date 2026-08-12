@@ -271,9 +271,8 @@ export function firefoxWebRequestDownloadCandidate(
   const isMainFrame = resourceType === 'main_frame';
   const navType = isMainFrame || resourceType === 'object' || resourceType === 'other';
 
-  // CORS-enabled responses without attachment are page data fetches (Nexus stats CSVs,
-  // autocomplete, etc.), not user downloads. Real file CDNs still hit downloads.onCreated.
-  if (hasCorsAllowOrigin(headers) && !hasAttachment) {
+  // File CDNs often send ACAO without attachment; only drop page-data CORS.
+  if (hasCorsAllowOrigin(headers) && !hasAttachment && !(strongMime || strongExt)) {
     return null;
   }
 

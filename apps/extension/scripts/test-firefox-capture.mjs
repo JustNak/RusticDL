@@ -285,6 +285,83 @@ assert(
 );
 
 assert(
+  'captures CORS main_frame pdf without Content-Disposition',
+  candidate({
+    url: 'https://cdn.example.com/docs/manual.pdf',
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/pdf' },
+      { name: 'access-control-allow-origin', value: '*' },
+      { name: 'content-length', value: '250000' },
+    ],
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'captures CORS main_frame zip without Content-Disposition',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'access-control-allow-origin', value: '*' },
+      { name: 'content-length', value: '5000000' },
+    ],
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'captures user-added log served as text/plain on onCreated',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://example.com/debug/app.log',
+      filename: 'app.log',
+      mime: 'text/plain',
+      totalBytes: 50_000,
+    },
+    {
+      ...defaultSettings,
+      capturedFileExtensions: [...defaultSettings.capturedFileExtensions, 'log'],
+    },
+  ) === true,
+);
+
+assert(
+  'captures same-origin export.csv + octet-stream when csv is still captured',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://www.example.com/account/export.csv',
+      filename: 'export.csv',
+      mime: 'application/octet-stream',
+      referrer: 'https://www.example.com/account',
+      totalBytes: 200_000,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'rejects export.csv + octet-stream when csv was dropped from captured list',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://www.example.com/account/export.csv',
+      filename: 'export.csv',
+      mime: 'application/octet-stream',
+      referrer: 'https://www.example.com/account',
+      totalBytes: 200_000,
+    },
+    {
+      ...defaultSettings,
+      capturedFileExtensions: defaultSettings.capturedFileExtensions.filter(
+        (ext) => ext !== 'csv',
+      ),
+    },
+  ) === false,
+);
+
+assert(
   'respects disabled capture',
   candidate(
     {

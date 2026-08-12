@@ -110,15 +110,6 @@ export function mimeLooksLikeDownload(mime: string): boolean {
   return DOWNLOAD_ITEM_MIME_HINTS.some((hint) => mime.includes(hint));
 }
 
-function isCrossOrigin(url: string, referrer: string | undefined): boolean {
-  if (!referrer) return false;
-  try {
-    return new URL(url).origin !== new URL(referrer).origin;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * downloads.onCreated filter (Firefox fallback + Chromium primary).
  *
@@ -137,8 +128,6 @@ export function shouldCaptureDownloadItem(
   if (url.startsWith('blob:') || url.startsWith('data:')) return false;
 
   const mime = (item.mime || '').toLowerCase().split(';')[0].trim();
-  if (isPageOrApiMime(mime)) return false;
-
   const ext = filenameExtension(item.filename);
   const ignored = new Set(
     (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
@@ -148,6 +137,9 @@ export function shouldCaptureDownloadItem(
   const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
   const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
   const dispositionHint = mimeLooksLikeDownload(mime);
+
+  // text/plain is common for user-added .log/.srt; only veto weak/unknown names.
+  if (isPageOrApiMime(mime) && !strongName) return false;
 
   // Media MIME types are usually page assets; allow only when the filename matches
   // a user-configured *strong* captured extension (e.g. user added mp3/mp4/png).
@@ -166,12 +158,8 @@ export function shouldCaptureDownloadItem(
     return false;
   }
 
-  // Weak data extensions (csv/json/…) fetched cross-origin are page APIs.
-  if (isWeakCaptureExtension(ext) && isCrossOrigin(url, item.referrer)) {
-    return false;
-  }
-  if (isWeakCaptureExtension(ext) && !dispositionHint) {
-    return false;
+  if (isWeakCaptureExtension(ext)) {
+    return Boolean(ext && captured.has(ext) && dispositionHint);
   }
 
   if (strongName) return true;
