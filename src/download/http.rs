@@ -307,17 +307,36 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
 
         // Pre-write: charge the shared limiter (may burst up to bucket capacity).
-        // Abort promptly on pause/cancel instead of waiting out a long throttle.
-        if !limiter.acquire(chunk.len(), Some(&control)).await {
-            writer.flush().await.map_err(disk_write_error)?;
-            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
-        }
+        // Interruptible for pause/cancel, but once the stream has delivered a chunk
+        // it must be written — dropping it leaves a Range-resume hole.
+        // On abort mid-throttle some quanta may already be charged; do not re-acquire
+        // the full length (would double-bill). Slight under-charge on the pause edge
+        // is acceptable.
+        let acquired = limiter.acquire(chunk.len(), Some(&control)).await;
 
         writer.write_all(&chunk).await.map_err(disk_write_error)?;
 
         let n = chunk.len() as u64;
         downloaded = downloaded.saturating_add(n);
         window_bytes = window_bytes.saturating_add(n);
+
+        if !acquired {
+            writer.flush().await.map_err(disk_write_error)?;
+            // Keep job/UI counters aligned with what is on disk before pause/cancel.
+            on_progress(ProgressUpdate {
+                downloaded_bytes: downloaded,
+                total_bytes,
+                speed: 0,
+                eta_secs: 0,
+                progress: progress_percent(downloaded, total_bytes),
+                filename: None,
+                target_path: None,
+                temp_path: None,
+                resume_supported: None,
+                state_hint: ProgressHint::Downloading,
+            });
+            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
+        }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
             let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
