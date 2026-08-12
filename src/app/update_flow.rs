@@ -4,23 +4,35 @@
 //! 1. **Checking for update…**
 //! 2a. **You're up to date** — or —
 //! 2b. **Update available vX.Y.Z** `[Update]` → **Restart to update** `[Restart]`
-//! 3. On Restart: flush state, spawn **RusticDL Updater**, quit.
+//! 3. On Restart: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
 //! 4. Updater downloads, runs NSIS `/S`, relaunches the main app.
+//! 5. **What’s new** — post-relaunch dialog with the release changelog.
 //!
 //! Channel (`UpdateChannel`) selects Stable vs Nightly GitHub Releases.
 //! In-flight checks are invalidated when the channel changes.
 
 use std::time::Duration;
 
-use gpui::Context;
+use gpui::{
+    div, px, Context, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+};
+use gpui_component::{
+    button::{Button, ButtonVariants},
+    dialog::DialogButtonProps,
+    h_flex, v_flex, ActiveTheme, Sizable, WindowExt,
+};
 
 use super::toast::{ToastActionKind, ToastKind};
 use super::DownloadApp;
 use crate::branding::{APP_VERSION, UPDATER_NAME};
+use crate::persistence::{clear_pending_whats_new, save_pending_whats_new, PendingWhatsNew};
 use crate::settings::UpdateChannel;
 use crate::updater::{
-    check_for_update, launch_updater, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
+    check_for_update, launch_updater, open_url, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
+
+/// Scroll height for the post-update changelog body.
+const WHATS_NEW_NOTES_MAX_H: f32 = 200.0;
 
 impl DownloadApp {
     /// Label for the single update action (check or advance cached release).
@@ -154,6 +166,133 @@ impl DownloadApp {
         }
     }
 
+    /// Open the post-update changelog once a `Window` is free.
+    pub(crate) fn apply_pending_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pending_show_whats_new {
+            return;
+        }
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(pending) = self.pending_whats_new.clone() else {
+            self.pending_show_whats_new = false;
+            return;
+        };
+        self.pending_show_whats_new = false;
+        self.open_whats_new_dialog(pending, window, cx);
+    }
+
+    /// Tasteful post-update changelog (Esc / mouse-back / outside / Close).
+    pub(crate) fn open_whats_new_dialog(
+        &mut self,
+        pending: PendingWhatsNew,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Ack on open so Esc / mouse-back via `close_dialog` (no on_close) cannot re-show.
+        self.ack_whats_new(cx);
+
+        let to = pending.to_version.clone();
+        let from = pending.from_version.clone();
+        let release_name = pending.release_name.clone();
+        let html_url = pending.html_url.clone();
+        let notes_display = pending
+            .notes
+            .as_ref()
+            .map(|n| format_changelog_notes(n))
+            .filter(|n| !n.is_empty());
+        let title = format!("Updated to v{to}");
+        let has_url = !html_url.trim().is_empty();
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
+            let title = title.clone();
+            let from = from.clone();
+            let release_name = release_name.clone();
+            let html_url = html_url.clone();
+            let notes_display = notes_display.clone();
+
+            let est_h = if notes_display.is_some() {
+                380.0
+            } else {
+                240.0
+            };
+            let view_h = window.viewport_size().height.to_f64() as f32;
+            let max_top = (view_h - est_h - 20.0).max(24.0);
+            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
+
+            let mut body = v_flex().gap_3().child(
+                div()
+                    .text_sm()
+                    .child(format!("You were on v{from}. Here’s what changed.")),
+            );
+
+            if !release_name.trim().is_empty() {
+                body = body.child(div().text_xs().text_color(muted).child(release_name));
+            }
+
+            if let Some(notes) = notes_display {
+                body = body.child(
+                    div()
+                        .id("whats-new-notes")
+                        .w_full()
+                        .max_h(px(WHATS_NEW_NOTES_MAX_H))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border.opacity(0.4))
+                        .bg(theme.popover.opacity(0.55))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(notes),
+                );
+            } else {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("No release notes were included for this version."),
+                );
+            }
+
+            if has_url {
+                let url = html_url.clone();
+                body = body.child(
+                    h_flex().child(
+                        Button::new("whats-new-open-release")
+                            .ghost()
+                            .small()
+                            .label("Open full notes")
+                            .on_click(move |_, _, _| {
+                                let _ = open_url(&url);
+                            }),
+                    ),
+                );
+            }
+
+            dialog
+                .title(title)
+                .alert()
+                // alert() disables outside-click; re-enable for light dismiss UX.
+                .overlay_closable(true)
+                .keyboard(true)
+                .w(px(460.))
+                .margin_top(px(margin_top))
+                .border_color(theme.border.opacity(0.32))
+                .button_props(DialogButtonProps::default().ok_text("Close"))
+                .child(body)
+        });
+    }
+
+    /// Drop the on-disk snapshot so the dialog does not reappear next launch.
+    pub(crate) fn ack_whats_new(&mut self, _cx: &mut Context<Self>) {
+        self.pending_whats_new = None;
+        self.pending_show_whats_new = false;
+        let _ = clear_pending_whats_new(&self.paths);
+    }
+
     pub(crate) fn begin_apply_update(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
         if self.update_busy {
             self.show_toast("An update is already in progress…", cx);
@@ -165,7 +304,7 @@ impl DownloadApp {
         self.begin_apply_update_inner(info, cx);
     }
 
-    /// Persist state, spawn RusticDL Updater, then quit so files can be replaced.
+    /// Persist state, snapshot What’s new, spawn RusticDL Updater, then quit.
     pub(crate) fn begin_apply_update_inner(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
         self.replace_update_toast(
             format!("Handing off to {UPDATER_NAME}…"),
@@ -185,6 +324,16 @@ impl DownloadApp {
             info.current_version.clone()
         };
 
+        // Snapshot notes now so the relaunched binary can show them without GitHub.
+        let pending = PendingWhatsNew {
+            from_version: from_version.clone(),
+            to_version: info.latest_version.clone(),
+            release_name: info.release_name.clone(),
+            html_url: info.html_url.clone(),
+            notes: info.notes.clone(),
+        };
+        let _ = save_pending_whats_new(&self.paths, &pending);
+
         let opts = LaunchUpdaterOpts {
             download_url: info.setup_download_url.clone(),
             from_version,
@@ -194,6 +343,9 @@ impl DownloadApp {
         };
 
         if let Err(message) = launch_updater(&opts) {
+            // Handoff failed — discard the snapshot so a normal start does not
+            // claim an update that never applied.
+            let _ = clear_pending_whats_new(&self.paths);
             self.update_busy = false;
             self.replace_update_toast(message, ToastKind::Error, None, cx);
             cx.notify();
@@ -241,4 +393,91 @@ pub(crate) fn spawn_update_check(
         });
     })
     .detach();
+}
+
+/// Format GitHub release Markdown lightly for a readable plain-text changelog.
+fn format_changelog_notes(notes: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for raw in notes.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            // Collapse runs of blank lines to a single spacer at most.
+            if lines.last().is_some_and(|l| !l.is_empty()) {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        // Horizontal rules / HTML comments — skip.
+        if trimmed
+            .chars()
+            .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace())
+            && trimmed.len() >= 3
+        {
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            continue;
+        }
+
+        let mut line = trimmed.to_string();
+        // ATX headers → plain title text.
+        if line.starts_with('#') {
+            line = line.trim_start_matches('#').trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        // Unescape common emphasis markers for quieter display.
+        line = line.replace("**", "").replace("__", "");
+        // Normalize list markers to a bullet.
+        if let Some(rest) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("+ "))
+        {
+            line = format!("• {rest}");
+        } else if let Some(rest) = line.strip_prefix("-").or_else(|| line.strip_prefix("*")) {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                line = format!("• {rest}");
+            }
+        }
+
+        lines.push(line);
+    }
+    // Trim trailing blank lines.
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_changelog_preserves_structure() {
+        let raw = r#"## What's new
+
+- Fix tray exit
+- Add What's new dialog
+
+### Notes
+**Important** change
+"#;
+        let out = format_changelog_notes(raw);
+        assert!(out.contains("What's new"));
+        assert!(out.contains("• Fix tray exit"));
+        assert!(out.contains("• Add What's new dialog"));
+        assert!(out.contains("Important change"));
+        assert!(!out.contains("##"));
+        assert!(!out.contains("**"));
+    }
+
+    #[test]
+    fn format_changelog_skips_rules() {
+        let out = format_changelog_notes("---\n- item\n***");
+        assert_eq!(out, "• item");
+    }
 }

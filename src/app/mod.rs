@@ -50,7 +50,9 @@ use crate::notifications::{
     in_app_summary_messages, soft_os_eligible, terminal_edges, BalloonContextMap, BalloonOutcome,
     InAppToastKind, OsNotifyBuffer, PendingOsTerminal, TerminalKind,
 };
-use crate::persistence::{save_jobs, save_settings, AppPaths};
+use crate::persistence::{
+    load_pending_whats_new, save_jobs, save_settings, AppPaths, PendingWhatsNew,
+};
 use crate::prompt_window::{
     open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
 };
@@ -131,6 +133,10 @@ pub struct DownloadApp {
     available_update: Option<UpdateInfo>,
     /// Id of the staged update-flow toast so check → result replaces instead of stacking.
     update_toast_id: Option<u64>,
+    /// Post-update changelog snapshot (from `pending_whats_new.json` after relaunch).
+    pending_whats_new: Option<PendingWhatsNew>,
+    /// Open the What’s new dialog once a Window is free (no stacking over About/etc.).
+    pending_show_whats_new: bool,
     /// System tray icon (Windows). Present when close-to-tray, hidden-to-tray,
     /// or OS notify mode is enabled (`sync_tray_lifetime`).
     system_tray: Option<SystemTray>,
@@ -475,6 +481,8 @@ impl DownloadApp {
             update_check_gen: 0,
             available_update: None,
             update_toast_id: None,
+            pending_whats_new: None,
+            pending_show_whats_new: false,
             system_tray,
             force_quit: false,
             window_hidden_to_tray: started_minimized,
@@ -487,6 +495,12 @@ impl DownloadApp {
             settings_category: SettingsCategory::General,
             settings_return_filter: FilterKind::All,
         };
+
+        // Post-update What’s new: snapshot written before handoff, shown once after relaunch.
+        if let Some(pending) = load_pending_whats_new(&app.paths) {
+            app.pending_whats_new = Some(pending);
+            app.pending_show_whats_new = true;
+        }
 
         // Quiet startup check against GitHub Releases (toast only if an update exists).
         // Route through begin_update_check so update_busy serializes with interactive checks.
@@ -1732,6 +1746,8 @@ impl Render for DownloadApp {
         self.poll_browser_progress(cx);
         self.poll_browser_complete(cx);
         self.apply_pending_tray_actions(window, cx);
+        // Post-update changelog after relaunch (once a Window is free).
+        self.apply_pending_whats_new(window, cx);
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);
