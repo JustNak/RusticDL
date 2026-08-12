@@ -88,6 +88,10 @@ impl DownloadApp {
             &self.concurrent_input,
             &self.retry_input,
             &self.speed_input,
+            &self.multi_max_segments_input,
+            &self.multi_min_mib_input,
+            &self.max_total_connections_input,
+            &self.max_connections_per_host_input,
             &self.excluded_hosts_input,
             &self.captured_extensions_input,
         ]

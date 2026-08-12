@@ -79,6 +79,11 @@ pub struct DownloadApp {
     concurrent_input: Entity<InputState>,
     retry_input: Entity<InputState>,
     speed_input: Entity<InputState>,
+    multi_max_segments_input: Entity<InputState>,
+    /// Draft for multi min size in MiB (settings store bytes).
+    multi_min_mib_input: Entity<InputState>,
+    max_total_connections_input: Entity<InputState>,
+    max_connections_per_host_input: Entity<InputState>,
     /// Draft textarea for `settings.extension.excluded_hosts` (one host per line).
     excluded_hosts_input: Entity<InputState>,
     /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
@@ -180,6 +185,19 @@ impl DownloadApp {
                 .placeholder("0 = unlimited")
                 .default_value(settings.speed_limit_kib_per_second.to_string())
         });
+        let multi_max_segments_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.multi_max_segments.to_string())
+        });
+        let multi_min_mib_input = cx.new(|cx| {
+            let mib = (settings.multi_min_bytes / (1024 * 1024)).max(1);
+            InputState::new(window, cx).default_value(mib.to_string())
+        });
+        let max_total_connections_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.max_total_connections.to_string())
+        });
+        let max_connections_per_host_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.max_connections_per_host.to_string())
+        });
         let excluded_hosts_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -250,6 +268,10 @@ impl DownloadApp {
             &concurrent_input,
             &retry_input,
             &speed_input,
+            &multi_max_segments_input,
+            &multi_min_mib_input,
+            &max_total_connections_input,
+            &max_connections_per_host_input,
             &excluded_hosts_input,
             &captured_extensions_input,
             &dir_input,
@@ -456,6 +478,10 @@ impl DownloadApp {
             concurrent_input,
             retry_input,
             speed_input,
+            multi_max_segments_input,
+            multi_min_mib_input,
+            max_total_connections_input,
+            max_connections_per_host_input,
             excluded_hosts_input,
             captured_extensions_input,
             extension_settings_dirty: false,
@@ -610,6 +636,12 @@ impl DownloadApp {
         let concurrent = self.settings.max_concurrent_downloads.to_string();
         let retry = self.settings.auto_retry_attempts.to_string();
         let speed = self.settings.speed_limit_kib_per_second.to_string();
+        let multi_segs = self.settings.multi_max_segments.to_string();
+        let multi_mib = (self.settings.multi_min_bytes / (1024 * 1024))
+            .max(1)
+            .to_string();
+        let max_total = self.settings.max_total_connections.to_string();
+        let max_host = self.settings.max_connections_per_host.to_string();
         self.dir_input
             .update(cx, |i, cx| i.set_value(dir, window, cx));
         self.concurrent_input
@@ -618,6 +650,14 @@ impl DownloadApp {
             .update(cx, |i, cx| i.set_value(retry, window, cx));
         self.speed_input
             .update(cx, |i, cx| i.set_value(speed, window, cx));
+        self.multi_max_segments_input
+            .update(cx, |i, cx| i.set_value(multi_segs, window, cx));
+        self.multi_min_mib_input
+            .update(cx, |i, cx| i.set_value(multi_mib, window, cx));
+        self.max_total_connections_input
+            .update(cx, |i, cx| i.set_value(max_total, window, cx));
+        self.max_connections_per_host_input
+            .update(cx, |i, cx| i.set_value(max_host, window, cx));
         self.refresh_extension_text_inputs(window, cx);
 
         // Appearance sliders (same rebind as reset_appearance_draft).
@@ -671,6 +711,12 @@ impl DownloadApp {
             let concurrent = self.settings.max_concurrent_downloads.to_string();
             let retry = self.settings.auto_retry_attempts.to_string();
             let speed = self.settings.speed_limit_kib_per_second.to_string();
+            let multi_segs = self.settings.multi_max_segments.to_string();
+            let multi_mib = (self.settings.multi_min_bytes / (1024 * 1024))
+                .max(1)
+                .to_string();
+            let max_total = self.settings.max_total_connections.to_string();
+            let max_host = self.settings.max_connections_per_host.to_string();
             self.dir_input
                 .update(cx, |i, cx| i.set_value(dir, window, cx));
             self.concurrent_input
@@ -679,6 +725,14 @@ impl DownloadApp {
                 .update(cx, |i, cx| i.set_value(retry, window, cx));
             self.speed_input
                 .update(cx, |i, cx| i.set_value(speed, window, cx));
+            self.multi_max_segments_input
+                .update(cx, |i, cx| i.set_value(multi_segs, window, cx));
+            self.multi_min_mib_input
+                .update(cx, |i, cx| i.set_value(multi_mib, window, cx));
+            self.max_total_connections_input
+                .update(cx, |i, cx| i.set_value(max_total, window, cx));
+            self.max_connections_per_host_input
+                .update(cx, |i, cx| i.set_value(max_host, window, cx));
             self.refresh_extension_text_inputs(window, cx);
         }
         cx.notify();

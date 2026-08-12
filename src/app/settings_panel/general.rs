@@ -27,6 +27,20 @@ impl DownloadApp {
         let update_channel = self.settings.update_channel;
         let update_busy = self.update_busy;
         let update_label = self.update_action_label();
+        let multi_enabled = self.settings.multi_connection_enabled;
+        let fsync_on_pause = self.settings.fsync_on_pause;
+        let budget_hint = {
+            let concurrent = self.settings.max_concurrent_downloads;
+            let segs = self.settings.multi_max_segments;
+            let total = self.settings.max_total_connections;
+            if concurrent.saturating_mul(segs) > total {
+                Some(
+                    "Max concurrent × multi segments exceeds total connections — segments will queue on budget.",
+                )
+            } else {
+                None
+            }
+        };
 
         GroupBox::new().outline().child(
             v_flex()
@@ -115,7 +129,146 @@ impl DownloadApp {
                                 )),
                         )
                 })
-                .child(field_hint("Speed limit: 0 means unlimited.", cx))
+                .child(field_hint(
+                    "Speed limit: 0 means unlimited (shared across all downloads).",
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Fsync on pause",
+                    Some("Flush partial data to disk when pausing (safer on power loss)."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("fsync-pause-off")
+                                .label("Off")
+                                .when(!fsync_on_pause, |b| b.primary())
+                                .when(fsync_on_pause, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_fsync_on_pause(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("fsync-pause-on")
+                                .label("On")
+                                .when(fsync_on_pause, |b| b.primary())
+                                .when(!fsync_on_pause, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_fsync_on_pause(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child(settings_choice_row(
+                    "Multi-connection",
+                    Some("Split large downloads across parallel connections (coming soon)."),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("multi-conn-off")
+                                .label("Off")
+                                .when(!multi_enabled, |b| b.primary())
+                                .when(multi_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_multi_connection_enabled(false, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("multi-conn-on")
+                                .label("On")
+                                .when(multi_enabled, |b| b.primary())
+                                .when(!multi_enabled, |b| b.outline())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_multi_connection_enabled(true, window, cx);
+                                })),
+                        ),
+                    cx,
+                ))
+                .child({
+                    let defaults = Settings::default();
+                    let app = cx.entity();
+                    let segs_val = self.multi_max_segments_input.read(cx).value().to_string();
+                    let mib_val = self.multi_min_mib_input.read(cx).value().to_string();
+                    let total_val = self
+                        .max_total_connections_input
+                        .read(cx)
+                        .value()
+                        .to_string();
+                    let host_val = self
+                        .max_connections_per_host_input
+                        .read(cx)
+                        .value()
+                        .to_string();
+                    let segs_def = defaults.multi_max_segments.to_string();
+                    let mib_def = (defaults.multi_min_bytes / (1024 * 1024))
+                        .max(1)
+                        .to_string();
+                    let total_def = defaults.max_total_connections.to_string();
+                    let host_def = defaults.max_connections_per_host.to_string();
+                    h_flex()
+                        .gap_4()
+                        .items_start()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Max segments", cx))
+                                .child(settings_input_with_reset(
+                                    "reset-multi-max-segments",
+                                    &self.multi_max_segments_input,
+                                    &segs_val,
+                                    &segs_def,
+                                    segs_def.clone(),
+                                    app.clone(),
+                                    !multi_enabled,
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Min size (MiB)", cx))
+                                .child(settings_input_with_reset(
+                                    "reset-multi-min-mib",
+                                    &self.multi_min_mib_input,
+                                    &mib_val,
+                                    &mib_def,
+                                    mib_def.clone(),
+                                    app.clone(),
+                                    !multi_enabled,
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Total connections", cx))
+                                .child(settings_input_with_reset(
+                                    "reset-max-total-connections",
+                                    &self.max_total_connections_input,
+                                    &total_val,
+                                    &total_def,
+                                    total_def.clone(),
+                                    app.clone(),
+                                    !multi_enabled,
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1p5()
+                                .child(settings_field_label("Per-host connections", cx))
+                                .child(settings_input_with_reset(
+                                    "reset-max-conn-per-host",
+                                    &self.max_connections_per_host_input,
+                                    &host_val,
+                                    &host_def,
+                                    host_def.clone(),
+                                    app,
+                                    !multi_enabled,
+                                )),
+                        )
+                })
+                .when_some(budget_hint, |el, text| el.child(field_hint(text, cx)))
                 .child(settings_subgroup("Updates", true, cx))
                 .child(settings_choice_row(
                     "Check for updates",

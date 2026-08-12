@@ -345,6 +345,24 @@ pub struct Settings {
     pub max_concurrent_downloads: u32,
     pub auto_retry_attempts: u32,
     pub speed_limit_kib_per_second: u32,
+    /// Flush partial file to durable storage on pause (power-loss safety).
+    #[serde(default = "default_true")]
+    pub fsync_on_pause: bool,
+    /// Multi-connection downloads master switch (behavior lands in later PRs).
+    #[serde(default = "default_true")]
+    pub multi_connection_enabled: bool,
+    /// Max parallel segments per multi download (clamped 1–16).
+    #[serde(default = "default_multi_max_segments")]
+    pub multi_max_segments: u32,
+    /// Files smaller than this use a single connection (bytes).
+    #[serde(default = "default_multi_min_bytes")]
+    pub multi_min_bytes: u64,
+    /// Process-wide cap on concurrent download body connections.
+    #[serde(default = "default_max_total_connections")]
+    pub max_total_connections: u32,
+    /// Per-host connection budget for multi-segment downloads.
+    #[serde(default = "default_max_connections_per_host")]
+    pub max_connections_per_host: u32,
     /// Stable vs Nightly (prerelease) update stream.
     #[serde(default)]
     pub update_channel: UpdateChannel,
@@ -422,6 +440,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_multi_max_segments() -> u32 {
+    8
+}
+
+fn default_multi_min_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+fn default_max_total_connections() -> u32 {
+    32
+}
+
+fn default_max_connections_per_host() -> u32 {
+    8
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -429,6 +463,12 @@ impl Default for Settings {
             max_concurrent_downloads: 3,
             auto_retry_attempts: 6,
             speed_limit_kib_per_second: 0,
+            fsync_on_pause: true,
+            multi_connection_enabled: true,
+            multi_max_segments: default_multi_max_segments(),
+            multi_min_bytes: default_multi_min_bytes(),
+            max_total_connections: default_max_total_connections(),
+            max_connections_per_host: default_max_connections_per_host(),
             update_channel: UpdateChannel::Stable,
             theme: AppTheme::Light,
             accent_preset: AccentPreset::Default,
@@ -459,6 +499,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Clamp download / engine limit fields to safe ranges.
+    pub fn sanitize_download_limits(&mut self) {
+        self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 64);
+        self.auto_retry_attempts = self.auto_retry_attempts.min(100);
+        self.multi_max_segments = self.multi_max_segments.clamp(1, 16);
+        self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
+        self.max_total_connections = self.max_total_connections.clamp(1, 256);
+        self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
+    }
+
     /// Clamp appearance fields to safe ranges (call after load / before save).
     pub fn sanitize_appearance(&mut self) {
         self.noise_intensity = self.noise_intensity.min(MAX_NOISE_INTENSITY);
@@ -470,6 +520,7 @@ impl Settings {
         self.accent_lightness = self.accent_lightness.clamp(0.0, 100.0);
         self.window_layout.sanitize();
         self.extension.sanitize();
+        self.sanitize_download_limits();
     }
 
     /// Reset all appearance fields to defaults (keeps download prefs).
@@ -560,6 +611,31 @@ mod tests {
         assert!(s.notify_on_complete);
         assert!(s.notify_on_fail);
         assert!(!s.clipboard_watch_enabled);
+        // Multi / fsync defaults for legacy JSON without those keys.
+        assert!(s.fsync_on_pause);
+        assert!(s.multi_connection_enabled);
+        assert_eq!(s.multi_max_segments, 8);
+        assert_eq!(s.multi_min_bytes, 5 * 1024 * 1024);
+        assert_eq!(s.max_total_connections, 32);
+        assert_eq!(s.max_connections_per_host, 8);
+    }
+
+    #[test]
+    fn sanitize_download_limits_clamps() {
+        let mut s = Settings::default();
+        s.max_concurrent_downloads = 0;
+        s.auto_retry_attempts = 500;
+        s.multi_max_segments = 99;
+        s.multi_min_bytes = 100;
+        s.max_total_connections = 0;
+        s.max_connections_per_host = 0;
+        s.sanitize_download_limits();
+        assert_eq!(s.max_concurrent_downloads, 1);
+        assert_eq!(s.auto_retry_attempts, 100);
+        assert_eq!(s.multi_max_segments, 16);
+        assert_eq!(s.multi_min_bytes, 1024 * 1024);
+        assert_eq!(s.max_total_connections, 1);
+        assert_eq!(s.max_connections_per_host, 1);
     }
 
     #[test]

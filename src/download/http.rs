@@ -11,6 +11,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::sleep;
 
+use super::bandwidth::GlobalBandwidthLimiter;
 use super::client::{download_client, referer_for_url};
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
@@ -55,7 +56,7 @@ pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 pub async fn run_http_download(
     job: &Job,
-    speed_limit_bytes_per_second: Option<u64>,
+    limiter: Arc<GlobalBandwidthLimiter>,
     control: Arc<AtomicU8>,
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
@@ -305,6 +306,9 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             continue;
         }
 
+        // Pre-write: charge the shared limiter so concurrent jobs share one budget.
+        limiter.acquire(chunk.len()).await;
+
         writer
             .write_all(&chunk)
             .await
@@ -313,17 +317,6 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         let n = chunk.len() as u64;
         downloaded = downloaded.saturating_add(n);
         window_bytes = window_bytes.saturating_add(n);
-
-        if let Some(limit) = speed_limit_bytes_per_second {
-            if limit > 0 {
-                let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
-                let allowed = limit as f64 * elapsed;
-                if window_bytes as f64 > allowed {
-                    let extra = (window_bytes as f64 - allowed) / limit as f64;
-                    sleep(Duration::from_secs_f64(extra.min(2.0))).await;
-                }
-            }
-        }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
             let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
