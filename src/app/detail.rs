@@ -362,7 +362,10 @@ pub(crate) fn render_detail(
                                             .icon(IconName::Close)
                                             .label("Cancel")
                                             .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Cancel(id.clone()));
+                                                this.engine.send(EngineCommand::Cancel {
+                                                    id: id.clone(),
+                                                    delete_partial: false,
+                                                });
                                             })),
                                     )
                                 })

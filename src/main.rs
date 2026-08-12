@@ -4,6 +4,7 @@ mod app;
 mod appearance;
 mod assets;
 mod branding;
+mod browser_popup_chrome;
 mod download;
 mod extension_settings;
 mod format;

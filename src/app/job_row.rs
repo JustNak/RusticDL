@@ -345,7 +345,10 @@ pub(crate) fn render_job_row(
                                                     );
                                                 });
                                             } else {
-                                                engine.send(EngineCommand::Cancel(id.clone()));
+                                                engine.send(EngineCommand::Cancel {
+                                                    id: id.clone(),
+                                                    delete_partial: false,
+                                                });
                                             }
                                         }
                                     }),
