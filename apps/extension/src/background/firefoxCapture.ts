@@ -159,7 +159,7 @@ export function extensionOf(name: string | undefined): string | undefined {
   const base = name.split(/[\\/]/).pop() ?? name;
   const dot = base.lastIndexOf('.');
   if (dot < 0 || dot === base.length - 1) return undefined;
-  // Ignore multi-dot noise like "v1.2" version-only segments without a real extension.
+  // Only accept simple alphanumeric extensions (1–10 chars).
   const ext = base.slice(dot + 1).toLowerCase();
   if (!/^[a-z0-9]{1,10}$/.test(ext)) return undefined;
   return ext;
@@ -256,6 +256,12 @@ export function firefoxWebRequestDownloadCandidate(
   const hasAttachment = /\battachment\b/i.test(disposition);
   const strongExt = Boolean(ext && captured.has(ext));
   const strongMime = DOWNLOAD_MIME.has(mime);
+  // Present but non-captured extension is a veto for MIME-only capture (e.g. f.txt + octet-stream).
+  const knownNonCapturedExt = Boolean(ext && !captured.has(ext));
+  const navType =
+    resourceType === 'main_frame' ||
+    resourceType === 'object' ||
+    resourceType === 'other';
 
   // Page documents / API payloads are never downloads unless the server forces
   // a saved file with a recognized captured extension.
@@ -278,23 +284,20 @@ export function firefoxWebRequestDownloadCandidate(
 
   let reason: string | null = null;
 
-  // Attachment must pair with a *strong* signal. A bare
-  // `Content-Disposition: attachment; filename=f.txt` (YouTube/ads noise) is not enough.
-  if (hasAttachment && dispositionName && (strongExt || strongMime)) {
+  // Attachment must pair with a *strong* signal. Bare
+  // `Content-Disposition: attachment; filename=f.txt` is not enough, even with octet-stream.
+  if (hasAttachment && strongExt) {
     reason = 'attachment_disposition';
-  } else if (strongMime && hasAttachment) {
-    reason = 'download_mime';
-  } else if (
-    strongMime &&
-    (resourceType === 'main_frame' || resourceType === 'object' || resourceType === 'other')
-  ) {
-    // Direct navigation / plugin hit on a binary MIME (e.g. clicking a .zip / .pdf link).
+  } else if (hasAttachment && strongMime && !knownNonCapturedExt) {
+    reason = dispositionName ? 'attachment_disposition' : 'download_mime';
+  } else if (strongMime && navType && !knownNonCapturedExt) {
+    // Direct navigation / plugin / opaque hit on a binary MIME (e.g. clicking a .zip / .pdf link).
     reason = 'download_mime_navigation';
-  } else if (strongExt && resourceType === 'main_frame' && dispositionName) {
-    // Top-level navigation with disposition filename matching a captured extension.
+  } else if (strongExt && navType && dispositionName) {
+    // Navigation with disposition filename matching a captured extension.
     reason = 'strong_filename_navigation';
-  } else if (strongExt && resourceType === 'main_frame' && !mime) {
-    // Some CDNs omit Content-Type on file links; only trust top-level navigations.
+  } else if (strongExt && navType && !mime) {
+    // Some CDNs omit Content-Type on file links; trust main/object/other navigations only.
     reason = 'strong_filename_navigation';
   }
 

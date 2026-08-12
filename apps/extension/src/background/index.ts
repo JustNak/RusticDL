@@ -202,11 +202,7 @@ function shouldCaptureDownload(
   if (
     mime.startsWith('text/html') ||
     mime === 'application/xhtml+xml' ||
-    mime === 'application/json' ||
-    mime.startsWith('image/') ||
-    mime.startsWith('audio/') ||
-    mime.startsWith('video/') ||
-    mime.startsWith('font/')
+    mime === 'application/json'
   ) {
     return false;
   }
@@ -220,6 +216,18 @@ function shouldCaptureDownload(
   const strongName = filenameLooksCaptured(item.filename, settings.capturedFileExtensions);
   const dispositionHint = DOWNLOAD_ITEM_MIME_HINTS.some((hint) => mime.includes(hint));
 
+  // Media MIME types are usually page assets; allow only when the filename matches
+  // a user-configured captured extension (e.g. user added mp3/mp4/png).
+  if (
+    (mime.startsWith('image/') ||
+      mime.startsWith('audio/') ||
+      mime.startsWith('video/') ||
+      mime.startsWith('font/')) &&
+    !strongName
+  ) {
+    return false;
+  }
+
   // Known-size micro responses are never real archives/installers.
   const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
   if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES && !strongName) {
@@ -227,7 +235,10 @@ function shouldCaptureDownload(
   }
 
   // Require a strong signal — do NOT fall back to "any filename".
-  return strongName || dispositionHint;
+  // A non-captured extension (e.g. f.txt + octet-stream) is a veto for MIME-only capture.
+  if (strongName) return true;
+  if (ext) return false;
+  return dispositionHint;
 }
 
 async function handOffUrl(

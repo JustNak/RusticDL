@@ -122,6 +122,20 @@ assert(
 );
 
 assert(
+  'rejects non-captured extension even with large octet-stream attachment',
+  candidate({
+    url: 'https://cdn.example.com/api/blob',
+    type: 'other',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="f.txt"' },
+      { name: 'content-length', value: String(MIN_CAPTURE_BYTES + 50) },
+    ],
+  }) === null,
+);
+
+assert(
   'rejects xhr entirely (even real-looking zip)',
   candidate({
     url: 'https://cdn.example.com/files/app.zip',
@@ -175,6 +189,18 @@ assert(
       { name: 'content-length', value: '8000000' },
     ],
   })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures type=other zip with no Content-Type via strong extension',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'other',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-length', value: '5000000' },
+    ],
+  })?.reason === 'strong_filename_navigation',
 );
 
 assert(
