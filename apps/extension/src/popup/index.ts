@@ -3,8 +3,10 @@ import browser from 'webextension-polyfill';
 import type { PopupRequest, PopupStateResponse } from '../shared/messages';
 import { createDefaultExtensionSettings } from '../shared/defaultExtensionSettings';
 import {
+  APPEARANCE_STORAGE_KEY,
   applyExtensionAppearance,
   DEFAULT_APPEARANCE_SETTINGS,
+  normalizeAppearanceSettings,
   readCachedAppearance,
 } from '../shared/appearance';
 
@@ -14,13 +16,12 @@ const syncButton = document.querySelector<HTMLButtonElement>('#sync-button');
 const silentDownloadToggle = document.querySelector<HTMLInputElement>('#silent-download-toggle');
 const extensionEnabledToggle = document.querySelector<HTMLInputElement>('#extension-enabled-toggle');
 const advancedButton = document.querySelector<HTMLButtonElement>('#advanced-button');
-const openAppButton = document.querySelector<HTMLButtonElement>('#open-app-button');
 const statusLine = document.querySelector<HTMLElement>('#status-line');
 
 let currentState: PopupStateResponse | null = null;
 let isUpdating = false;
 
-// Paint immediately from local cache (no desktop dependency).
+// Paint immediately from last-known desktop appearance (FOUC cache).
 applyExtensionAppearance(readCachedAppearance());
 
 async function sendMessage<T>(message: PopupRequest): Promise<T> {
@@ -48,7 +49,7 @@ function renderState(state: PopupStateResponse) {
   currentState = state;
   const settings = state.extensionSettings ?? createDefaultExtensionSettings();
 
-  // Always apply extension-local appearance, whether or not desktop is connected.
+  // Appearance comes from the desktop app (cached when offline).
   applyExtensionAppearance(state.appearanceSettings ?? DEFAULT_APPEARANCE_SETTINGS);
 
   if (connectionStatusDot) {
@@ -79,7 +80,6 @@ function renderState(state: PopupStateResponse) {
   }
   if (syncButton) syncButton.disabled = isUpdating;
   if (advancedButton) advancedButton.disabled = isUpdating;
-  if (openAppButton) openAppButton.disabled = isUpdating;
 }
 
 async function patchSettings(patch: Partial<ExtensionIntegrationSettings>) {
@@ -111,13 +111,6 @@ advancedButton?.addEventListener('click', () => {
   void sendMessage({ type: 'popup_open_options' });
 });
 
-openAppButton?.addEventListener('click', async () => {
-  isUpdating = true;
-  const state = await sendMessage<PopupStateResponse>({ type: 'popup_open_app' });
-  isUpdating = false;
-  renderState(state);
-});
-
 silentDownloadToggle?.addEventListener('change', () => {
   void patchSettings({
     downloadHandoffMode: silentDownloadToggle.checked ? 'auto' : 'ask',
@@ -126,6 +119,15 @@ silentDownloadToggle?.addEventListener('change', () => {
 
 extensionEnabledToggle?.addEventListener('change', () => {
   void patchSettings({ enabled: extensionEnabledToggle.checked });
+});
+
+// Background may refresh appearance on connection health / ping — apply without polling.
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  const appearanceChange = changes[APPEARANCE_STORAGE_KEY];
+  if (appearanceChange?.newValue) {
+    applyExtensionAppearance(normalizeAppearanceSettings(appearanceChange.newValue));
+  }
 });
 
 void (async () => {

@@ -12,7 +12,6 @@ export type PopupRequest =
   | { type: 'popup_open_app' }
   | { type: 'popup_open_options' }
   | { type: 'extension_settings_update'; settings: ExtensionIntegrationSettings }
-  | { type: 'appearance_settings_update'; settings: AppearanceSettings }
   | { type: 'appearance_settings_get' };
 
 export interface PopupStateResponse {
@@ -20,7 +19,7 @@ export interface PopupStateResponse {
   isSubmitting: boolean;
   queueSummary?: QueueSummary;
   extensionSettings?: ExtensionIntegrationSettings;
-  /** Extension-local appearance (not mirrored from the desktop app). */
+  /** Mirrors desktop appearance (cached for offline / FOUC paint). */
   appearanceSettings?: AppearanceSettings;
   lastResult?: HostToExtensionResponse;
   lastError?: { code: ErrorCode; message: string };

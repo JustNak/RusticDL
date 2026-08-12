@@ -3,25 +3,13 @@ import type { AppearanceSettings, AppearanceTheme } from '@rusticdl/protocol';
 export const DEFAULT_ACCENT_COLOR = '#3b82f6';
 /** localStorage key for FOUC-free paint in popup/options pages. */
 export const APPEARANCE_CACHE_KEY = 'rusticdl-appearance';
-/** browser.storage.local key — source of truth for extension appearance. */
+/** browser.storage.local key — cached desktop appearance for the extension. */
 export const APPEARANCE_STORAGE_KEY = 'appearance-settings';
 
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
   theme: 'system',
   accentColor: DEFAULT_ACCENT_COLOR,
 };
-
-/** Accent presets offered in the options UI (independent of the desktop app). */
-export const ACCENT_PRESETS: ReadonlyArray<{ id: string; label: string; color: string }> = [
-  { id: 'blue', label: 'Blue', color: '#3b82f6' },
-  { id: 'indigo', label: 'Indigo', color: '#6366f1' },
-  { id: 'violet', label: 'Violet', color: '#8b5cf6' },
-  { id: 'rose', label: 'Rose', color: '#f43f5e' },
-  { id: 'orange', label: 'Orange', color: '#f97316' },
-  { id: 'emerald', label: 'Emerald', color: '#10b981' },
-  { id: 'cyan', label: 'Cyan', color: '#06b6d4' },
-  { id: 'slate', label: 'Slate', color: '#64748b' },
-];
 
 export function normalizeAccentColor(rawColor: string | undefined): string {
   const color = rawColor?.trim() ?? '';
