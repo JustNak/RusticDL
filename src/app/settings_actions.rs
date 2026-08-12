@@ -9,7 +9,7 @@ use super::confirm_dialogs;
 use super::DownloadApp;
 use crate::appearance::{apply_appearance, apply_window_opacity};
 use crate::download::EngineCommand;
-use crate::extension_settings::DownloadHandoffMode;
+use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::persistence::save_settings;
 use crate::settings::{
     AccentPreset, AppTheme, CornerRadiusScale, OsNotifyMode, ProgressStyle, Settings, UiDensity,
@@ -179,16 +179,27 @@ impl DownloadApp {
         cx.notify();
     }
 
+    /// Mutate extension settings draft, mark dirty, and notify.
+    ///
     /// Browser capture toggles preview immediately; disk + IPC flush is "Save settings".
+    /// Shared by the near-identical `set_*` extension draft setters below.
+    fn update_extension_settings_draft(
+        &mut self,
+        f: impl FnOnce(&mut ExtensionIntegrationSettings),
+        cx: &mut Context<Self>,
+    ) {
+        f(&mut self.settings.extension);
+        self.extension_settings_dirty = true;
+        cx.notify();
+    }
+
     pub(crate) fn set_extension_enabled(
         &mut self,
         on: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.enabled = on;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.enabled = on, cx);
     }
 
     pub(crate) fn set_download_handoff_mode(
@@ -197,9 +208,7 @@ impl DownloadApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.download_handoff_mode = mode;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.download_handoff_mode = mode, cx);
     }
 
     pub(crate) fn set_context_menu_enabled(
@@ -208,9 +217,7 @@ impl DownloadApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.context_menu_enabled = on;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.context_menu_enabled = on, cx);
     }
 
     pub(crate) fn set_show_badge_status(
@@ -219,9 +226,7 @@ impl DownloadApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.show_badge_status = on;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.show_badge_status = on, cx);
     }
 
     pub(crate) fn set_show_progress_after_handoff(
@@ -230,9 +235,7 @@ impl DownloadApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.show_progress_after_handoff = on;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.show_progress_after_handoff = on, cx);
     }
 
     pub(crate) fn set_download_capture_debug_logging(
@@ -241,9 +244,7 @@ impl DownloadApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.extension.download_capture_debug_logging = on;
-        self.extension_settings_dirty = true;
-        cx.notify();
+        self.update_extension_settings_draft(|ext| ext.download_capture_debug_logging = on, cx);
     }
 
     pub(crate) fn set_launch_at_startup(
