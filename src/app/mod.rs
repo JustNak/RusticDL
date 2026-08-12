@@ -48,8 +48,8 @@ use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
 use crate::notifications::{
     compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
-    in_app_summary_messages, soft_os_eligible, terminal_edges, BalloonContextMap,
-    InAppToastKind, OsNotifyBuffer, PendingOsTerminal, TerminalKind,
+    in_app_summary_messages, soft_os_eligible, terminal_edges, BalloonContextMap, InAppToastKind,
+    OsNotifyBuffer, PendingOsTerminal, TerminalKind,
 };
 use crate::persistence::{
     load_pending_whats_new, save_jobs, save_settings, AppPaths, PendingWhatsNew,
@@ -63,9 +63,7 @@ use crate::settings::{
     MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::{apply_launch_at_startup, launched_minimized};
-use crate::tray::{
-    main_window_hwnd, show_main_window, SystemTray, TrayEvent,
-};
+use crate::tray::{main_window_hwnd, show_main_window, SystemTray, TrayEvent};
 use crate::updater::UpdateInfo;
 use toast::{Toast, ToastAction, ToastActionKind, ToastKind, TOAST_AUTO_HIDE, TOAST_MAX_STACK};
 use widgets::render_vignette_overlay;
