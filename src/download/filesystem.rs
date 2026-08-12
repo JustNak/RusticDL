@@ -155,7 +155,7 @@ pub struct ReconcileResult {
     pub resume_required: bool,
 }
 
-fn apply_progress_from_sum(job: &mut Job, sum: u64) {
+pub(crate) fn apply_progress_from_sum(job: &mut Job, sum: u64) {
     job.downloaded_bytes = sum;
     if job.total_bytes > 0 {
         job.progress = ((sum as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);

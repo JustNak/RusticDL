@@ -13,8 +13,6 @@
 //! Per-host semaphores are retained for the process lifetime (v0.2). Idle entries
 //! are small; pruning is deferred polish.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,6 +21,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 /// Process-wide connection budget: one global pool plus per-host caps.
 pub struct ConnectionBudget {
     global: Arc<Semaphore>,
+    #[allow(dead_code)]
     max_total: usize,
     max_per_host: usize,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -51,14 +50,17 @@ impl ConnectionBudget {
         })
     }
 
+    #[allow(dead_code)]
     pub fn max_total(&self) -> usize {
         self.max_total
     }
 
+    #[allow(dead_code)]
     pub fn max_per_host(&self) -> usize {
         self.max_per_host
     }
 
+    #[allow(dead_code)]
     pub fn available_global(&self) -> usize {
         self.global.available_permits()
     }

@@ -1,17 +1,16 @@
 //! Transfer entry + planner decision tree.
 //!
-//! PR 10: always routes single-stream. The planner still evaluates multi
-//! qualification (`multi_connection_enabled`, known size ≥ `multi_min_bytes`,
-//! resume/ranges) and records `transfer_mode` / `fallback_reason` when multi
-//! *would* have been selected. Multi workers land in PR 11.
+//! When multi qualifies (`multi_connection_enabled`, known size ≥ `multi_min_bytes`,
+//! ranges supported) the planner now chooses [`TransferMode::Multi`].
 
 use super::http::{
     apply_preflight, control_outcome, run_http_download_with_ctx, ProgressUpdate, TransferContext,
 };
 use super::job::{DownloadError, DownloadOutcome, Job, TransferMode};
+use super::multi::run_multi_segment_download;
 use super::preflight::PreflightInfo;
 
-/// Why the planner stayed on single-stream (PR 10 always does).
+/// Why the planner chose single-stream, or that multi qualified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPlanReason {
     MultiDisabled,
@@ -19,11 +18,12 @@ pub enum TransferPlanReason {
     RangesUnknown,
     RangesUnsupported,
     BelowMinSize,
-    /// Multi *would* qualify; PR 10 still routes single-stream.
-    MultiQualifiedSingleOnly,
+    /// Multi qualifies — orchestrator should run.
+    MultiQualified,
 }
 
 impl TransferPlanReason {
+    #[allow(dead_code)] // surfaced to UI / fallback polish
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MultiDisabled => "multi_disabled",
@@ -31,16 +31,16 @@ impl TransferPlanReason {
             Self::RangesUnknown => "ranges_unknown",
             Self::RangesUnsupported => "ranges_unsupported",
             Self::BelowMinSize => "below_multi_min_bytes",
-            Self::MultiQualifiedSingleOnly => "multi_qualified_single_only",
+            Self::MultiQualified => "multi_qualified",
         }
     }
 
     pub fn would_qualify_multi(self) -> bool {
-        matches!(self, Self::MultiQualifiedSingleOnly)
+        matches!(self, Self::MultiQualified)
     }
 }
 
-/// Planner result. `chosen` is always [`TransferMode::Single`] in PR 10.
+/// Planner result. `chosen` is Multi when [`TransferPlanReason::MultiQualified`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferPlan {
     pub chosen: TransferMode,
@@ -51,18 +51,12 @@ impl TransferPlan {
     pub fn to_progress_update(self) -> ProgressUpdate {
         ProgressUpdate {
             transfer_mode: Some(self.chosen),
-            // Only a *fallback* when multi would have been selected.
-            fallback_reason: self
-                .reason
-                .would_qualify_multi()
-                .then(|| self.reason.as_str().to_string()),
             ..Default::default()
         }
     }
 }
 
-/// Decide transfer mode. Always returns single-stream; `reason` says whether
-/// multi would have qualified (and why not, otherwise).
+/// Decide transfer mode. Multi when enabled, size known, ranges supported, size ≥ min.
 pub fn plan_transfer(
     job: &Job,
     preflight: Option<&PreflightInfo>,
@@ -71,7 +65,11 @@ pub fn plan_transfer(
 ) -> TransferPlan {
     let reason = plan_reason(job, preflight, multi_connection_enabled, multi_min_bytes);
     TransferPlan {
-        chosen: TransferMode::Single,
+        chosen: if reason.would_qualify_multi() {
+            TransferMode::Multi
+        } else {
+            TransferMode::Single
+        },
         reason,
     }
 }
@@ -100,7 +98,7 @@ fn plan_reason(
         return TransferPlanReason::BelowMinSize;
     }
 
-    TransferPlanReason::MultiQualifiedSingleOnly
+    TransferPlanReason::MultiQualified
 }
 
 fn known_size(job: &Job, preflight: Option<&PreflightInfo>) -> Option<u64> {
@@ -126,7 +124,7 @@ fn range_support(job: &Job, preflight: Option<&PreflightInfo>) -> RangeSupport {
     }
 }
 
-/// Engine transfer entry: preflight → plan (always single) → single-stream body.
+/// Engine transfer entry: preflight → plan → multi orchestrator or single-stream.
 pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, DownloadError> {
     let preflight = apply_preflight(&mut ctx).await;
 
@@ -142,7 +140,10 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
     );
     (ctx.on_progress)(plan.to_progress_update());
 
-    // PR 11 will branch on `plan.reason.would_qualify_multi()` here.
+    if plan.chosen == TransferMode::Multi {
+        return run_multi_segment_download(&mut ctx).await;
+    }
+
     run_http_download_with_ctx(&mut ctx).await
 }
 
@@ -207,11 +208,10 @@ mod tests {
         job.total_bytes = 8 * 1024 * 1024;
         job.resume_supported = true;
         let plan = plan_transfer(&job, None, true, 5 * 1024 * 1024);
-        assert_eq!(plan.reason, TransferPlanReason::MultiQualifiedSingleOnly);
-        assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
-            Some("multi_qualified_single_only")
-        );
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+        assert_eq!(plan.chosen, TransferMode::Multi);
+        assert_eq!(plan.reason.as_str(), "multi_qualified");
+        assert!(plan.to_progress_update().fallback_reason.is_none());
     }
 
     #[test]
@@ -242,19 +242,16 @@ mod tests {
     }
 
     #[test]
-    fn planner_multi_would_qualify_still_single() {
+    fn planner_multi_qualifies_chooses_multi() {
         let job = sample_job();
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
         let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
-        assert_eq!(plan.chosen, TransferMode::Single);
+        assert_eq!(plan.chosen, TransferMode::Multi);
         assert!(plan.reason.would_qualify_multi());
-        assert_eq!(plan.reason, TransferPlanReason::MultiQualifiedSingleOnly);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         let patch = plan.to_progress_update();
-        assert_eq!(patch.transfer_mode, Some(TransferMode::Single));
-        assert_eq!(
-            patch.fallback_reason.as_deref(),
-            Some("multi_qualified_single_only")
-        );
+        assert_eq!(patch.transfer_mode, Some(TransferMode::Multi));
+        assert!(patch.fallback_reason.is_none());
     }
 
     #[test]
@@ -264,8 +261,8 @@ mod tests {
         job.total_bytes = 20 * 1024 * 1024;
         job.resume_supported = true;
         let plan = plan_transfer(&job, None, true, 5 * 1024 * 1024);
-        assert_eq!(plan.reason, TransferPlanReason::MultiQualifiedSingleOnly);
-        assert_eq!(plan.chosen, TransferMode::Single);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+        assert_eq!(plan.chosen, TransferMode::Multi);
     }
 
     #[test]
@@ -275,11 +272,12 @@ mod tests {
         job.resume_supported = true;
         let pf = preflight(Some(9 * 1024 * 1024), None);
         let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
-        assert_eq!(plan.reason, TransferPlanReason::MultiQualifiedSingleOnly);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+        assert_eq!(plan.chosen, TransferMode::Multi);
     }
 
     #[tokio::test]
-    async fn run_transfer_always_single_and_sets_mode_when_multi_would_qualify() {
+    async fn run_transfer_stays_single_when_multi_disabled() {
         let body = vec![b'x'; 64];
         let head = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -312,13 +310,14 @@ Accept-Ranges: bytes\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let ctx = TransferContext::new(
+        let mut ctx = TransferContext::new(
             job,
             Arc::new(AtomicU8::new(0)),
             on_progress,
             None,
             GlobalBandwidthLimiter::new(None),
         );
+        ctx.multi_connection_enabled = false;
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -329,10 +328,7 @@ Accept-Ranges: bytes\r\n\
         let mode_patch = seen.iter().find(|p| p.transfer_mode.is_some());
         let mode_patch = mode_patch.expect("planner should publish transfer_mode");
         assert_eq!(mode_patch.transfer_mode, Some(TransferMode::Single));
-        assert_eq!(
-            mode_patch.fallback_reason.as_deref(),
-            Some("multi_qualified_single_only")
-        );
+        assert!(mode_patch.fallback_reason.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

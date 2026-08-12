@@ -8,7 +8,10 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::filesystem::{apply_partial_progress_from_disk, metadata_len, remove_partial};
+use super::conn_budget::ConnectionBudget;
+use super::filesystem::{
+    apply_partial_progress_from_disk, apply_progress_from_sum, metadata_len, remove_partial,
+};
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
@@ -17,9 +20,8 @@ use crate::settings::Settings;
 
 mod commands;
 
-/// Live engine knobs (from Settings). Multi fields are stored early for later PRs.
+/// Live engine knobs (from Settings).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // multi_* reserved until segment orchestrator lands
 pub struct EngineRuntimeConfig {
     pub max_concurrent: u32,
     pub auto_retry: u32,
@@ -157,6 +159,7 @@ pub(super) struct EngineInner {
     pending_partial_deletes: HashMap<String, PathBuf>,
     pub(super) config: EngineRuntimeConfig,
     pub(super) limiter: Arc<GlobalBandwidthLimiter>,
+    pub(super) conn_budget: Arc<ConnectionBudget>,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     wake: Arc<Notify>,
 }
@@ -172,6 +175,10 @@ pub fn spawn_engine(
     let mut config = config;
     config.sanitize();
     let limiter = GlobalBandwidthLimiter::new(config.speed_limit_bytes_per_second());
+    let conn_budget = ConnectionBudget::new(
+        config.max_total_connections,
+        config.max_connections_per_host,
+    );
 
     let mut jobs = initial_jobs;
     for job in &mut jobs {
@@ -192,6 +199,7 @@ pub fn spawn_engine(
         pending_partial_deletes: HashMap::new(),
         config,
         limiter,
+        conn_budget,
         event_tx,
         wake: wake.clone(),
     }));
@@ -336,11 +344,13 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             // Re-read live multi knobs so UpdateSettings applies to the next attempt.
             // Mid-transfer reconnect (short backoff, max 5) is nested inside
             // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
-            let (multi_enabled, multi_min) = {
+            let (multi_enabled, multi_min, multi_max, conn_budget) = {
                 let guard = inner.lock().await;
                 (
                     guard.config.multi_connection_enabled,
                     guard.config.multi_min_bytes,
+                    guard.config.multi_max_segments,
+                    guard.conn_budget.clone(),
                 )
             };
             let mut ctx = TransferContext::new(
@@ -352,6 +362,8 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             );
             ctx.multi_connection_enabled = multi_enabled;
             ctx.multi_min_bytes = multi_min;
+            ctx.multi_max_segments = multi_max;
+            ctx.conn_budget = conn_budget;
             ctx.fsync_on_pause = fsync_on_pause;
             let attempt_result = run_transfer(ctx).await;
 
@@ -518,8 +530,15 @@ fn spawn_progress_pump(
             match flush_at {
                 None => match progress_rx.recv().await {
                     Some(update) => {
+                        let immediate = should_flush_immediately(&update);
                         coalesce_push(&mut pending, update);
-                        flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
+                        if immediate {
+                            if let Some(update) = pending.take() {
+                                apply_progress(&inner, &job_id, update).await;
+                            }
+                        } else {
+                            flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
+                        }
                     }
                     None => {
                         if let Some(update) = pending.take() {
@@ -533,9 +552,16 @@ fn spawn_progress_pump(
                         item = progress_rx.recv() => {
                             match item {
                                 Some(update) => {
+                                    let immediate = should_flush_immediately(&update);
                                     // Deadline already set ⇒ pending is Some.
                                     coalesce_push(&mut pending, update);
-                                    // Keep existing deadline so the first patch opens the window.
+                                    if immediate {
+                                        if let Some(update) = pending.take() {
+                                            apply_progress(&inner, &job_id, update).await;
+                                        }
+                                        flush_at = None;
+                                    }
+                                    // Else keep existing deadline so the first patch opens the window.
                                 }
                                 None => {
                                     if let Some(update) = pending.take() {
@@ -556,6 +582,12 @@ fn spawn_progress_pump(
             }
         }
     })
+}
+
+/// Map + version (or explicit clear) must hit Job before multi workers write.
+fn should_flush_immediately(update: &ProgressUpdate) -> bool {
+    (update.segment_map.is_some() && update.transfer_format_version.is_some())
+        || update.clear_segment_map == Some(true)
 }
 
 /// Merge `update` into the coalesce buffer (later wins on Some).
@@ -659,7 +691,10 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
         job.fallback_reason = Some(reason);
     }
     // None = unchanged; lifecycle (Restart / Cancel+delete / Completed) clears.
-    if let Some(map) = update.segment_map {
+    // Multi→single rollback is the only transfer-path clear.
+    if update.clear_segment_map == Some(true) {
+        job.segment_map = None;
+    } else if let Some(map) = update.segment_map {
         job.segment_map = Some(map);
     }
 
@@ -763,6 +798,7 @@ mod tests {
             pending_partial_deletes: HashMap::new(),
             config: EngineRuntimeConfig::default(),
             limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
             event_tx,
             wake: Arc::new(Notify::new()),
         }))
@@ -1019,6 +1055,35 @@ mod tests {
         assert_eq!(job.reconnect_count, 2);
         assert_eq!(job.transfer_mode, Some(TransferMode::Multi));
         assert_eq!(job.fallback_reason.as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn apply_progress_clear_segment_map() {
+        let mut job = sample_job(JobState::Downloading);
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 10,
+                state: SegmentState::Active,
+            }],
+            preallocated: false,
+        });
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                transfer_format_version: Some(0),
+                clear_segment_map: Some(true),
+                transfer_mode: Some(TransferMode::Single),
+                ..Default::default()
+            },
+        );
+        assert!(job.segment_map.is_none());
+        assert_eq!(job.transfer_format_version, 0);
+        assert_eq!(job.transfer_mode, Some(TransferMode::Single));
     }
 
     #[test]

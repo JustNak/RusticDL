@@ -14,6 +14,7 @@ use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::client::{download_client, referer_for_url};
+use super::conn_budget::ConnectionBudget;
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
     parse_content_range, sanitize_filename,
@@ -32,9 +33,9 @@ pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const MAX_REDIRECTS: u32 = 10;
 
 /// Nested mid-transfer reconnect before worker-level `RETRY_DELAYS`.
-const RECONNECT_MAX: u32 = 5;
-const RECONNECT_BASE: Duration = Duration::from_millis(200);
-const RECONNECT_CAP: Duration = Duration::from_secs(2);
+pub(crate) const RECONNECT_MAX: u32 = 5;
+pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
+pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(2);
 
 const CONTROL_CONTINUE: u8 = 0;
 const CONTROL_PAUSED: u8 = 1;
@@ -68,6 +69,8 @@ pub struct ProgressUpdate {
     pub toast: Option<String>,
     /// None = unchanged. Speed ticks must not clear a stored map.
     pub segment_map: Option<SegmentMap>,
+    /// When `Some(true)`, clear `job.segment_map` (multi→single rollback).
+    pub clear_segment_map: Option<bool>,
 }
 
 const FULL_REPLACE_NOTICE: &str =
@@ -98,6 +101,7 @@ impl ProgressUpdate {
             fallback_reason: later.fallback_reason.or(self.fallback_reason),
             toast: later.toast.or(self.toast),
             segment_map: later.segment_map.or(self.segment_map),
+            clear_segment_map: later.clear_segment_map.or(self.clear_segment_map),
         }
     }
 
@@ -131,6 +135,7 @@ impl ProgressUpdate {
             fallback_reason: None,
             toast: None,
             segment_map: None,
+            clear_segment_map: None,
         }
     }
 
@@ -162,6 +167,7 @@ impl ProgressUpdate {
             fallback_reason: None,
             toast: None,
             segment_map: None,
+            clear_segment_map: None,
         }
     }
 
@@ -194,6 +200,7 @@ impl ProgressUpdate {
             fallback_reason: None,
             toast: None,
             segment_map: None,
+            clear_segment_map: None,
         }
     }
 }
@@ -220,10 +227,14 @@ pub struct TransferContext {
     /// Memory-only browser session headers (snapshot from `EngineInner`).
     pub handoff_auth: Option<HandoffAuth>,
     pub limiter: Arc<GlobalBandwidthLimiter>,
-    /// Planner input (PR 10 records only; routing stays single-stream).
+    /// Planner input: master switch for multi-segment routing.
     pub multi_connection_enabled: bool,
     /// Planner input: files smaller than this never qualify for multi.
     pub multi_min_bytes: u64,
+    /// Fresh multi partition cap (clamped 1–16 by settings).
+    pub multi_max_segments: u32,
+    /// Process-wide HTTP body budget (global + per-host).
+    pub conn_budget: Arc<ConnectionBudget>,
     /// Attempt-local; updated only when redirect follow succeeds. Init = `job.url`.
     pub resolved_url: String,
     /// Set after a preflight attempt this run so `run_transfer` + single do not double-probe.
@@ -249,6 +260,8 @@ impl TransferContext {
             limiter,
             multi_connection_enabled: true,
             multi_min_bytes: DEFAULT_MULTI_MIN_BYTES,
+            multi_max_segments: super::segment::DEFAULT_SEGMENT_COUNT,
+            conn_budget: ConnectionBudget::new(32, 8),
             resolved_url,
             preflight_done: false,
             fsync_on_pause: false,
@@ -705,6 +718,9 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                 // Pre-write: charge the shared limiter (may burst up to bucket capacity).
                 // Interruptible for pause/cancel, but once the stream has delivered a chunk
                 // it must be written — dropping it leaves a Range-resume hole.
+                // On abort mid-throttle some quanta may already be charged; do not re-acquire
+                // the full length (would double-bill). Slight under-charge on the pause edge
+                // is acceptable.
                 let acquired = limiter.acquire(chunk.len(), Some(control.as_ref())).await;
 
                 writer.write_all(&chunk).await.map_err(disk_write_error)?;
@@ -913,14 +929,17 @@ fn ranges_usable_for_reconnect(existing_bytes: u64, resume_supported: bool) -> b
 }
 
 /// Short backoff: base 200ms, doubles per attempt, cap 2s.
-fn reconnect_backoff(attempt_1_based: u32) -> Duration {
+pub(crate) fn reconnect_backoff(attempt_1_based: u32) -> Duration {
     let shift = attempt_1_based.saturating_sub(1).min(16);
     let ms = (RECONNECT_BASE.as_millis() as u64).saturating_mul(1u64 << shift);
     Duration::from_millis(ms.min(RECONNECT_CAP.as_millis() as u64))
 }
 
 /// Sleep `total` while polling control every `CONTROL_POLL` (pause/cancel aborts).
-async fn sleep_interruptible(control: &AtomicU8, total: Duration) -> Option<DownloadOutcome> {
+pub(crate) async fn sleep_interruptible(
+    control: &AtomicU8,
+    total: Duration,
+) -> Option<DownloadOutcome> {
     let deadline = tokio::time::Instant::now() + total;
     loop {
         if let Some(outcome) = control_outcome(control) {
@@ -1019,6 +1038,8 @@ async fn fetch_with_redirects(
 pub(crate) enum TransferRequestKind {
     /// GET with optional open-ended Range resume (`bytes=N-`).
     Get { existing_bytes: u64 },
+    /// GET closed Range (`bytes={start}-{end}`, inclusive) for multi-segment.
+    GetClosed { start: u64, end: u64 },
     /// HEAD preflight probe.
     Head,
     /// GET `Range: bytes=0-0` Accept-Ranges / size probe.
@@ -1035,7 +1056,9 @@ pub(crate) fn build_transfer_request(
     handoff_auth: Option<&HandoffAuth>,
 ) -> reqwest::RequestBuilder {
     let mut request = match kind {
-        TransferRequestKind::Get { .. } | TransferRequestKind::RangeProbe => client.get(url),
+        TransferRequestKind::Get { .. }
+        | TransferRequestKind::GetClosed { .. }
+        | TransferRequestKind::RangeProbe => client.get(url),
         TransferRequestKind::Head => client.head(url),
     };
     request = request.header(ACCEPT_ENCODING, "identity");
@@ -1067,6 +1090,9 @@ pub(crate) fn build_transfer_request(
     match kind {
         TransferRequestKind::Get { existing_bytes } if existing_bytes > 0 => {
             request = request.header(RANGE, format!("bytes={existing_bytes}-"));
+        }
+        TransferRequestKind::GetClosed { start, end } => {
+            request = request.header(RANGE, format!("bytes={start}-{end}"));
         }
         TransferRequestKind::RangeProbe => {
             request = request.header(RANGE, "bytes=0-0");
@@ -1148,7 +1174,20 @@ pub(crate) async fn apply_preflight(
     )
     .await?;
     ctx.resolved_url = info.final_url.clone();
-    (ctx.on_progress)(preflight_progress_patch(&ctx.job, &info));
+    let patch = preflight_progress_patch(&ctx.job, &info);
+    if let Some(total) = patch.total_bytes {
+        ctx.job.total_bytes = total;
+    }
+    if let Some(resume) = patch.resume_supported {
+        ctx.job.resume_supported = resume;
+    }
+    if let Some(validators) = patch.validators.clone() {
+        ctx.job.validators.merge_present(validators);
+    }
+    if let Some(filename) = patch.filename.clone() {
+        ctx.job.filename = filename;
+    }
+    (ctx.on_progress)(patch);
     Some(info)
 }
 
@@ -1233,6 +1272,89 @@ async fn send_download_request(
             .send()
             .await
             {
+                Ok(response) => Ok(response),
+                Err(http3_error) => {
+                    let tcp_detail = format_reqwest_error(&error);
+                    let h3_detail = format_reqwest_error(&http3_error);
+                    let retryable = error.is_timeout()
+                        || error.is_connect()
+                        || error.is_request()
+                        || http3_error.is_timeout()
+                        || http3_error.is_connect()
+                        || http3_error.is_request();
+                    let message = if tcp_detail == h3_detail {
+                        format!("Could not connect (TCP + HTTP/3): {tcp_detail}")
+                    } else {
+                        format!(
+                            "Could not connect. TCP/HTTPS: {tcp_detail} | HTTP/3 (QUIC): {h3_detail}"
+                        )
+                    };
+                    Err(download_error(FailureCategory::Network, message, retryable))
+                }
+            }
+        }
+        Err(error) => {
+            let retryable = error.is_timeout() || error.is_connect() || error.is_request();
+            Err(download_error(
+                FailureCategory::Network,
+                format!("Could not connect: {}", format_reqwest_error(&error)),
+                retryable,
+            ))
+        }
+    }
+}
+
+/// GET a closed Range against a **pinned** URL. Does not follow redirects
+/// (unexpected hops reconnect to the pinned URL).
+pub(crate) async fn send_segment_get(
+    client: &Client,
+    job_url: &str,
+    pinned_url: &str,
+    range_start: u64,
+    range_end: u64,
+    validators: &ContentValidators,
+    handoff_auth: Option<&HandoffAuth>,
+) -> Result<reqwest::Response, DownloadError> {
+    let mut request = build_transfer_request(
+        client,
+        TransferRequestKind::GetClosed {
+            start: range_start,
+            end: range_end,
+        },
+        job_url,
+        pinned_url,
+        handoff_auth,
+    );
+    if range_start > 0 {
+        if let Some(if_range) = if_range_header_value(validators) {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
+                request = request.header(IF_RANGE, value);
+            }
+        }
+    }
+
+    let primary = request.send().await;
+    match primary {
+        Ok(response) => Ok(response),
+        Err(error) if should_try_http3(&error) && pinned_url.starts_with("https://") => {
+            let mut retry = build_transfer_request(
+                client,
+                TransferRequestKind::GetClosed {
+                    start: range_start,
+                    end: range_end,
+                },
+                job_url,
+                pinned_url,
+                handoff_auth,
+            );
+            if range_start > 0 {
+                if let Some(if_range) = if_range_header_value(validators) {
+                    if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
+                        retry = retry.header(IF_RANGE, value);
+                    }
+                }
+            }
+            match retry.version(Version::HTTP_3).send().await {
                 Ok(response) => Ok(response),
                 Err(http3_error) => {
                     let tcp_detail = format_reqwest_error(&error);
@@ -1354,7 +1476,7 @@ pub fn store_control(control: &AtomicU8, value: WorkerControl) {
     control.store(raw, Ordering::Relaxed);
 }
 
-fn progress_percent(downloaded: u64, total: u64) -> f64 {
+pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     if total == 0 {
         return 0.0;
     }
@@ -1402,7 +1524,7 @@ fn is_strong_etag(etag: &str) -> bool {
 /// - weak ETag only → prefer Last-Modified if present, else bare Range (`None`)
 /// - Last-Modified (no strong ETag) → use it
 /// - none → bare Range
-fn if_range_header_value(validators: &ContentValidators) -> Option<&str> {
+pub(crate) fn if_range_header_value(validators: &ContentValidators) -> Option<&str> {
     if let Some(etag) = validators.etag.as_deref() {
         let etag = etag.trim();
         if is_strong_etag(etag) {
@@ -1436,7 +1558,7 @@ fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValida
 }
 
 /// Size mismatch when both stored expected_size and a numeric Content-Range total are known.
-fn content_range_size_mismatch(
+pub(crate) fn content_range_size_mismatch(
     content_range_total: Option<u64>,
     expected_size: Option<u64>,
 ) -> Option<(u64, u64)> {
@@ -1518,7 +1640,7 @@ fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, t
     ));
 }
 
-fn should_retry_status(status: StatusCode) -> bool {
+pub(crate) fn should_retry_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::REQUEST_TIMEOUT

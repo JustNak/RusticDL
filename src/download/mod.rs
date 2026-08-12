@@ -8,6 +8,7 @@ pub mod filesystem;
 pub mod handoff;
 pub mod http;
 pub mod job;
+pub mod multi;
 pub mod preflight;
 pub mod segment;
 pub mod segment_io;

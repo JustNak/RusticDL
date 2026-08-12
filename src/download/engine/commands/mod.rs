@@ -574,7 +574,7 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: true,
@@ -613,7 +613,7 @@ mod tests {
         };
         let id = job.id.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: false,
