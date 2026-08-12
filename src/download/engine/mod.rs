@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
-use tokio::time::sleep;
+use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::filesystem::remove_partial;
@@ -91,6 +91,9 @@ const RETRY_DELAYS: [Duration; 8] = [
     Duration::from_secs(30),
     Duration::from_secs(45),
 ];
+
+/// Coalesce window for progress patches (150–250 ms band).
+const PROGRESS_COALESCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -277,13 +280,70 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             (job, control, limiter, auth)
         };
 
-        // Serialize progress updates so out-of-order ticks cannot regress speed/bytes.
+        // Coalesce progress patches (merge Option fields) then apply at most ~every 200 ms.
+        // Immediate flush when the channel closes (before terminal finalizer).
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
         let progress_inner = inner.clone();
         let progress_job_id = job_id.clone();
         let progress_pump = tokio::spawn(async move {
-            while let Some(update) = progress_rx.recv().await {
-                apply_progress(&progress_inner, &progress_job_id, update).await;
+            let mut pending: Option<ProgressUpdate> = None;
+            let mut flush_at: Option<TokioInstant> = None;
+
+            loop {
+                match flush_at {
+                    None => match progress_rx.recv().await {
+                        Some(update) => {
+                            pending = Some(match pending.take() {
+                                Some(prev) => prev.merge(update),
+                                None => update,
+                            });
+                            flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
+                        }
+                        None => {
+                            if let Some(update) = pending.take() {
+                                apply_progress(&progress_inner, &progress_job_id, update).await;
+                            }
+                            break;
+                        }
+                    },
+                    Some(deadline) => {
+                        tokio::select! {
+                            item = progress_rx.recv() => {
+                                match item {
+                                    Some(update) => {
+                                        pending = Some(match pending.take() {
+                                            Some(prev) => prev.merge(update),
+                                            None => update,
+                                        });
+                                        // Keep existing deadline so the first patch opens the window.
+                                    }
+                                    None => {
+                                        if let Some(update) = pending.take() {
+                                            apply_progress(
+                                                &progress_inner,
+                                                &progress_job_id,
+                                                update,
+                                            )
+                                            .await;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = sleep_until(deadline) => {
+                                if let Some(update) = pending.take() {
+                                    apply_progress(
+                                        &progress_inner,
+                                        &progress_job_id,
+                                        update,
+                                    )
+                                    .await;
+                                }
+                                flush_at = None;
+                            }
+                        }
+                    }
+                }
             }
         });
         let on_progress: ProgressCallback = Arc::new(move |update: ProgressUpdate| {
@@ -465,32 +525,54 @@ async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: Progr
         return;
     };
 
+    if !apply_progress_patch(job, update) {
+        return;
+    }
+
+    emit_jobs_locked(&guard);
+}
+
+/// Apply a partial progress patch. `None` fields leave the job value unchanged.
+/// Returns false if the job is terminal (no mutation).
+fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     if matches!(
         job.state,
         JobState::Completed | JobState::Canceled | JobState::Failed
     ) {
-        return;
+        return false;
     }
 
-    match update.state_hint {
-        ProgressHint::Starting => {
-            if job.state != JobState::Paused {
-                job.state = JobState::Starting;
+    // state_hint: None ⇒ do not change job.state.
+    if let Some(hint) = update.state_hint {
+        match hint {
+            ProgressHint::Starting => {
+                if job.state != JobState::Paused {
+                    job.state = JobState::Starting;
+                }
             }
-        }
-        ProgressHint::Downloading => {
-            if !matches!(job.state, JobState::Paused | JobState::Canceled) {
-                job.state = JobState::Downloading;
+            ProgressHint::Downloading => {
+                if !matches!(job.state, JobState::Paused | JobState::Canceled) {
+                    job.state = JobState::Downloading;
+                }
             }
         }
     }
 
-    job.downloaded_bytes = update.downloaded_bytes;
-    job.total_bytes = update.total_bytes;
-    job.speed = update.speed;
-    job.eta_secs = update.eta_secs;
-    job.progress = update.progress;
-
+    if let Some(v) = update.downloaded_bytes {
+        job.downloaded_bytes = v;
+    }
+    if let Some(v) = update.total_bytes {
+        job.total_bytes = v;
+    }
+    if let Some(v) = update.speed {
+        job.speed = v;
+    }
+    if let Some(v) = update.eta_secs {
+        job.eta_secs = v;
+    }
+    if let Some(v) = update.progress {
+        job.progress = v;
+    }
     if let Some(name) = update.filename {
         job.filename = name;
     }
@@ -504,7 +586,7 @@ async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: Progr
         job.resume_supported = resume;
     }
 
-    emit_jobs_locked(&guard);
+    true
 }
 
 pub(super) fn find_job_mut<'a>(jobs: &'a mut [Job], id: &str) -> Option<&'a mut Job> {
@@ -553,5 +635,113 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
         } else {
             open_path(path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample_job(state: JobState) -> Job {
+        let target = PathBuf::from("C:\\downloads\\file.bin");
+        let temp = PathBuf::from("C:\\downloads\\file.bin.part");
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.state = state;
+        job.downloaded_bytes = 10;
+        job.total_bytes = 100;
+        job.speed = 1;
+        job.eta_secs = 90;
+        job.progress = 10.0;
+        job
+    }
+
+    #[test]
+    fn state_hint_none_does_not_clobber_state() {
+        let mut job = sample_job(JobState::Downloading);
+        let ok = apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                downloaded_bytes: Some(40),
+                total_bytes: None,
+                speed: Some(8),
+                eta_secs: Some(7),
+                progress: Some(40.0),
+                filename: None,
+                target_path: None,
+                temp_path: None,
+                resume_supported: None,
+                state_hint: None,
+            },
+        );
+        assert!(ok);
+        assert_eq!(job.state, JobState::Downloading);
+        assert_eq!(job.downloaded_bytes, 40);
+        assert_eq!(job.total_bytes, 100); // unchanged
+        assert_eq!(job.speed, 8);
+        assert_eq!(job.eta_secs, 7);
+        assert_eq!(job.progress, 40.0);
+    }
+
+    #[test]
+    fn state_hint_none_preserves_starting() {
+        let mut job = sample_job(JobState::Starting);
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                downloaded_bytes: Some(0),
+                speed: Some(0),
+                state_hint: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.state, JobState::Starting);
+    }
+
+    #[test]
+    fn state_hint_some_transitions_to_downloading() {
+        let mut job = sample_job(JobState::Starting);
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(1, 100, 1, 99, 1.0),
+        );
+        assert_eq!(job.state, JobState::Downloading);
+    }
+
+    #[test]
+    fn apply_progress_skips_terminal_jobs() {
+        let mut job = sample_job(JobState::Completed);
+        let before = job.downloaded_bytes;
+        let ok = apply_progress_patch(
+            &mut job,
+            ProgressUpdate::downloading_tick(99, 100, 1, 0, 99.0),
+        );
+        assert!(!ok);
+        assert_eq!(job.downloaded_bytes, before);
+        assert_eq!(job.state, JobState::Completed);
+    }
+
+    #[test]
+    fn option_none_scalars_leave_job_unchanged() {
+        let mut job = sample_job(JobState::Downloading);
+        apply_progress_patch(
+            &mut job,
+            ProgressUpdate {
+                filename: Some("renamed.bin".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.filename, "renamed.bin");
+        assert_eq!(job.downloaded_bytes, 10);
+        assert_eq!(job.total_bytes, 100);
+        assert_eq!(job.speed, 1);
+        assert_eq!(job.eta_secs, 90);
+        assert_eq!(job.progress, 10.0);
+        assert_eq!(job.state, JobState::Downloading);
     }
 }
