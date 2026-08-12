@@ -133,7 +133,7 @@ impl ProgressUpdate {
             validators,
             replace_validators: None,
             transfer_format_version: None,
-            active_connections: None,
+            active_connections: Some(1),
             reconnect_count: None,
             transfer_mode: None,
             fallback_reason: None,
