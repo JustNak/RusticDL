@@ -754,9 +754,16 @@ Windows: `GetDiskFreeSpaceExW` via `windows` crate — add feature **`Win32_Stor
 pub async fn free_space_bytes(path: &Path) -> Option<u64>;
 ```
 
-Require `free > remaining_to_write + margin` (margin max(64 MiB, 1% of total)). Fail → `FailureCategory::Disk`.
+**Two-tier free-space policy** (margin = max(64 MiB, 1% of total)):
 
-**Preallocate default (Key Decision):** only when free-space check **passes** and `total_bytes >= multi_min_bytes`; else multi without `set_len` (extend-on-write), `preallocated = false`.
+| Condition | Outcome |
+| --- | --- |
+| free space unknown (`None`) | Fail-open: multi without `set_len` (`preallocated = false`) |
+| `free <= remaining_to_write` | Fail → `FailureCategory::Disk` (cannot finish) |
+| `remaining < free <= remaining + margin` | Multi without preallocate (extend-on-write, `preallocated = false`) |
+| `free > remaining + margin` | Preallocate allowed (`set_len`, `preallocated = true` after success) |
+
+**Preallocate default (Key Decision):** only when free-space check **passes the preallocate tier** and `total_bytes >= multi_min_bytes`; else multi without `set_len` (extend-on-write), `preallocated = false`.
 
 #### 3.2 Optional hash verify (**PR 14**)
 

@@ -188,20 +188,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn global_fail_releases_host_permit() {
-        // max_total=1, max_per_host=2: hold the only global on a.com; second try
-        // on b.com gets host but must release it when global fails so a.com can
-        // still take a second host slot after release.
-        let budget = ConnectionBudget::new(1, 2);
+        // max_total=1, max_per_host=1: host-first takes b.com's only host slot, then
+        // global fails. If the host permit leaked, b.com would stay saturated forever
+        // and the post-drop try_acquire would still fail.
+        let budget = ConnectionBudget::new(1, 1);
         let held = budget.try_acquire("a.com").await.expect("hold global");
-        assert!(budget.try_acquire("b.com").await.is_none());
-        // Host pool for b must not stay permanently taken after global miss.
-        // After drop, a.com can acquire again (same host, second slot free).
+        assert!(
+            budget.try_acquire("b.com").await.is_none(),
+            "global exhausted"
+        );
         drop(held);
-        let again = budget.try_acquire("a.com").await;
-        assert!(again.is_some());
-        // And b.com is usable.
-        drop(again);
-        assert!(budget.try_acquire("b.com").await.is_some());
+        assert!(
+            budget.try_acquire("b.com").await.is_some(),
+            "host b must be free after global miss released its host permit"
+        );
     }
 
     #[tokio::test]
