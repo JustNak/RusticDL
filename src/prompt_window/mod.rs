@@ -13,6 +13,7 @@ pub use open::{
     open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
 };
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,6 +29,8 @@ use crate::settings::ProgressStyle;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
+/// Rolling speed samples for the Progress sparkline (~9s at 100ms tick).
+const SPEED_SAMPLE_CAP: usize = 90;
 
 /// Phase of the floating capture HUD.
 #[derive(Debug, Clone)]
@@ -70,9 +73,25 @@ pub struct BrowserPromptWindow {
     waiting_url_noted: bool,
     /// Progress HUD cancel in-flight (disable double-click).
     canceling: bool,
+    /// Rolling bytes/sec samples for the Progress speed sparkline.
+    speed_samples: VecDeque<u64>,
+    /// When true, skip animating sample growth (settings reduce_motion).
+    reduce_motion: bool,
 }
 
 impl BrowserPromptWindow {
+    fn push_speed_sample(&mut self, speed: u64) {
+        if self.reduce_motion {
+            // Keep a short flat trail so the chart still has shape without churn.
+            if self.speed_samples.len() >= 12 {
+                self.speed_samples.pop_front();
+            }
+        } else if self.speed_samples.len() >= SPEED_SAMPLE_CAP {
+            self.speed_samples.pop_front();
+        }
+        self.speed_samples.push_back(speed);
+    }
+
     fn release_ownership(&mut self) {
         if let CapturePhase::Progress { job_id, url } = &self.phase {
             if let Some(id) = job_id {

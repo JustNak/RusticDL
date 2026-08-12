@@ -5,8 +5,10 @@
 
 use std::path::PathBuf;
 
-use gpui::{px, Hsla, IntoElement, Styled};
-use gpui_component::progress::Progress;
+use gpui::{
+    div, prelude::FluentBuilder, px, Hsla, InteractiveElement, IntoElement, ParentElement, Styled,
+};
+use gpui_component::{h_flex, progress::Progress, v_flex, StyledExt};
 
 use crate::settings::ProgressStyle;
 
@@ -27,6 +29,83 @@ pub(super) fn capture_progress_bar(
         .h(height)
         .w_full()
         .rounded_full()
+}
+
+/// Compact bar sparkline of recent throughput (bytes/sec samples).
+pub(super) fn speed_sparkline(
+    samples: &[u64],
+    bar_color: Hsla,
+    muted: Hsla,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let max = samples.iter().copied().max().unwrap_or(0).max(1);
+    let has_data = samples.iter().any(|&s| s > 0);
+
+    v_flex()
+        .id("capture-speed-sparkline")
+        .flex_1()
+        .min_h(px(56.))
+        .w_full()
+        .gap_1()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border.opacity(0.55))
+        .bg(theme.secondary.opacity(0.35))
+        .px_2()
+        .py_1p5()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(muted)
+                        .child("Speed"),
+                )
+                .child(div().text_xs().text_color(muted).child(if has_data {
+                    "live"
+                } else {
+                    "waiting…"
+                })),
+        )
+        .child(
+            h_flex()
+                .id("sparkline-bars")
+                .flex_1()
+                .w_full()
+                .min_h(px(36.))
+                .items_end()
+                .gap_px()
+                .when(!has_data, |el| {
+                    el.child(
+                        div()
+                            .flex_1()
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(muted.opacity(0.35)),
+                    )
+                })
+                .when(has_data, |el| {
+                    el.children(samples.iter().enumerate().map(|(i, &speed)| {
+                        let t = (speed as f32 / max as f32).clamp(0.08, 1.0);
+                        let h = (36.0 * t).max(2.0);
+                        let latest = i + 1 == samples.len();
+                        div()
+                            .flex_1()
+                            .min_w(px(1.))
+                            .h(px(h))
+                            .rounded(px(1.))
+                            .bg(if latest {
+                                bar_color
+                            } else {
+                                bar_color.opacity(0.45 + 0.4 * t)
+                            })
+                    }))
+                }),
+        )
 }
 
 pub(super) fn truncate_middle(value: &str, max_chars: usize) -> String {

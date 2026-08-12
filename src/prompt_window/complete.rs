@@ -1,5 +1,7 @@
 //! Complete phase: construct, open/reveal actions, and render.
 
+use std::collections::VecDeque;
+
 use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -48,6 +50,8 @@ impl BrowserPromptWindow {
             resolved: true,
             waiting_url_noted: false,
             canceling: false,
+            speed_samples: VecDeque::new(),
+            reduce_motion: settings.reduce_motion,
         }
     }
 

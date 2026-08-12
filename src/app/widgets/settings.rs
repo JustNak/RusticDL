@@ -1,9 +1,13 @@
 use gpui::{
-    div, hsla, prelude::FluentBuilder, px, App, Context, Hsla, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    div, hsla, prelude::FluentBuilder, px, App, Context, Entity, Hsla, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 use gpui_component::{
-    h_flex, tooltip::Tooltip, v_flex, ActiveTheme, Icon, Sizable, StyledExt, Theme,
+    button::{Button, ButtonVariants},
+    h_flex,
+    input::{Input, InputState},
+    tooltip::Tooltip,
+    v_flex, ActiveTheme, Icon, Sizable, StyledExt, Theme,
 };
 
 use super::super::DownloadApp;
@@ -40,6 +44,48 @@ pub(crate) fn settings_field_label(text: &'static str, cx: &mut App) -> impl Int
         .font_semibold()
         .text_color(theme.foreground)
         .child(text)
+}
+
+/// Settings text field with an in-field ↺ reset when the draft diverges from factory default.
+pub(crate) fn settings_input_with_reset(
+    id: impl Into<SharedString>,
+    input: &Entity<InputState>,
+    current: &str,
+    default_value: &str,
+    default_label: impl Into<SharedString>,
+    app: Entity<DownloadApp>,
+    disabled: bool,
+) -> Input {
+    let dirty = current.trim() != default_value.trim();
+    let default_owned = default_value.to_string();
+    let tip: SharedString = format!("Reset to default ({})", default_label.into()).into();
+    let reset_id = id.into();
+    let input_entity = input.clone();
+
+    Input::new(input)
+        .w_full()
+        .disabled(disabled)
+        .when(dirty && !disabled, |inp| {
+            inp.suffix(
+                Button::new(reset_id)
+                    .ghost()
+                    .compact()
+                    .icon(Icon::empty().path("icons/rotate-cw.svg"))
+                    .tooltip(tip)
+                    .on_click({
+                        let input_entity = input_entity.clone();
+                        let default_owned = default_owned.clone();
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            input_entity.update(cx, |state, cx| {
+                                state.set_value(default_owned.clone(), window, cx);
+                            });
+                            // Re-render settings so the suffix can hide when clean.
+                            let _ = app.update(cx, |_, cx| cx.notify());
+                        }
+                    }),
+            )
+        })
 }
 
 /// Sub-group eyebrow (e.g. NOTIFICATIONS). Optional top hairline divider.

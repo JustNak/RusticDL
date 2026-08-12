@@ -1,14 +1,16 @@
 //! Progress phase: construct, engine controls, sync, and render.
 
+use std::collections::VecDeque;
+
 use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex, v_flex, ActiveTheme, StyledExt,
 };
 
-use super::helpers::capture_progress_bar;
+use super::helpers::{capture_progress_bar, speed_sparkline};
 use super::start_sync_timer;
-use super::{BrowserPromptWindow, CapturePhase};
+use super::{BrowserPromptWindow, CapturePhase, SPEED_SAMPLE_CAP};
 use crate::appearance::apply_appearance;
 use crate::download::{EngineCommand, EngineHandle, JobState};
 use crate::format::{format_eta, format_size, format_speed};
@@ -54,6 +56,13 @@ impl BrowserPromptWindow {
             }
         };
 
+        let mut speed_samples = VecDeque::with_capacity(SPEED_SAMPLE_CAP);
+        if let Some(j) = job.as_ref() {
+            if matches!(j.state, JobState::Downloading | JobState::Starting) && j.speed > 0 {
+                speed_samples.push_back(j.speed);
+            }
+        }
+
         window.activate_window();
         start_sync_timer(cx);
 
@@ -70,6 +79,8 @@ impl BrowserPromptWindow {
             resolved: true,
             waiting_url_noted: false,
             canceling: false,
+            speed_samples,
+            reduce_motion: settings.reduce_motion,
         }
     }
 
@@ -151,6 +162,11 @@ impl BrowserPromptWindow {
 
                 if let Some(id) = bound_id.clone() {
                     if let Some(j) = jobs.iter().find(|j| j.id == id) {
+                        if matches!(j.state, JobState::Downloading | JobState::Starting) {
+                            self.push_speed_sample(j.speed);
+                        } else if j.state == JobState::Paused {
+                            // Freeze chart — do not push new samples while paused.
+                        }
                         self.job = Some(j.clone());
                         if j.state == JobState::Completed {
                             let _ = self.ipc.try_claim_complete_hud(&id);
@@ -258,12 +274,15 @@ impl BrowserPromptWindow {
             theme.progress_bar
         };
 
+        let samples: Vec<u64> = self.speed_samples.iter().copied().collect();
+
         v_flex()
-            .gap_3()
+            .gap_2()
             .size_full()
             .child(
                 v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(div().text_sm().font_medium().child(filename))
                     .child(
                         div()
@@ -275,6 +294,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1p5()
+                    .flex_shrink_0()
                     .child(capture_progress_bar(
                         progress,
                         progress_color,
@@ -294,14 +314,23 @@ impl BrowserPromptWindow {
                     ),
             )
             .when_some(error, |el, msg| {
-                el.child(div().text_xs().text_color(theme.danger).child(msg))
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .flex_shrink_0()
+                        .child(msg),
+                )
             })
+            // Live speed sparkline fills the empty band under the progress row.
+            .child(speed_sparkline(&samples, progress_color, muted, &theme))
             .child(
                 h_flex()
                     .w_full()
                     .justify_end()
                     .gap_2()
                     .pt_1()
+                    .flex_shrink_0()
                     .when(can_pause, |el| {
                         el.child(
                             Button::new("capture-pause")

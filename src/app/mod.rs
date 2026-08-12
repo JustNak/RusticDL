@@ -245,6 +245,23 @@ impl DownloadApp {
         })
         .detach();
 
+        // Re-render settings so per-field reset icons appear when drafts diverge.
+        for input in [
+            &concurrent_input,
+            &retry_input,
+            &speed_input,
+            &excluded_hosts_input,
+            &captured_extensions_input,
+            &dir_input,
+        ] {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+
         cx.subscribe(&noise_slider, |this, _, event: &SliderEvent, cx| {
             let SliderEvent::Change(v) = event;
             this.settings.noise_intensity = v.start().round().clamp(0.0, 100.0) as u8;

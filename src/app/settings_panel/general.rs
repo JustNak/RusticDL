@@ -13,11 +13,12 @@ use gpui_component::{
 };
 
 use super::super::widgets::{
-    browse_directory, field_hint, settings_choice_row, settings_field_label, settings_subgroup,
+    browse_directory, field_hint, settings_choice_row, settings_field_label,
+    settings_input_with_reset, settings_subgroup,
 };
 use super::super::DownloadApp;
 use crate::download::reveal_in_folder;
-use crate::settings::UpdateChannel;
+use crate::settings::{Settings, UpdateChannel};
 
 impl DownloadApp {
     pub(super) fn render_settings_general(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -56,7 +57,15 @@ impl DownloadApp {
                         ),
                 )
                 .child(settings_subgroup("Limits", true, cx))
-                .child(
+                .child({
+                    let defaults = Settings::default();
+                    let app = cx.entity();
+                    let concurrent_val = self.concurrent_input.read(cx).value().to_string();
+                    let retry_val = self.retry_input.read(cx).value().to_string();
+                    let speed_val = self.speed_input.read(cx).value().to_string();
+                    let concurrent_def = defaults.max_concurrent_downloads.to_string();
+                    let retry_def = defaults.auto_retry_attempts.to_string();
+                    let speed_def = defaults.speed_limit_kib_per_second.to_string();
                     h_flex()
                         .gap_4()
                         .items_start()
@@ -65,23 +74,47 @@ impl DownloadApp {
                                 .flex_1()
                                 .gap_1p5()
                                 .child(settings_field_label("Max concurrent", cx))
-                                .child(Input::new(&self.concurrent_input).w_full()),
+                                .child(settings_input_with_reset(
+                                    "reset-max-concurrent",
+                                    &self.concurrent_input,
+                                    &concurrent_val,
+                                    &concurrent_def,
+                                    concurrent_def.clone(),
+                                    app.clone(),
+                                    false,
+                                )),
                         )
                         .child(
                             v_flex()
                                 .flex_1()
                                 .gap_1p5()
                                 .child(settings_field_label("Auto-retry attempts", cx))
-                                .child(Input::new(&self.retry_input).w_full()),
+                                .child(settings_input_with_reset(
+                                    "reset-auto-retry",
+                                    &self.retry_input,
+                                    &retry_val,
+                                    &retry_def,
+                                    retry_def.clone(),
+                                    app.clone(),
+                                    false,
+                                )),
                         )
                         .child(
                             v_flex()
                                 .flex_1()
                                 .gap_1p5()
                                 .child(settings_field_label("Speed limit (KiB/s)", cx))
-                                .child(Input::new(&self.speed_input).w_full()),
-                        ),
-                )
+                                .child(settings_input_with_reset(
+                                    "reset-speed-limit",
+                                    &self.speed_input,
+                                    &speed_val,
+                                    &speed_def,
+                                    "0 = unlimited",
+                                    app,
+                                    false,
+                                )),
+                        )
+                })
                 .child(field_hint("Speed limit: 0 means unlimited.", cx))
                 .child(settings_subgroup("Updates", true, cx))
                 .child(settings_choice_row(

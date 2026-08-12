@@ -21,5 +21,5 @@ pub(crate) use queue::{
 };
 pub(crate) use settings::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, field_hint, field_label,
-    settings_choice_row, settings_field_label, settings_subgroup,
+    settings_choice_row, settings_field_label, settings_input_with_reset, settings_subgroup,
 };
