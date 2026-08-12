@@ -38,6 +38,7 @@ await esbuild.build({
 const require = createRequire(import.meta.url);
 const {
   firefoxWebRequestDownloadCandidate,
+  shouldCaptureDownloadItem,
   MIN_CAPTURE_BYTES,
 } = require(outfile);
 
@@ -76,7 +77,7 @@ function candidate(details, settings = defaultSettings) {
 
 console.log('Firefox capture heuristics\n');
 
-// --- User's YouTube false positive ---
+// --- YouTube false positive (previous) ---
 assert(
   'rejects YouTube suggestqueries xhr with tiny attachment f.txt',
   candidate({
@@ -149,6 +150,73 @@ assert(
   }) === null,
 );
 
+// --- Nexus Mods live stats CSV (this report) ---
+const nexusStats = {
+  url: 'https://staticstats.nexusmods.com/live_download_counts/mods/8915.csv',
+  type: 'other',
+  statusCode: 200,
+  originUrl: 'https://www.nexusmods.com/skyrimspecialedition/mods/8915',
+  documentUrl: 'https://www.nexusmods.com/skyrimspecialedition/mods/8915',
+  responseHeaders: [
+    { name: 'content-type', value: 'text/plain' },
+    { name: 'access-control-allow-origin', value: '*' },
+    { name: 'cache-control', value: 'public, max-age=3600, immutable' },
+  ],
+};
+
+assert(
+  'rejects Nexus live_download_counts CSV via webRequest (text/plain + CORS)',
+  candidate(nexusStats) === null,
+);
+
+assert(
+  'rejects Nexus stats CSV even if Firefox types it as other with no MIME',
+  candidate({
+    ...nexusStats,
+    responseHeaders: [
+      { name: 'access-control-allow-origin', value: '*' },
+    ],
+  }) === null,
+);
+
+assert(
+  'rejects Nexus stats CSV on downloads.onCreated (weak csv + text/plain)',
+  shouldCaptureDownloadItem(
+    {
+      url: nexusStats.url,
+      filename: 'C:\\Users\\ZeusVeilmon\\Downloads\\8915.csv',
+      mime: 'text/plain',
+      referrer: nexusStats.documentUrl,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'rejects Nexus stats CSV on downloads.onCreated even with csv still in captured list',
+  shouldCaptureDownloadItem(
+    {
+      url: nexusStats.url,
+      filename: '8915.csv',
+      mime: '',
+      referrer: nexusStats.documentUrl,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'rejects type=other zip with no Content-Type (too noisy; let downloads API decide)',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'other',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-length', value: '5000000' },
+    ],
+  }) === null,
+);
+
 // --- Legitimate captures ---
 assert(
   'captures main_frame zip with attachment',
@@ -192,15 +260,105 @@ assert(
 );
 
 assert(
-  'captures type=other zip with no Content-Type via strong extension',
+  'captures main_frame zip with no Content-Type via strong extension',
   candidate({
     url: 'https://cdn.example.com/files/app.zip',
-    type: 'other',
+    type: 'main_frame',
     statusCode: 200,
     responseHeaders: [
       { name: 'content-length', value: '5000000' },
     ],
   })?.reason === 'strong_filename_navigation',
+);
+
+assert(
+  'captures downloads.onCreated zip by strong filename',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://cdn.example.com/files/app.zip',
+      filename: 'app.zip',
+      mime: 'application/zip',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'captures CORS main_frame pdf without Content-Disposition',
+  candidate({
+    url: 'https://cdn.example.com/docs/manual.pdf',
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/pdf' },
+      { name: 'access-control-allow-origin', value: '*' },
+      { name: 'content-length', value: '250000' },
+    ],
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'captures CORS main_frame zip without Content-Disposition',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'access-control-allow-origin', value: '*' },
+      { name: 'content-length', value: '5000000' },
+    ],
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'captures user-added log served as text/plain on onCreated',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://example.com/debug/app.log',
+      filename: 'app.log',
+      mime: 'text/plain',
+      totalBytes: 50_000,
+    },
+    {
+      ...defaultSettings,
+      capturedFileExtensions: [...defaultSettings.capturedFileExtensions, 'log'],
+    },
+  ) === true,
+);
+
+assert(
+  'captures same-origin export.csv + octet-stream when csv is still captured',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://www.example.com/account/export.csv',
+      filename: 'export.csv',
+      mime: 'application/octet-stream',
+      referrer: 'https://www.example.com/account',
+      totalBytes: 200_000,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'rejects export.csv + octet-stream when csv was dropped from captured list',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://www.example.com/account/export.csv',
+      filename: 'export.csv',
+      mime: 'application/octet-stream',
+      referrer: 'https://www.example.com/account',
+      totalBytes: 200_000,
+    },
+    {
+      ...defaultSettings,
+      capturedFileExtensions: defaultSettings.capturedFileExtensions.filter(
+        (ext) => ext !== 'csv',
+      ),
+    },
+  ) === false,
 );
 
 assert(

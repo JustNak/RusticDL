@@ -6,7 +6,7 @@ export const MAX_METADATA_LENGTH = 512;
 export const ALLOWED_URL_PROTOCOLS = ['http:', 'https:'] as const;
 export const DEFAULT_EXTENSION_EXCLUDED_HOSTS = ['web.telegram.org'] as const;
 export const DEFAULT_CAPTURED_FILE_EXTENSIONS = [
-  '7z', 'apk', 'bz2', 'cab', 'csv', 'deb', 'dmg', 'doc', 'docx', 'exe', 'gz', 'iso', 'jar',
+  '7z', 'apk', 'bz2', 'cab', 'deb', 'dmg', 'doc', 'docx', 'exe', 'gz', 'iso', 'jar',
   'msi', 'pdf', 'ppt', 'pptx', 'rar', 'rpm', 'tar', 'tgz', 'txz', 'xls', 'xlsx', 'xz', 'zip', 'zst',
 ] as const;
 

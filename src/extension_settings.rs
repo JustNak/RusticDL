@@ -3,9 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CAPTURED_FILE_EXTENSIONS: &[&str] = &[
-    "7z", "apk", "bz2", "cab", "csv", "deb", "dmg", "doc", "docx", "exe", "gz", "iso", "jar",
-    "msi", "pdf", "ppt", "pptx", "rar", "rpm", "tar", "tgz", "txz", "xls", "xlsx", "xz", "zip",
-    "zst",
+    "7z", "apk", "bz2", "cab", "deb", "dmg", "doc", "docx", "exe", "gz", "iso", "jar", "msi",
+    "pdf", "ppt", "pptx", "rar", "rpm", "tar", "tgz", "txz", "xls", "xlsx", "xz", "zip", "zst",
 ];
 
 pub const DEFAULT_EXCLUDED_HOSTS: &[&str] = &["web.telegram.org"];
