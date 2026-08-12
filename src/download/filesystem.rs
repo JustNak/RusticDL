@@ -4,6 +4,83 @@ use tokio::fs;
 
 use super::job::Job;
 
+/// Safety margin beyond remaining download bytes before preallocate is allowed.
+/// `max(64 MiB, 1% of total)`.
+pub fn preallocate_margin(total_bytes: u64) -> u64 {
+    (total_bytes / 100).max(64 * 1024 * 1024)
+}
+
+/// True when free space is enough to finish writing `remaining` bytes.
+pub fn free_space_allows_write(free: u64, remaining: u64) -> bool {
+    free > remaining
+}
+
+/// True when free space covers remaining bytes **plus** preallocate margin.
+pub fn free_space_allows_preallocate(free: u64, remaining: u64, total_bytes: u64) -> bool {
+    free > remaining.saturating_add(preallocate_margin(total_bytes))
+}
+
+/// Free bytes available on the volume containing `path` (caller-available).
+///
+/// Returns `None` when the platform API is unavailable or the call fails
+/// (fail-open for preallocate: multi may extend-on-write).
+pub async fn free_space_bytes(path: &Path) -> Option<u64> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || free_space_bytes_sync(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(windows)]
+fn free_space_bytes_sync(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // Prefer an existing directory for the query; fall back to parent or path.
+    let query = if path.is_dir() && path.exists() {
+        path.to_path_buf()
+    } else if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if parent.exists() {
+            parent.to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    let wide: Vec<u16> = query
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut free_available: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_free: u64 = 0;
+
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut free_available as *mut u64),
+            Some(&mut total_bytes as *mut u64),
+            Some(&mut total_free as *mut u64),
+        )
+    };
+
+    match result {
+        Ok(()) => Some(free_available),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(windows))]
+fn free_space_bytes_sync(_path: &Path) -> Option<u64> {
+    None
+}
+
 pub async fn ensure_parent_directory(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
@@ -505,5 +582,48 @@ mod tests {
         assert!(result.changed);
         assert_eq!(job.downloaded_bytes, 250);
         assert!((job.progress - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preallocate_margin_is_max_of_64mib_and_one_percent() {
+        assert_eq!(preallocate_margin(0), 64 * 1024 * 1024);
+        assert_eq!(preallocate_margin(100), 64 * 1024 * 1024);
+        let big = 20 * 1024 * 1024 * 1024u64; // 20 GiB → 1% = 200 MiB
+        assert_eq!(preallocate_margin(big), big / 100);
+    }
+
+    #[test]
+    fn free_space_gate_helpers() {
+        let total = 1000u64;
+        let remaining = 100u64;
+        let margin = preallocate_margin(total);
+        assert!(!free_space_allows_write(remaining, remaining));
+        assert!(free_space_allows_write(remaining + 1, remaining));
+        assert!(!free_space_allows_preallocate(
+            remaining + margin,
+            remaining,
+            total
+        ));
+        assert!(free_space_allows_preallocate(
+            remaining + margin + 1,
+            remaining,
+            total
+        ));
+    }
+
+    #[tokio::test]
+    async fn free_space_bytes_on_temp() {
+        let dir = std::env::temp_dir();
+        let free = free_space_bytes(&dir).await;
+        #[cfg(windows)]
+        {
+            let free = free.expect("GetDiskFreeSpaceExW should work on temp dir");
+            assert!(free > 0, "expected positive free space on temp volume");
+        }
+        #[cfg(not(windows))]
+        {
+            // Non-Windows: API not implemented; fail-open returns None.
+            let _ = free;
+        }
     }
 }
