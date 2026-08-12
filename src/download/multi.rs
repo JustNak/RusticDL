@@ -16,8 +16,7 @@ use tokio::time::sleep;
 use super::client::download_client;
 use super::conn_budget::ConnectionBudget;
 use super::filesystem::{
-    ensure_parent_directory, is_untracked_preallocate_hole, looks_like_preallocate_hole,
-    metadata_len, move_to_final_path,
+    ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
 };
 use super::http::{
     content_range_size_mismatch, control_outcome, progress_percent, reconnect_backoff,
@@ -33,6 +32,55 @@ use super::segment_io::{try_preallocate, SegmentFileWriter};
 
 const CONTROL_POLL: Duration = Duration::from_millis(200);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
+
+/// User-visible Resume error when a v1 map is missing or inconsistent.
+pub(crate) const RESUME_RESTART_MESSAGE: &str = "Multi-part incomplete; Restart required.";
+pub(crate) const FALLBACK_LEGACY_PARTIAL: &str = "legacy_contiguous_partial";
+pub(crate) const FALLBACK_MAP_MISSING: &str = "map_missing";
+pub(crate) const FALLBACK_MAP_INCONSISTENT: &str = "map_inconsistent";
+
+/// Normative resume policy for an existing job (before planner qualification).
+///
+/// - Convert multi→single **only** when every `written == 0` (see
+///   [`may_convert_multi_to_single`]); never because a prefix segment is complete.
+/// - Legacy v0 contiguous `.part` stays single until Restart.
+/// - v1 map missing/inconsistent → Resume error; do not invent Range offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultiResumePolicy {
+    /// Fresh v0 start, or a present consistent map (reuse — never repartition).
+    Proceed,
+    /// v0 contiguous partial — stay single until Restart.
+    LegacySingle,
+    /// `transfer_format_version >= 1` and no map.
+    MapMissing,
+    /// Map present but fails structural consistency.
+    MapInconsistent,
+}
+
+impl MultiResumePolicy {
+    pub(crate) fn fallback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Proceed => None,
+            Self::LegacySingle => Some(FALLBACK_LEGACY_PARTIAL),
+            Self::MapMissing => Some(FALLBACK_MAP_MISSING),
+            Self::MapInconsistent => Some(FALLBACK_MAP_INCONSISTENT),
+        }
+    }
+
+    pub(crate) fn is_resume_error(self) -> bool {
+        matches!(self, Self::MapMissing | Self::MapInconsistent)
+    }
+}
+
+pub(crate) fn multi_resume_policy(job: &super::job::Job) -> MultiResumePolicy {
+    match job.segment_map.as_ref() {
+        Some(map) if map.is_consistent() => MultiResumePolicy::Proceed,
+        Some(_) => MultiResumePolicy::MapInconsistent,
+        None if job.transfer_format_version >= 1 => MultiResumePolicy::MapMissing,
+        None if is_legacy_contiguous_partial(job) => MultiResumePolicy::LegacySingle,
+        None => MultiResumePolicy::Proceed,
+    }
+}
 
 /// Outcome of the multi-start map step (reuse vs fresh partition).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +108,10 @@ pub(crate) fn prepare_segment_map(
     Ok(PreparedMap::Fresh(partition(total_bytes, max_segments)))
 }
 
-fn resume_restart_required() -> DownloadError {
+pub(crate) fn resume_restart_required() -> DownloadError {
     download_error(
         FailureCategory::Resume,
-        "Multi-part incomplete; Restart required.".into(),
+        RESUME_RESTART_MESSAGE.into(),
         false,
     )
 }
@@ -85,6 +133,13 @@ pub(crate) fn all_written_zero(map: &SegmentMap) -> bool {
     map.segments.iter().all(|segment| segment.written == 0)
 }
 
+/// Convert multi→single **only** when every segment still has `written == 0`.
+/// A completed prefix (first segment full, later segments empty) is **not**
+/// convertible — retain the map and require Restart / Resume reuse.
+pub(crate) fn may_convert_multi_to_single(map: &SegmentMap) -> bool {
+    all_written_zero(map)
+}
+
 /// v0 contiguous `.part` must stay single until Restart (do not invent holes).
 pub(crate) fn is_legacy_contiguous_partial(job: &super::job::Job) -> bool {
     job.segment_map.is_none() && job.transfer_format_version == 0 && job.downloaded_bytes > 0
@@ -96,7 +151,7 @@ pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
     if is_legacy_contiguous_partial(&ctx.job) {
-        return fallback_to_single(ctx, "legacy_contiguous_partial").await;
+        return fallback_to_single(ctx, FALLBACK_LEGACY_PARTIAL).await;
     }
 
     // Disk check only for v0 / no-map (single-stream semantics).
@@ -106,12 +161,26 @@ pub async fn run_multi_segment_download(
             // Crash window after set_len, before map persist — do not metadata_len resume.
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         } else if on_disk > 0 {
-            return fallback_to_single(ctx, "legacy_contiguous_partial").await;
+            return fallback_to_single(ctx, FALLBACK_LEGACY_PARTIAL).await;
         }
     }
 
     let total = known_total(&ctx.job)?;
-    let prepared = prepare_segment_map(&ctx.job, total, ctx.multi_max_segments)?;
+    let prepared = match prepare_segment_map(&ctx.job, total, ctx.multi_max_segments) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let reason = match ctx.job.segment_map.as_ref() {
+                None => FALLBACK_MAP_MISSING,
+                Some(_) => FALLBACK_MAP_INCONSISTENT,
+            };
+            ctx.job.fallback_reason = Some(reason.to_string());
+            (ctx.on_progress)(ProgressUpdate {
+                fallback_reason: Some(reason.to_string()),
+                ..Default::default()
+            });
+            return Err(error);
+        }
+    };
     let reused = matches!(prepared, PreparedMap::Reuse(_));
     let mut map = match prepared {
         PreparedMap::Reuse(map) | PreparedMap::Fresh(map) => map,
@@ -215,7 +284,7 @@ pub async fn run_multi_segment_download(
         }
         Err((error, map)) => {
             persist_map_exit(ctx, &map, 0);
-            if all_written_zero(&map) {
+            if may_convert_multi_to_single(&map) {
                 // Windows: DeleteFile fails while SegmentFileWriter still holds the handle.
                 drop(writer);
                 if map.preallocated {
@@ -1037,7 +1106,7 @@ fn host_key_for_budget(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::download::bandwidth::GlobalBandwidthLimiter;
-    use crate::download::filesystem::reconcile_partial_progress;
+    use crate::download::filesystem::{looks_like_preallocate_hole, reconcile_partial_progress};
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use crate::download::http::ProgressCallback;
     use crate::download::job::Job;
@@ -1165,7 +1234,41 @@ mod tests {
     #[test]
     fn convert_only_when_all_written_zero() {
         assert!(all_written_zero(&two_seg_map(0, 0)));
+        assert!(may_convert_multi_to_single(&two_seg_map(0, 0)));
         assert!(!all_written_zero(&two_seg_map(1, 0)));
+        assert!(!may_convert_multi_to_single(&two_seg_map(1, 0)));
+        // Prefix-complete (first segment full, rest empty) is NOT convertible.
+        assert!(!may_convert_multi_to_single(&two_seg_map(
+            MIN_SEGMENT_SIZE,
+            0
+        )));
+    }
+
+    #[test]
+    fn resume_policy_legacy_and_map_errors() {
+        let mut job = sample_job();
+        job.downloaded_bytes = 10;
+        assert_eq!(multi_resume_policy(&job), MultiResumePolicy::LegacySingle);
+        assert_eq!(
+            multi_resume_policy(&job).fallback_reason(),
+            Some(FALLBACK_LEGACY_PARTIAL)
+        );
+
+        job.downloaded_bytes = 0;
+        job.transfer_format_version = 1;
+        assert_eq!(multi_resume_policy(&job), MultiResumePolicy::MapMissing);
+        assert!(multi_resume_policy(&job).is_resume_error());
+
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 100,
+            segment_count: 2,
+            segments: vec![],
+            preallocated: false,
+        });
+        assert_eq!(
+            multi_resume_policy(&job),
+            MultiResumePolicy::MapInconsistent
+        );
     }
 
     #[test]
@@ -1564,6 +1667,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn non_prefix_failure_keeps_map() {
+        // First segment already written (prefix complete). Remaining segment fails.
+        // Must retain the map — no multi→single conversion, no invented Range.
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = (0..total).map(|i| (i % 173) as u8).collect();
+        let (base, _seen, _handle) =
+            spawn_range_server(body.clone(), RangeServeMode::FailNonPrefix).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-np-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+
+        let mut part = vec![0u8; total];
+        part[..MIN_SEGMENT_SIZE as usize].copy_from_slice(&body[..MIN_SEGMENT_SIZE as usize]);
+        std::fs::write(&temp, &part).unwrap();
+
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target, temp.clone());
+        job.total_bytes = total as u64;
+        job.transfer_format_version = 1;
+        job.resume_supported = true;
+        job.validators.expected_size = Some(total as u64);
+        job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
+        job.downloaded_bytes = MIN_SEGMENT_SIZE;
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let err = run_transfer(ctx)
+            .await
+            .expect_err("non-prefix failure must not convert to single");
+        assert_ne!(
+            err.category,
+            FailureCategory::Internal,
+            "expected transfer error, got {err:?}"
+        );
+
+        let published = patches.lock().unwrap();
+        assert!(
+            !published.iter().any(|p| p.clear_segment_map == Some(true)),
+            "must not clear the map on non-prefix failure"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|p| p.transfer_format_version == Some(0)),
+            "must not roll back version on non-prefix failure"
+        );
+        let last_map = published
+            .iter()
+            .rev()
+            .find_map(|p| p.segment_map.clone())
+            .expect("map must stay published");
+        assert_eq!(last_map.segments[0].start, 0);
+        assert_eq!(last_map.segments[0].end, MIN_SEGMENT_SIZE - 1);
+        assert_eq!(last_map.segments[0].written, MIN_SEGMENT_SIZE);
+        assert_eq!(last_map.segments[1].start, MIN_SEGMENT_SIZE);
+        assert_eq!(last_map.segments[1].end, total as u64 - 1);
+        assert!(
+            !published.iter().any(
+                |p| p.fallback_reason.as_deref() == Some("multi_http_fallback")
+                    || p.fallback_reason.as_deref() == Some("multi_network_fallback")
+            ),
+            "convert fallback_reason must not be set when written > 0"
+        );
+        assert!(temp.exists(), "non-prefix failure must keep the .part");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[derive(Clone, Copy)]
     enum RangeServeMode {
         Honest,
@@ -1571,6 +1758,8 @@ mod tests {
         FullBodyOnNonzeroRange,
         /// Body GETs return 403 (convert-to-single path).
         ForbiddenBody,
+        /// Fail Range requests that start at/after the first segment (prefix already done).
+        FailNonPrefix,
     }
 
     async fn spawn_range_server(
@@ -1631,6 +1820,18 @@ Content-Length: 0\r\n\
                 }
 
                 let range = parse_test_range(&req);
+                if matches!(mode, RangeServeMode::FailNonPrefix) {
+                    if range.is_some_and(|(start, _)| start >= MIN_SEGMENT_SIZE) {
+                        let reply = "HTTP/1.1 416 Range Not Satisfiable\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n";
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                        continue;
+                    }
+                }
+
                 let (start, end) = match range {
                     Some((start, Some(end))) => (start as usize, end as usize),
                     Some((start, None)) => (start as usize, body.len().saturating_sub(1)),

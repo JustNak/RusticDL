@@ -6,8 +6,27 @@ use tokio::sync::Mutex;
 
 use super::super::super::filesystem::remove_partial;
 use super::super::super::http::store_control;
-use super::super::super::job::{JobState, WorkerControl};
+use super::super::super::job::{FailureCategory, Job, JobState, WorkerControl};
+use super::super::super::multi::{multi_resume_policy, RESUME_RESTART_MESSAGE};
 use super::super::{emit_jobs_locked, find_job_mut, EngineInner};
+
+/// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
+fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
+    let policy = multi_resume_policy(job);
+    if !policy.is_resume_error() {
+        return false;
+    }
+    job.state = JobState::Failed;
+    job.error = Some(RESUME_RESTART_MESSAGE.into());
+    job.failure_category = Some(FailureCategory::Resume);
+    if let Some(reason) = policy.fallback_reason() {
+        job.fallback_reason = Some(reason.to_string());
+    }
+    job.speed = 0;
+    job.eta_secs = 0;
+    job.active_connections = 0;
+    true
+}
 
 pub(super) async fn pause(inner: &Arc<Mutex<EngineInner>>, id: String) {
     let mut guard = inner.lock().await;
@@ -33,6 +52,10 @@ pub(super) async fn resume(inner: &Arc<Mutex<EngineInner>>, id: String) {
     let mut guard = inner.lock().await;
     if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
         if matches!(job.state, JobState::Paused | JobState::Canceled) {
+            if fail_if_resume_map_unusable(job) {
+                emit_jobs_locked(&guard);
+                return;
+            }
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;
@@ -121,6 +144,10 @@ pub(super) async fn retry(inner: &Arc<Mutex<EngineInner>>, id: String) {
     let mut guard = inner.lock().await;
     if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
         if matches!(job.state, JobState::Failed | JobState::Canceled) {
+            if fail_if_resume_map_unusable(job) {
+                emit_jobs_locked(&guard);
+                return;
+            }
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;
