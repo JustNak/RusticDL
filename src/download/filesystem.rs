@@ -16,6 +16,11 @@ pub fn free_space_allows_write(free: u64, remaining: u64) -> bool {
 }
 
 /// True when free space covers remaining bytes **plus** preallocate margin.
+///
+/// Two-tier free-space policy (see `segment_io::preallocate_decision`):
+/// - `free <= remaining` → Disk error (cannot finish)
+/// - `remaining < free <= remaining + margin` → multi without `set_len`
+/// - `free > remaining + margin` → preallocate allowed
 pub fn free_space_allows_preallocate(free: u64, remaining: u64, total_bytes: u64) -> bool {
     free > remaining.saturating_add(preallocate_margin(total_bytes))
 }
@@ -39,7 +44,7 @@ fn free_space_bytes_sync(path: &Path) -> Option<u64> {
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
     // Prefer an existing directory for the query; fall back to parent or path.
-    let query = if path.is_dir() && path.exists() {
+    let query = if path.is_dir() {
         path.to_path_buf()
     } else if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if parent.exists() {

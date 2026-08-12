@@ -4,6 +4,16 @@
 //! request bodies (single-stream job or multi-segment workers).
 //!
 //! Wired into the multi-segment orchestrator in a later PR; keep public API live.
+//!
+//! # Acquire order
+//! Host permit first, then global. Waiters blocked on the global pool only hold a
+//! host slot (same-host backpressure), so one saturated host cannot exhaust the
+//! process-wide pool and starve other hosts. On `try_acquire`, a failed global
+//! attempt drops the host permit via RAII.
+//!
+//! # Host map growth
+//! Per-host semaphores are retained for the process lifetime (v0.2). Idle entries
+//! are small; pruning is deferred polish.
 
 #![allow(dead_code)]
 
@@ -22,15 +32,18 @@ pub struct ConnectionBudget {
 
 /// RAII permits for both global and per-host slots. Drop to release.
 pub struct ConnectionPermit {
-    _global: OwnedSemaphorePermit,
     _host: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
 }
 
 impl ConnectionBudget {
-    /// Build a budget from runtime config caps (clamped to ≥1).
+    /// Build a budget from runtime config caps.
+    ///
+    /// Clamps match [`crate::download::engine::EngineRuntimeConfig::sanitize`]:
+    /// total ∈ [1, 256], per-host ∈ [1, 64], per-host ≤ total.
     pub fn new(max_total: u32, max_per_host: u32) -> Arc<Self> {
-        let max_total = max_total.max(1) as usize;
-        let max_per_host = (max_per_host.max(1) as usize).min(max_total);
+        let max_total = max_total.clamp(1, 256) as usize;
+        let max_per_host = max_per_host.clamp(1, 64).min(max_total as u32) as usize;
         Arc::new(Self {
             global: Arc::new(Semaphore::new(max_total)),
             max_total,
@@ -51,11 +64,26 @@ impl ConnectionBudget {
         self.global.available_permits()
     }
 
-    /// Block until both a global and a per-host slot are held for `host`.
+    /// Normalize host for the per-host map (HTTP hostnames are case-insensitive).
     ///
-    /// Global is acquired first, then per-host, so total in-flight never exceeds
-    /// the process-wide cap even while waiting on a busy host.
+    /// Lowercases the whole key. Port, if present (`host:port`), is preserved so
+    /// different ports stay independent pools.
+    pub fn normalize_host(host: &str) -> String {
+        host.trim().to_ascii_lowercase()
+    }
+
+    /// Block until both a per-host and a global slot are held for `host`.
+    ///
+    /// Host is acquired first, then global (see module docs).
     pub async fn acquire(self: &Arc<Self>, host: &str) -> ConnectionPermit {
+        let key = Self::normalize_host(host);
+        let host_sem = self.host_semaphore(&key).await;
+
+        let host = host_sem
+            .acquire_owned()
+            .await
+            .expect("connection budget host semaphore closed");
+
         let global = self
             .global
             .clone()
@@ -63,44 +91,36 @@ impl ConnectionBudget {
             .await
             .expect("connection budget global semaphore closed");
 
-        let host_sem = {
-            let mut hosts = self.hosts.lock().await;
-            hosts
-                .entry(host.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
-                .clone()
-        };
-
-        let host = host_sem
-            .acquire_owned()
-            .await
-            .expect("connection budget host semaphore closed");
-
         ConnectionPermit {
-            _global: global,
             _host: host,
+            _global: global,
         }
     }
 
     /// Non-blocking attempt. Returns `None` if either pool is exhausted.
+    ///
+    /// Host first: if global is exhausted after host succeeds, the host permit
+    /// is dropped and released immediately.
     pub async fn try_acquire(self: &Arc<Self>, host: &str) -> Option<ConnectionPermit> {
-        let global = self.global.clone().try_acquire_owned().ok()?;
+        let key = Self::normalize_host(host);
+        let host_sem = self.host_semaphore(&key).await;
+        let host = host_sem.try_acquire_owned().ok()?;
 
-        let host_sem = {
-            let mut hosts = self.hosts.lock().await;
-            hosts
-                .entry(host.to_string())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
-                .clone()
-        };
-
-        match host_sem.try_acquire_owned() {
-            Ok(host) => Some(ConnectionPermit {
-                _global: global,
+        match self.global.clone().try_acquire_owned() {
+            Ok(global) => Some(ConnectionPermit {
                 _host: host,
+                _global: global,
             }),
-            Err(_) => None, // global dropped → released
+            Err(_) => None, // host dropped → released
         }
+    }
+
+    async fn host_semaphore(&self, key: &str) -> Arc<Semaphore> {
+        let mut hosts = self.hosts.lock().await;
+        hosts
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
+            .clone()
     }
 }
 
@@ -137,6 +157,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn host_fail_releases_does_not_leak_slots() {
+        // max_total=2, max_per_host=1: fill host a, fail second a, still allow b.
+        let budget = ConnectionBudget::new(2, 1);
+        let a1 = budget.try_acquire("a.com").await.expect("first a");
+        assert_eq!(budget.available_global(), 1);
+
+        assert!(
+            budget.try_acquire("a.com").await.is_none(),
+            "host a saturated"
+        );
+        // Host-first: host miss never took global. Global-first bug would also
+        // release global on host miss; this tight total makes a leak visible if
+        // someone reintroduces global-first without release.
+        assert_eq!(
+            budget.available_global(),
+            1,
+            "failed host acquire must not consume global"
+        );
+
+        let b1 = budget
+            .try_acquire("b.com")
+            .await
+            .expect("b.com must get the remaining global slot");
+        assert_eq!(budget.available_global(), 0);
+        drop(a1);
+        drop(b1);
+        assert_eq!(budget.available_global(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn global_fail_releases_host_permit() {
+        // max_total=1, max_per_host=2: hold the only global on a.com; second try
+        // on b.com gets host but must release it when global fails so a.com can
+        // still take a second host slot after release.
+        let budget = ConnectionBudget::new(1, 2);
+        let held = budget.try_acquire("a.com").await.expect("hold global");
+        assert!(budget.try_acquire("b.com").await.is_none());
+        // Host pool for b must not stay permanently taken after global miss.
+        // After drop, a.com can acquire again (same host, second slot free).
+        drop(held);
+        let again = budget.try_acquire("a.com").await;
+        assert!(again.is_some());
+        // And b.com is usable.
+        drop(again);
+        assert!(budget.try_acquire("b.com").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn host_key_is_case_insensitive() {
+        let budget = ConnectionBudget::new(4, 1);
+        let a = budget.try_acquire("Example.COM").await.expect("first");
+        assert!(
+            budget.try_acquire("example.com").await.is_none(),
+            "mixed case must share per-host cap"
+        );
+        assert!(budget.try_acquire("EXAMPLE.com:443").await.is_some());
+        drop(a);
+        assert!(budget.try_acquire("example.com").await.is_some());
+    }
+
+    #[test]
+    fn normalize_host_lowercases() {
+        assert_eq!(
+            ConnectionBudget::normalize_host("  CDN.Example.COM "),
+            "cdn.example.com"
+        );
+        assert_eq!(
+            ConnectionBudget::normalize_host("Host.Example:8443"),
+            "host.example:8443"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn acquire_waits_until_release() {
         let budget = ConnectionBudget::new(1, 1);
         let held = budget.acquire("host.example").await;
@@ -161,12 +254,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clamps_zero_to_one() {
+    async fn clamps_zero_to_one_and_upper_bounds() {
         let budget = ConnectionBudget::new(0, 0);
         assert_eq!(budget.max_per_host(), 1);
         assert_eq!(budget.max_total(), 1);
         let p = budget.try_acquire("x").await;
         assert!(p.is_some());
         assert!(budget.try_acquire("x").await.is_none());
+
+        let hi = ConnectionBudget::new(10_000, 10_000);
+        assert_eq!(hi.max_total(), 256);
+        assert_eq!(hi.max_per_host(), 64);
     }
 }

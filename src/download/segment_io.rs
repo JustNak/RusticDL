@@ -4,6 +4,11 @@
 //! short `std::sync::Mutex` around `seek_write` (Windows) / seek+write (other).
 //!
 //! Consumed by multi-segment transfer (later PR); keep public API live.
+//!
+//! # Async runtime
+//! All methods take a blocking mutex and perform disk IO. Call from a blocking
+//! context (`tokio::task::spawn_blocking` / dedicated pool), not on a tokio
+//! worker under multi-segment load.
 
 #![allow(dead_code)]
 
@@ -18,6 +23,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::windows::fs::FileExt;
 
 /// Shared handle for multi-segment positioned writes into one `.part` file.
+///
+/// **Blocking:** see module docs — use `spawn_blocking` from async workers.
 pub struct SegmentFileWriter {
     file: Mutex<File>,
 }
@@ -38,9 +45,11 @@ impl SegmentFileWriter {
     /// Write `data` starting at `offset`, hard-capped so no byte past
     /// `end_inclusive` is written.
     ///
-    /// Returns the number of bytes written (may be less than `data.len()` when
-    /// the end-cap truncates). Zero-length `data` is a no-op. Writing with
-    /// `offset` past the end-cap returns `InvalidInput`.
+    /// Returns the number of bytes written. A value less than `data.len()` means
+    /// the **end-cap truncated** the buffer — the returned prefix is fully
+    /// committed (short OS writes are retried inside the lock). Zero-length
+    /// `data` is a no-op. Writing with `offset` past the end-cap returns
+    /// `InvalidInput`.
     pub fn write_at(&self, offset: u64, data: &[u8], end_inclusive: u64) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -58,15 +67,17 @@ impl SegmentFileWriter {
             ));
         }
 
-        let allowed = (end_exclusive - offset) as usize;
-        let to_write = &data[..data.len().min(allowed)];
+        // Portable: never cast a u64 span larger than usize to usize first.
+        let max_len = (end_exclusive - offset).min(data.len() as u64) as usize;
+        let to_write = &data[..max_len];
 
         let mut file = self
             .file
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "segment file lock poisoned"))?;
 
-        write_at_locked(&mut file, offset, to_write)
+        write_all_at_locked(&mut file, offset, to_write)?;
+        Ok(to_write.len())
     }
 
     /// Flush OS buffers for this file (data only; metadata may lag).
@@ -88,16 +99,54 @@ impl SegmentFileWriter {
     }
 }
 
+/// Loop until the entire slice is written (or hard-error). Mirrors `write_all`.
 #[cfg(windows)]
-fn write_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<usize> {
-    // FileExt::seek_write takes &self.
-    file.seek_write(data, offset)
+fn write_all_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < data.len() {
+        // FileExt::seek_write takes &self.
+        let n = file.seek_write(&data[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-fn write_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<usize> {
+fn write_all_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
-    file.write(data)
+    file.write_all(data)
+}
+
+/// Pure free-space decision for preallocate (unit-testable without disk API).
+///
+/// - `Err(())` → insufficient free space for remaining (Disk)
+/// - `Ok(false)` → skip preallocate (unknown free / below margin)
+/// - `Ok(true)` → proceed with `set_len`
+pub fn preallocate_decision(
+    free: Option<u64>,
+    remaining: u64,
+    total_bytes: u64,
+) -> Result<bool, ()> {
+    use super::filesystem::{free_space_allows_preallocate, free_space_allows_write};
+
+    match free {
+        None => Ok(false),
+        Some(free) => {
+            if !free_space_allows_write(free, remaining) {
+                Err(())
+            } else if !free_space_allows_preallocate(free, remaining, total_bytes) {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+    }
 }
 
 /// Preallocate `path` to `total_bytes` only when free space is known and
@@ -115,23 +164,18 @@ pub async fn try_preallocate(
     total_bytes: u64,
     remaining_to_write: u64,
 ) -> Result<bool, String> {
-    use super::filesystem::{
-        free_space_allows_preallocate, free_space_allows_write, free_space_bytes,
-    };
+    use super::filesystem::free_space_bytes;
 
     let free = free_space_bytes(path).await;
-    match free {
-        None => Ok(false),
-        Some(free) => {
-            if !free_space_allows_write(free, remaining_to_write) {
-                return Err(format!(
-                    "Not enough free disk space (need {remaining_to_write} bytes free, have {free})."
-                ));
-            }
-            if !free_space_allows_preallocate(free, remaining_to_write, total_bytes) {
-                return Ok(false);
-            }
-
+    match preallocate_decision(free, remaining_to_write, total_bytes) {
+        Err(()) => {
+            let free = free.unwrap_or(0);
+            Err(format!(
+                "Not enough free disk space (need {remaining_to_write} bytes free, have {free})."
+            ))
+        }
+        Ok(false) => Ok(false),
+        Ok(true) => {
             let path = path.to_path_buf();
             tokio::task::spawn_blocking(move || {
                 let writer = SegmentFileWriter::open(&path)
@@ -188,6 +232,20 @@ mod tests {
     }
 
     #[test]
+    fn write_at_full_buffer_commits_entire_capped_slice() {
+        let path = temp_part();
+        let writer = SegmentFileWriter::open(&path).unwrap();
+        let buf = vec![0xCCu8; 4096];
+        let n = writer.write_at(0, &buf, 4095).unwrap();
+        assert_eq!(n, 4096, "full capped slice must be committed");
+        writer.flush_sync_data().unwrap();
+        drop(writer);
+        let data = fs::read(&path).unwrap();
+        assert_eq!(data, buf);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn two_threads_non_overlapping_writes() {
         let path = temp_part();
         let writer = Arc::new(SegmentFileWriter::open(&path).unwrap());
@@ -230,5 +288,26 @@ mod tests {
         drop(writer);
         assert_eq!(fs::metadata(&path).unwrap().len(), 1024);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preallocate_decision_tiers() {
+        let total = 1000u64;
+        let remaining = 100u64;
+        assert_eq!(preallocate_decision(None, remaining, total), Ok(false));
+        assert_eq!(
+            preallocate_decision(Some(remaining), remaining, total),
+            Err(())
+        );
+        assert_eq!(
+            preallocate_decision(Some(remaining + 1), remaining, total),
+            Ok(false),
+            "fits write but not margin → soft skip"
+        );
+        let margin = super::super::filesystem::preallocate_margin(total);
+        assert_eq!(
+            preallocate_decision(Some(remaining + margin + 1), remaining, total),
+            Ok(true)
+        );
     }
 }
