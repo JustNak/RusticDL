@@ -5,10 +5,11 @@
 //!
 //! Staged flow (main app UI in `update_flow`):
 //! 1. Query the GitHub Releases API for the latest tag + assets.
-//! 2. Compare against the built-in app version and surface an available-update dialog.
-//! 3. On user confirm (“Install and restart”), flush app state, spawn **RusticDL
-//!    Updater** with the setup download URL, then quit. The updater shows progress,
-//!    runs NSIS `/S`, and relaunches this app.
+//! 2. Compare against the built-in app version and surface toast stages:
+//!    Checking → You're up to date | Update available [Update] → Restart [Restart].
+//! 3. On Restart, flush app state, spawn **RusticDL Updater** with the setup
+//!    download URL, then quit. The updater shows progress, runs NSIS `/S`, and
+//!    relaunches this app.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,7 +40,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone)]
 pub enum UpdateCheck {
     /// Installed version is already the latest (or newer, e.g. dev builds).
-    UpToDate { current: String, latest: String },
+    UpToDate {
+        #[allow(dead_code)]
+        current: String,
+        #[allow(dead_code)]
+        latest: String,
+    },
     /// A newer release is available.
     Available(UpdateInfo),
 }
@@ -49,9 +55,12 @@ pub enum UpdateCheck {
 pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
+    /// GitHub release title (reserved for richer update UI).
+    #[allow(dead_code)]
     pub release_name: String,
     pub html_url: String,
-    /// Truncated release body from GitHub (shown in the available-update dialog).
+    /// Truncated release body from GitHub (reserved for richer update UI).
+    #[allow(dead_code)]
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
