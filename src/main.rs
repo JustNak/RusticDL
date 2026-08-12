@@ -10,6 +10,7 @@ mod format;
 mod ipc;
 mod notifications;
 mod persistence;
+mod browser_popup_chrome;
 mod prompt_window;
 mod settings;
 mod single_instance;

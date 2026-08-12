@@ -51,7 +51,9 @@ use crate::notifications::{
     InAppToastKind, OsNotifyBuffer, PendingOsTerminal, TerminalKind,
 };
 use crate::persistence::{save_jobs, save_settings, AppPaths};
-use crate::prompt_window::open_browser_prompt_window;
+use crate::prompt_window::{
+    open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
+};
 use crate::settings::{
     AccentPreset, AppTheme, CornerRadiusScale, OsNotifyMode, ProgressStyle, Settings, SortColumn,
     SortDirection, UiDensity, WindowLayout, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY,
@@ -114,6 +116,8 @@ pub struct DownloadApp {
     last_window_layout_save: Instant,
     /// Browser ask-mode prompt currently shown in its dedicated window.
     browser_prompt_open_id: Option<String>,
+    /// Browser-handoff job ids that should re-open Complete if Progress was closed early.
+    browser_watch_complete_ids: Vec<String>,
     /// Queue snapshot differs from last successful disk write.
     jobs_dirty: bool,
     /// Throttle progress-only state.json writes.
@@ -378,8 +382,10 @@ impl DownloadApp {
                         // Flush a debounced window-layout write after the user stops resizing.
                         app.flush_window_layout_if_due();
                         app.flush_jobs_save_if_due();
-                        // Dedicated prompt windows open even if the main UI is idle.
+                        // Dedicated prompt / progress / complete windows even if main UI is idle.
                         app.poll_browser_prompt(cx);
+                        app.poll_browser_progress(cx);
+                        app.poll_browser_complete(cx);
                         // Second-instance / extension show_window while hidden to tray.
                         app.poll_hidden_window_actions(cx);
                     })
@@ -459,6 +465,7 @@ impl DownloadApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             browser_prompt_open_id: None,
+            browser_watch_complete_ids: Vec::new(),
             jobs_dirty: false,
             last_jobs_save: Instant::now()
                 .checked_sub(Duration::from_secs(2))
@@ -1233,20 +1240,94 @@ impl DownloadApp {
         if let Some(id) = self.browser_prompt_open_id.clone() {
             if !self.ipc.is_prompt_pending(&id) {
                 self.browser_prompt_open_id = None;
+            } else {
+                // One confirm at a time.
+                return;
             }
-            return;
         }
 
         let Some(prompt) = self.ipc.claim_next_prompt_for_ui() else {
             return;
         };
         let prompt_id = prompt.id.clone();
-        let opened = open_browser_prompt_window(prompt, self.ipc.clone(), &self.settings, cx);
+        let opened = open_browser_prompt_window(
+            prompt,
+            self.ipc.clone(),
+            self.engine.clone(),
+            &self.settings,
+            cx,
+        );
         if opened.is_some() {
             self.browser_prompt_open_id = Some(prompt_id);
         } else {
             self.browser_prompt_open_id = None;
         }
+    }
+
+    /// Open floating progress HUDs for browser handoffs (auto mode + confirm morph fallback).
+    fn poll_browser_progress(&mut self, cx: &mut Context<Self>) {
+        // Always adopt watch ids so Complete re-open works for Confirm morph too.
+        for job_id in self.ipc.take_progress_watch_jobs() {
+            if !self.browser_watch_complete_ids.iter().any(|id| id == &job_id) {
+                self.browser_watch_complete_ids.push(job_id);
+            }
+        }
+
+        if !self.settings.extension.show_progress_after_handoff {
+            // Drain open-queue so ids do not pile up while the setting is off.
+            let _ = self.ipc.take_pending_progress_jobs();
+            return;
+        }
+
+        for job_id in self.ipc.take_pending_progress_jobs() {
+            let _ = open_browser_progress_window(
+                job_id,
+                self.ipc.clone(),
+                self.engine.clone(),
+                &self.settings,
+                cx,
+            );
+        }
+    }
+
+    /// If Progress was closed early, re-open a Complete HUD when the job finishes.
+    fn poll_browser_complete(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.extension.show_progress_after_handoff {
+            self.browser_watch_complete_ids.clear();
+            return;
+        }
+        if self.browser_watch_complete_ids.is_empty() {
+            return;
+        }
+
+        let mut still_watch = Vec::new();
+        for job_id in self.browser_watch_complete_ids.drain(..) {
+            let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
+                // Job removed — stop watching.
+                continue;
+            };
+            match job.state {
+                JobState::Completed => {
+                    // Progress HUD still open will morph itself; avoid a second window.
+                    if self.ipc.is_progress_hud_owned(&job_id) {
+                        still_watch.push(job_id);
+                    } else {
+                        let _ = open_browser_complete_window(
+                            job.clone(),
+                            self.ipc.clone(),
+                            self.engine.clone(),
+                            &self.settings,
+                            cx,
+                        );
+                    }
+                }
+                JobState::Failed | JobState::Canceled => {
+                    // Terminal non-success: do not show Complete.
+                }
+                _ => still_watch.push(job_id),
+            }
+        }
+        self.browser_watch_complete_ids = still_watch;
     }
 
     fn set_theme_draft(&mut self, theme: AppTheme, window: &mut Window, cx: &mut Context<Self>) {
@@ -1543,6 +1624,8 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.poll_browser_prompt(cx);
+        self.poll_browser_progress(cx);
+        self.poll_browser_complete(cx);
         self.apply_pending_tray_actions(window, cx);
         self.apply_pending_update_dialog(window, cx);
         if self.ipc.take_show_window_request() {

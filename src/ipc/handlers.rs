@@ -258,7 +258,20 @@ async fn engine_enqueue(
     });
 
     match tokio::time::timeout(ENQUEUE_REPLY_TIMEOUT, reply_rx).await {
-        Ok(Ok(outcome)) => HostResponse::enqueue_result(request_id, outcome),
+        Ok(Ok(outcome)) => {
+            // Open floating progress HUD for newly queued browser handoffs.
+            if outcome.status == EnqueueStatus::Queued {
+                let show_progress = bridge
+                    .inner
+                    .lock()
+                    .ok()
+                    .is_some_and(|g| g.extension_settings.show_progress_after_handoff);
+                if show_progress {
+                    bridge.enqueue_progress_job(outcome.job_id.clone());
+                }
+            }
+            HostResponse::enqueue_result(request_id, outcome)
+        }
         Ok(Err(_)) => HostResponse::error(
             request_id,
             "INTERNAL_ERROR",

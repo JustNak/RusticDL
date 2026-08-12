@@ -560,7 +560,7 @@ impl DownloadApp {
                 ))
                 .child(settings_choice_row(
                     "Show progress after handoff",
-                    Some("Focus or surface RusticDL after a browser handoff."),
+                    Some("Show a floating progress window after browser capture."),
                     h_flex()
                         .gap_2()
                         .child(

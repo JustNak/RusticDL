@@ -48,7 +48,12 @@ pub enum EngineCommand {
     },
     Pause(String),
     Resume(String),
-    Cancel(String),
+    /// Stop a job. When `delete_partial` is true, remove the `.part` file after
+    /// the worker exits (or immediately if no worker is running).
+    Cancel {
+        id: String,
+        delete_partial: bool,
+    },
     Retry(String),
     Restart(String),
     Remove {

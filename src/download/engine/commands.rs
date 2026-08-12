@@ -223,21 +223,65 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             emit_jobs_locked(&guard);
             guard.wake.notify_one();
         }
-        EngineCommand::Cancel(id) => {
-            let mut guard = inner.lock().await;
-            if let Some(ctrl) = guard.controls.get(&id) {
-                store_control(ctrl, WorkerControl::Canceled);
-            }
-            if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
-                if !job.state.is_terminal() || job.state == JobState::Paused {
+        EngineCommand::Cancel {
+            id,
+            delete_partial,
+        } => {
+            let immediate_partial = {
+                let mut guard = inner.lock().await;
+                if let Some(ctrl) = guard.controls.get(&id) {
+                    store_control(ctrl, WorkerControl::Canceled);
+                }
+                let worker_running = guard.active.contains_key(&id);
+                let temp_path = guard
+                    .jobs
+                    .iter()
+                    .find(|j| j.id == id)
+                    .map(|j| j.temp_path.clone());
+
+                let Some(job) = find_job_mut(&mut guard.jobs, &id) else {
+                    emit_jobs_locked(&guard);
+                    return;
+                };
+
+                // Already terminal: optional leftover .part cleanup only.
+                let immediate = if job.state.is_terminal() {
+                    if delete_partial && !worker_running {
+                        temp_path
+                    } else {
+                        None
+                    }
+                } else {
+                    // Queued / Paused: mark Canceled now. In-flight Starting/Downloading:
+                    // worker finalizer sets Canceled after control flag is observed.
                     if !matches!(job.state, JobState::Downloading | JobState::Starting) {
                         job.state = JobState::Canceled;
                         job.speed = 0;
                         job.eta_secs = 0;
                     }
-                }
+
+                    if delete_partial {
+                        if worker_running {
+                            if let Some(path) = temp_path {
+                                guard.pending_partial_deletes.insert(id.clone(), path);
+                            }
+                            None
+                        } else {
+                            guard.handoff_auth.remove(&id);
+                            temp_path
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                emit_jobs_locked(&guard);
+                immediate
+            };
+
+            if let Some(path) = immediate_partial {
+                remove_partial(&path).await;
             }
-            emit_jobs_locked(&guard);
         }
         EngineCommand::Retry(id) => {
             let mut guard = inner.lock().await;
@@ -721,6 +765,90 @@ mod tests {
 
         let jobs = next_jobs(&mut events).await;
         assert_eq!(jobs.len(), 2);
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_with_delete_partial_removes_part_file() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/partial.bin", JobState::Paused, &dir);
+        // Simulate a leftover partial.
+        std::fs::write(&job.temp_path, b"partial-bytes").expect("write part");
+        assert!(job.temp_path.exists());
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+        job.state = JobState::Queued;
+
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        // Consume initial JobsChanged from spawn if any; then cancel.
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: true,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        let canceled = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(canceled.state, JobState::Canceled);
+        // Give async remove_partial a moment.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!part.exists(), ".part must be deleted on cancel cleanup");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_without_delete_partial_keeps_part_file() {
+        let dir = temp_dir();
+        let job = sample_job("https://example.com/keep.bin", JobState::Paused, &dir);
+        std::fs::write(&job.temp_path, b"keep-me").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: false,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        assert_eq!(
+            jobs.iter().find(|j| j.id == id).map(|j| j.state),
+            Some(JobState::Canceled)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(part.exists(), "partial retained when delete_partial is false");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn double_cancel_is_idempotent() {
+        let dir = temp_dir();
+        let job = sample_job("https://example.com/once.bin", JobState::Paused, &dir);
+        let id = job.id.clone();
+        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: true,
+        });
+        let _ = next_jobs(&mut events).await;
+
+        engine.send(EngineCommand::Cancel {
+            id: id.clone(),
+            delete_partial: true,
+        });
+        // Should not panic; job stays Canceled.
+        let jobs = tokio::time::timeout(Duration::from_millis(200), next_jobs(&mut events))
+            .await
+            .unwrap_or_else(|_| Vec::new());
+        if let Some(j) = jobs.iter().find(|j| j.id == id) {
+            assert_eq!(j.state, JobState::Canceled);
+        }
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

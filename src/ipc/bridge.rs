@@ -1,6 +1,6 @@
 //! Shared IPC bridge state between the UI and the named-pipe server.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -86,6 +86,16 @@ pub(crate) struct IpcState {
     pub(crate) active_prompt_id: Option<String>,
     /// Set by `show_window` IPC; UI polls and activates the main window.
     pub(crate) show_window_requested: bool,
+    /// Job ids from browser handoff that should open the progress HUD.
+    pub(crate) pending_progress_job_ids: VecDeque<String>,
+    /// Job ids to watch for Complete re-open (even if Progress HUD owns them).
+    pub(crate) pending_progress_watch_ids: VecDeque<String>,
+    /// Job ids already bound to an open capture HUD (avoid double windows).
+    pub(crate) progress_hud_owned_jobs: HashSet<String>,
+    /// URLs where Confirm morph is waiting to bind a newly enqueued job.
+    pub(crate) progress_hud_waiting_urls: HashSet<String>,
+    /// Completed jobs for which the Complete HUD was already shown (once per id).
+    pub(crate) complete_hud_shown: HashSet<String>,
 }
 
 impl IpcBridge {
@@ -99,6 +109,11 @@ impl IpcBridge {
                 prompt_queue: VecDeque::new(),
                 active_prompt_id: None,
                 show_window_requested: false,
+                pending_progress_job_ids: VecDeque::new(),
+                pending_progress_watch_ids: VecDeque::new(),
+                progress_hud_owned_jobs: HashSet::new(),
+                progress_hud_waiting_urls: HashSet::new(),
+                complete_hud_shown: HashSet::new(),
             })),
             engine,
             paths,
@@ -218,5 +233,144 @@ impl IpcBridge {
             guard.settings.clone(),
             guard.jobs.clone(),
         ))
+    }
+
+    /// Queue a browser-handoff job for the floating progress HUD (deduped, capped).
+    pub fn enqueue_progress_job(&self, job_id: String) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if !guard
+            .pending_progress_watch_ids
+            .iter()
+            .any(|id| id == &job_id)
+        {
+            if guard.pending_progress_watch_ids.len() >= 40 {
+                let _ = guard.pending_progress_watch_ids.pop_front();
+            }
+            guard.pending_progress_watch_ids.push_back(job_id.clone());
+        }
+        if guard
+            .pending_progress_job_ids
+            .iter()
+            .any(|id| id == &job_id)
+        {
+            return;
+        }
+        // Cap so a runaway extension cannot grow unbounded.
+        if guard.pending_progress_job_ids.len() >= 20 {
+            let _ = guard.pending_progress_job_ids.pop_front();
+        }
+        guard.pending_progress_job_ids.push_back(job_id);
+    }
+
+    /// Drain job ids that should be watched for Complete re-open.
+    pub fn take_progress_watch_jobs(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .ok()
+            .map(|mut guard| guard.pending_progress_watch_ids.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drain pending progress job ids that still need a new HUD window.
+    ///
+    /// Skips jobs already owned by a HUD and jobs whose URL is being bound by
+    /// a Confirm→Progress morph (those windows claim the job themselves).
+    pub fn take_pending_progress_jobs(&self) -> Vec<String> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let jobs = guard.jobs.clone();
+        let mut open = Vec::new();
+        let mut keep = VecDeque::new();
+        while let Some(id) = guard.pending_progress_job_ids.pop_front() {
+            if guard.progress_hud_owned_jobs.contains(&id) {
+                continue;
+            }
+            let waiting = jobs
+                .iter()
+                .find(|j| j.id == id)
+                .is_some_and(|j| guard.progress_hud_waiting_urls.contains(&j.url));
+            if waiting {
+                // Confirm morph will bind; leave id for a later claim if morph abandons.
+                keep.push_back(id);
+                continue;
+            }
+            open.push(id);
+        }
+        guard.pending_progress_job_ids = keep;
+        open
+    }
+
+    /// Snapshot of current jobs for floating capture windows (progress/complete).
+    pub fn jobs_snapshot(&self) -> Vec<Job> {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| guard.jobs.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn note_progress_waiting_url(&self, url: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.progress_hud_waiting_urls.insert(url.to_string());
+        }
+    }
+
+    pub fn clear_progress_waiting_url(&self, url: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.progress_hud_waiting_urls.remove(url);
+        }
+    }
+
+    /// Mark a job as shown in a progress HUD. Returns false if already owned.
+    pub fn try_own_progress_job(&self, job_id: &str) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        if guard.progress_hud_owned_jobs.contains(job_id) {
+            return false;
+        }
+        guard.progress_hud_owned_jobs.insert(job_id.to_string());
+        // Drop from pending queue if present.
+        guard.pending_progress_job_ids.retain(|id| id != job_id);
+        true
+    }
+
+    pub fn release_progress_job(&self, job_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.progress_hud_owned_jobs.remove(job_id);
+        }
+    }
+
+    pub fn is_progress_hud_owned(&self, job_id: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|g| g.progress_hud_owned_jobs.contains(job_id))
+    }
+
+    /// Returns true the first time Complete should be shown for this job.
+    pub fn try_claim_complete_hud(&self, job_id: &str) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        if guard.complete_hud_shown.contains(job_id) {
+            return false;
+        }
+        // Cap memory for long-running sessions.
+        if guard.complete_hud_shown.len() >= 200 {
+            guard.complete_hud_shown.clear();
+        }
+        guard.complete_hud_shown.insert(job_id.to_string());
+        true
+    }
+
+    pub fn show_progress_after_handoff(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .is_some_and(|g| g.extension_settings.show_progress_after_handoff)
     }
 }
