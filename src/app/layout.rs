@@ -7,8 +7,12 @@ pub(crate) const COL_ETA_W: f32 = 56.0;
 pub(crate) const COL_SIZE_W: f32 = 92.0;
 /// Single overflow control — no multi-icon action strip.
 pub(crate) const COL_ACTIONS_W: f32 = 40.0;
-/// Status color dot beside the filename (tooltip shows the full label).
-pub(crate) const STATUS_DOT: f32 = 9.0;
+/// File-type icon tile (status badge overlays bottom-right).
+pub(crate) const FILE_ICON_W: f32 = 24.0;
+/// Status color badge size on the file-type tile.
+pub(crate) const STATUS_BADGE: f32 = 8.0;
+/// Legacy alias — header/row spacer used the old status-dot width.
+pub(crate) const STATUS_DOT: f32 = FILE_ICON_W;
 /// Keep at least this much list height when the detail panel is open.
 pub(crate) const LIST_MIN_H: f32 = 140.0;
 /// Hard cap for the selected-job detail panel (also clamped vs viewport).

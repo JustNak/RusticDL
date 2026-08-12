@@ -11,8 +11,8 @@ use gpui_component::{
 
 use super::layout::{QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W};
 use super::widgets::{
-    ellipsize_name, metric_cell, name_char_budget, soft_tooltip, status_color, status_dot,
-    styled_progress,
+    ellipsize_name, file_type_status_tile, metric_cell, name_char_budget, soft_tooltip,
+    status_color, styled_progress,
 };
 use super::DownloadApp;
 use crate::download::{open_path, reveal_in_folder, EngineCommand, Job, JobState};
@@ -116,24 +116,34 @@ pub(crate) fn render_job_row(
             cx.notify();
             cx.stop_propagation();
         }))
-        // Status as a color dot (tooltip = full label), then the filename.
-        .child(status_dot(&id, status, accent, theme.muted_foreground))
+        // File-type tile with status badge, then the filename (+ progress under name).
+        .child(file_type_status_tile(
+            &id,
+            &job.filename,
+            status,
+            accent,
+            &theme,
+        ))
         .child(
-            // Name takes remaining width; metrics stay fixed and compact.
+            // Name takes remaining width; metrics stay fixed so every row shares
+            // the same name column width (no per-filename width stretch).
             v_flex()
                 .flex_1()
-                .gap_1p5()
                 .min_w_0()
+                .max_w_full()
+                .gap_1()
                 .justify_center()
-                .child(h_flex().w_full().min_w_0().items_center().child({
+                .overflow_hidden()
+                .child({
                     // Explicit "..." when too long; hover shows the full name.
                     let tip_color = theme.muted_foreground;
                     div()
                         .id(SharedString::from(format!("job-name-{id}")))
-                        .flex_1()
+                        .w_full()
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_sm()
                         .font_semibold()
                         .text_color(theme.foreground)
@@ -141,7 +151,7 @@ pub(crate) fn render_job_row(
                             soft_tooltip(filename_tip.clone(), tip_color, window, cx)
                         })
                         .child(filename_label)
-                }))
+                })
                 .when(show_progress, |el| {
                     el.child(
                         h_flex()

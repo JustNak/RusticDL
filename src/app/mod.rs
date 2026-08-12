@@ -717,10 +717,6 @@ impl DownloadApp {
         let id = self.primary_selected_id()?;
         self.jobs.iter().find(|j| j.id == id)
     }
-
-    fn filtered_count(&self) -> usize {
-        filter_jobs(&self.jobs, self.filter.as_index()).len()
-    }
 }
 
 impl Drop for DownloadApp {
