@@ -17,7 +17,7 @@ pub(crate) use path::{browse_directory, shorten_path_display};
 pub(crate) use progress::styled_progress;
 pub(crate) use queue::{
     ellipsize_name, file_type_status_tile, metric_cell, name_char_budget, sortable_header,
-    status_chip, status_color, status_dot, status_tag,
+    status_chip, status_color, status_tag,
 };
 pub(crate) use settings::{
     accent_custom_swatch, accent_hsl_slider_row, accent_preset_swatch, field_hint, field_label,

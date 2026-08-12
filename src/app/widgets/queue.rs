@@ -8,7 +8,7 @@ use gpui_component::{
 
 use super::super::layout::{
     QueueColumns, COL_ACTIONS_W, COL_DATE_W, COL_ETA_W, COL_SIZE_W, COL_SPEED_W, FILE_ICON_W,
-    STATUS_BADGE, STATUS_DOT,
+    STATUS_BADGE,
 };
 use super::super::DownloadApp;
 use super::chrome::soft_tooltip;
@@ -128,26 +128,6 @@ pub(crate) fn status_tag(status: &'static str, tone: i32) -> Tag {
         4 => Tag::danger().small().child(status),
         _ => Tag::secondary().small().child(status),
     }
-}
-
-/// Compact circular status indicator. Hover shows the full status label.
-pub(crate) fn status_dot(
-    job_id: &str,
-    status: &'static str,
-    color: Hsla,
-    tip_color: Hsla,
-) -> impl IntoElement {
-    let label: SharedString = status.into();
-    div()
-        .id(SharedString::from(format!("status-dot-{job_id}")))
-        .flex_shrink_0()
-        .w(px(STATUS_DOT))
-        .h(px(STATUS_DOT))
-        .rounded_full()
-        .bg(color)
-        .border_1()
-        .border_color(color.opacity(0.45))
-        .tooltip(move |window, cx| soft_tooltip(label.clone(), tip_color, window, cx))
 }
 
 /// File-type group used for queue row icons.
