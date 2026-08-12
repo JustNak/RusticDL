@@ -31,6 +31,11 @@ const CONTROL_POLL: Duration = Duration::from_millis(200);
 pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const MAX_REDIRECTS: u32 = 10;
 
+/// Nested mid-transfer reconnect before worker-level `RETRY_DELAYS`.
+const RECONNECT_MAX: u32 = 5;
+const RECONNECT_BASE: Duration = Duration::from_millis(200);
+const RECONNECT_CAP: Duration = Duration::from_secs(2);
+
 const CONTROL_CONTINUE: u8 = 0;
 const CONTROL_PAUSED: u8 = 1;
 const CONTROL_CANCELED: u8 = 2;
@@ -262,9 +267,6 @@ pub async fn run_http_download(
 pub async fn run_http_download_with_ctx(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
-    let limiter = ctx.limiter.clone();
-    let fsync_on_pause = ctx.fsync_on_pause;
-
     ensure_parent_directory(&ctx.job.target_path)
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
@@ -310,374 +312,628 @@ pub async fn run_http_download_with_ctx(
         }
     };
 
-    // Follow redirects manually (client has Policy::none); start from pinned URL.
-    let (response, final_url) = fetch_with_redirects(
-        &client,
-        &ctx.job.url,
-        &ctx.resolved_url,
-        existing_bytes,
-        &ctx.job.validators,
-        &ctx.control,
-        ctx.handoff_auth.as_ref(),
-    )
-    .await?;
-    ctx.resolved_url = final_url;
-    let current_url = ctx.resolved_url.clone();
-    let job = &ctx.job;
-    let control = &ctx.control;
-    let on_progress = &ctx.on_progress;
+    let job_url = ctx.job.url.clone();
+    // Pinned resolved URL (updated after redirects); handoff still keyed off job_url.
+    let mut current_url = ctx.resolved_url.clone();
+    let mut validators = ctx.job.validators.clone();
+    let mut target_path = ctx.job.target_path.clone();
+    let mut temp_path = ctx.job.temp_path.clone();
+    let mut filename = ctx.job.filename.clone();
+    // Mutated on full-replace so reconnect oracle matches the progress patch (v1+ → 0).
+    let mut transfer_format_version = ctx.job.transfer_format_version;
+    let mut total_bytes: u64;
+    let mut resume_supported = ctx.job.resume_supported;
 
-    if let Some(outcome) = control_outcome(control) {
-        return Ok(outcome);
-    }
+    // Short reconnect budget resets each `run_http_download_with_ctx` call (worker
+    // long-retry does not share the budget). Cumulative job counter is preserved.
+    let mut short_reconnects: u32 = 0;
+    let mut cumulative_reconnects = ctx.job.reconnect_count;
+    let reconnect_baseline = ctx.job.reconnect_count;
 
-    let status = response.status();
-    // 416 Range Not Satisfiable — non-retryable without Restart.
-    if status == StatusCode::RANGE_NOT_SATISFIABLE && existing_bytes > 0 {
-        return Err(download_error(
-            FailureCategory::Resume,
-            format!(
-                "Server rejected resume at {existing_bytes} bytes. Use Restart to download from zero."
-            ),
-            false,
-        ));
-    }
+    let control = ctx.control.clone();
+    let on_progress = ctx.on_progress.clone();
+    let handoff_auth = ctx.handoff_auth.clone();
+    let limiter = ctx.limiter.clone();
 
-    if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-        let retryable = should_retry_status(status);
-        let mut message = format!("Download failed with HTTP {status}.");
-        if status == StatusCode::BAD_GATEWAY || status == StatusCode::SERVICE_UNAVAILABLE {
-            message.push_str(
-                " The CDN/origin rejected this request — often a bad or glued download token/URL, \
-or a temporary gateway issue. Confirm the full URL is a single link (not two pasted together).",
-            );
-        } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
-            message.push_str(
-                " Access denied — the link may require a browser session, cookies, or a fresh token.",
-            );
-        } else if status == StatusCode::NOT_FOUND {
-            message.push_str(" File not found — the link may have expired.");
+    loop {
+        if let Some(outcome) = control_outcome(&control) {
+            return Ok(outcome);
         }
-        return Err(download_error(FailureCategory::Http, message, retryable));
-    }
 
-    let resume_supported = status == StatusCode::PARTIAL_CONTENT
-        || response
+        let fetch_result = fetch_with_redirects(
+            &client,
+            &job_url,
+            &current_url,
+            existing_bytes,
+            &validators,
+            &control,
+            handoff_auth.as_ref(),
+        )
+        .await;
+
+        let (response, final_url) = match fetch_result {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Connect errors on reconnect GET only (not the first attempt).
+                match prepare_reconnect(
+                    &error,
+                    /*is_fetch_phase=*/ true,
+                    short_reconnects,
+                    existing_bytes,
+                    resume_supported,
+                    transfer_format_version,
+                    &temp_path,
+                    &control,
+                    &on_progress,
+                    &mut cumulative_reconnects,
+                )
+                .await
+                {
+                    ReconnectAction::Retry { offset } => {
+                        short_reconnects += 1;
+                        existing_bytes = offset;
+                        continue;
+                    }
+                    ReconnectAction::Control(outcome) => return Ok(outcome),
+                    ReconnectAction::GiveUp => return Err(error),
+                }
+            }
+        };
+        current_url = final_url;
+        ctx.resolved_url = current_url.clone();
+
+        if let Some(outcome) = control_outcome(&control) {
+            return Ok(outcome);
+        }
+
+        let status = response.status();
+        // 416 Range Not Satisfiable — non-retryable without Restart.
+        if status == StatusCode::RANGE_NOT_SATISFIABLE && existing_bytes > 0 {
+            return Err(download_error(
+                FailureCategory::Resume,
+                format!(
+                    "Server rejected resume at {existing_bytes} bytes. Use Restart to download from zero."
+                ),
+                false,
+            ));
+        }
+
+        if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
+            let retryable = should_retry_status(status);
+            let mut message = format!("Download failed with HTTP {status}.");
+            if status == StatusCode::BAD_GATEWAY || status == StatusCode::SERVICE_UNAVAILABLE {
+                message.push_str(
+                    " The CDN/origin rejected this request — often a bad or glued download token/URL, \
+or a temporary gateway issue. Confirm the full URL is a single link (not two pasted together).",
+                );
+            } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+                message.push_str(
+                    " Access denied — the link may require a browser session, cookies, or a fresh token.",
+                );
+            } else if status == StatusCode::NOT_FOUND {
+                message.push_str(" File not found — the link may have expired.");
+            }
+            // Retryable HTTP on reconnect GET can use short budget; first attempt bubbles.
+            let error = download_error(FailureCategory::Http, message, retryable);
+            if retryable {
+                match prepare_reconnect(
+                    &error,
+                    /*is_fetch_phase=*/ true,
+                    short_reconnects,
+                    existing_bytes,
+                    resume_supported,
+                    transfer_format_version,
+                    &temp_path,
+                    &control,
+                    &on_progress,
+                    &mut cumulative_reconnects,
+                )
+                .await
+                {
+                    ReconnectAction::Retry { offset } => {
+                        short_reconnects += 1;
+                        existing_bytes = offset;
+                        continue;
+                    }
+                    ReconnectAction::Control(outcome) => return Ok(outcome),
+                    ReconnectAction::GiveUp => return Err(error),
+                }
+            }
+            return Err(error);
+        }
+
+        resume_supported = status == StatusCode::PARTIAL_CONTENT
+            || response
+                .headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
+            || resume_supported;
+
+        // 200 with partial on disk: full replace (Range ignored or If-Range entity changed).
+        let mut full_replace = false;
+        if existing_bytes > 0 && status != StatusCode::PARTIAL_CONTENT {
+            existing_bytes = 0;
+            full_replace = true;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+
+        // Parse Content-Range once (206 resume + optional * total).
+        let parsed_range = response
             .headers()
-            .get(ACCEPT_RANGES)
+            .get(CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
+            .and_then(parse_content_range);
 
-    // 200 with partial on disk: full replace (Range ignored or If-Range entity changed).
-    let mut full_replace = false;
-    if existing_bytes > 0 && status != StatusCode::PARTIAL_CONTENT {
-        existing_bytes = 0;
-        full_replace = true;
-        let _ = tokio::fs::remove_file(&job.temp_path).await;
-    }
-
-    let parsed_range = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_range);
-
-    // 206 resume: require parseable Content-Range whose start matches expected offset
-    // (fail-closed — RFC requires Content-Range on 206; misaligned append is worse).
-    if status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
-        match parsed_range {
-            Some((start, _end, _total)) if start == existing_bytes => {
-                let incoming = content_validators_from_headers(response.headers(), 0);
-                if resume_identity_mismatch(&job.validators, &incoming) {
+        // 206 resume: require parseable Content-Range whose start matches expected offset
+        // (fail-closed — RFC requires Content-Range on 206; misaligned append is worse).
+        if status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
+            match parsed_range {
+                Some((start, _end, _total)) if start == existing_bytes => {
+                    let incoming = content_validators_from_headers(response.headers(), 0);
+                    if resume_identity_mismatch(&validators, &incoming) {
+                        return Err(download_error(
+                            FailureCategory::Resume,
+                            "Remote content identity changed (ETag or Last-Modified). Use Restart."
+                                .into(),
+                            false,
+                        ));
+                    }
+                }
+                Some((start, _end, _total)) => {
                     return Err(download_error(
                         FailureCategory::Resume,
-                        "Remote content identity changed (ETag or Last-Modified). Use Restart."
-                            .into(),
+                        format!(
+                            "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
+                        ),
+                        false,
+                    ));
+                }
+                None => {
+                    return Err(download_error(
+                        FailureCategory::Resume,
+                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
                         false,
                     ));
                 }
             }
-            Some((start, _end, _total)) => {
+        }
+
+        // Numeric Content-Range total vs stored expected_size (ignore * totals).
+        // Skip expected_size check after full replace — identity is being rebuilt.
+        let range_total = parsed_range.and_then(|(_s, _e, total)| total);
+        if !full_replace {
+            if let Some((total, expected)) =
+                content_range_size_mismatch(range_total, validators.expected_size)
+            {
                 return Err(download_error(
                     FailureCategory::Resume,
                     format!(
-                        "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
+                        "Remote size changed ({total} bytes vs expected {expected}). Use Restart."
                     ),
                     false,
                 ));
             }
-            None => {
-                return Err(download_error(
-                    FailureCategory::Resume,
-                    "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                    false,
-                ));
-            }
         }
-    }
 
-    // Numeric Content-Range total vs stored expected_size (ignore * totals).
-    // Skip expected_size check after full replace — identity is being rebuilt.
-    let range_total = parsed_range.and_then(|(_s, _e, total)| total);
-    if !full_replace {
-        if let Some((total, expected)) =
-            content_range_size_mismatch(range_total, job.validators.expected_size)
+        total_bytes = response
+            .content_length()
+            .map(|len| {
+                if status == StatusCode::PARTIAL_CONTENT {
+                    existing_bytes.saturating_add(len)
+                } else {
+                    len
+                }
+            })
+            .unwrap_or(0);
+
+        // Prefer numeric Content-Range total when present; `*` leaves content-length math.
+        if let Some((_start, _end, Some(total))) = parsed_range {
+            total_bytes = total;
+        }
+
+        // Capture validators for this response; keep local copy for reconnect If-Range.
+        // Full replace: snapshot replaces identity; else field-wise merge.
+        let validators_patch = if full_replace {
+            let snap = content_validators_from_headers(response.headers(), total_bytes);
+            validators = snap.clone();
+            Some(snap)
+        } else {
+            let patch = content_validators_patch(response.headers(), total_bytes);
+            if let Some(ref p) = patch {
+                validators.merge_present(p.clone());
+            }
+            patch
+        };
+
+        // Filename / path discovery (first response or when still generic).
+        if let Some(header_name) = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_disposition_filename)
         {
-            return Err(download_error(
-                FailureCategory::Resume,
-                format!("Remote size changed ({total} bytes vs expected {expected}). Use Restart."),
-                false,
-            ));
-        }
-    }
-
-    let mut total_bytes = response
-        .content_length()
-        .map(|len| {
-            if status == StatusCode::PARTIAL_CONTENT {
-                existing_bytes.saturating_add(len)
-            } else {
-                len
+            if filename == "download.bin"
+                || filename_from_url_fallback(&job_url).as_deref() == Some(filename.as_str())
+            {
+                filename = header_name;
+                if let Some(parent) = target_path.parent() {
+                    let new_target = parent.join(&filename);
+                    let new_temp = super::filesystem::temp_path_for(&new_target);
+                    if temp_path != new_temp && temp_path.exists() {
+                        let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                    }
+                    target_path = new_target;
+                    temp_path = new_temp;
+                }
             }
-        })
-        .unwrap_or(0);
+        } else if let Some(from_final) = filename_from_response_url(&current_url) {
+            if filename == "download.bin" {
+                filename = from_final;
+                if let Some(parent) = target_path.parent() {
+                    let new_target = parent.join(&filename);
+                    let new_temp = super::filesystem::temp_path_for(&new_target);
+                    if temp_path != new_temp && temp_path.exists() {
+                        let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                    }
+                    target_path = new_target;
+                    temp_path = new_temp;
+                }
+            }
+        }
 
-    // Prefer numeric Content-Range total when present; `*` leaves content-length math.
-    if let Some((_start, _end, Some(total))) = parsed_range {
-        total_bytes = total;
-    }
-
-    // Normal path: empty capture → None so apply leaves stored validators alone
-    // (CDN 206 without identity headers but size matches → continue).
-    // Full replace: snapshot from 200 and *replace* (not merge) so stale ETags clear.
-    let validators = if full_replace {
-        Some(content_validators_from_headers(
-            response.headers(),
+        let mut starting = ProgressUpdate::starting_tick(
+            existing_bytes,
             total_bytes,
-        ))
-    } else {
-        content_validators_patch(response.headers(), total_bytes)
-    };
-
-    let mut target_path = job.target_path.clone();
-    let mut temp_path = job.temp_path.clone();
-    let mut filename = job.filename.clone();
-
-    if let Some(header_name) = response
-        .headers()
-        .get(CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_disposition_filename)
-    {
-        if job.filename == "download.bin"
-            || filename_from_url_fallback(&job.url).as_deref() == Some(job.filename.as_str())
-        {
-            filename = header_name;
-            if let Some(parent) = target_path.parent() {
-                target_path = parent.join(&filename);
-                temp_path = super::filesystem::temp_path_for(&target_path);
-                // If we already wrote to the old temp path, rename it.
-                if job.temp_path != temp_path && job.temp_path.exists() {
-                    let _ = tokio::fs::rename(&job.temp_path, &temp_path).await;
-                }
-            }
+            Some(filename.clone()),
+            Some(target_path.clone()),
+            Some(temp_path.clone()),
+            Some(resume_supported),
+            validators_patch,
+        );
+        if full_replace {
+            // Replace identity + clear multi version; surface a non-fatal user notice.
+            starting.replace_validators = Some(true);
+            starting.transfer_format_version = Some(0);
+            starting.toast = Some(FULL_REPLACE_NOTICE.into());
         }
-    } else if let Some(from_final) = filename_from_response_url(&current_url) {
-        if job.filename == "download.bin" {
-            filename = from_final;
-            if let Some(parent) = target_path.parent() {
-                target_path = parent.join(&filename);
-                temp_path = super::filesystem::temp_path_for(&target_path);
-                if job.temp_path != temp_path && job.temp_path.exists() {
-                    let _ = tokio::fs::rename(&job.temp_path, &temp_path).await;
-                }
-            }
+        if cumulative_reconnects > reconnect_baseline {
+            starting.reconnect_count = Some(cumulative_reconnects);
         }
-    }
+        on_progress(starting);
 
-    let mut starting = ProgressUpdate::starting_tick(
-        existing_bytes,
-        total_bytes,
-        Some(filename.clone()),
-        Some(target_path.clone()),
-        Some(temp_path.clone()),
-        Some(resume_supported),
-        validators,
-    );
-    if full_replace {
-        starting.replace_validators = Some(true);
-        starting.transfer_format_version = Some(0);
-        starting.toast = Some(FULL_REPLACE_NOTICE.into());
-    }
-    on_progress(starting);
+        ensure_parent_directory(&temp_path)
+            .await
+            .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-    ensure_parent_directory(&temp_path)
-        .await
-        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
-
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(existing_bytes == 0)
-        .open(&temp_path)
-        .await
-        .map_err(|error| {
-            download_error(
-                FailureCategory::Disk,
-                format!("Could not open partial download file: {error}"),
-                false,
-            )
-        })?;
-
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-    if existing_bytes > 0 {
-        writer
-            .seek(std::io::SeekFrom::Start(existing_bytes))
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(existing_bytes == 0)
+            .open(&temp_path)
             .await
             .map_err(|error| {
                 download_error(
                     FailureCategory::Disk,
-                    format!("Could not seek partial download file: {error}"),
+                    format!("Could not open partial download file: {error}"),
                     false,
                 )
             })?;
-    }
 
-    let mut downloaded = existing_bytes;
-    let mut stream = response.bytes_stream();
-    let mut last_progress = Instant::now();
-    let mut window_start = Instant::now();
-    let mut window_bytes: u64 = 0;
-
-    on_progress(ProgressUpdate::downloading_tick(
-        downloaded,
-        total_bytes,
-        0,
-        0,
-        progress_percent(downloaded, total_bytes),
-    ));
-
-    loop {
-        if let Some(outcome) = control_outcome(&control) {
-            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
-            // Align UI with flushed bytes (may be ahead of last PROGRESS_INTERVAL tick).
-            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
-            return Ok(outcome);
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        if existing_bytes > 0 {
+            writer
+                .seek(std::io::SeekFrom::Start(existing_bytes))
+                .await
+                .map_err(|error| {
+                    download_error(
+                        FailureCategory::Disk,
+                        format!("Could not seek partial download file: {error}"),
+                        false,
+                    )
+                })?;
         }
 
-        let next = tokio::select! {
-            item = stream.next() => item,
-            _ = sleep(CONTROL_POLL) => {
-                continue;
-            }
-        };
+        let mut downloaded = existing_bytes;
+        let mut stream = response.bytes_stream();
+        let mut last_progress = Instant::now();
+        let mut window_start = Instant::now();
+        let mut window_bytes: u64 = 0;
 
-        let Some(chunk_result) = next else {
-            break;
-        };
-
-        let chunk = chunk_result.map_err(|error| {
-            let retryable = error.is_timeout()
-                || error.is_connect()
-                || error.is_request()
-                || error.is_body()
-                || error.is_decode();
-            download_error(
-                FailureCategory::Network,
-                format!("Download stream failed: {}", format_reqwest_error(&error)),
-                retryable,
-            )
-        })?;
-
-        if chunk.is_empty() {
-            continue;
-        }
-
-        // Pre-write: charge the shared limiter (may burst up to bucket capacity).
-        // Interruptible for pause/cancel, but once the stream has delivered a chunk
-        // it must be written — dropping it leaves a Range-resume hole.
-        // On abort mid-throttle some quanta may already be charged; do not re-acquire
-        // the full length (would double-bill). Slight under-charge on the pause edge
-        // is acceptable.
-        let acquired = limiter.acquire(chunk.len(), Some(&control)).await;
-
-        writer.write_all(&chunk).await.map_err(disk_write_error)?;
-
-        let n = chunk.len() as u64;
-        downloaded = downloaded.saturating_add(n);
-        window_bytes = window_bytes.saturating_add(n);
-
-        if !acquired {
-            let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
-            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
-            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
-            return Ok(outcome);
-        }
-
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
-            let speed = (window_bytes as f64 / elapsed) as u64;
-            window_start = Instant::now();
-            window_bytes = 0;
-
-            let eta_secs = if speed > 0 && total_bytes > downloaded {
-                (total_bytes - downloaded) / speed
-            } else {
-                0
-            };
-
-            on_progress(ProgressUpdate::downloading_tick(
-                downloaded,
-                total_bytes,
-                speed,
-                eta_secs,
-                progress_percent(downloaded, total_bytes),
-            ));
-            last_progress = Instant::now();
-        }
-    }
-
-    if let Some(outcome) = control_outcome(&control) {
-        flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
-        emit_control_exit_progress(&on_progress, downloaded, total_bytes);
-        return Ok(outcome);
-    }
-
-    writer
-        .flush()
-        .await
-        .map_err(|error| disk_write_error(error))?;
-    drop(writer);
-
-    if total_bytes > 0 && downloaded < total_bytes {
-        return Err(download_error(
-            FailureCategory::Network,
-            format!("Download incomplete ({downloaded} of {total_bytes} bytes)."),
-            true,
+        on_progress(ProgressUpdate::downloading_tick(
+            downloaded,
+            total_bytes,
+            0,
+            0,
+            progress_percent(downloaded, total_bytes),
         ));
+
+        // Body read loop — body/network errors trigger mid-transfer reconnect.
+        let body_result: Result<DownloadOutcome, DownloadError> = async {
+            loop {
+                if let Some(outcome) = control_outcome(&control) {
+                    flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                    emit_control_exit_progress(&on_progress, downloaded, total_bytes);
+                    return Ok(outcome);
+                }
+
+                let next = tokio::select! {
+                    item = stream.next() => item,
+                    _ = sleep(CONTROL_POLL) => {
+                        continue;
+                    }
+                };
+
+                let Some(chunk_result) = next else {
+                    break;
+                };
+
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(error) => {
+                        // Durable flush + close before reconnect: oracle must not run
+                        // ahead of disk, and metadata_len needs a closed handle.
+                        writer.flush().await.map_err(|e| disk_write_error(e))?;
+                        drop(writer);
+                        let retryable = error.is_timeout()
+                            || error.is_connect()
+                            || error.is_request()
+                            || error.is_body()
+                            || error.is_decode();
+                        return Err(download_error(
+                            FailureCategory::Network,
+                            format!("Download stream failed: {}", format_reqwest_error(&error)),
+                            retryable,
+                        ));
+                    }
+                };
+
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                // Pre-write: charge the shared limiter (may burst up to bucket capacity).
+                // Interruptible for pause/cancel, but once the stream has delivered a chunk
+                // it must be written — dropping it leaves a Range-resume hole.
+                let acquired = limiter.acquire(chunk.len(), Some(control.as_ref())).await;
+
+                writer.write_all(&chunk).await.map_err(disk_write_error)?;
+
+                let n = chunk.len() as u64;
+                downloaded = downloaded.saturating_add(n);
+                window_bytes = window_bytes.saturating_add(n);
+
+                if !acquired {
+                    let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
+                    flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                    emit_control_exit_progress(&on_progress, downloaded, total_bytes);
+                    return Ok(outcome);
+                }
+
+                if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                    let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
+                    let speed = (window_bytes as f64 / elapsed) as u64;
+                    window_start = Instant::now();
+                    window_bytes = 0;
+
+                    let eta_secs = if speed > 0 && total_bytes > downloaded {
+                        (total_bytes - downloaded) / speed
+                    } else {
+                        0
+                    };
+
+                    on_progress(ProgressUpdate::downloading_tick(
+                        downloaded,
+                        total_bytes,
+                        speed,
+                        eta_secs,
+                        progress_percent(downloaded, total_bytes),
+                    ));
+                    last_progress = Instant::now();
+                }
+            }
+
+            if let Some(outcome) = control_outcome(&control) {
+                flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                emit_control_exit_progress(&on_progress, downloaded, total_bytes);
+                return Ok(outcome);
+            }
+
+            writer
+                .flush()
+                .await
+                .map_err(|error| disk_write_error(error))?;
+            drop(writer);
+
+            if total_bytes > 0 && downloaded < total_bytes {
+                return Err(download_error(
+                    FailureCategory::Network,
+                    format!("Download incomplete ({downloaded} of {total_bytes} bytes)."),
+                    true,
+                ));
+            }
+
+            let final_path = move_to_final_path(&temp_path, &target_path)
+                .await
+                .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+
+            on_progress(ProgressUpdate::completed_tick(
+                downloaded,
+                if total_bytes == 0 {
+                    downloaded
+                } else {
+                    total_bytes
+                },
+                final_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string()),
+                Some(final_path),
+                Some(temp_path.clone()),
+                Some(resume_supported),
+            ));
+
+            Ok(DownloadOutcome::Completed)
+        }
+        .await;
+
+        match body_result {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => {
+                if let Some(outcome) = control_outcome(&control) {
+                    return Ok(outcome);
+                }
+                // Keep local downloaded for oracle when version-gated (v1+).
+                existing_bytes = downloaded;
+                match prepare_reconnect(
+                    &error,
+                    /*is_fetch_phase=*/ false,
+                    short_reconnects,
+                    existing_bytes,
+                    resume_supported,
+                    transfer_format_version,
+                    &temp_path,
+                    &control,
+                    &on_progress,
+                    &mut cumulative_reconnects,
+                )
+                .await
+                {
+                    ReconnectAction::Retry { offset } => {
+                        short_reconnects += 1;
+                        existing_bytes = offset;
+                        continue;
+                    }
+                    ReconnectAction::Control(outcome) => return Ok(outcome),
+                    ReconnectAction::GiveUp => return Err(error),
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of a mid-transfer reconnect decision.
+enum ReconnectAction {
+    Retry { offset: u64 },
+    Control(DownloadOutcome),
+    GiveUp,
+}
+
+/// Decide whether to short-reconnect, sleep (control-polled), and refresh offset.
+async fn prepare_reconnect(
+    error: &DownloadError,
+    is_fetch_phase: bool,
+    short_reconnects: u32,
+    existing_bytes: u64,
+    resume_supported: bool,
+    transfer_format_version: u32,
+    temp_path: &std::path::Path,
+    control: &AtomicU8,
+    on_progress: &ProgressCallback,
+    cumulative_reconnects: &mut u32,
+) -> ReconnectAction {
+    if !can_mid_transfer_reconnect(
+        error,
+        is_fetch_phase,
+        short_reconnects,
+        existing_bytes,
+        resume_supported,
+    ) {
+        return ReconnectAction::GiveUp;
     }
 
-    let final_path = move_to_final_path(&temp_path, &target_path)
-        .await
-        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+    *cumulative_reconnects = cumulative_reconnects.saturating_add(1);
+    let next_short = short_reconnects + 1;
 
-    on_progress(ProgressUpdate::completed_tick(
-        downloaded,
-        if total_bytes == 0 {
-            downloaded
-        } else {
-            total_bytes
-        },
-        final_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string()),
-        Some(final_path),
-        Some(temp_path),
-        Some(resume_supported),
-    ));
+    on_progress(ProgressUpdate {
+        downloaded_bytes: Some(existing_bytes),
+        speed: Some(0),
+        eta_secs: Some(0),
+        reconnect_count: Some(*cumulative_reconnects),
+        state_hint: Some(ProgressHint::Starting),
+        ..Default::default()
+    });
 
-    Ok(DownloadOutcome::Completed)
+    let delay = reconnect_backoff(next_short);
+    if let Some(outcome) = sleep_interruptible(control, delay).await {
+        return ReconnectAction::Control(outcome);
+    }
+
+    // Refresh offset from progress oracle after durable flush.
+    let offset = refresh_reconnect_offset(transfer_format_version, existing_bytes, temp_path).await;
+
+    ReconnectAction::Retry { offset }
+}
+
+/// Nested reconnect eligibility (before worker `RETRY_DELAYS`).
+fn can_mid_transfer_reconnect(
+    error: &DownloadError,
+    is_fetch_phase: bool,
+    short_reconnects: u32,
+    existing_bytes: u64,
+    resume_supported: bool,
+) -> bool {
+    if short_reconnects >= RECONNECT_MAX {
+        return false;
+    }
+    if !is_reconnectable_error(error) {
+        return false;
+    }
+    // Initial connect/GET failures bubble to worker retry; only reconnect-GET connect
+    // errors use the short budget (`short_reconnects > 0`).
+    if is_fetch_phase && short_reconnects == 0 {
+        return false;
+    }
+    // Ranges usable: from zero always; partial needs known resume support.
+    ranges_usable_for_reconnect(existing_bytes, resume_supported)
+}
+
+fn is_reconnectable_error(error: &DownloadError) -> bool {
+    error.retryable
+        && matches!(
+            error.category,
+            FailureCategory::Network | FailureCategory::Http
+        )
+}
+
+fn ranges_usable_for_reconnect(existing_bytes: u64, resume_supported: bool) -> bool {
+    existing_bytes == 0 || resume_supported
+}
+
+/// Short backoff: base 200ms, doubles per attempt, cap 2s.
+fn reconnect_backoff(attempt_1_based: u32) -> Duration {
+    let shift = attempt_1_based.saturating_sub(1).min(16);
+    let ms = (RECONNECT_BASE.as_millis() as u64).saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(RECONNECT_CAP.as_millis() as u64))
+}
+
+/// Sleep `total` while polling control every `CONTROL_POLL` (pause/cancel aborts).
+async fn sleep_interruptible(control: &AtomicU8, total: Duration) -> Option<DownloadOutcome> {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if let Some(outcome) = control_outcome(control) {
+            return Some(outcome);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let slice = (deadline - now).min(CONTROL_POLL);
+        sleep(slice).await;
+    }
+}
+
+/// Progress oracle after reconnect: v1+ keeps tracked bytes; v0 uses `.part` length.
+async fn refresh_reconnect_offset(
+    transfer_format_version: u32,
+    tracked_downloaded: u64,
+    temp_path: &std::path::Path,
+) -> u64 {
+    if transfer_format_version >= 1 {
+        tracked_downloaded
+    } else {
+        metadata_len(temp_path).await.unwrap_or(tracked_downloaded)
+    }
 }
 
 async fn fetch_with_redirects(
@@ -1778,5 +2034,170 @@ mod tests {
         job.filename = "download.bin".into();
         let patch = preflight_progress_patch(&job, &info);
         assert_eq!(patch.filename.as_deref(), Some("server-name.zip"));
+    }
+
+    #[test]
+    fn reconnect_backoff_200ms_to_2s() {
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(200));
+        assert_eq!(reconnect_backoff(2), Duration::from_millis(400));
+        assert_eq!(reconnect_backoff(3), Duration::from_millis(800));
+        assert_eq!(reconnect_backoff(4), Duration::from_millis(1600));
+        assert_eq!(reconnect_backoff(5), Duration::from_secs(2)); // 3200 capped
+        assert_eq!(reconnect_backoff(6), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn can_reconnect_body_network_incomplete() {
+        let body_err = download_error(
+            FailureCategory::Network,
+            "Download stream failed: reset".into(),
+            true,
+        );
+        let incomplete = download_error(
+            FailureCategory::Network,
+            "Download incomplete (100 of 500 bytes).".into(),
+            true,
+        );
+        // Mid-body with resume support.
+        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&incomplete, false, 0, 100, true));
+        // Exhausted short budget.
+        assert!(!can_mid_transfer_reconnect(
+            &body_err,
+            false,
+            RECONNECT_MAX,
+            100,
+            true
+        ));
+        // Partial without range support — not seamless reconnect.
+        assert!(!can_mid_transfer_reconnect(&body_err, false, 0, 100, false));
+        // From zero always ranges-usable.
+        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 0, false));
+    }
+
+    #[test]
+    fn can_reconnect_fetch_only_after_prior_short_reconnect() {
+        let connect = download_error(
+            FailureCategory::Network,
+            "Could not connect: timed out".into(),
+            true,
+        );
+        // First attempt connect → worker RETRY_DELAYS.
+        assert!(!can_mid_transfer_reconnect(&connect, true, 0, 50, true));
+        // Reconnect GET connect error → short budget.
+        assert!(can_mid_transfer_reconnect(&connect, true, 1, 50, true));
+    }
+
+    #[test]
+    fn non_retryable_and_disk_errors_not_reconnectable() {
+        let resume = download_error(
+            FailureCategory::Resume,
+            "Server rejected resume".into(),
+            false,
+        );
+        let disk = download_error(FailureCategory::Disk, "Could not write".into(), false);
+        assert!(!can_mid_transfer_reconnect(&resume, false, 0, 10, true));
+        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 10, true));
+        assert!(!is_reconnectable_error(&resume));
+        assert!(!is_reconnectable_error(&disk));
+    }
+
+    #[test]
+    fn ranges_usable_for_reconnect_rules() {
+        assert!(ranges_usable_for_reconnect(0, false));
+        assert!(ranges_usable_for_reconnect(0, true));
+        assert!(ranges_usable_for_reconnect(10, true));
+        assert!(!ranges_usable_for_reconnect(10, false));
+    }
+
+    #[tokio::test]
+    async fn sleep_interruptible_respects_cancel() {
+        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
+        let control_sleep = control.clone();
+        let sleeper = tokio::spawn(async move {
+            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
+        });
+        // Flip cancel shortly after start.
+        sleep(Duration::from_millis(20)).await;
+        control.store(CONTROL_CANCELED, Ordering::Relaxed);
+        let outcome = sleeper.await.expect("join");
+        assert_eq!(outcome, Some(DownloadOutcome::Canceled));
+    }
+
+    #[tokio::test]
+    async fn sleep_interruptible_completes_without_control() {
+        let control = AtomicU8::new(CONTROL_CONTINUE);
+        let outcome = sleep_interruptible(&control, Duration::from_millis(30)).await;
+        assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_reconnect_offset_version_gate() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconnect-offset-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let part = dir.join("f.bin.part");
+        tokio::fs::write(&part, vec![0u8; 77]).await.unwrap();
+
+        // v0: disk length wins.
+        assert_eq!(refresh_reconnect_offset(0, 10, &part).await, 77);
+        // v1+: tracked downloaded (map-authoritative), ignore sparse length.
+        assert_eq!(refresh_reconnect_offset(1, 42, &part).await, 42);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn prepare_reconnect_bumps_count_and_refreshes_offset() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconnect-prep-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let part = dir.join("f.bin.part");
+        tokio::fs::write(&part, vec![1u8; 64]).await.unwrap();
+
+        let control = AtomicU8::new(CONTROL_CONTINUE);
+        let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+
+        let mut cumulative = 3u32;
+        let err = download_error(
+            FailureCategory::Network,
+            "Download incomplete (64 of 200 bytes).".into(),
+            true,
+        );
+        let action = prepare_reconnect(
+            &err,
+            false,
+            0,
+            64,
+            true,
+            0,
+            &part,
+            &control,
+            &on_progress,
+            &mut cumulative,
+        )
+        .await;
+
+        match action {
+            ReconnectAction::Retry { offset } => {
+                assert_eq!(offset, 64); // disk oracle
+            }
+            ReconnectAction::Control(_) => panic!("expected Retry, got Control"),
+            ReconnectAction::GiveUp => panic!("expected Retry, got GiveUp"),
+        }
+        assert_eq!(cumulative, 4);
+        let held = patches.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].reconnect_count, Some(4));
+        assert_eq!(held[0].downloaded_bytes, Some(64));
+        assert_eq!(held[0].state_hint, Some(ProgressHint::Starting));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
