@@ -570,7 +570,6 @@ impl DownloadApp {
         cx.notify();
     }
 
-
     /// Factory reset of settings prefs into the live draft (keeps window layout + download dir).
     ///
     /// Does **not** call `save_settings`, IPC, engine, or startup-registry updates. The

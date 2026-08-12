@@ -372,11 +372,7 @@ impl DownloadApp {
         cx.notify();
     }
 
-    pub(crate) fn reset_appearance_draft(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn reset_appearance_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.reset_appearance();
         let noise = self.settings.noise_intensity as f32;
         let transparency = self.settings.window_transparency as f32;
