@@ -12,6 +12,7 @@ import {
 
 const connectionStatusDot = document.querySelector<HTMLSpanElement>('#connection-status');
 const connectionStatusLabel = document.querySelector<HTMLSpanElement>('#connection-status-label');
+const openAppButton = document.querySelector<HTMLButtonElement>('#open-app-button');
 const syncButton = document.querySelector<HTMLButtonElement>('#sync-button');
 const silentDownloadToggle = document.querySelector<HTMLInputElement>('#silent-download-toggle');
 const extensionEnabledToggle = document.querySelector<HTMLInputElement>('#extension-enabled-toggle');
@@ -80,6 +81,12 @@ function renderState(state: PopupStateResponse) {
   }
   if (syncButton) syncButton.disabled = isUpdating;
   if (advancedButton) advancedButton.disabled = isUpdating;
+  if (openAppButton) {
+    // Offer one-click recovery when the desktop is not connected.
+    const needsOpen = state.connection !== 'connected' && state.connection !== 'checking';
+    openAppButton.hidden = !needsOpen;
+    openAppButton.disabled = isUpdating;
+  }
 }
 
 async function patchSettings(patch: Partial<ExtensionIntegrationSettings>) {
@@ -105,6 +112,16 @@ async function refresh() {
 
 syncButton?.addEventListener('click', () => {
   void refresh();
+});
+
+openAppButton?.addEventListener('click', () => {
+  void (async () => {
+    isUpdating = true;
+    if (currentState) renderState(currentState);
+    const state = await sendMessage<PopupStateResponse>({ type: 'popup_open_app' });
+    isUpdating = false;
+    renderState(state);
+  })();
 });
 
 advancedButton?.addEventListener('click', () => {

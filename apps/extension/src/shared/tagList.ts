@@ -21,6 +21,8 @@ export interface TagListOptions {
   emptyLabel?: string;
   /** Optional sort comparator; default localeCompare. */
   sort?: (a: string, b: string) => number;
+  /** Fired after a user-driven add/remove/clear (not setValues). */
+  onChange?: () => void;
 }
 
 export class TagListController {
@@ -59,23 +61,21 @@ export class TagListController {
         this.tryAddFromInput();
         return;
       }
-      if (event.key === 'Backspace' && !inputEl.value && this.items.length > 0) {
-        // Remove last when caret is empty — common tag-input pattern.
+      if (event.key === 'Backspace' && !inputEl.value) {
+        const visible = this.visibleItems();
+        if (visible.length === 0) return;
+        // Remove the last *visible* chip (filter-aware), not lexicographic end of full list.
         event.preventDefault();
-        this.remove(this.items[this.items.length - 1]!);
+        this.remove(visible[visible.length - 1]!);
       }
     });
 
     // Paste bulk: "a, b, c" or multi-line hosts.
     inputEl.addEventListener('paste', (event) => {
       const text = event.clipboardData?.getData('text');
-      if (!text || !/[\s,]/.test(text)) return;
+      if (!text || !/[\s,;]/.test(text)) return;
       event.preventDefault();
-      const parts = text.split(/[\s,;]+/).map((p) => p.trim()).filter(Boolean);
-      let added = 0;
-      for (const part of parts) {
-        if (this.add(part, { silent: true })) added += 1;
-      }
+      const added = this.addMany(text);
       this.setFeedback(
         added > 0
           ? `Added ${added} ${added === 1 ? this.opts.itemNoun : this.plural()}.`
@@ -83,6 +83,7 @@ export class TagListController {
       );
       inputEl.value = '';
       this.render();
+      if (added > 0) this.opts.onChange?.();
     });
 
     filterEl?.addEventListener('input', () => {
@@ -93,10 +94,39 @@ export class TagListController {
 
   private tryAddFromInput(): void {
     const raw = this.opts.inputEl.value;
+    if (!raw.trim()) return;
+
+    // Match paste: multi-item delimiters bulk-add instead of a single invalid token.
+    if (/[\s,;]/.test(raw.trim())) {
+      const added = this.addMany(raw);
+      this.setFeedback(
+        added > 0
+          ? `Added ${added} ${added === 1 ? this.opts.itemNoun : this.plural()}.`
+          : `No new ${this.plural()} from input.`,
+      );
+      if (added > 0) {
+        this.opts.inputEl.value = '';
+        this.opts.inputEl.focus();
+        this.render();
+        this.opts.onChange?.();
+      }
+      return;
+    }
+
     if (this.add(raw)) {
       this.opts.inputEl.value = '';
       this.opts.inputEl.focus();
     }
+  }
+
+  /** Split on whitespace/commas/semicolons and add each part. Returns count added. */
+  private addMany(raw: string): number {
+    const parts = raw.split(/[\s,;]+/).map((p) => p.trim()).filter(Boolean);
+    let added = 0;
+    for (const part of parts) {
+      if (this.add(part, { silent: true })) added += 1;
+    }
+    return added;
   }
 
   add(raw: string, options: { silent?: boolean } = {}): boolean {
@@ -129,6 +159,7 @@ export class TagListController {
     if (!options.silent) {
       this.setFeedback(`Added ${normalized}.`);
       this.render();
+      this.opts.onChange?.();
     }
     return true;
   }
@@ -139,6 +170,7 @@ export class TagListController {
     if (this.items.length < before) {
       this.setFeedback(`Removed ${value}.`);
       this.render();
+      this.opts.onChange?.();
     }
   }
 
@@ -146,6 +178,7 @@ export class TagListController {
     this.items = [];
     this.setFeedback(`Cleared all ${this.plural()}.`);
     this.render();
+    this.opts.onChange?.();
   }
 
   private plural(): string {
@@ -221,7 +254,11 @@ export class TagListController {
   }
 }
 
-/** Normalize a file extension for the capture list. */
+/**
+ * Normalize a single file-extension token for the capture list.
+ * Matches desktop `normalize_extensions` / `normalizeFileExtensions` rules so
+ * load→edit→save round-trips do not drop previously accepted values (e.g. tar.gz).
+ */
 export function normalizeFileExtensionTag(raw: string): string {
   let extension = raw.trim().replace(/^\.+/, '').toLowerCase();
   if (extension === '7zip') extension = '7z';
@@ -230,7 +267,7 @@ export function normalizeFileExtensionTag(raw: string): string {
     || extension.includes('/')
     || extension.includes('\\')
     || extension.includes(' ')
-    || !/^[a-z0-9]{1,16}$/.test(extension)
+    || extension.split('').every((c) => c === '.')
   ) {
     return '';
   }

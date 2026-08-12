@@ -28,6 +28,13 @@ const extsReset = document.querySelector<HTMLButtonElement>('#exts-reset');
 // Immediate paint from last-known desktop appearance.
 applyExtensionAppearance(readCachedAppearance());
 
+/** True after the user edits capture controls; blocks soft-refresh form overwrite. */
+let captureDirty = false;
+
+function markCaptureDirty(): void {
+  captureDirty = true;
+}
+
 const hostsList = new TagListController({
   listEl: document.querySelector<HTMLElement>('#hosts-list')!,
   inputEl: document.querySelector<HTMLInputElement>('#hosts-input')!,
@@ -42,6 +49,7 @@ const hostsList = new TagListController({
   invalidMessage: (raw) =>
     `"${raw}" is not a valid host pattern. Use a hostname like example.com or *.cdn.example.com.`,
   duplicateMessage: (value) => `"${value}" is already excluded.`,
+  onChange: markCaptureDirty,
 });
 
 const extsList = new TagListController({
@@ -56,9 +64,14 @@ const extsList = new TagListController({
   emptyLabel: 'No extensions listed. Capture will rely on MIME hints only.',
   normalize: normalizeFileExtensionTag,
   invalidMessage: (raw) =>
-    `"${raw}" is not a valid extension. Use letters/numbers only (e.g. zip, 7z, pdf).`,
+    `"${raw}" is not a valid extension. Use letters/numbers (e.g. zip, 7z, tar.gz).`,
   duplicateMessage: (value) => `".${value}" is already in the list.`,
+  onChange: markCaptureDirty,
 });
+
+for (const el of [enabled, contextMenu, badge, silent]) {
+  el?.addEventListener('change', markCaptureDirty);
+}
 
 async function sendMessage<T>(message: PopupRequest): Promise<T> {
   return browser.runtime.sendMessage(message) as Promise<T>;
@@ -97,6 +110,7 @@ function fillCaptureForm(settings: ExtensionIntegrationSettings) {
   if (silent) silent.checked = settings.downloadHandoffMode === 'auto';
   hostsList.setValues(settings.excludedHosts);
   extsList.setValues(settings.capturedFileExtensions);
+  captureDirty = false;
 }
 
 function readCaptureForm(base: ExtensionIntegrationSettings): ExtensionIntegrationSettings {
@@ -117,6 +131,7 @@ function applyAppearanceFromState(state: PopupStateResponse) {
 
 extsReset?.addEventListener('click', () => {
   extsList.setValues([...DEFAULT_CAPTURED_FILE_EXTENSIONS]);
+  markCaptureDirty();
   const feedback = document.querySelector('#exts-feedback');
   if (feedback) feedback.textContent = 'Restored default file extensions (not saved yet).';
 });
@@ -171,8 +186,11 @@ void (async () => {
   fillCaptureForm(state.extensionSettings ?? createDefaultExtensionSettings());
 
   // Soft refresh pulls capture + appearance from desktop when available.
+  // Do not overwrite capture fields if the user already started editing.
   const refreshed = await sendMessage<PopupStateResponse>({ type: 'popup_ping' });
   applyAppearanceFromState(refreshed);
   renderConnection(refreshed);
-  if (refreshed.extensionSettings) fillCaptureForm(refreshed.extensionSettings);
+  if (refreshed.extensionSettings && !captureDirty) {
+    fillCaptureForm(refreshed.extensionSettings);
+  }
 })();
