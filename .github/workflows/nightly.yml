@@ -1,9 +1,6 @@
 name: Nightly
 
 on:
-  schedule:
-    # 06:00 UTC daily
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -148,9 +145,9 @@ jobs:
           body: |
             ## RusticDL ${{ needs.decide.outputs.version }}
 
-            Unstable **Nightly** build from `master` (`${{ github.sha }}`).
+            **Nightly** pre-release from `master` (`${{ github.sha }}`) for testing upcoming changes before a Stable cut.
 
-            These builds can break. Prefer **Stable** unless you want the newest `master` bits.
+            These builds can break. Prefer **Stable** unless you are trying new work.
 
             In the app: **Settings → General → Update channel → Nightly**, then check for updates.
 

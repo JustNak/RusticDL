@@ -34,7 +34,7 @@ Get the latest Windows build from GitHub Releases:
 
 **[→ Download RusticDL for Windows](https://github.com/JustNak/RusticDL/releases/latest)**
 
-Nightly (unsigned, may be unstable) is published daily from `master` as a GitHub pre-release. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
+Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
 
 | Asset | What it contains |
 | --- | --- |
@@ -371,7 +371,7 @@ GitHub Actions workflows live in `.github/workflows/`:
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
 | **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a **Stable** GitHub Release |
-| **Nightly** (`nightly.yml`) | Daily cron (06:00 UTC) or **Run workflow** | Same assets as Release, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`). Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
+| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Same assets as Release, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
 
 To cut a new **stable** release from a clean tree:
 
@@ -382,7 +382,7 @@ git push origin v0.1.1
 
 The release workflow builds assets and attaches them to the GitHub Release automatically.
 
-To publish a **nightly** immediately (without waiting for the cron):
+To publish a **nightly** (when you want testers to try new work):
 
 1. Actions → **Nightly** → **Run workflow**
 2. Optionally check **Publish even if this commit already has a nightly**
