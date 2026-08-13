@@ -44,6 +44,14 @@ impl DownloadApp {
         } else {
             APP_LOGO_LIGHT
         };
+        // gpui-component TitleBar insets children (12px on Windows/Linux, 80px
+        // on macOS for traffic lights). Size the brand column so the search
+        // field starts at the sidebar's right edge.
+        #[cfg(target_os = "macos")]
+        const TITLE_BAR_LEFT_PAD: f32 = 80.0;
+        #[cfg(not(target_os = "macos"))]
+        const TITLE_BAR_LEFT_PAD: f32 = 12.0;
+        let brand_col_w = (self.settings.ui_density.sidebar_w() - TITLE_BAR_LEFT_PAD).max(80.0);
         let brand_menu = {
             let view = view.clone();
             move |menu: gpui_component::menu::PopupMenu,
@@ -121,49 +129,60 @@ impl DownloadApp {
                 .items_center()
                 .gap_2()
                 .pr_1()
-                // Brand mark + name share one overflow menu (logo is clickable too).
+                // Brand column matches sidebar width so search starts on the divider.
                 .child(
-                    Button::new("app-brand-menu")
-                        .ghost()
-                        .compact()
-                        .tooltip("App menu")
+                    h_flex()
+                        .id("title-bar-brand")
+                        .w(px(brand_col_w))
+                        .h_full()
+                        .flex_shrink_0()
+                        .items_center()
+                        .overflow_hidden()
+                        .gap_2()
+                        // Brand mark + name share one overflow menu (logo is clickable too).
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
+                            Button::new("app-brand-menu")
+                                .ghost()
+                                .compact()
+                                .tooltip("App menu")
                                 .child(
-                                    div()
-                                        .w(px(32.))
-                                        .h(px(32.))
-                                        .rounded(theme.radius)
-                                        .overflow_hidden()
-                                        .flex_shrink_0()
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
                                         .child(
-                                            img(logo)
+                                            div()
                                                 .w(px(32.))
                                                 .h(px(32.))
-                                                .object_fit(ObjectFit::Cover),
+                                                .rounded(theme.radius)
+                                                .overflow_hidden()
+                                                .flex_shrink_0()
+                                                .child(
+                                                    img(logo)
+                                                        .w(px(32.))
+                                                        .h(px(32.))
+                                                        .object_fit(ObjectFit::Cover),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .text_color(theme.foreground)
+                                                .child(APP_NAME),
                                         ),
                                 )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(theme.foreground)
-                                        .child(APP_NAME),
-                                ),
+                                .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
                         )
-                        .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
+                        .when_some(speed_label, |el, label| {
+                            el.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .flex_shrink_0()
+                                    .child(label),
+                            )
+                        }),
                 )
-                .when_some(speed_label, |el, label| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .flex_shrink_0()
-                            .child(label),
-                    )
-                })
                 .when(show_queue_chrome, |el| {
                     el.child(
                         div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
@@ -184,10 +203,7 @@ impl DownloadApp {
                                 Self::queue_overflow_menu_builder(view.clone()),
                             ),
                     )
-                })
-                .when(!show_queue_chrome, |el| el.child(div().flex_1()))
-                .when(show_queue_chrome, |el| {
-                    el.child(
+                    .child(
                         Button::new("add-download")
                             .primary()
                             .icon(IconName::Plus)
@@ -196,7 +212,8 @@ impl DownloadApp {
                                 this.open_add_dialog(window, cx);
                             })),
                     )
-                }),
+                })
+                .when(!show_queue_chrome, |el| el.child(div().flex_1())),
         )
     }
 
