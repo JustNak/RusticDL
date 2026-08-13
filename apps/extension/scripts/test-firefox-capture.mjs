@@ -39,7 +39,9 @@ const require = createRequire(import.meta.url);
 const {
   firefoxWebRequestDownloadCandidate,
   shouldCaptureDownloadItem,
+  shouldWaitForDownloadSize,
   MIN_CAPTURE_BYTES,
+  MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
 
 const defaultSettings = {
@@ -137,7 +139,7 @@ assert(
 );
 
 assert(
-  'rejects xhr entirely (even real-looking zip)',
+  'rejects tiny xhr zip (API noise, not a file-host CDN)',
   candidate({
     url: 'https://cdn.example.com/files/app.zip',
     type: 'xmlhttprequest',
@@ -145,9 +147,24 @@ assert(
     responseHeaders: [
       { name: 'content-type', value: 'application/zip' },
       { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
-      { name: 'content-length', value: '5000000' },
+      { name: 'content-length', value: String(MIN_CAPTURE_BYTES + 50) },
     ],
   }) === null,
+);
+
+assert(
+  'captures large xhr zip from a file-host CDN',
+  candidate({
+    url: 'https://store1.gofile.io/download/web/token/app.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 1_000_000) },
+    ],
+  })?.reason === 'attachment_disposition',
 );
 
 // --- Nexus Mods live stats CSV (this report) ---
@@ -376,6 +393,136 @@ assert(
     },
     { ...defaultSettings, enabled: false },
   ) === null,
+);
+
+// --- File-host wait-page stub (SteamRIP / Gofile / Buzzheavier) ---
+const steamripStub = {
+  url: 'https://buzzheavier.com/dl/Shift-At-Midnight-SteamRIP.com.rar',
+  type: 'main_frame',
+  method: 'GET',
+  statusCode: 200,
+  originUrl: 'https://buzzheavier.com/abc',
+  documentUrl: 'https://buzzheavier.com/abc',
+  responseHeaders: [
+    { name: 'content-type', value: 'text/html; charset=utf-8' },
+    {
+      name: 'content-disposition',
+      value: 'attachment; filename="Shift-At-Midnight-SteamRIP.com.rar"',
+    },
+    { name: 'content-length', value: '3280' },
+  ],
+};
+
+assert(
+  'rejects 3 KB HTML wait-page stub named as .rar (webRequest)',
+  candidate(steamripStub) === null,
+);
+
+assert(
+  'rejects 3 KB octet-stream stub named as .rar (webRequest)',
+  candidate({
+    ...steamripStub,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      {
+        name: 'content-disposition',
+        value: 'attachment; filename="Shift-At-Midnight-SteamRIP.com.rar"',
+      },
+      { name: 'content-length', value: '3280' },
+    ],
+  }) === null,
+);
+
+assert(
+  'rejects 3 KB .rar on downloads.onCreated (strong name no longer bypasses size)',
+  shouldCaptureDownloadItem(
+    {
+      url: steamripStub.url,
+      filename: 'C:\\Users\\ZeusVeilmon\\Downloads\\Shift-At-Midnight-SteamRIP.com (1).rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 3280,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'waits for size when onCreated .rar has unknown totalBytes',
+  shouldWaitForDownloadSize(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: -1,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'does not wait when 3 KB .rar size is already known',
+  shouldWaitForDownloadSize(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 3280,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'captures the real 381 MB .rar attachment',
+  candidate({
+    url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+    type: 'main_frame',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/x-rar-compressed' },
+      {
+        name: 'content-disposition',
+        value: 'attachment; filename="Shift-At-Midnight-SteamRIP.com.rar"',
+      },
+      { name: 'content-length', value: String(381 * 1024 * 1024) },
+    ],
+  })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures large CORS CDN .rar without Content-Disposition',
+  candidate({
+    url: 'https://store1.gofile.io/download/web/token/Shift-At-Midnight-SteamRIP.com.rar',
+    type: 'other',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'access-control-allow-origin', value: '*' },
+      { name: 'content-length', value: String(381 * 1024 * 1024) },
+    ],
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'still rejects CORS Nexus CSV after CDN exception',
+  candidate(nexusStats) === null,
+);
+
+assert(
+  'rejects POST even when it looks like a zip (cannot replay as GET)',
+  candidate({
+    url: 'https://1fichier.com/get/abc.zip',
+    type: 'main_frame',
+    method: 'POST',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="abc.zip"' },
+      { name: 'content-length', value: '12000000' },
+    ],
+  }) === null,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

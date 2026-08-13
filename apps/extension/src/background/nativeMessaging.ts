@@ -154,6 +154,56 @@ export async function saveExtensionSettings(
   return sendNativeMessage(createSaveExtensionSettingsRequest(settings));
 }
 
+/**
+ * Browser session headers so the desktop GET can replay the same file the
+ * tab just requested. Without cookies/referer, file hosts return a 3 KB HTML
+ * wait page that still has `filename="Game.rar"`.
+ */
+export async function collectHandoffAuth(
+  url: string,
+  extra: { referrer?: string; pageUrl?: string; incognito?: boolean } = {},
+): Promise<DownloadRequestMetadata['handoffAuth']> {
+  const headers: NonNullable<DownloadRequestMetadata['handoffAuth']>['headers'] = [];
+
+  try {
+    let storeId: string | undefined;
+    try {
+      const stores = await browser.cookies.getAllCookieStores();
+      const match = extra.incognito
+        ? stores.find((store) => store.incognito)
+        : stores.find((store) => !store.incognito);
+      storeId = match?.id;
+    } catch {
+      // Chromium may omit getAllCookieStores in some contexts.
+    }
+    const cookies = await browser.cookies.getAll(storeId ? { url, storeId } : { url });
+    if (cookies.length > 0) {
+      headers.push({
+        name: 'Cookie',
+        value: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
+      });
+    }
+  } catch {
+    // Restricted cookie / missing permission — still send referer/UA.
+  }
+
+  const referrer = extra.referrer || extra.pageUrl;
+  if (referrer) {
+    headers.push({ name: 'Referer', value: referrer });
+    try {
+      headers.push({ name: 'Origin', value: new URL(referrer).origin });
+    } catch {
+      // ignore invalid referrer
+    }
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.userAgent) {
+    headers.push({ name: 'User-Agent', value: navigator.userAgent });
+  }
+
+  return headers.length > 0 ? { headers } : undefined;
+}
+
 export function buildContextMenuPayload(
   info: browser.menus.OnClickData,
   tab?: browser.tabs.Tab,
