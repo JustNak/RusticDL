@@ -22,5 +22,5 @@ pub use engine::{
     EngineRuntimeConfig,
 };
 pub use handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader};
-pub use job::{Job, JobState};
+pub use job::{fallback_reason_label, Job, JobState};
 pub use urls::extract_http_urls;

@@ -387,18 +387,27 @@ fn persist_map_exit(ctx: &mut TransferContext, map: &SegmentMap, active: u32) {
     emit_force_persist(ctx, map, active, None, None);
 }
 
-fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str) {
+/// One-shot toast when multi actually converts to single-stream.
+const MULTI_FALLBACK_TOAST: &str = "Fell back to a single connection.";
+
+/// Roll back v1 map. `continue_as_single` publishes live `active_connections=1`
+/// and a convert toast (skipped when this reason was already recorded).
+/// Hard-fail (`false`) stays at 0 connections and never toasts.
+fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str, continue_as_single: bool) {
+    let should_toast = continue_as_single && ctx.job.fallback_reason.as_deref() != Some(reason);
     ctx.job.transfer_format_version = 0;
     ctx.job.segment_map = None;
     ctx.job.transfer_mode = Some(TransferMode::Single);
     ctx.job.fallback_reason = Some(reason.to_string());
-    ctx.job.active_connections = 0;
+    let active = if continue_as_single { 1 } else { 0 };
+    ctx.job.active_connections = active;
     (ctx.on_progress)(ProgressUpdate {
         transfer_format_version: Some(0),
         clear_segment_map: Some(true),
         transfer_mode: Some(TransferMode::Single),
         fallback_reason: Some(reason.to_string()),
-        active_connections: Some(0),
+        active_connections: Some(active),
+        toast: should_toast.then(|| MULTI_FALLBACK_TOAST.to_string()),
         ..Default::default()
     });
 }
@@ -414,7 +423,7 @@ async fn fail_before_workers(
             // No writer handle yet (open failed or never opened).
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         }
-        rollback_multi_identity(ctx, "multi_start_failed");
+        rollback_multi_identity(ctx, "multi_start_failed", false);
     }
     Err(error)
 }
@@ -423,7 +432,7 @@ async fn fallback_to_single(
     ctx: &mut TransferContext,
     reason: &str,
 ) -> Result<DownloadOutcome, DownloadError> {
-    rollback_multi_identity(ctx, reason);
+    rollback_multi_identity(ctx, reason, true);
     run_http_download_with_ctx(ctx).await
 }
 
@@ -1663,6 +1672,144 @@ mod tests {
                 "preallocated hole must not remain for single-stream metadata_len"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn convert_to_single_publishes_live_connection_and_one_shot_toast() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = vec![0xABu8; total];
+        let (base, _seen, _handle) = spawn_range_server(body, RangeServeMode::ForbiddenBody).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-fb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target, temp);
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let result = run_transfer(ctx).await;
+        assert!(result.is_err(), "403 should fail after fallback");
+
+        let seen = patches.lock().unwrap();
+        let rollback = seen
+            .iter()
+            .find(|p| p.fallback_reason.as_deref() == Some("multi_http_fallback"))
+            .expect("convert should publish fallback_reason");
+        assert_eq!(rollback.transfer_mode, Some(TransferMode::Single));
+        assert_eq!(
+            rollback.active_connections,
+            Some(1),
+            "continuing as single must keep a live connection"
+        );
+        let toasts: Vec<_> = seen.iter().filter(|p| p.toast.is_some()).collect();
+        assert_eq!(toasts.len(), 1, "convert toast must be one-shot");
+        assert_eq!(toasts[0].toast.as_deref(), Some(MULTI_FALLBACK_TOAST));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn convert_retry_same_reason_skips_toast() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = vec![0xABu8; total];
+        let (base, _seen, _handle) = spawn_range_server(body, RangeServeMode::ForbiddenBody).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-fb2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target, temp);
+        job.fallback_reason = Some("multi_http_fallback".into());
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let _ = run_transfer(ctx).await;
+
+        let seen = patches.lock().unwrap();
+        assert!(
+            seen.iter().all(|p| p.toast.is_none()),
+            "same convert reason must not re-toast"
+        );
+        assert!(seen.iter().any(|p| {
+            p.fallback_reason.as_deref() == Some("multi_http_fallback")
+                && p.active_connections == Some(1)
+        }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fail_before_workers_zeros_connections_without_toast() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = vec![0xABu8; total];
+        let (base, _seen, _handle) = spawn_range_server(body, RangeServeMode::Honest).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-ff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Parent is a file so ensure_parent_directory fails after map attach.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target, temp);
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let result = run_transfer(ctx).await;
+        assert!(result.is_err(), "start checklist should fail");
+
+        let seen = patches.lock().unwrap();
+        let rollback = seen
+            .iter()
+            .find(|p| p.fallback_reason.as_deref() == Some("multi_start_failed"))
+            .expect("hard-fail rollback should publish reason");
+        assert_eq!(rollback.active_connections, Some(0));
+        assert!(rollback.toast.is_none(), "hard fail must not toast");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
