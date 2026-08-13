@@ -5,6 +5,16 @@
 //! `apps/updater/build.rs` and `assets/windows/app.manifest`.
 
 fn main() {
+    // Nightly CI stamps a unique version via RUSTICDL_VERSION without rewriting Cargo.toml
+    // (so cargo-packager / Windows ProductVersion stay on the stable x.y.z triple).
+    let version = std::env::var("RUSTICDL_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
+    println!("cargo:rerun-if-env-changed=RUSTICDL_VERSION");
+    println!("cargo:rustc-env=RUSTICDL_VERSION={version}");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

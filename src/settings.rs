@@ -318,7 +318,7 @@ pub enum UpdateChannel {
     /// Latest non-prerelease (`/releases/latest`).
     #[default]
     Stable,
-    /// Newest published prerelease with a setup asset.
+    /// Newest published `vX.Y.Z-nightly.*` GitHub pre-release with a setup asset.
     Nightly,
 }
 
@@ -350,7 +350,7 @@ pub struct Settings {
     /// Per-host connection budget for multi-segment downloads.
     #[serde(default = "default_max_connections_per_host")]
     pub max_connections_per_host: u32,
-    /// Stable vs Nightly (prerelease) update stream.
+    /// Stable vs Nightly (`vX.Y.Z-nightly.*` pre-release) update stream.
     #[serde(default)]
     pub update_channel: UpdateChannel,
     pub theme: AppTheme,

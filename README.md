@@ -34,6 +34,8 @@ Get the latest Windows build from GitHub Releases:
 
 **[→ Download RusticDL for Windows](https://github.com/JustNak/RusticDL/releases/latest)**
 
+Nightly (unsigned, may be unstable) is published daily from `master` as a GitHub pre-release. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
+
 | Asset | What it contains |
 | --- | --- |
 | **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app + native host + browser host registration) |
@@ -368,9 +370,10 @@ GitHub Actions workflows live in `.github/workflows/`:
 | Workflow | When it runs | What it does |
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
-| **Release** (`release.yml`) | Tag `v*` (e.g. `v0.1.0`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a GitHub Release |
+| **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a **Stable** GitHub Release |
+| **Nightly** (`nightly.yml`) | Daily cron (06:00 UTC) or **Run workflow** | Same assets as Release, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`). Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
 
-To cut a new release from a clean tree:
+To cut a new **stable** release from a clean tree:
 
 ```bash
 git tag v0.1.1
@@ -378,6 +381,13 @@ git push origin v0.1.1
 ```
 
 The release workflow builds assets and attaches them to the GitHub Release automatically.
+
+To publish a **nightly** immediately (without waiting for the cron):
+
+1. Actions → **Nightly** → **Run workflow**
+2. Optionally check **Publish even if this commit already has a nightly**
+
+The in-app updater on the Nightly channel follows tags matching `vX.Y.Z-nightly.*`. Stable still uses `/releases/latest`.
 
 ---
 

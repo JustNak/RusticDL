@@ -1,0 +1,195 @@
+name: Nightly
+
+on:
+  schedule:
+    # 06:00 UTC daily
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish even if this commit already has a nightly
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  # Queue instead of cancelling: a mid-publish cancel can leave a partial Nightly.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg reqwest_unstable
+
+jobs:
+  decide:
+    name: Resolve nightly version
+    runs-on: ubuntu-latest
+    if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master'
+    outputs:
+      skip: ${{ steps.meta.outputs.skip }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and skip duplicate commits
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}
+        run: |
+          set -euo pipefail
+          base=$(python3 - <<'PY'
+          import re, pathlib
+          text = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+          if not m:
+              raise SystemExit("Could not read version from Cargo.toml")
+          print(m.group(1).split("-", 1)[0])
+          PY
+          )
+          stamp=$(date -u +%Y%m%d%H%M%S)
+          version="${base}-nightly.${stamp}"
+          tag="v${version}"
+          skip=false
+
+          if [ "$FORCE" != "true" ]; then
+            sha="${GITHUB_SHA}"
+            mapfile -t tags < <(gh release list --limit 50 --json tagName,isPrerelease,isDraft \
+              --jq '.[] | select(.isPrerelease and (isDraft|not) and (.tagName | test("-nightly\\."))) | .tagName')
+            for existing in "${tags[@]+"${tags[@]}"}"; do
+              [ -z "$existing" ] && continue
+              tag_sha=$(git rev-list -n 1 "refs/tags/${existing}" 2>/dev/null || true)
+              if [ -z "$tag_sha" ]; then
+                git fetch --force origin "refs/tags/${existing}:refs/tags/${existing}" || true
+                tag_sha=$(git rev-list -n 1 "refs/tags/${existing}" 2>/dev/null || true)
+              fi
+              if [ -n "$tag_sha" ] && [ "$tag_sha" = "$sha" ]; then
+                echo "Commit ${sha} already published as ${existing}; skipping."
+                skip=true
+                break
+              fi
+            done
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+          echo "Nightly ${version} (tag ${tag}, skip=${skip})"
+
+  release-windows:
+    name: Build & publish nightly (Windows)
+    needs: decide
+    if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true'
+    runs-on: windows-latest
+    env:
+      RUSTICDL_VERSION: ${{ needs.decide.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: nightly
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/extension/package-lock.json
+
+      - name: Build Rust release binaries
+        run: |
+          cargo build --release -p rusticdl
+          cargo build --release -p rusticdl-updater
+          cargo build --release -p rusticdl-native-host
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: Build browser extension
+        working-directory: apps/extension
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell -ExecutionPolicy Bypass -File scripts/package-release-assets.ps1
+
+      - name: Create nightly GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.decide.outputs.tag }}
+          name: Nightly ${{ needs.decide.outputs.version }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist-release/RusticDL-windows-x64-setup.exe
+            dist-release/RusticDL-windows-x64.zip
+            dist-release/RusticDL-full-windows-x64.zip
+            dist-release/extension-chromium.zip
+            dist-release/extension-firefox.zip
+          body: |
+            ## RusticDL ${{ needs.decide.outputs.version }}
+
+            Unstable **Nightly** build from `master` (`${{ github.sha }}`).
+
+            These builds can break. Prefer **Stable** unless you want the newest `master` bits.
+
+            In the app: **Settings → General → Update channel → Nightly**, then check for updates.
+
+            ### Downloads
+            | Asset | Contents |
+            | --- | --- |
+            | **RusticDL-windows-x64-setup.exe** | **Recommended** — NSIS installer (app + native host + browser host registration) |
+            | **RusticDL-windows-x64.zip** | Portable desktop app only |
+            | **RusticDL-full-windows-x64.zip** | Portable app + native host + scripts + extensions |
+            | **extension-chromium.zip** | Chromium / Edge / Brave extension |
+            | **extension-firefox.zip** | Firefox extension |
+
+            ### Quick start
+            1. Download **RusticDL-windows-x64-setup.exe**
+            2. Run the installer (per-user, no admin required)
+            3. Launch RusticDL from the Start Menu
+
+            To return to Stable: Settings → General → Update channel → Stable, then check for updates.
+
+            **License:** MIT — commercial use allowed; keep attribution (copyright notice).
+
+      - name: Prune old nightly releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $keep = 14
+          $rels = gh release list --limit 50 --json tagName,createdAt,isPrerelease,isDraft | ConvertFrom-Json
+          $nightlies = @(
+            $rels |
+              Where-Object { $_.isPrerelease -and -not $_.isDraft -and $_.tagName -match '-nightly\.' } |
+              Sort-Object createdAt -Descending
+          )
+          if ($nightlies.Count -le $keep) {
+            Write-Host "Keeping all $($nightlies.Count) nightly releases (limit $keep)."
+            return
+          }
+          $nightlies | Select-Object -Skip $keep | ForEach-Object {
+            Write-Host "Deleting old nightly $($_.tagName)"
+            gh release delete $_.tagName --yes --cleanup-tag
+          }

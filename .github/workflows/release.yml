@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+      # Nightlies use vX.Y.Z-nightly.STAMP (see nightly.yml). Do not republish them as Stable.
+      - "!v*-nightly.*"
 
 permissions:
   contents: write
@@ -52,61 +54,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dist = "dist-release"
-          New-Item -ItemType Directory -Force -Path $dist | Out-Null
-
-          # NSIS installer (recommended for most users)
-          cargo packager --release --formats nsis -p rusticdl
-          $setup = Get-ChildItem -Path $dist -Filter "*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $setup) {
-            throw "NSIS setup.exe not found under $dist"
-          }
-          Copy-Item -Force $setup.FullName "$dist/RusticDL-windows-x64-setup.exe"
-          Write-Host "Packed RusticDL-windows-x64-setup.exe ($([math]::Round((Get-Item "$dist/RusticDL-windows-x64-setup.exe").Length / 1MB, 2)) MB)"
-
-          # App-only zip (portable)
-          $appDir = Join-Path $dist "app"
-          New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-          Copy-Item "target/release/rusticdl.exe" $appDir
-          Copy-Item "target/release/rusticdl-updater.exe" $appDir
-          Copy-Item "LICENSE" $appDir
-          Copy-Item "README.md" $appDir
-          Compress-Archive -Path (Join-Path $appDir "*") -DestinationPath "$dist/RusticDL-windows-x64.zip" -Force
-
-          # Extension zips
-          Compress-Archive -Path "apps/extension/dist/chromium/*" -DestinationPath "$dist/extension-chromium.zip" -Force
-          Compress-Archive -Path "apps/extension/dist/firefox/*" -DestinationPath "$dist/extension-firefox.zip" -Force
-
-          # Full package (portable)
-          $fullDir = Join-Path $dist "full"
-          New-Item -ItemType Directory -Force -Path $fullDir | Out-Null
-          Copy-Item "target/release/rusticdl.exe" $fullDir
-          Copy-Item "target/release/rusticdl-updater.exe" $fullDir
-          Copy-Item "target/release/rusticdl-native-host.exe" $fullDir
-          Copy-Item "LICENSE" $fullDir
-          Copy-Item "README.md" $fullDir
-          New-Item -ItemType Directory -Force -Path (Join-Path $fullDir "scripts") | Out-Null
-          Copy-Item "scripts/register-native-host.ps1" (Join-Path $fullDir "scripts")
-          Copy-Item "scripts/unregister-native-host.ps1" (Join-Path $fullDir "scripts")
-          # Templates used by the register script (relative to apps/native-host when not bundled)
-          $nativeManifests = "apps/native-host/manifests"
-          if (Test-Path $nativeManifests) {
-            Copy-Item "$nativeManifests/*" (Join-Path $fullDir "scripts") -ErrorAction SilentlyContinue
-          }
-          New-Item -ItemType Directory -Force -Path (Join-Path $fullDir "extension/chromium") | Out-Null
-          New-Item -ItemType Directory -Force -Path (Join-Path $fullDir "extension/firefox") | Out-Null
-          Copy-Item "apps/extension/dist/chromium/*" (Join-Path $fullDir "extension/chromium") -Recurse
-          Copy-Item "apps/extension/dist/firefox/*" (Join-Path $fullDir "extension/firefox") -Recurse
-          Compress-Archive -Path (Join-Path $fullDir "*") -DestinationPath "$dist/RusticDL-full-windows-x64.zip" -Force
-
-          Get-ChildItem $dist -Filter *.zip | ForEach-Object {
-            Write-Host "Packed $($_.Name) ($([math]::Round($_.Length / 1MB, 2)) MB)"
-          }
+          powershell -ExecutionPolicy Bypass -File scripts/package-release-assets.ps1
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          make_latest: true
+          prerelease: false
           files: |
             dist-release/RusticDL-windows-x64-setup.exe
             dist-release/RusticDL-windows-x64.zip

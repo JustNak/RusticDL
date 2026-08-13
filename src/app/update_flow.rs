@@ -8,7 +8,8 @@
 //! 4. Updater downloads, runs NSIS `/S`, relaunches the main app.
 //! 5. **What’s new** — post-relaunch dialog with the release changelog.
 //!
-//! Channel (`UpdateChannel`) selects Stable vs Nightly GitHub Releases.
+//! Channel (`UpdateChannel`) selects Stable (`/releases/latest`) vs Nightly
+//! (`vX.Y.Z-nightly.*` pre-releases).
 //! In-flight checks are invalidated when the channel changes.
 
 use std::time::Duration;

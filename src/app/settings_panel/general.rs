@@ -251,7 +251,9 @@ impl DownloadApp {
                 ))
                 .child(settings_choice_row(
                     "Update channel",
-                    Some("Stable = latest release. Nightly = newest pre-release with a setup."),
+                    Some(
+                        "Stable follows the latest full release. Nightly follows dated pre-releases from master (may be unstable).",
+                    ),
                     h_flex()
                         .gap_2()
                         .child(
