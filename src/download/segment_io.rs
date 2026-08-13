@@ -8,8 +8,6 @@
 //! context (`tokio::task::spawn_blocking` / dedicated pool), not on a tokio
 //! worker under multi-segment load.
 
-#![allow(dead_code)]
-
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
