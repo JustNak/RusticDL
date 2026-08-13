@@ -4,7 +4,9 @@
 //! the planner chooses [`TransferMode::Multi`].
 //!
 //! Normative policy (PR 12):
-//! - Convert multi→single **only** when every segment `written == 0`.
+//! - Convert multi→single when every segment `written == 0`.
+//! - If the server ignores Range after multi started, salvage the contiguous
+//!   prefix and continue as single-stream (do not require Restart).
 //! - Legacy v0 `.part` stays single until Restart.
 //! - v1 map missing/inconsistent → Resume error (never invent Range offsets).
 //! - Surface `fallback_reason` whenever the planner stays on single-stream.

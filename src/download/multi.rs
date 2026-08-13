@@ -3,6 +3,9 @@
 //! Parallel Range workers write into one `.part` via [`SegmentFileWriter`].
 //! Progress is **map-authoritative** (`sum(written)`); never `metadata_len`
 //! after a map exists (preallocate would report the full file size).
+//!
+//! If the server cannot honor Range after multi has started, salvage the
+//! contiguous prefix and continue as single-stream instead of asking Restart.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +40,8 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
 /// User-visible Resume error when a v1 map is missing or inconsistent.
 pub(crate) const RESUME_RESTART_MESSAGE: &str = "Multi-part incomplete; Restart required.";
+pub(crate) const RANGE_IGNORED_MESSAGE: &str =
+    "Server ignored Range on a multi-segment resume. Use Restart.";
 pub(crate) const FALLBACK_LEGACY_PARTIAL: &str = "legacy_contiguous_partial";
 pub(crate) const FALLBACK_MAP_MISSING: &str = "map_missing";
 pub(crate) const FALLBACK_MAP_INCONSISTENT: &str = "map_inconsistent";
@@ -135,11 +140,42 @@ pub(crate) fn all_written_zero(map: &SegmentMap) -> bool {
     map.segments.iter().all(|segment| segment.written == 0)
 }
 
-/// Convert multi→single **only** when every segment still has `written == 0`.
-/// A completed prefix (first segment full, later segments empty) is **not**
-/// convertible — retain the map and require Restart / Resume reuse.
+/// Convert multi→single when every segment still has `written == 0`.
 pub(crate) fn may_convert_multi_to_single(map: &SegmentMap) -> bool {
     all_written_zero(map)
+}
+
+/// Bytes from 0 that form a hole-free prefix. Stops at the first incomplete
+/// segment so later islands are not treated as resumeable single-stream data.
+pub(crate) fn contiguous_prefix_bytes(map: &SegmentMap) -> u64 {
+    let mut prefix = 0u64;
+    for segment in &map.segments {
+        if segment.start != prefix {
+            break;
+        }
+        prefix = prefix.saturating_add(segment.written);
+        if segment.written < segment.length() {
+            break;
+        }
+    }
+    prefix
+}
+
+/// Server cannot honor the Range we need for this multi map.
+fn is_range_capability_error(error: &DownloadError) -> bool {
+    if error.category != FailureCategory::Resume {
+        return false;
+    }
+    let message = error.message.as_str();
+    message == RANGE_IGNORED_MESSAGE
+        || message.contains("Unexpected resume range")
+        || message.contains("Missing or invalid Content-Range")
+}
+
+/// Fall back when nothing is written yet, or when Range is unusable so a
+/// contiguous prefix can be kept and the rest fetched on one connection.
+fn should_fallback_to_single(map: &SegmentMap, error: &DownloadError) -> bool {
+    may_convert_multi_to_single(map) || is_range_capability_error(error)
 }
 
 /// v0 contiguous `.part` must stay single until Restart (do not invent holes).
@@ -147,8 +183,9 @@ pub(crate) fn is_legacy_contiguous_partial(job: &super::job::Job) -> bool {
     job.segment_map.is_none() && job.transfer_format_version == 0 && job.downloaded_bytes > 0
 }
 
-/// Run multi-segment transfer. Falls back to single-stream only when every
-/// segment still has `written == 0`.
+/// Run multi-segment transfer. Falls back to single-stream when every
+/// segment still has `written == 0`, or when the server ignores Range and a
+/// contiguous prefix can be salvaged.
 pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
@@ -286,19 +323,11 @@ pub async fn run_multi_segment_download(
         }
         Err((error, map)) => {
             persist_map_exit(ctx, &map, 0);
-            if may_convert_multi_to_single(&map) {
-                // Windows: DeleteFile fails while SegmentFileWriter still holds the handle.
+            if should_fallback_to_single(&map, &error) {
+                // Windows: DeleteFile / set_len fail while SegmentFileWriter holds the handle.
                 drop(writer);
-                if map.preallocated {
-                    if let Err(io_err) = tokio::fs::remove_file(&ctx.job.temp_path).await {
-                        return Err(download_error(
-                            FailureCategory::Disk,
-                            format!(
-                                "Could not remove preallocated file before single-stream fallback: {io_err}"
-                            ),
-                            false,
-                        ));
-                    }
+                if let Err(io_err) = prepare_single_stream_partial(ctx, &map).await {
+                    return Err(io_err);
                 }
                 fallback_to_single(ctx, fallback_reason_for(&error)).await
             } else {
@@ -436,6 +465,56 @@ async fn fallback_to_single(
 ) -> Result<DownloadOutcome, DownloadError> {
     rollback_multi_identity(ctx, reason, true);
     run_http_download_with_ctx(ctx).await
+}
+
+/// Make `.part` a contiguous v0 file: keep the prefix, drop holes / islands.
+async fn prepare_single_stream_partial(
+    ctx: &mut TransferContext,
+    map: &SegmentMap,
+) -> Result<(), DownloadError> {
+    let prefix = contiguous_prefix_bytes(map);
+    if prefix == 0 {
+        if ctx.job.temp_path.exists() {
+            tokio::fs::remove_file(&ctx.job.temp_path)
+                .await
+                .map_err(|io_err| {
+                    download_error(
+                        FailureCategory::Disk,
+                        format!(
+                            "Could not remove preallocated file before single-stream fallback: {io_err}"
+                        ),
+                        false,
+                    )
+                })?;
+        }
+    } else {
+        let path = ctx.job.temp_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            file.set_len(prefix)?;
+            let _ = file.sync_data();
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|join| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not resize partial file before single-stream fallback: {join}"),
+                false,
+            )
+        })?
+        .map_err(|io_err| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not resize partial file before single-stream fallback: {io_err}"),
+                false,
+            )
+        })?;
+    }
+    ctx.job.downloaded_bytes = prefix;
+    ctx.job.total_bytes = map.total_bytes;
+    ctx.job.progress = progress_percent(prefix, map.total_bytes);
+    Ok(())
 }
 
 fn fallback_reason_for(error: &DownloadError) -> &'static str {
@@ -769,7 +848,7 @@ async fn run_segment_loop(
             });
             return Err(download_error(
                 FailureCategory::Resume,
-                "Server ignored Range on a multi-segment resume. Use Restart.".into(),
+                RANGE_IGNORED_MESSAGE.into(),
                 false,
             ));
         }
@@ -1285,11 +1364,30 @@ mod tests {
         assert!(may_convert_multi_to_single(&two_seg_map(0, 0)));
         assert!(!all_written_zero(&two_seg_map(1, 0)));
         assert!(!may_convert_multi_to_single(&two_seg_map(1, 0)));
-        // Prefix-complete (first segment full, rest empty) is NOT convertible.
+        // Prefix-complete (first segment full, rest empty) is not a zero-write convert.
         assert!(!may_convert_multi_to_single(&two_seg_map(
             MIN_SEGMENT_SIZE,
             0
         )));
+    }
+
+    #[test]
+    fn contiguous_prefix_stops_at_first_hole() {
+        assert_eq!(contiguous_prefix_bytes(&two_seg_map(0, 0)), 0);
+        assert_eq!(contiguous_prefix_bytes(&two_seg_map(80, 50)), 80);
+        assert_eq!(
+            contiguous_prefix_bytes(&two_seg_map(MIN_SEGMENT_SIZE, 0)),
+            MIN_SEGMENT_SIZE
+        );
+        assert_eq!(
+            contiguous_prefix_bytes(&two_seg_map(MIN_SEGMENT_SIZE, 40)),
+            MIN_SEGMENT_SIZE + 40
+        );
+        let mut gapped = two_seg_map(0, 50);
+        assert_eq!(contiguous_prefix_bytes(&gapped), 0);
+        gapped.segments[0].written = MIN_SEGMENT_SIZE;
+        gapped.segments[1].written = 0;
+        assert_eq!(contiguous_prefix_bytes(&gapped), MIN_SEGMENT_SIZE);
     }
 
     #[test]
@@ -1719,7 +1817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_hundred_on_nonzero_segment_does_not_corrupt() {
+    async fn two_hundred_on_nonzero_segment_falls_back_to_single() {
         let total = 2 * MIN_SEGMENT_SIZE as usize;
         let body: Vec<u8> = (0..total).map(|i| (i % 211) as u8).collect();
         let (base, _seen, _handle) =
@@ -1730,9 +1828,13 @@ mod tests {
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
         let url = format!("{base}/file.bin");
-        let job = Job::new(url, "out.bin".into(), target, temp.clone());
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
         let mut ctx = TransferContext::new(
             job,
             Arc::new(AtomicU8::new(0)),
@@ -1743,23 +1845,74 @@ mod tests {
         ctx.multi_min_bytes = 1;
         ctx.multi_max_segments = 2;
 
-        let err = run_transfer(ctx)
+        let outcome = run_transfer(ctx)
             .await
-            .expect_err("200 on non-first segment must fail");
-        assert_eq!(err.category, FailureCategory::Resume);
+            .expect("ignored Range must fall back to single-stream");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
 
-        // Second half must not be the start of the full body (file-from-zero write).
-        if temp.exists() {
-            let part = std::fs::read(&temp).unwrap_or_default();
-            if part.len() >= MIN_SEGMENT_SIZE as usize + 64 {
-                let second = &part[MIN_SEGMENT_SIZE as usize..MIN_SEGMENT_SIZE as usize + 64];
-                assert_ne!(
-                    second,
-                    &body[..64],
-                    "200 body was written at non-zero offset"
-                );
-            }
-        }
+        let published = patches.lock().unwrap();
+        assert!(published.iter().any(|p| {
+            p.fallback_reason.as_deref() == Some("multi_resume_fallback")
+                && p.transfer_mode == Some(TransferMode::Single)
+        }));
+        assert!(published
+            .iter()
+            .any(|p| p.toast.as_deref() == Some(MULTI_FALLBACK_TOAST)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn range_ignored_on_resume_salvages_prefix() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = (0..total).map(|i| (i % 193) as u8).collect();
+        let (base, _seen, _handle) =
+            spawn_range_server(body.clone(), RangeServeMode::FullBodyOnNonzeroRange).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-multi-200r-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+
+        let mut part = vec![0u8; total];
+        part[..MIN_SEGMENT_SIZE as usize].copy_from_slice(&body[..MIN_SEGMENT_SIZE as usize]);
+        std::fs::write(&temp, &part).unwrap();
+
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.total_bytes = total as u64;
+        job.transfer_format_version = 1;
+        job.resume_supported = true;
+        job.validators.expected_size = Some(total as u64);
+        job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
+        job.downloaded_bytes = MIN_SEGMENT_SIZE;
+
+        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches_cb = patches.clone();
+        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+            patches_cb.lock().unwrap().push(u);
+        });
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_min_bytes = 1;
+        ctx.multi_max_segments = 2;
+
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("resume Range-ignore must salvage prefix and finish");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        assert!(patches.lock().unwrap().iter().any(|p| {
+            p.fallback_reason.as_deref() == Some("multi_resume_fallback")
+                && p.clear_segment_map == Some(true)
+        }));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
