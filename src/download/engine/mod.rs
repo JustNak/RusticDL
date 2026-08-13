@@ -334,6 +334,8 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 let _ = progress_tx.send(update);
             });
 
+            // Mid-transfer reconnect (short backoff, max 5) is nested inside
+            // `run_http_download`; worker `RETRY_DELAYS` only run after that budget is spent.
             let attempt_result = run_http_download(
                 &attempt_job,
                 limiter.clone(),
