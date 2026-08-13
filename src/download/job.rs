@@ -207,6 +207,9 @@ pub struct Job {
     /// Last multi→single or planner failure reason (UI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// Optional SHA-256 hex; verified after transfer, before finalize rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
 }
 
 impl Job {
@@ -235,6 +238,7 @@ impl Job {
             reconnect_count: 0,
             transfer_mode: None,
             fallback_reason: None,
+            expected_sha256: None,
         }
     }
 
@@ -299,6 +303,7 @@ mod tests {
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
+        assert!(job.expected_sha256.is_none());
     }
 
     #[test]
@@ -316,6 +321,7 @@ mod tests {
         assert_eq!(job.reconnect_count, 0);
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
+        assert!(job.expected_sha256.is_none());
     }
 
     #[test]
@@ -397,6 +403,8 @@ mod tests {
         job.reconnect_count = 2;
         job.transfer_mode = Some(TransferMode::Multi);
         job.fallback_reason = Some("planner".into());
+        job.expected_sha256 =
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
 
         let json = serde_json::to_string(&job).expect("serialize");
         // camelCase keys for new fields
@@ -409,6 +417,7 @@ mod tests {
         assert!(json.contains("\"reconnectCount\":2"));
         assert!(json.contains("\"transferMode\":\"multi\""));
         assert!(json.contains("\"fallbackReason\":\"planner\""));
+        assert!(json.contains("\"expectedSha256\""));
         assert!(json.contains("\"etag\""));
 
         let back: Job = serde_json::from_str(&json).expect("deserialize");
@@ -419,6 +428,7 @@ mod tests {
         assert_eq!(back.reconnect_count, 2);
         assert_eq!(back.transfer_mode, Some(TransferMode::Multi));
         assert_eq!(back.fallback_reason.as_deref(), Some("planner"));
+        assert_eq!(back.expected_sha256, job.expected_sha256);
     }
 
     #[test]

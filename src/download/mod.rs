@@ -14,6 +14,7 @@ pub mod segment;
 pub mod segment_io;
 pub mod transfer;
 pub mod urls;
+pub mod verify;
 
 pub use drop_files::extract_urls_from_dropped_paths;
 pub use duplicates::find_active_duplicate;

@@ -258,6 +258,7 @@ mod tests {
     use crate::download::http::ProgressCallback;
     use crate::download::job::{FailureCategory, Job};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
+    use crate::download::verify::{sha256_hex, SHA256_EMPTY};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU8;
     use std::sync::{Arc, Mutex};
@@ -951,6 +952,80 @@ Content-Length: 48\r\n\
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn single_stream_sha256_match_renames() {
+        let body = vec![b'x'; 64];
+        let expected = sha256_hex(&body);
+        let (dir, target, temp, ctx) = single_stream_ctx(&body, Some(expected)).await;
+
+        let outcome = run_transfer(ctx).await.expect("match should complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        assert!(!temp.exists(), "successful verify must rename .part away");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn single_stream_sha256_mismatch_keeps_part() {
+        let body = vec![b'x'; 64];
+        let (dir, target, temp, ctx) =
+            single_stream_ctx(&body, Some(SHA256_EMPTY.to_string())).await;
+
+        let err = run_transfer(ctx)
+            .await
+            .expect_err("mismatch must fail before rename");
+        assert_eq!(err.category, FailureCategory::Internal);
+        assert!(!err.retryable);
+        assert!(err.message.contains("SHA-256 mismatch"));
+        assert!(temp.exists(), "hash fail must keep .part");
+        assert!(!target.exists(), "hash fail must not rename to final");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn single_stream_ctx(
+        body: &[u8],
+        expected_sha256: Option<String>,
+    ) -> (PathBuf, PathBuf, PathBuf, TransferContext) {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: {}\r\n\
+\r\n",
+            body.len()
+        );
+        let get = format!(
+            "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\
+Accept-Ranges: bytes\r\n\
+\r\n",
+            body.len()
+        );
+        let (base, _handle) = spawn_scripted_server(vec![head, get]).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-sha-xfer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.expected_sha256 = expected_sha256;
+
+        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.multi_connection_enabled = false;
+        (dir, target, temp, ctx)
     }
 
     async fn spawn_scripted_server(replies: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
