@@ -217,10 +217,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_limit_unblocks_waiters() {
         let limiter = GlobalBandwidthLimiter::new(Some(1)); // 1 byte/s
-        let limiter2 = limiter.clone();
+        // Capacity is max(2*rate, 64 KiB) = 64 KiB at 1 B/s — drain it first so
+        // the next acquire must wait (otherwise the burst returns immediately).
+        assert!(
+            limiter
+                .acquire(GlobalBandwidthLimiter::MAX_ACQUIRE_QUANTUM, None)
+                .await
+        );
 
+        let limiter2 = limiter.clone();
         let blocked = tokio::spawn(async move {
-            assert!(limiter2.acquire(64 * 1024, None).await);
+            assert!(limiter2.acquire(1024, None).await);
         });
 
         sleep(Duration::from_millis(50)).await;

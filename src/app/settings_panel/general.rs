@@ -52,7 +52,7 @@ impl DownloadApp {
                 .parse::<u32>()
                 .unwrap_or(self.settings.max_total_connections)
                 .clamp(1, 256);
-            if concurrent.saturating_mul(segs) > total {
+            if multi_enabled && concurrent.saturating_mul(segs) > total {
                 Some(
                     "Max concurrent × multi segments exceeds total connections — segments will queue on budget.",
                 )
