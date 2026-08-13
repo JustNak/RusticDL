@@ -482,10 +482,7 @@ mod tests {
             fallback_reason_label("legacy_contiguous_partial"),
             "Existing single-stream partial"
         );
-        assert_eq!(
-            fallback_reason_label("map_missing"),
-            "Segment map missing"
-        );
+        assert_eq!(fallback_reason_label("map_missing"), "Segment map missing");
         assert_eq!(
             fallback_reason_label("map_inconsistent"),
             "Segment map inconsistent"

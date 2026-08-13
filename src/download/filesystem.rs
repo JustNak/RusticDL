@@ -525,7 +525,9 @@ mod tests {
     #[test]
     fn disk_free_query_path_walks_to_existing_ancestor() {
         let dir = std::env::temp_dir();
-        let missing = dir.join("no-such-dir-rusticdl-free-space").join("file.part");
+        let missing = dir
+            .join("no-such-dir-rusticdl-free-space")
+            .join("file.part");
         let q = disk_free_query_path(&missing);
         assert!(q.exists(), "query path should exist: {}", q.display());
     }
