@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::Root;
 
-use super::{BrowserPromptWindow, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W};
+use super::{BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W};
 use crate::branding::APP_NAME;
 use crate::download::{EngineHandle, Job};
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
@@ -23,6 +23,7 @@ pub fn open_browser_prompt_window(
 ) -> Option<WindowHandle<Root>> {
     open_capture_window(
         format!("{APP_NAME} — Confirm download"),
+        CAPTURE_WINDOW_H,
         {
             let prompt = prompt.clone();
             let ipc = ipc.clone();
@@ -51,6 +52,7 @@ pub fn open_browser_progress_window(
     }
     let opened = open_capture_window(
         format!("{APP_NAME} — Downloading"),
+        CAPTURE_WINDOW_H,
         {
             let job_id = job_id.clone();
             let ipc = ipc.clone();
@@ -85,6 +87,7 @@ pub fn open_browser_complete_window(
     let job_id = job.id.clone();
     let opened = open_capture_window(
         format!("{APP_NAME} — Download complete"),
+        CAPTURE_COMPLETE_H,
         {
             let ipc = ipc.clone();
             let engine = engine.clone();
@@ -106,6 +109,7 @@ pub fn open_browser_complete_window(
 
 fn open_capture_window<F>(
     title: String,
+    height: f32,
     build: F,
     ipc_fallback: IpcBridge,
     fallback_prompt_id: &str,
@@ -114,7 +118,7 @@ fn open_capture_window<F>(
 where
     F: FnOnce(&mut Window, &mut Context<BrowserPromptWindow>) -> BrowserPromptWindow + 'static,
 {
-    let prompt_size = size(px(CAPTURE_WINDOW_W), px(CAPTURE_WINDOW_H));
+    let prompt_size = size(px(CAPTURE_WINDOW_W), px(height));
     let bounds = Bounds::centered(None, prompt_size, cx);
     let fallback_id = fallback_prompt_id.to_string();
 
@@ -127,7 +131,7 @@ where
                 traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
             }),
             window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(size(px(400.0), px(260.0))),
+            window_min_size: Some(size(px(360.0), px(160.0))),
             // Normal (not PopUp/tool-window): survives focus switches; only X closes.
             // Closing Progress/Complete releases HUD ownership — download keeps running.
             kind: WindowKind::Normal,

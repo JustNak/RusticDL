@@ -4,6 +4,7 @@ pub mod conn_budget;
 pub mod drop_files;
 pub mod duplicates;
 pub mod engine;
+pub mod eta;
 pub mod filesystem;
 pub mod handoff;
 pub mod http;

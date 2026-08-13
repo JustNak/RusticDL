@@ -74,6 +74,7 @@ impl BrowserPromptWindow {
             canceling: false,
             speed_samples: VecDeque::new(),
             reduce_motion: settings.reduce_motion,
+            fitted_height: None,
         }
     }
 

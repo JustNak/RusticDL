@@ -15,6 +15,7 @@ use tokio::time::sleep;
 
 use super::client::download_client;
 use super::conn_budget::ConnectionBudget;
+use super::eta::EtaSmoother;
 use super::filesystem::{
     ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
 };
@@ -457,6 +458,7 @@ struct SharedMulti {
 struct SpeedWindow {
     start: Instant,
     bytes: u64,
+    eta: EtaSmoother,
 }
 
 fn lock_map(map: &Mutex<SegmentMap>) -> std::sync::MutexGuard<'_, SegmentMap> {
@@ -519,6 +521,7 @@ async fn run_segment_workers(
         window: Mutex::new(SpeedWindow {
             start: Instant::now(),
             bytes: 0,
+            eta: EtaSmoother::new(),
         }),
     });
 
@@ -1051,9 +1054,17 @@ fn emit_progress(task: &SegmentTask, speed: Option<u64>) {
         (map.clone(), downloaded, total)
     };
     let speed = speed.or_else(|| Some(take_aggregate_speed(&task.shared)));
+    let remaining = total.saturating_sub(downloaded);
     let eta = match speed {
-        Some(s) if s > 0 && total > downloaded => Some((total - downloaded) / s),
-        Some(_) => Some(0),
+        Some(s) => {
+            let mut window = task
+                .shared
+                .window
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_, eta) = window.eta.observe(s, remaining);
+            Some(eta)
+        }
         None => None,
     };
     (task.on_progress)(ProgressUpdate {

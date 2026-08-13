@@ -16,6 +16,7 @@ use tokio::time::sleep;
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::client::{download_client, referer_for_url};
 use super::conn_budget::ConnectionBudget;
+use super::eta::EtaSmoother;
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
     parse_content_range, sanitize_filename,
@@ -672,6 +673,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         let mut last_progress = Instant::now();
         let mut window_start = Instant::now();
         let mut window_bytes: u64 = 0;
+        let mut eta_smoother = EtaSmoother::new();
 
         on_progress(ProgressUpdate::downloading_tick(
             downloaded,
@@ -752,11 +754,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                     window_start = Instant::now();
                     window_bytes = 0;
 
-                    let eta_secs = if speed > 0 && total_bytes > downloaded {
-                        (total_bytes - downloaded) / speed
-                    } else {
-                        0
-                    };
+                    let remaining = total_bytes.saturating_sub(downloaded);
+                    let (_, eta_secs) = eta_smoother.observe(speed, remaining);
 
                     on_progress(ProgressUpdate::downloading_tick(
                         downloaded,

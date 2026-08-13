@@ -81,6 +81,7 @@ impl BrowserPromptWindow {
             canceling: false,
             speed_samples,
             reduce_motion: settings.reduce_motion,
+            fitted_height: None,
         }
     }
 
