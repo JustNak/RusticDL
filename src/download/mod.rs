@@ -1,5 +1,6 @@
 pub mod bandwidth;
 pub mod client;
+pub mod conn_budget;
 pub mod drop_files;
 pub mod duplicates;
 pub mod engine;
@@ -7,6 +8,7 @@ pub mod filesystem;
 pub mod handoff;
 pub mod http;
 pub mod job;
+pub mod segment_io;
 pub mod urls;
 
 pub use drop_files::extract_urls_from_dropped_paths;
