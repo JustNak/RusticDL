@@ -50,6 +50,12 @@ impl JobState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Canceled)
     }
+
+    /// Queued items that can leave the list (finished or paused). Active
+    /// transfers must be canceled first.
+    pub fn is_removable(self) -> bool {
+        self.is_terminal() || self == Self::Paused
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +266,16 @@ impl Job {
         self.downloaded_bytes = 0;
         self.progress = 0.0;
         self.clear_transfer_identity();
+    }
+
+    /// True when the job can leave the queue (terminal or paused).
+    pub fn is_removable(&self) -> bool {
+        self.state.is_removable()
+    }
+
+    /// True when a completed (or leftover) file exists and the job can be removed.
+    pub fn has_deletable_file(&self) -> bool {
+        self.is_removable() && self.target_path.is_file()
     }
 
     /// Completed: slim state.json — drop map, version 0, mode; keep validators / reconnects.
@@ -491,6 +507,37 @@ mod tests {
             fallback_reason_label("unknown_custom_reason"),
             "unknown_custom_reason"
         );
+    }
+
+    #[test]
+    fn removable_states_are_terminal_or_paused() {
+        assert!(JobState::Completed.is_removable());
+        assert!(JobState::Failed.is_removable());
+        assert!(JobState::Canceled.is_removable());
+        assert!(JobState::Paused.is_removable());
+        assert!(!JobState::Queued.is_removable());
+        assert!(!JobState::Starting.is_removable());
+        assert!(!JobState::Downloading.is_removable());
+    }
+
+    #[test]
+    fn has_deletable_file_requires_existing_target() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-del-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("file.bin");
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "file.bin".into(),
+            target.clone(),
+            dir.join("file.bin.part"),
+        );
+        job.state = JobState::Completed;
+        assert!(!job.has_deletable_file(), "missing file is not deletable");
+        std::fs::write(&target, b"ok").expect("write target");
+        assert!(job.has_deletable_file());
+        job.state = JobState::Downloading;
+        assert!(!job.has_deletable_file(), "active jobs are not deletable");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -124,9 +124,12 @@ pub enum EngineCommand {
     },
     Retry(String),
     Restart(String),
+    /// Drop a job from the queue. `delete_partial` removes leftover `.part`
+    /// files; `delete_file` also deletes the completed download on disk.
     Remove {
         id: String,
         delete_partial: bool,
+        delete_file: bool,
     },
     PauseAll,
     ResumeAll,

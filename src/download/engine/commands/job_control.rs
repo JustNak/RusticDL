@@ -197,17 +197,22 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
     guard.wake.notify_one();
 }
 
-pub(super) async fn remove(inner: &Arc<Mutex<EngineInner>>, id: String, delete_partial: bool) {
-    let (temp_path, worker_still_running) = {
+pub(super) async fn remove(
+    inner: &Arc<Mutex<EngineInner>>,
+    id: String,
+    delete_partial: bool,
+    delete_file: bool,
+) {
+    let (temp_path, target_path, worker_still_running) = {
         let mut guard = inner.lock().await;
         if let Some(ctrl) = guard.controls.get(&id) {
             store_control(ctrl, WorkerControl::Canceled);
         }
-        let path = guard
+        let paths = guard
             .jobs
             .iter()
             .find(|j| j.id == id)
-            .map(|j| j.temp_path.clone());
+            .map(|j| (j.temp_path.clone(), j.target_path.clone()));
         let worker_still_running = guard.active.contains_key(&id);
         guard.jobs.retain(|j| j.id != id);
         guard.handoff_auth.remove(&id);
@@ -218,16 +223,28 @@ pub(super) async fn remove(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             guard.controls.remove(&id);
             guard.pending_partial_deletes.remove(&id);
         } else if delete_partial {
-            if let Some(path) = path.clone() {
+            if let Some((path, _)) = paths.clone() {
                 guard.pending_partial_deletes.insert(id.clone(), path);
             }
         }
         emit_jobs_locked(&guard);
-        (path, worker_still_running)
+        match paths {
+            Some((temp, target)) => (Some(temp), Some(target), worker_still_running),
+            None => (None, None, worker_still_running),
+        }
     };
-    if delete_partial && !worker_still_running {
-        if let Some(path) = temp_path {
-            remove_partial(&path).await;
+    if !worker_still_running {
+        if delete_partial {
+            if let Some(path) = temp_path {
+                remove_partial(&path).await;
+            }
+        }
+        if delete_file {
+            if let Some(path) = target_path {
+                if path.is_file() {
+                    remove_partial(&path).await;
+                }
+            }
         }
     }
 }

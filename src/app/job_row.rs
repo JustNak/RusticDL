@@ -230,9 +230,8 @@ pub(crate) fn render_job_row(
                                 let can_open = job.is_some_and(|j| {
                                     j.state == JobState::Completed && j.target_path.exists()
                                 });
-                                let can_remove = job.is_some_and(|j| {
-                                    j.state.is_terminal() || j.state == JobState::Paused
-                                });
+                                let can_remove = job.is_some_and(|j| j.is_removable());
+                                let can_delete = job.is_some_and(|j| j.has_deletable_file());
 
                                 let mut menu = menu.min_w(px(180.));
 
@@ -328,17 +327,13 @@ pub(crate) fn render_job_row(
                                         }),
                                 );
 
-                                menu.separator().item(
+                                menu = menu.separator().item(
                                     PopupMenuItem::new(if can_remove {
                                         "Remove"
                                     } else {
                                         "Cancel"
                                     })
-                                    .icon(if can_remove {
-                                        IconName::Delete
-                                    } else {
-                                        IconName::Close
-                                    })
+                                    .icon(IconName::Close)
                                     .on_click({
                                         let view = view.clone();
                                         let engine = engine.clone();
@@ -362,7 +357,31 @@ pub(crate) fn render_job_row(
                                             }
                                         }
                                     }),
-                                )
+                                );
+
+                                if can_delete {
+                                    menu = menu.item(
+                                        PopupMenuItem::new("Delete file")
+                                            .icon(IconName::Delete)
+                                            .on_click({
+                                                let view = view.clone();
+                                                let id = id.clone();
+                                                let filename = filename.clone();
+                                                move |_, window, cx| {
+                                                    let _ = view.update(cx, |app, cx| {
+                                                        app.confirm_delete(
+                                                            id.clone(),
+                                                            filename.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
+
+                                menu
                             }
                         }),
                 ),

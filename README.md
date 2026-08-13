@@ -107,7 +107,7 @@ RusticDL is a **simple, local-first download manager** focused on everyday HTTP/
 - Live progress: percent, size, speed, ETA
 - Status bar with totals, aggregate speed, and speed limit
 - Pause / resume, pause-all / resume-all
-- Retry, restart, cancel, remove (with confirmation)
+- Retry, restart, cancel, remove from the queue, or delete the file from disk (with confirmation)
 - Clear completed / clear failed
 - Detail panel with full job actions (open, reveal, copy path)
 - Multi-connection segmented downloads for large HTTP files (parallel Range requests)

@@ -61,6 +61,14 @@ impl DownloadApp {
             return;
         }
 
+        if modifiers.shift && modifiers.number_of_modifiers() == 1 && key == "delete" {
+            if self.queue_shortcuts_active() {
+                self.shortcut_confirm_delete(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         if no_mods && key == "space" {
             if self.queue_shortcuts_active() {
                 self.shortcut_toggle_pause_resume();
@@ -131,6 +139,27 @@ impl DownloadApp {
             self.confirm_remove(id, filename, window, cx);
         } else {
             self.confirm_remove_selected(window, cx);
+        }
+    }
+
+    /// Shift+Delete — confirm delete-from-disk for selected jobs with files.
+    fn shortcut_confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
+            return;
+        }
+        if self.selected_ids.len() == 1 {
+            let id = self.selected_ids[0].clone();
+            let Some(job) = self.jobs.iter().find(|j| j.id == id) else {
+                return;
+            };
+            if !job.has_deletable_file() {
+                self.show_toast("No file on disk to delete.", cx);
+                return;
+            }
+            let filename = job.filename.clone();
+            self.confirm_delete(id, filename, window, cx);
+        } else {
+            self.confirm_delete_selected(window, cx);
         }
     }
 
