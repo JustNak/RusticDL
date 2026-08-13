@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
 use reqwest::header::{
-    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, RANGE, REFERER,
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+    REFERER,
 };
 use reqwest::{Client, StatusCode, Version};
 use std::error::Error as StdError;
@@ -19,7 +20,8 @@ use super::filesystem::{
 };
 use super::handoff::{handoff_auth_for_request_url, is_allowed_handoff_header, HandoffAuth};
 use super::job::{
-    download_error, DownloadError, DownloadOutcome, FailureCategory, Job, WorkerControl,
+    download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
+    TransferMode, WorkerControl,
 };
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
@@ -33,6 +35,8 @@ const CONTROL_PAUSED: u8 = 1;
 const CONTROL_CANCELED: u8 = 2;
 
 /// Partial progress patch. `None` = leave the field unchanged on apply/merge.
+/// Structured fields (`validators`, metrics) stay sparse `None` on speed ticks so
+/// coalesce never clears them.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressUpdate {
     pub downloaded_bytes: Option<u64>,
@@ -45,6 +49,12 @@ pub struct ProgressUpdate {
     pub temp_path: Option<std::path::PathBuf>,
     pub resume_supported: Option<bool>,
     pub state_hint: Option<ProgressHint>,
+    pub validators: Option<ContentValidators>,
+    pub transfer_format_version: Option<u32>,
+    pub active_connections: Option<u32>,
+    pub reconnect_count: Option<u32>,
+    pub transfer_mode: Option<TransferMode>,
+    pub fallback_reason: Option<String>,
 }
 
 impl ProgressUpdate {
@@ -61,10 +71,18 @@ impl ProgressUpdate {
             temp_path: later.temp_path.or(self.temp_path),
             resume_supported: later.resume_supported.or(self.resume_supported),
             state_hint: later.state_hint.or(self.state_hint),
+            validators: later.validators.or(self.validators),
+            transfer_format_version: later
+                .transfer_format_version
+                .or(self.transfer_format_version),
+            active_connections: later.active_connections.or(self.active_connections),
+            reconnect_count: later.reconnect_count.or(self.reconnect_count),
+            transfer_mode: later.transfer_mode.or(self.transfer_mode),
+            fallback_reason: later.fallback_reason.or(self.fallback_reason),
         }
     }
 
-    /// Starting metadata tick (paths/filename/resume + zero speed).
+    /// Starting metadata tick (paths/filename/resume/validators + zero speed).
     pub fn starting_tick(
         downloaded: u64,
         total: u64,
@@ -72,6 +90,7 @@ impl ProgressUpdate {
         target_path: Option<std::path::PathBuf>,
         temp_path: Option<std::path::PathBuf>,
         resume_supported: Option<bool>,
+        validators: Option<ContentValidators>,
     ) -> Self {
         Self {
             downloaded_bytes: Some(downloaded),
@@ -84,10 +103,16 @@ impl ProgressUpdate {
             temp_path,
             resume_supported,
             state_hint: Some(ProgressHint::Starting),
+            validators,
+            transfer_format_version: None,
+            active_connections: None,
+            reconnect_count: None,
+            transfer_mode: None,
+            fallback_reason: None,
         }
     }
 
-    /// Periodic downloading scalar tick (no path/filename changes).
+    /// Periodic downloading scalar tick (no path/filename/validator changes).
     pub fn downloading_tick(
         downloaded: u64,
         total: u64,
@@ -106,6 +131,12 @@ impl ProgressUpdate {
             temp_path: None,
             resume_supported: None,
             state_hint: Some(ProgressHint::Downloading),
+            validators: None,
+            transfer_format_version: None,
+            active_connections: None,
+            reconnect_count: None,
+            transfer_mode: None,
+            fallback_reason: None,
         }
     }
 
@@ -129,6 +160,12 @@ impl ProgressUpdate {
             temp_path,
             resume_supported,
             state_hint: Some(ProgressHint::Downloading),
+            validators: None,
+            transfer_format_version: None,
+            active_connections: None,
+            reconnect_count: None,
+            transfer_mode: None,
+            fallback_reason: None,
         }
     }
 }
@@ -155,8 +192,10 @@ pub async fn run_http_download(
 
     let client = download_client()?;
     let mut current_url = job.url.clone();
-    // Single-stream Range start = on-disk .part length (authoritative; see reconcile_partial_progress).
-    let mut existing_bytes = metadata_len(&job.temp_path).await.unwrap_or(0);
+    // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
+    // Range/progress. v0 uses single-stream metadata_len.
+    let disk_len = metadata_len(&job.temp_path).await.unwrap_or(0);
+    let mut existing_bytes = resume_offset(job, disk_len);
 
     // Follow redirects manually (client has Policy::none).
     let (response, final_url) = fetch_with_redirects(
@@ -258,6 +297,10 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
+    // Empty capture → None so apply leaves stored validators alone (CDN 206 without
+    // identity headers). Non-empty Some is field-wise merged on apply (never wipes).
+    let validators = content_validators_patch(response.headers(), total_bytes);
+
     let mut target_path = job.target_path.clone();
     let mut temp_path = job.temp_path.clone();
     let mut filename = job.filename.clone();
@@ -301,6 +344,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         Some(target_path.clone()),
         Some(temp_path.clone()),
         Some(resume_supported),
+        validators,
     ));
 
     ensure_parent_directory(&temp_path)
@@ -740,6 +784,50 @@ fn progress_percent(downloaded: u64, total: u64) -> f64 {
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
 
+/// Resume Range start: v1+ is map-authoritative (`job.downloaded_bytes`); v0 uses `.part` length.
+fn resume_offset(job: &Job, disk_len: u64) -> u64 {
+    if job.transfer_format_version >= 1 {
+        job.downloaded_bytes
+    } else {
+        disk_len
+    }
+}
+
+/// Capture ETag / Last-Modified / expected size from a successful download response.
+fn content_validators_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    total_bytes: u64,
+) -> ContentValidators {
+    ContentValidators {
+        etag: headers
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        last_modified: headers
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        expected_size: if total_bytes > 0 {
+            Some(total_bytes)
+        } else {
+            None
+        },
+    }
+}
+
+/// Progress patch value: `None` when capture is empty so apply does not replace stored identity.
+fn content_validators_patch(
+    headers: &reqwest::header::HeaderMap,
+    total_bytes: u64,
+) -> Option<ContentValidators> {
+    let captured = content_validators_from_headers(headers, total_bytes);
+    if captured.is_empty() {
+        None
+    } else {
+        Some(captured)
+    }
+}
+
 fn disk_write_error(error: std::io::Error) -> DownloadError {
     download_error(
         FailureCategory::Disk,
@@ -762,7 +850,7 @@ async fn flush_partial_writer(
     Ok(())
 }
 
-/// `sync_data` only on pause when enabled — cancel/complete skip fsync (§0.3).
+/// `sync_data` only on pause when enabled — cancel/complete skip fsync.
 fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> bool {
     fsync_on_pause && matches!(outcome, DownloadOutcome::Paused)
 }
@@ -890,6 +978,12 @@ mod tests {
             temp_path: Some(PathBuf::from("/tmp/a.part")),
             resume_supported: Some(true),
             state_hint: Some(ProgressHint::Starting),
+            validators: Some(ContentValidators {
+                etag: Some("\"v1\"".into()),
+                last_modified: None,
+                expected_size: Some(100),
+            }),
+            ..Default::default()
         };
         let later = ProgressUpdate {
             downloaded_bytes: Some(50),
@@ -902,6 +996,9 @@ mod tests {
             temp_path: None,
             resume_supported: None,
             state_hint: Some(ProgressHint::Downloading),
+            // Speed tick leaves validators None → earlier preserved.
+            validators: None,
+            ..Default::default()
         };
 
         let merged = earlier.merge(later);
@@ -915,6 +1012,70 @@ mod tests {
         assert_eq!(merged.temp_path, Some(PathBuf::from("/tmp/a.part")));
         assert_eq!(merged.resume_supported, Some(true));
         assert_eq!(merged.state_hint, Some(ProgressHint::Downloading));
+        assert_eq!(
+            merged.validators.as_ref().and_then(|v| v.etag.as_deref()),
+            Some("\"v1\"")
+        );
+    }
+
+    #[test]
+    fn content_validators_from_headers_captures_etag_lm_size() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(ETAG, "\"abc123\"".parse().unwrap());
+        headers.insert(
+            LAST_MODIFIED,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        let v = content_validators_from_headers(&headers, 4096);
+        assert_eq!(v.etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(
+            v.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+        assert_eq!(v.expected_size, Some(4096));
+    }
+
+    #[test]
+    fn content_validators_zero_total_omits_expected_size() {
+        let headers = reqwest::header::HeaderMap::new();
+        let v = content_validators_from_headers(&headers, 0);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn content_validators_patch_none_when_empty() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(content_validators_patch(&headers, 0).is_none());
+    }
+
+    #[test]
+    fn content_validators_patch_some_when_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(ETAG, "\"x\"".parse().unwrap());
+        let patch = content_validators_patch(&headers, 0).expect("non-empty");
+        assert_eq!(patch.etag.as_deref(), Some("\"x\""));
+    }
+
+    #[test]
+    fn starting_tick_empty_validators_leave_none() {
+        let tick = ProgressUpdate::starting_tick(0, 0, None, None, None, Some(true), None);
+        assert!(tick.validators.is_none());
+    }
+
+    #[test]
+    fn resume_offset_version_gate() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
+        job.transfer_format_version = 0;
+        assert_eq!(resume_offset(&job, 999), 999);
+
+        job.transfer_format_version = 1;
+        assert_eq!(resume_offset(&job, 999), 42);
     }
 
     #[test]
@@ -923,6 +1084,8 @@ mod tests {
         assert_eq!(tick.downloaded_bytes, Some(25));
         assert_eq!(tick.total_bytes, Some(100));
         assert_eq!(tick.speed, Some(10));
+        assert!(tick.validators.is_none());
+        assert!(tick.transfer_format_version.is_none());
         assert_eq!(tick.eta_secs, Some(7));
         assert_eq!(tick.progress, Some(25.0));
         assert!(tick.filename.is_none());
