@@ -7,14 +7,77 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::sleep;
 
+use super::bandwidth::GlobalBandwidthLimiter;
 use super::filesystem::remove_partial;
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{
     run_http_download, store_control, ProgressCallback, ProgressHint, ProgressUpdate,
 };
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
+use crate::settings::Settings;
 
 mod commands;
+
+/// Live engine knobs (from Settings). Multi / fsync fields are stored early for later PRs.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // multi_* / fsync_on_pause reserved until orchestrator / pause fsync land
+pub struct EngineRuntimeConfig {
+    pub max_concurrent: u32,
+    pub auto_retry: u32,
+    pub speed_limit_kib: u32,
+    pub fsync_on_pause: bool,
+    pub multi_connection_enabled: bool,
+    pub multi_max_segments: u32,
+    pub multi_min_bytes: u64,
+    pub max_total_connections: u32,
+    pub max_connections_per_host: u32,
+}
+
+impl EngineRuntimeConfig {
+    pub fn from_settings(s: &Settings) -> Self {
+        let mut cfg = Self {
+            max_concurrent: s.max_concurrent_downloads,
+            auto_retry: s.auto_retry_attempts,
+            speed_limit_kib: s.speed_limit_kib_per_second,
+            fsync_on_pause: s.fsync_on_pause,
+            multi_connection_enabled: s.multi_connection_enabled,
+            multi_max_segments: s.multi_max_segments,
+            multi_min_bytes: s.multi_min_bytes,
+            max_total_connections: s.max_total_connections,
+            max_connections_per_host: s.max_connections_per_host,
+        };
+        cfg.sanitize();
+        cfg
+    }
+
+    pub fn sanitize(&mut self) {
+        self.max_concurrent = self.max_concurrent.clamp(1, 64);
+        self.auto_retry = self.auto_retry.min(100);
+        // 0 = unlimited; no upper clamp needed for practical UI values.
+        self.multi_max_segments = self.multi_max_segments.clamp(1, 16);
+        self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
+        self.max_total_connections = self.max_total_connections.clamp(1, 256);
+        self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
+        // Per-host cannot exceed process-wide total (multi orchestrator will rely on this).
+        self.max_connections_per_host = self
+            .max_connections_per_host
+            .min(self.max_total_connections);
+    }
+
+    pub fn speed_limit_bytes_per_second(&self) -> Option<u64> {
+        if self.speed_limit_kib == 0 {
+            None
+        } else {
+            Some(self.speed_limit_kib as u64 * 1024)
+        }
+    }
+}
+
+impl Default for EngineRuntimeConfig {
+    fn default() -> Self {
+        Self::from_settings(&Settings::default())
+    }
+}
 
 /// Backoff schedule for auto-retry (indexed by attempt number - 1).
 /// Longer delays help with flaky TLS / filter / CDN blips that browsers also hit.
@@ -63,11 +126,7 @@ pub enum EngineCommand {
     PauseAll,
     ResumeAll,
     RetryAll,
-    UpdateSettings {
-        max_concurrent: u32,
-        auto_retry: u32,
-        speed_limit_kib: u32,
-    },
+    UpdateSettings(EngineRuntimeConfig),
     ReplaceJobs(Vec<Job>),
     Shutdown,
 }
@@ -83,12 +142,6 @@ impl EngineHandle {
     }
 }
 
-pub(super) struct EngineConfig {
-    max_concurrent: u32,
-    auto_retry: u32,
-    speed_limit_kib: u32,
-}
-
 pub(super) struct EngineInner {
     jobs: Vec<Job>,
     controls: HashMap<String, Arc<AtomicU8>>,
@@ -100,20 +153,23 @@ pub(super) struct EngineInner {
     requeue_on_cancel: HashMap<String, ()>,
     /// Partial paths to delete after a still-running worker exits (Remove).
     pending_partial_deletes: HashMap<String, PathBuf>,
-    config: EngineConfig,
+    pub(super) config: EngineRuntimeConfig,
+    pub(super) limiter: Arc<GlobalBandwidthLimiter>,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     wake: Arc<Notify>,
 }
 
 pub fn spawn_engine(
     initial_jobs: Vec<Job>,
-    max_concurrent: u32,
-    auto_retry: u32,
-    speed_limit_kib: u32,
+    config: EngineRuntimeConfig,
 ) -> (EngineHandle, mpsc::UnboundedReceiver<EngineEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let wake = Arc::new(Notify::new());
+
+    let mut config = config;
+    config.sanitize();
+    let limiter = GlobalBandwidthLimiter::new(config.speed_limit_bytes_per_second());
 
     let mut jobs = initial_jobs;
     for job in &mut jobs {
@@ -132,11 +188,8 @@ pub fn spawn_engine(
         handoff_auth: HashMap::new(),
         requeue_on_cancel: HashMap::new(),
         pending_partial_deletes: HashMap::new(),
-        config: EngineConfig {
-            max_concurrent: max_concurrent.max(1),
-            auto_retry,
-            speed_limit_kib,
-        },
+        config,
+        limiter,
         event_tx,
         wake: wake.clone(),
     }));
@@ -207,7 +260,7 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
 
 fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     tokio::spawn(async move {
-        let (job_snapshot, control, speed_limit, max_retry, handoff_auth) = {
+        let (job_snapshot, control, limiter, handoff_auth) = {
             let mut guard = inner.lock().await;
             let control = Arc::new(AtomicU8::new(0));
             guard.controls.insert(job_id.clone(), control.clone());
@@ -219,14 +272,9 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                     return;
                 }
             };
-            let speed = if guard.config.speed_limit_kib == 0 {
-                None
-            } else {
-                Some(guard.config.speed_limit_kib as u64 * 1024)
-            };
-            let max_retry = guard.config.auto_retry;
+            let limiter = guard.limiter.clone();
             let auth = guard.handoff_auth.get(&job_id).cloned();
-            (job, control, speed, max_retry, auth)
+            (job, control, limiter, auth)
         };
 
         // Serialize progress updates so out-of-order ticks cannot regress speed/bytes.
@@ -265,7 +313,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
 
             match run_http_download(
                 &attempt_job,
-                speed_limit,
+                limiter.clone(),
                 control.clone(),
                 on_progress.clone(),
                 handoff_auth.as_ref(),
@@ -281,6 +329,11 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                             break Ok(DownloadOutcome::Canceled);
                         }
                     }
+                    // Re-read live auto_retry so UpdateSettings applies to the next failure.
+                    let max_retry = {
+                        let guard = inner.lock().await;
+                        guard.config.auto_retry
+                    };
                     let can_retry = error.retryable && retry_attempts < max_retry;
                     if can_retry {
                         retry_attempts += 1;

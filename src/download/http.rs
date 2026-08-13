@@ -11,6 +11,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::sleep;
 
+use super::bandwidth::GlobalBandwidthLimiter;
 use super::client::{download_client, referer_for_url};
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
@@ -55,7 +56,7 @@ pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 pub async fn run_http_download(
     job: &Job,
-    speed_limit_bytes_per_second: Option<u64>,
+    limiter: Arc<GlobalBandwidthLimiter>,
     control: Arc<AtomicU8>,
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
@@ -305,24 +306,36 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             continue;
         }
 
-        writer
-            .write_all(&chunk)
-            .await
-            .map_err(|error| disk_write_error(error))?;
+        // Pre-write: charge the shared limiter (may burst up to bucket capacity).
+        // Interruptible for pause/cancel, but once the stream has delivered a chunk
+        // it must be written — dropping it leaves a Range-resume hole.
+        // On abort mid-throttle some quanta may already be charged; do not re-acquire
+        // the full length (would double-bill). Slight under-charge on the pause edge
+        // is acceptable.
+        let acquired = limiter.acquire(chunk.len(), Some(&control)).await;
+
+        writer.write_all(&chunk).await.map_err(disk_write_error)?;
 
         let n = chunk.len() as u64;
         downloaded = downloaded.saturating_add(n);
         window_bytes = window_bytes.saturating_add(n);
 
-        if let Some(limit) = speed_limit_bytes_per_second {
-            if limit > 0 {
-                let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
-                let allowed = limit as f64 * elapsed;
-                if window_bytes as f64 > allowed {
-                    let extra = (window_bytes as f64 - allowed) / limit as f64;
-                    sleep(Duration::from_secs_f64(extra.min(2.0))).await;
-                }
-            }
+        if !acquired {
+            writer.flush().await.map_err(disk_write_error)?;
+            // Keep job/UI counters aligned with what is on disk before pause/cancel.
+            on_progress(ProgressUpdate {
+                downloaded_bytes: downloaded,
+                total_bytes,
+                speed: 0,
+                eta_secs: 0,
+                progress: progress_percent(downloaded, total_bytes),
+                filename: None,
+                target_path: None,
+                temp_path: None,
+                resume_supported: None,
+                state_hint: ProgressHint::Downloading,
+            });
+            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
         }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {

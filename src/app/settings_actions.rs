@@ -8,7 +8,7 @@ use gpui_component::WindowExt;
 use super::confirm_dialogs;
 use super::DownloadApp;
 use crate::appearance::{apply_appearance, apply_window_opacity};
-use crate::download::EngineCommand;
+use crate::download::{EngineCommand, EngineRuntimeConfig};
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::persistence::save_settings;
 use crate::settings::{
@@ -90,11 +90,41 @@ impl DownloadApp {
             .value()
             .parse::<u32>()
             .unwrap_or(0);
+        let multi_max_segments = self
+            .multi_max_segments_input
+            .read(cx)
+            .value()
+            .parse::<u32>()
+            .unwrap_or(8);
+        let multi_min_mib = self
+            .multi_min_mib_input
+            .read(cx)
+            .value()
+            .parse::<u64>()
+            .unwrap_or(5)
+            .max(1);
+        let max_total_connections = self
+            .max_total_connections_input
+            .read(cx)
+            .value()
+            .parse::<u32>()
+            .unwrap_or(32);
+        let max_connections_per_host = self
+            .max_connections_per_host_input
+            .read(cx)
+            .value()
+            .parse::<u32>()
+            .unwrap_or(8);
 
         self.settings.download_directory = download_directory;
         self.settings.max_concurrent_downloads = max_concurrent;
         self.settings.auto_retry_attempts = auto_retry;
         self.settings.speed_limit_kib_per_second = speed_limit;
+        self.settings.multi_max_segments = multi_max_segments;
+        self.settings.multi_min_bytes = multi_min_mib.saturating_mul(1024 * 1024);
+        self.settings.max_total_connections = max_total_connections;
+        self.settings.max_connections_per_host = max_connections_per_host;
+        // multi_connection_enabled / fsync_on_pause are draft-toggled on self.settings.
 
         // Browser capture text lists — drafts until Save; sanitize via extension.sanitize().
         let excluded_hosts = self
@@ -119,6 +149,28 @@ impl DownloadApp {
         self.settings.extension.captured_file_extensions = captured_extensions;
 
         self.settings.sanitize_appearance();
+        // Reflect clamped multi limits back into text drafts.
+        let multi_segs = self.settings.multi_max_segments.to_string();
+        let multi_mib = (self.settings.multi_min_bytes / (1024 * 1024))
+            .max(1)
+            .to_string();
+        let max_total = self.settings.max_total_connections.to_string();
+        let max_host = self.settings.max_connections_per_host.to_string();
+        let concurrent = self.settings.max_concurrent_downloads.to_string();
+        let retry = self.settings.auto_retry_attempts.to_string();
+        self.concurrent_input
+            .update(cx, |i, cx| i.set_value(concurrent, window, cx));
+        self.retry_input
+            .update(cx, |i, cx| i.set_value(retry, window, cx));
+        self.multi_max_segments_input
+            .update(cx, |i, cx| i.set_value(multi_segs, window, cx));
+        self.multi_min_mib_input
+            .update(cx, |i, cx| i.set_value(multi_mib, window, cx));
+        self.max_total_connections_input
+            .update(cx, |i, cx| i.set_value(max_total, window, cx));
+        self.max_connections_per_host_input
+            .update(cx, |i, cx| i.set_value(max_host, window, cx));
+
         self.extension_settings_dirty = false;
         self.extension_committed = self.settings.extension.clone();
         // Show sanitized hosts/extensions in the drafts after Save.
@@ -139,13 +191,31 @@ impl DownloadApp {
 
         apply_appearance(&self.settings, Some(window), cx);
 
-        self.engine.send(EngineCommand::UpdateSettings {
-            max_concurrent,
-            auto_retry,
-            speed_limit_kib: speed_limit,
-        });
+        self.engine.send(EngineCommand::UpdateSettings(
+            EngineRuntimeConfig::from_settings(&self.settings),
+        ));
 
         self.show_toast("Settings saved.", cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_multi_connection_enabled(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.multi_connection_enabled = on;
+        cx.notify();
+    }
+
+    pub(crate) fn set_fsync_on_pause(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.fsync_on_pause = on;
         cx.notify();
     }
 
