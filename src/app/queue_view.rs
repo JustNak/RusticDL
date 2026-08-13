@@ -121,6 +121,7 @@ impl DownloadApp {
             // Search + overflow live in the title bar — no separate toolbar strip.
             .child(
                 h_flex()
+                    .w_full()
                     .h(px(28.))
                     .px_4()
                     .gap_3()
