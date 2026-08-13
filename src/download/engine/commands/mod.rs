@@ -64,7 +64,8 @@ mod tests {
     use super::*;
     use crate::download::engine::{spawn_engine, EngineEvent, EngineRuntimeConfig};
     use crate::download::handoff::EnqueueStatus;
-    use crate::download::job::{ContentValidators, Job, JobState, TransferMode};
+    use crate::download::job::{ContentValidators, FailureCategory, Job, JobState, TransferMode};
+    use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -628,6 +629,65 @@ mod tests {
         assert_eq!(canceled.downloaded_bytes, 100);
         assert_eq!(canceled.validators.etag.as_deref(), Some("\"keep\""));
         assert_eq!(canceled.active_connections, 0);
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_v1_map_missing_fails_without_inventing_ranges() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/v1-missing.bin", JobState::Paused, &dir);
+        job.transfer_format_version = 1;
+        job.segment_map = None;
+        job.downloaded_bytes = 250;
+        job.total_bytes = 1000;
+        job.progress = 25.0;
+        std::fs::write(&job.temp_path, vec![0u8; 250]).expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        engine.send(EngineCommand::Resume(id.clone()));
+
+        let jobs = next_jobs(&mut events).await;
+        let failed = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.failure_category, Some(FailureCategory::Resume));
+        assert_eq!(failed.error.as_deref(), Some(RESUME_RESTART_MESSAGE));
+        assert_eq!(failed.fallback_reason.as_deref(), Some("map_missing"));
+        assert_eq!(failed.transfer_format_version, 1);
+        assert!(failed.segment_map.is_none());
+        assert_eq!(failed.downloaded_bytes, 250);
+        assert!(part.exists(), "Resume error must not delete the .part");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retry_v1_inconsistent_map_fails_resume() {
+        let dir = temp_dir();
+        let mut job = sample_job("https://example.com/v1-bad.bin", JobState::Failed, &dir);
+        job.transfer_format_version = 1;
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![],
+            preallocated: false,
+        });
+        job.downloaded_bytes = 100;
+        let id = job.id.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        engine.send(EngineCommand::Retry(id.clone()));
+
+        let jobs = next_jobs(&mut events).await;
+        let failed = jobs.iter().find(|j| j.id == id).expect("job remains");
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.failure_category, Some(FailureCategory::Resume));
+        assert_eq!(failed.fallback_reason.as_deref(), Some("map_inconsistent"));
+        assert!(failed.segment_map.is_some(), "inconsistent map is retained");
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
