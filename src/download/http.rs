@@ -156,7 +156,6 @@ pub async fn run_http_download(
     let client = download_client()?;
     let mut current_url = job.url.clone();
     // Single-stream Range start = on-disk .part length (authoritative; see reconcile_partial_progress).
-    // PR4/PR8: map/version jobs must not use metadata_len for offsets.
     let mut existing_bytes = metadata_len(&job.temp_path).await.unwrap_or(0);
 
     // Follow redirects manually (client has Policy::none).
@@ -757,11 +756,8 @@ async fn flush_partial_writer(
 ) -> Result<(), DownloadError> {
     writer.flush().await.map_err(disk_write_error)?;
     if should_sync_data_on_exit(fsync_on_pause, outcome) {
-        writer
-            .get_ref()
-            .sync_data()
-            .await
-            .map_err(disk_write_error)?;
+        // Already flushed to the OS; a failed durability sync must not fail Pause.
+        let _ = writer.get_ref().sync_data().await;
     }
     Ok(())
 }
@@ -772,18 +768,13 @@ fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> b
 }
 
 fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, total_bytes: u64) {
-    on_progress(ProgressUpdate {
-        downloaded_bytes: downloaded,
+    on_progress(ProgressUpdate::downloading_tick(
+        downloaded,
         total_bytes,
-        speed: 0,
-        eta_secs: 0,
-        progress: progress_percent(downloaded, total_bytes),
-        filename: None,
-        target_path: None,
-        temp_path: None,
-        resume_supported: None,
-        state_hint: ProgressHint::Downloading,
-    });
+        0,
+        0,
+        progress_percent(downloaded, total_bytes),
+    ));
 }
 
 fn should_retry_status(status: StatusCode) -> bool {

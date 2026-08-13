@@ -48,19 +48,10 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
 
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
-/// **PR 2 scope:** single-stream / legacy only (`metadata_len`).
-/// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex
-/// is not held across filesystem I/O; this convenience wrapper remains for tests
-/// and call sites that already own the job exclusively.
-///
-/// Future branches (not yet — Job lacks these fields in PR 2):
-/// - **PR 4:** if `transfer_format_version >= 1`, skip `metadata_len` (version gate).
-/// - **PR 8:** if `segment_map.is_some()`, `downloaded_bytes = sum(written)` only.
-#[allow(dead_code)] // public API; engine prefers lock-split path
+/// Disk is the single-stream source of truth. Prefer `metadata_len` plus
+/// `apply_partial_progress_from_disk` so the engine mutex is not held across I/O.
+#[allow(dead_code)]
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
-    // PR4: if job.transfer_format_version >= 1 { /* no metadata_len */ }
-    // PR8: if job.segment_map.is_some() { /* sum(segment.written); return */ }
-
     let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
     apply_partial_progress_from_disk(job, on_disk)
 }

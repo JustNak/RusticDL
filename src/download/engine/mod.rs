@@ -286,7 +286,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         // Per-attempt progress pump: drain (flush pending) after each attempt so
         // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
-            // Disk is authoritative for single-stream resume (PR4/PR8 map/version later).
+            // Disk is authoritative for single-stream resume.
             // Snapshot path under the lock, then await metadata without holding it.
             let (temp_path, fsync_on_pause) = {
                 let guard = inner.lock().await;
@@ -304,14 +304,16 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             {
                 let mut guard = inner.lock().await;
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
-                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                    apply_partial_progress_from_disk(job, on_disk);
-                    if !restarting {
+                // Restart already unlinked the .part and zeroed counters. Do not
+                // apply a metadata snapshot taken before that unlink.
+                if !restarting {
+                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                        apply_partial_progress_from_disk(job, on_disk);
                         job.state = JobState::Downloading;
                         job.error = None;
+                        attempt_job = job.clone();
+                        emit_jobs_locked(&guard);
                     }
-                    attempt_job = job.clone();
-                    emit_jobs_locked(&guard);
                 }
             }
 
