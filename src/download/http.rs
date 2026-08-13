@@ -26,9 +26,9 @@ use super::job::{
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 const CONTROL_POLL: Duration = Duration::from_millis(200);
-#[allow(dead_code)]
-const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_REDIRECTS: u32 = 10;
+/// Timeout for HEAD / Range 0-0 preflight probes (shared with `preflight`).
+pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const MAX_REDIRECTS: u32 = 10;
 
 const CONTROL_CONTINUE: u8 = 0;
 const CONTROL_PAUSED: u8 = 1;
@@ -194,6 +194,44 @@ pub enum ProgressHint {
 
 pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
+/// Attempt-scoped transfer inputs shared by preflight, single-stream, reconnect, and
+/// (later) multi-segment workers. `resolved_url` is pinned after a successful redirect
+/// chain so subsequent requests do not re-walk independent redirect races.
+#[derive(Clone)]
+pub struct TransferContext {
+    pub job: Job,
+    pub control: Arc<AtomicU8>,
+    pub on_progress: ProgressCallback,
+    /// Memory-only browser session headers (snapshot from `EngineInner`).
+    pub handoff_auth: Option<HandoffAuth>,
+    pub limiter: Arc<GlobalBandwidthLimiter>,
+    /// Attempt-local; updated only when redirect follow succeeds. Init = `job.url`.
+    pub resolved_url: String,
+    /// Flush + `sync_data` on pause (from `EngineRuntimeConfig`).
+    pub fsync_on_pause: bool,
+}
+
+impl TransferContext {
+    pub fn new(
+        job: Job,
+        control: Arc<AtomicU8>,
+        on_progress: ProgressCallback,
+        handoff_auth: Option<HandoffAuth>,
+        limiter: Arc<GlobalBandwidthLimiter>,
+    ) -> Self {
+        let resolved_url = job.url.clone();
+        Self {
+            job,
+            control,
+            on_progress,
+            handoff_auth,
+            limiter,
+            resolved_url,
+            fsync_on_pause: false,
+        }
+    }
+}
+
 pub async fn run_http_download(
     job: &Job,
     limiter: Arc<GlobalBandwidthLimiter>,
@@ -202,31 +240,71 @@ pub async fn run_http_download(
     handoff_auth: Option<&HandoffAuth>,
     fsync_on_pause: bool,
 ) -> Result<DownloadOutcome, DownloadError> {
-    ensure_parent_directory(&job.target_path)
+    let mut ctx = TransferContext::new(
+        job.clone(),
+        control,
+        on_progress,
+        handoff_auth.cloned(),
+        limiter,
+    );
+    ctx.fsync_on_pause = fsync_on_pause;
+    run_http_download_with_ctx(&mut ctx).await
+}
+
+/// Single-stream transfer using an attempt-local [`TransferContext`] (URL pin + handoff).
+pub async fn run_http_download_with_ctx(
+    ctx: &mut TransferContext,
+) -> Result<DownloadOutcome, DownloadError> {
+    let limiter = ctx.limiter.clone();
+    let fsync_on_pause = ctx.fsync_on_pause;
+
+    ensure_parent_directory(&ctx.job.target_path)
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
     let client = download_client()?;
-    let mut current_url = job.url.clone();
+
+    // Best-effort preflight: size / Accept-Ranges / validators + pin resolved URL.
+    if let Some(info) = super::preflight::run_preflight(
+        &client,
+        &ctx.job.url,
+        &ctx.resolved_url,
+        ctx.handoff_auth.as_ref(),
+        &ctx.control,
+    )
+    .await
+    {
+        ctx.resolved_url = info.final_url.clone();
+        (ctx.on_progress)(preflight_progress_patch(&ctx.job, &info));
+    }
+
+    if let Some(outcome) = control_outcome(&ctx.control) {
+        return Ok(outcome);
+    }
+
     // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
     // Range/progress. v0 uses single-stream metadata_len.
-    let disk_len = metadata_len(&job.temp_path).await.unwrap_or(0);
-    let mut existing_bytes = resume_offset(job, disk_len);
+    let disk_len = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
+    let mut existing_bytes = resume_offset(&ctx.job, disk_len);
 
-    // Follow redirects manually (client has Policy::none).
+    // Follow redirects manually (client has Policy::none); start from pinned URL.
     let (response, final_url) = fetch_with_redirects(
         &client,
-        &job.url,
-        &current_url,
+        &ctx.job.url,
+        &ctx.resolved_url,
         existing_bytes,
-        &job.validators,
-        &control,
-        handoff_auth,
+        &ctx.job.validators,
+        &ctx.control,
+        ctx.handoff_auth.as_ref(),
     )
     .await?;
-    current_url = final_url;
+    ctx.resolved_url = final_url;
+    let current_url = ctx.resolved_url.clone();
+    let job = &ctx.job;
+    let control = &ctx.control;
+    let on_progress = &ctx.on_progress;
 
-    if let Some(outcome) = control_outcome(&control) {
+    if let Some(outcome) = control_outcome(control) {
         return Ok(outcome);
     }
 
@@ -627,27 +705,7 @@ async fn fetch_with_redirects(
                     )
                 })?;
 
-            let next = match url::Url::parse(location) {
-                Ok(absolute) => absolute.to_string(),
-                Err(_) => {
-                    let base = url::Url::parse(&current).map_err(|error| {
-                        download_error(
-                            FailureCategory::Http,
-                            format!("Invalid URL during redirect: {error}"),
-                            false,
-                        )
-                    })?;
-                    base.join(location)
-                        .map_err(|error| {
-                            download_error(
-                                FailureCategory::Http,
-                                format!("Invalid redirect target: {error}"),
-                                false,
-                            )
-                        })?
-                        .to_string()
-                }
-            };
+            let next = resolve_redirect_location(&current, location)?;
 
             redirects += 1;
             if redirects > MAX_REDIRECTS {
@@ -665,16 +723,31 @@ async fn fetch_with_redirects(
     }
 }
 
-/// Build a GET for the download transfer (identity encoding, optional Range/If-Range, Referer).
-fn build_download_request(
+/// Kind of transfer request sharing handoff / referer / identity headers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TransferRequestKind {
+    /// GET with optional open-ended Range resume (`bytes=N-`).
+    Get { existing_bytes: u64 },
+    /// HEAD preflight probe.
+    Head,
+    /// GET `Range: bytes=0-0` Accept-Ranges / size probe.
+    RangeProbe,
+}
+
+/// Build a transfer request (preflight HEAD/Range probe or download GET).
+/// Applies same-origin handoff, identity encoding, and browser-like Referer.
+pub(crate) fn build_transfer_request(
     client: &Client,
+    kind: TransferRequestKind,
     job_url: &str,
     url: &str,
-    existing_bytes: u64,
-    validators: &ContentValidators,
     handoff_auth: Option<&HandoffAuth>,
 ) -> reqwest::RequestBuilder {
-    let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
+    let mut request = match kind {
+        TransferRequestKind::Get { .. } | TransferRequestKind::RangeProbe => client.get(url),
+        TransferRequestKind::Head => client.head(url),
+    };
+    request = request.header(ACCEPT_ENCODING, "identity");
 
     let mut has_referer = false;
     if let Some(auth) = handoff_auth_for_request_url(job_url, url, handoff_auth) {
@@ -700,16 +773,111 @@ fn build_download_request(
         }
     }
 
+    match kind {
+        TransferRequestKind::Get { existing_bytes } if existing_bytes > 0 => {
+            request = request.header(RANGE, format!("bytes={existing_bytes}-"));
+        }
+        TransferRequestKind::RangeProbe => {
+            request = request.header(RANGE, "bytes=0-0");
+        }
+        _ => {}
+    }
+
+    request
+}
+
+/// Build a GET for the download transfer (identity encoding, optional Range/If-Range, Referer).
+fn build_download_request(
+    client: &Client,
+    job_url: &str,
+    url: &str,
+    existing_bytes: u64,
+    validators: &ContentValidators,
+    handoff_auth: Option<&HandoffAuth>,
+) -> reqwest::RequestBuilder {
+    let mut request = build_transfer_request(
+        client,
+        TransferRequestKind::Get { existing_bytes },
+        job_url,
+        url,
+        handoff_auth,
+    );
     if existing_bytes > 0 {
-        request = request.header(RANGE, format!("bytes={existing_bytes}-"));
         if let Some(if_range) = if_range_header_value(validators) {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
                 request = request.header(IF_RANGE, value);
             }
         }
     }
-
     request
+}
+
+/// Resolve a redirect Location against the current URL (absolute or relative).
+pub(crate) fn resolve_redirect_location(
+    current: &str,
+    location: &str,
+) -> Result<String, DownloadError> {
+    match url::Url::parse(location) {
+        Ok(absolute) => Ok(absolute.to_string()),
+        Err(_) => {
+            let base = url::Url::parse(current).map_err(|error| {
+                download_error(
+                    FailureCategory::Http,
+                    format!("Invalid URL during redirect: {error}"),
+                    false,
+                )
+            })?;
+            base.join(location).map(|u| u.to_string()).map_err(|error| {
+                download_error(
+                    FailureCategory::Http,
+                    format!("Invalid redirect target: {error}"),
+                    false,
+                )
+            })
+        }
+    }
+}
+
+/// Early ProgressUpdate from preflight (size / validators / resume hint).
+///
+/// Sparse only: never forces `progress` (would zero a resume job) or overwrites a
+/// user/uniquified `filename` — GET `starting_tick` owns rename + path updates.
+fn preflight_progress_patch(job: &Job, info: &super::preflight::PreflightInfo) -> ProgressUpdate {
+    let total = info.total_bytes.filter(|&n| n > 0);
+    let validators = {
+        let captured = ContentValidators {
+            etag: info.etag.clone(),
+            last_modified: info.last_modified.clone(),
+            expected_size: total,
+        };
+        if captured.is_empty() {
+            None
+        } else {
+            Some(captured)
+        }
+    };
+    // Filename only from Content-Disposition, and only when the job still has a
+    // generic fallback name (matches GET CD rename caution). Never URL-derive here.
+    let filename = info.filename.as_ref().and_then(|cd_name| {
+        let generic = job.filename.is_empty()
+            || job.filename == "download.bin"
+            || filename_from_url_fallback(&job.url).as_deref() == Some(job.filename.as_str());
+        if generic {
+            Some(cd_name.clone())
+        } else {
+            None
+        }
+    });
+    ProgressUpdate {
+        total_bytes: total,
+        // Leave progress / downloaded_bytes / speed / eta None so resume partials
+        // and coalesce do not flash 0%.
+        filename,
+        resume_supported: info.accept_ranges,
+        state_hint: Some(ProgressHint::Starting),
+        validators,
+        ..Default::default()
+    }
 }
 
 /// Prefer TCP HTTP/1.1–2, then fall back to HTTP/3 (QUIC) on connect/TLS failures.
@@ -852,7 +1020,7 @@ fn looks_like_tls_interference(chain: &str) -> bool {
             && (lower.contains("fail") || lower.contains("error") || lower.contains("handshake")))
 }
 
-fn control_outcome(control: &AtomicU8) -> Option<DownloadOutcome> {
+pub(crate) fn control_outcome(control: &AtomicU8) -> Option<DownloadOutcome> {
     match control.load(Ordering::Relaxed) {
         CONTROL_PAUSED => Some(DownloadOutcome::Paused),
         CONTROL_CANCELED => Some(DownloadOutcome::Canceled),
@@ -1029,63 +1197,6 @@ fn filename_from_url_fallback(url: &str) -> Option<String> {
 
 fn filename_from_response_url(url: &str) -> Option<String> {
     super::filesystem::derive_filename_from_url(url).map(|s| sanitize_filename(&s))
-}
-
-/// HEAD preflight used when adding a job to guess size/filename (best effort).
-#[allow(dead_code)]
-pub async fn preflight(url: &str) -> Option<(Option<u64>, Option<String>)> {
-    let client = download_client().ok()?;
-    let mut current = url.to_string();
-    let mut redirects = 0u32;
-
-    let response = loop {
-        let mut request = client
-            .head(&current)
-            .timeout(PREFLIGHT_TIMEOUT)
-            .header(ACCEPT_ENCODING, "identity");
-        if let Some(referer) = referer_for_url(&current) {
-            request = request.header(REFERER, referer);
-        }
-        let response = request.send().await.ok()?;
-
-        if !response.status().is_redirection() {
-            break response;
-        }
-
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())?;
-        let next = url::Url::parse(location)
-            .ok()
-            .map(|u| u.to_string())
-            .or_else(|| {
-                url::Url::parse(&current)
-                    .ok()
-                    .and_then(|base| base.join(location).ok())
-                    .map(|u| u.to_string())
-            })?;
-        redirects += 1;
-        if redirects > MAX_REDIRECTS {
-            return None;
-        }
-        current = next;
-    };
-
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let total = response.content_length();
-    let filename = response
-        .headers()
-        .get(CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_content_disposition_filename)
-        .or_else(|| super::filesystem::derive_filename_from_url(&current));
-
-    let _accept_ranges = response.headers().get(ACCEPT_RANGES);
-    Some((total, filename))
 }
 
 #[cfg(test)]
@@ -1286,6 +1397,35 @@ mod tests {
     }
 
     #[test]
+    fn preflight_patch_leaves_progress_none_on_known_total() {
+        let job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        let info = super::super::preflight::PreflightInfo {
+            total_bytes: Some(1_000_000),
+            filename: None,
+            accept_ranges: Some(true),
+            etag: Some("\"e\"".into()),
+            last_modified: None,
+            final_url: job.url.clone(),
+        };
+        let patch = preflight_progress_patch(&job, &info);
+        assert_eq!(patch.total_bytes, Some(1_000_000));
+        assert!(patch.progress.is_none(), "must not force 0% on resume");
+        assert!(patch.downloaded_bytes.is_none());
+        assert!(patch.speed.is_none());
+        assert!(patch.eta_secs.is_none());
+        assert_eq!(patch.resume_supported, Some(true));
+        assert_eq!(
+            patch.validators.as_ref().and_then(|v| v.etag.as_deref()),
+            Some("\"e\"")
+        );
+    }
+
+    #[test]
     fn if_range_weak_etag_only_uses_bare_range() {
         let v = ContentValidators {
             etag: Some("W/\"only-weak\"".into()),
@@ -1461,5 +1601,33 @@ mod tests {
             .expect("build");
         assert!(req.headers().get(RANGE).is_none());
         assert!(req.headers().get(IF_RANGE).is_none());
+    }
+
+    #[test]
+    fn preflight_patch_preserves_user_and_uniquified_filename() {
+        let mut job = Job::new(
+            "https://example.com/file.zip".into(),
+            "file (1).zip".into(),
+            PathBuf::from("C:\\dl\\file (1).zip"),
+            PathBuf::from("C:\\dl\\file (1).zip.part"),
+        );
+        let info = super::super::preflight::PreflightInfo {
+            total_bytes: Some(10),
+            filename: Some("server-name.zip".into()),
+            accept_ranges: Some(true),
+            etag: None,
+            last_modified: None,
+            final_url: job.url.clone(),
+        };
+        let patch = preflight_progress_patch(&job, &info);
+        assert!(
+            patch.filename.is_none(),
+            "uniquified name must not be overwritten"
+        );
+
+        // Generic fallback still allows CD rename hint.
+        job.filename = "download.bin".into();
+        let patch = preflight_progress_patch(&job, &info);
+        assert_eq!(patch.filename.as_deref(), Some("server-name.zip"));
     }
 }
