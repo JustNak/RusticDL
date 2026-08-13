@@ -61,8 +61,8 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
 /// - `transfer_format_version >= 1`: **version gate** — do not use `metadata_len`
-///   for progress/Range (map-authoritative; full map-sum arrives in PR 8). Leaves
-///   `downloaded_bytes` unchanged (safe no-op when map is still absent).
+///   for progress/Range (map-authoritative). Leaves `downloaded_bytes` unchanged
+///   (safe no-op when map is still absent).
 /// - version 0: single-stream — set `downloaded_bytes` from `.part` length.
 ///
 /// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex

@@ -155,7 +155,6 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
         job.error = None;
         job.failure_category = None;
         job.retry_attempts = 0;
-        // Lifecycle: Restart clears validators + transfer format + metrics.
         job.clear_transfer_identity();
         job.resume_supported = false;
     }

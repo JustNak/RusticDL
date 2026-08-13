@@ -96,7 +96,6 @@ pub fn download_error(
 }
 
 /// HTTP content validators captured from response headers for resume identity checks.
-/// Used later for If-Range (PR 5); stored now so jobs persist validators across restarts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentValidators {

@@ -309,16 +309,16 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             {
                 let mut guard = inner.lock().await;
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
-                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                    if let Some(on_disk) = on_disk {
-                        apply_partial_progress_from_disk(job, on_disk);
-                    }
-                    if !restarting {
+                if !restarting {
+                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                        if let Some(on_disk) = on_disk {
+                            apply_partial_progress_from_disk(job, on_disk);
+                        }
                         job.state = JobState::Downloading;
                         job.error = None;
+                        attempt_job = job.clone();
+                        emit_jobs_locked(&guard);
                     }
-                    attempt_job = job.clone();
-                    emit_jobs_locked(&guard);
                 }
             }
 
@@ -610,7 +610,6 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
         job.resume_supported = resume;
     }
     // Field-wise merge: sparse captures must not wipe stored ETag/LM (CDN 206 quirk).
-    // Full clear is lifecycle-only (Restart / Cancel+delete).
     if let Some(validators) = update.validators {
         job.validators.merge_present(validators);
     }

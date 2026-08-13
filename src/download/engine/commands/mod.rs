@@ -502,7 +502,7 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], 1, 0, 0);
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
         engine.send(EngineCommand::Restart(id.clone()));
 
         let jobs = next_jobs(&mut events).await;

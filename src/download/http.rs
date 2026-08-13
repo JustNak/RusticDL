@@ -193,7 +193,7 @@ pub async fn run_http_download(
     let client = download_client()?;
     let mut current_url = job.url.clone();
     // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
-    // Range/progress (full map-sum lands in PR 8). v0 uses single-stream metadata_len.
+    // Range/progress. v0 uses single-stream metadata_len.
     let disk_len = metadata_len(&job.temp_path).await.unwrap_or(0);
     let mut existing_bytes = resume_offset(job, disk_len);
 
@@ -850,7 +850,7 @@ async fn flush_partial_writer(
     Ok(())
 }
 
-/// `sync_data` only on pause when enabled — cancel/complete skip fsync (§0.3).
+/// `sync_data` only on pause when enabled — cancel/complete skip fsync.
 fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> bool {
     fsync_on_pause && matches!(outcome, DownloadOutcome::Paused)
 }
