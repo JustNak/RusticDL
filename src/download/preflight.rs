@@ -121,7 +121,7 @@ pub async fn run_preflight(
                     .get(CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
                 {
-                    if let Some((_start, _end, total)) = parse_content_range(content_range) {
+                    if let Some((_start, _end, Some(total))) = parse_content_range(content_range) {
                         if total > 0 {
                             total_bytes = Some(total);
                         }

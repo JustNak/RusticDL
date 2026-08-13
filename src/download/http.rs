@@ -356,6 +356,7 @@ pub async fn run_http_download_with_ctx(
     let on_progress = ctx.on_progress.clone();
     let handoff_auth = ctx.handoff_auth.clone();
     let limiter = ctx.limiter.clone();
+    let fsync_on_pause = ctx.fsync_on_pause;
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
@@ -626,6 +627,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             transfer_format_version = 0;
             starting.replace_validators = Some(true);
             starting.transfer_format_version = Some(0);
+            starting.clear_segment_map = Some(true);
             starting.toast = Some(FULL_REPLACE_NOTICE.into());
         }
         if cumulative_reconnects > reconnect_baseline {
@@ -816,9 +818,18 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         match body_result {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
-                // Pause/cancel observed after stream teardown (or remapped control path).
+                // Pause/cancel after stream teardown. Do not swallow non-retryable
+                // verify / disk / internal failures as a user stop.
                 if let Some(outcome) = control_outcome(&control) {
-                    return Ok(outcome);
+                    if error.retryable
+                        || matches!(
+                            error.category,
+                            FailureCategory::Network | FailureCategory::Http
+                        )
+                    {
+                        emit_control_exit_progress(&on_progress, existing_bytes, total_bytes);
+                        return Ok(outcome);
+                    }
                 }
                 // Keep local downloaded for oracle when version-gated (v1+).
                 // Disk errors from flush are non-retryable → prepare_reconnect GiveUps.
@@ -1191,9 +1202,8 @@ pub(crate) async fn apply_preflight(
     if let Some(resume) = patch.resume_supported {
         ctx.job.resume_supported = resume;
     }
-    if let Some(validators) = patch.validators.clone() {
-        ctx.job.validators.merge_present(validators);
-    }
+    // Do not merge preflight ETag/LM onto the transfer-local job: If-Range
+    // must keep the validators that match bytes already on disk.
     if let Some(filename) = patch.filename.clone() {
         ctx.job.filename = filename;
     }
@@ -1210,7 +1220,7 @@ pub(crate) fn preflight_progress_patch(
     info: &super::preflight::PreflightInfo,
 ) -> ProgressUpdate {
     let total = info.total_bytes.filter(|&n| n > 0);
-    let validators = {
+    let validators = if job.validators.etag.is_none() && job.validators.last_modified.is_none() {
         let captured = ContentValidators {
             etag: info.etag.clone(),
             last_modified: info.last_modified.clone(),
@@ -1221,6 +1231,8 @@ pub(crate) fn preflight_progress_patch(
         } else {
             Some(captured)
         }
+    } else {
+        None
     };
     // Filename only from Content-Disposition, and only when the job still has a
     // generic fallback name (matches GET CD rename caution). Never URL-derive here.

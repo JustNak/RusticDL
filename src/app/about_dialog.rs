@@ -46,7 +46,7 @@ impl DownloadApp {
                                 .bordered(false)
                                 .label_width(px(96.))
                                 .item("Version", APP_VERSION, 1)
-                                .item("Engine", "Single-stream + Range resume", 1)
+                                .item("Engine", "Multi-segment + Range resume", 1)
                                 .item("License", "MIT", 1)
                                 .item("Updates", "GitHub Releases", 1),
                         )

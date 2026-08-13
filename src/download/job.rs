@@ -157,6 +157,8 @@ pub fn fallback_reason_label(reason: &str) -> &str {
         "below_multi_min_bytes" => "Below multi-connection size",
         "multi_qualified" => "Multi-connection",
         "legacy_contiguous_partial" => "Existing single-stream partial",
+        "map_missing" => "Segment map missing",
+        "map_inconsistent" => "Segment map inconsistent",
         "multi_start_failed" => "Multi-connection start failed",
         "multi_http_fallback" => "HTTP error during multi-connection",
         "multi_network_fallback" => "Network error during multi-connection",
@@ -479,6 +481,14 @@ mod tests {
         assert_eq!(
             fallback_reason_label("legacy_contiguous_partial"),
             "Existing single-stream partial"
+        );
+        assert_eq!(
+            fallback_reason_label("map_missing"),
+            "Segment map missing"
+        );
+        assert_eq!(
+            fallback_reason_label("map_inconsistent"),
+            "Segment map inconsistent"
         );
         assert_eq!(
             fallback_reason_label("unknown_custom_reason"),

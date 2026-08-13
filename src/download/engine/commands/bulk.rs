@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use super::super::super::http::store_control;
 use super::super::super::job::{JobState, WorkerControl};
 use super::super::{emit_jobs_locked, EngineInner};
+use super::job_control::fail_if_resume_map_unusable;
 
 pub(super) async fn pause_all(inner: &Arc<Mutex<EngineInner>>) {
     let mut guard = inner.lock().await;
@@ -40,6 +41,9 @@ pub(super) async fn resume_all(inner: &Arc<Mutex<EngineInner>>) {
     let mut guard = inner.lock().await;
     for job in &mut guard.jobs {
         if matches!(job.state, JobState::Paused) {
+            if fail_if_resume_map_unusable(job) {
+                continue;
+            }
             job.state = JobState::Queued;
             job.error = None;
             job.speed = 0;
@@ -54,6 +58,10 @@ pub(super) async fn retry_all(inner: &Arc<Mutex<EngineInner>>) {
     let mut any = false;
     for job in &mut guard.jobs {
         if matches!(job.state, JobState::Failed | JobState::Canceled) {
+            if fail_if_resume_map_unusable(job) {
+                any = true;
+                continue;
+            }
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;

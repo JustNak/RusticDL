@@ -689,6 +689,9 @@ async fn run_segment_loop(
                 if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
                     continue;
                 }
+                if control_outcome(&task.control).is_some() {
+                    return Ok(());
+                }
                 mark_segment(&task.shared, task.index, |s| {
                     s.state = SegmentState::Failed;
                 });
@@ -709,6 +712,9 @@ async fn run_segment_loop(
             );
             if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
                 continue;
+            }
+            if control_outcome(&task.control).is_some() {
+                return Ok(());
             }
             mark_segment(&task.shared, task.index, |s| {
                 s.state = SegmentState::Failed;
@@ -764,6 +770,9 @@ async fn run_segment_loop(
             );
             if retryable && try_segment_reconnect(task, &error, &mut short_reconnects).await? {
                 continue;
+            }
+            if control_outcome(&task.control).is_some() {
+                return Ok(());
             }
             mark_segment(&task.shared, task.index, |s| {
                 s.state = SegmentState::Failed;
@@ -835,6 +844,9 @@ async fn run_segment_loop(
                 }
                 if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
                     continue;
+                }
+                if control_outcome(&task.control).is_some() {
+                    return Ok(());
                 }
                 mark_segment(&task.shared, task.index, |s| {
                     s.state = SegmentState::Failed;
@@ -1005,7 +1017,15 @@ async fn try_segment_reconnect(
         return Ok(false);
     }
 
-    *short_reconnects += 1;
+    let next = *short_reconnects + 1;
+    if sleep_interruptible(&task.control, reconnect_backoff(next))
+        .await
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    *short_reconnects = next;
     let total = task.shared.reconnects.fetch_add(1, Ordering::Relaxed) + 1;
     emit_progress(task, None);
     (task.on_progress)(ProgressUpdate {
@@ -1013,12 +1033,6 @@ async fn try_segment_reconnect(
         state_hint: Some(ProgressHint::Starting),
         ..Default::default()
     });
-
-    if let Some(_outcome) =
-        sleep_interruptible(&task.control, reconnect_backoff(*short_reconnects)).await
-    {
-        return Ok(false);
-    }
     Ok(true)
 }
 

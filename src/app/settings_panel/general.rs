@@ -179,7 +179,7 @@ impl DownloadApp {
                 ))
                 .child(settings_choice_row(
                     "Multi-connection",
-                    Some("Split large downloads across parallel connections (coming soon)."),
+                    Some("Split large files across parallel Range connections. Off forces new jobs to single-stream."),
                     h_flex()
                         .gap_2()
                         .child(
