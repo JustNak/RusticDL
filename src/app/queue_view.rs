@@ -218,12 +218,11 @@ impl DownloadApp {
                     .when(filtered.is_empty(), |el| {
                         el.child(self.render_search_empty(cx))
                     })
-                    .children(filtered.into_iter().enumerate().map(|(index, job)| {
+                    .children(filtered.into_iter().map(|job| {
                         let is_selected = self.is_selected(job.id.as_str());
                         render_job_row(
                             job,
                             is_selected,
-                            index,
                             cols,
                             main_w,
                             density,

@@ -154,13 +154,6 @@ impl UiDensity {
         }
     }
 
-    pub fn row_h_progress(self) -> f32 {
-        match self {
-            Self::Comfortable => 68.0,
-            Self::Compact => 56.0,
-        }
-    }
-
     pub fn sidebar_w(self) -> f32 {
         match self {
             Self::Comfortable => 220.0,
