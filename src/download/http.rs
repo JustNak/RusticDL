@@ -1176,12 +1176,19 @@ pub(crate) async fn apply_preflight(
     }
     ctx.preflight_done = true;
     let client = download_client().ok()?;
-    let info = super::preflight::run_preflight(
+    let policy = super::multi::multi_resume_policy(&ctx.job);
+    let plan = super::preflight::PreflightPlan {
+        skip_range_probes: policy.is_resume_error(),
+        prove_ranges: matches!(policy, super::multi::MultiResumePolicy::Proceed),
+        multi_min_bytes: ctx.multi_min_bytes,
+    };
+    let info = super::preflight::run_preflight_planned(
         &client,
         &ctx.job.url,
         &ctx.resolved_url,
         ctx.handoff_auth.as_ref(),
         &ctx.control,
+        plan,
     )
     .await?;
     ctx.resolved_url = info.final_url.clone();

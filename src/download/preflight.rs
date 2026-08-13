@@ -33,6 +33,31 @@ pub struct PreflightInfo {
     pub final_url: String,
 }
 
+/// How aggressively preflight should prove Range support.
+///
+/// Transfer entry skips body probes when a v1 map is missing/inconsistent
+/// (never invent Range / fetch a body) and skips confirmation when the
+/// planner cannot choose multi (legacy v0 partial, or size already below min).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreflightPlan {
+    /// HEAD only — no GET (resume-required jobs).
+    pub skip_range_probes: bool,
+    /// Confirm GET `0-0` / `1-1` when multi might still qualify.
+    pub prove_ranges: bool,
+    /// Used to skip confirmation after HEAD already shows `size < min`.
+    pub multi_min_bytes: u64,
+}
+
+impl Default for PreflightPlan {
+    fn default() -> Self {
+        Self {
+            skip_range_probes: false,
+            prove_ranges: true,
+            multi_min_bytes: 0,
+        }
+    }
+}
+
 /// Run HEAD (8s), then confirm Range with GET probes.
 ///
 /// Uses the shared transfer request builder (handoff + referer + identity). Returns
@@ -44,14 +69,35 @@ pub struct PreflightInfo {
 ///
 /// `Accept-Ranges: none` skips Range confirmation. Otherwise GET `bytes=0-0`
 /// must be 206 to claim ranges; a 200 means the server ignored Range. When
-/// size is known and greater than 1 byte, GET `bytes=1-1` must also be 206
-/// or multi is disabled (single-stream can still start from zero).
+/// size is known, at or above `multi_min_bytes`, and greater than 1 byte,
+/// GET `bytes=1-1` must also be 206 — a 200 on either probe disables multi
+/// (single-stream can still start from zero). Other probe statuses are
+/// inconclusive and leave the HEAD / 0-0 result unchanged.
 pub async fn run_preflight(
     client: &Client,
     job_url: &str,
     start_url: &str,
     handoff_auth: Option<&HandoffAuth>,
     control: &AtomicU8,
+) -> Option<PreflightInfo> {
+    run_preflight_planned(
+        client,
+        job_url,
+        start_url,
+        handoff_auth,
+        control,
+        PreflightPlan::default(),
+    )
+    .await
+}
+
+pub async fn run_preflight_planned(
+    client: &Client,
+    job_url: &str,
+    start_url: &str,
+    handoff_auth: Option<&HandoffAuth>,
+    control: &AtomicU8,
+    plan: PreflightPlan,
 ) -> Option<PreflightInfo> {
     let head_result = send_with_redirects(
         client,
@@ -98,57 +144,72 @@ pub async fn run_preflight(
     }
     // HEAD transport failure: still try Range 0-0 from start_url (resolved unchanged).
 
-    // Confirm Range unless HEAD already said `none`. Size-only hosts still probe
-    // so we can read Content-Range / Content-Length.
-    let need_zero_probe = total_bytes.is_none() || accept_ranges != Some(false);
-
-    if need_zero_probe {
-        if let Some((probe_response, probe_url)) = send_with_redirects(
-            client,
-            TransferRequestKind::RangeProbe,
-            job_url,
-            &resolved,
-            handoff_auth,
-            control,
-        )
-        .await
-        {
-            resolved = probe_url;
-            apply_zero_range_probe(
-                &probe_response,
-                &mut total_bytes,
-                &mut accept_ranges,
-                &mut etag,
-                &mut last_modified,
-                &mut filename,
-            );
-            drop(probe_response);
-        } else if !head_ok {
-            // Neither HEAD (success or transport) nor probe succeeded.
+    if plan.skip_range_probes {
+        if !head_ok {
             return None;
         }
-    }
+    } else {
+        // Confirm Range unless HEAD already said `none`, the file is already
+        // below min, or the planner cannot choose multi. Size-only hosts still
+        // probe so we can read Content-Range / Content-Length.
+        let below_min = total_bytes.is_some_and(|n| n < plan.multi_min_bytes);
+        let need_zero_probe = total_bytes.is_none()
+            || (plan.prove_ranges && !below_min && accept_ranges != Some(false));
 
-    // Multi needs a non-zero Range (later segments never start at 0).
-    if accept_ranges == Some(true)
-        && total_bytes.is_some_and(|n| n > 1)
-        && control_outcome(control).is_none()
-    {
-        if let Some((mid_response, mid_url)) = send_with_redirects(
-            client,
-            TransferRequestKind::GetClosed { start: 1, end: 1 },
-            job_url,
-            &resolved,
-            handoff_auth,
-            control,
-        )
-        .await
-        {
-            resolved = mid_url;
-            if mid_response.status() != StatusCode::PARTIAL_CONTENT {
-                accept_ranges = Some(false);
+        if need_zero_probe {
+            if let Some((probe_response, probe_url)) = send_with_redirects(
+                client,
+                TransferRequestKind::RangeProbe,
+                job_url,
+                &resolved,
+                handoff_auth,
+                control,
+            )
+            .await
+            {
+                resolved = probe_url;
+                apply_zero_range_probe(
+                    &probe_response,
+                    &mut total_bytes,
+                    &mut accept_ranges,
+                    &mut etag,
+                    &mut last_modified,
+                    &mut filename,
+                );
+                drop(probe_response);
+            } else if !head_ok {
+                // Neither HEAD (success or transport) nor probe succeeded.
+                return None;
             }
-            drop(mid_response);
+        } else if !head_ok {
+            return None;
+        }
+
+        // Multi needs a non-zero Range (later segments never start at 0).
+        // Only a 200 (ignored Range) disables multi; 403/5xx is inconclusive.
+        let below_min = total_bytes.is_some_and(|n| n < plan.multi_min_bytes);
+        if plan.prove_ranges
+            && !below_min
+            && accept_ranges == Some(true)
+            && total_bytes.is_some_and(|n| n > 1)
+            && control_outcome(control).is_none()
+        {
+            if let Some((mid_response, mid_url)) = send_with_redirects(
+                client,
+                TransferRequestKind::GetClosed { start: 1, end: 1 },
+                job_url,
+                &resolved,
+                handoff_auth,
+                control,
+            )
+            .await
+            {
+                resolved = mid_url;
+                if mid_response.status() == StatusCode::OK {
+                    accept_ranges = Some(false);
+                }
+                drop(mid_response);
+            }
         }
     }
 
@@ -922,6 +983,112 @@ Content-Length: 10485760\r\n\
         let zero = reqs.recv().await.expect("zero");
         let mid = reqs.recv().await.expect("mid");
         assert!(zero.to_ascii_lowercase().contains("range: bytes=0-0"));
+        assert!(mid.to_ascii_lowercase().contains("range: bytes=1-1"));
+    }
+
+    #[tokio::test]
+    async fn skip_range_probes_sends_head_only() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let url = format!("{base}/resume.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight_planned(
+            &client,
+            &url,
+            &url,
+            None,
+            &control,
+            PreflightPlan {
+                skip_range_probes: true,
+                prove_ranges: false,
+                multi_min_bytes: 1,
+            },
+        )
+        .await
+        .expect("preflight");
+        assert_eq!(info.total_bytes, Some(10485760));
+        assert_eq!(info.accept_ranges, Some(true));
+        let recorded = reqs.recv().await.expect("HEAD");
+        assert!(recorded.starts_with("HEAD "), "got {recorded}");
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(150), reqs.recv()).await;
+        assert!(
+            extra.is_err(),
+            "resume-required must not GET a body, got {extra:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn below_min_after_head_skips_range_proof() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 64\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let url = format!("{base}/tiny.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight_planned(
+            &client,
+            &url,
+            &url,
+            None,
+            &control,
+            PreflightPlan {
+                skip_range_probes: false,
+                prove_ranges: true,
+                multi_min_bytes: 5 * 1024 * 1024,
+            },
+        )
+        .await
+        .expect("preflight");
+        assert_eq!(info.total_bytes, Some(64));
+        assert_eq!(info.accept_ranges, Some(true));
+        let recorded = reqs.recv().await.expect("HEAD");
+        assert!(recorded.starts_with("HEAD "));
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(150), reqs.recv()).await;
+        assert!(
+            extra.is_err(),
+            "size below min must not prove Range, got {extra:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_probe_403_keeps_head_ranges() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let forbidden = "HTTP/1.1 403 Forbidden\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(10485760, 0), forbidden]).await;
+        let url = format!("{base}/403.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("preflight");
+        assert_eq!(
+            info.accept_ranges,
+            Some(true),
+            "403 on 1-1 is inconclusive; keep 0-0 / HEAD ranges"
+        );
+        let _ = reqs.recv().await;
+        let _ = reqs.recv().await;
+        let mid = reqs.recv().await.expect("mid");
         assert!(mid.to_ascii_lowercase().contains("range: bytes=1-1"));
     }
 }

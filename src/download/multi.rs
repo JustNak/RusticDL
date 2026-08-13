@@ -1852,13 +1852,16 @@ mod tests {
         assert_eq!(std::fs::read(&target).expect("final file"), body);
 
         let published = patches.lock().unwrap();
+        // Mid-probe GET bytes=1-1 sees the ignored Range (200) and stays single
+        // before workers start — do not enter multi then convert.
         assert!(published.iter().any(|p| {
-            p.fallback_reason.as_deref() == Some("multi_resume_fallback")
+            p.fallback_reason.as_deref() == Some("ranges_unsupported")
                 && p.transfer_mode == Some(TransferMode::Single)
         }));
-        assert!(published
-            .iter()
-            .any(|p| p.toast.as_deref() == Some(MULTI_FALLBACK_TOAST)));
+        assert!(published.iter().any(|p| p.toast.as_deref()
+            == Some(
+                "Multi-connection unavailable for this large file; using a single connection."
+            )));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
