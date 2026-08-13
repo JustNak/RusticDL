@@ -1,7 +1,7 @@
 //! Transfer entry + planner decision tree.
 //!
-//! When multi qualifies (`multi_connection_enabled`, known size ≥ `multi_min_bytes`,
-//! ranges supported) the planner chooses [`TransferMode::Multi`].
+//! When multi qualifies (known size ≥ `multi_min_bytes`, ranges supported)
+//! the planner chooses [`TransferMode::Multi`].
 //!
 //! Normative policy (PR 12):
 //! - Convert multi→single **only** when every segment `written == 0`.
@@ -21,7 +21,6 @@ use super::preflight::PreflightInfo;
 /// Why the planner chose single-stream, or that multi qualified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPlanReason {
-    MultiDisabled,
     SizeUnknown,
     RangesUnknown,
     RangesUnsupported,
@@ -43,7 +42,6 @@ pub const LARGE_FILE_MULTI_UNAVAILABLE_TOAST: &str =
 impl TransferPlanReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::MultiDisabled => "multi_disabled",
             Self::SizeUnknown => "size_unknown",
             Self::RangesUnknown => "ranges_unknown",
             Self::RangesUnsupported => "ranges_unsupported",
@@ -100,7 +98,7 @@ impl TransferPlan {
     /// Planner patch plus connections and a one-shot toast for large files.
     ///
     /// Toast only when ranges are unknown/unsupported on a file at or above
-    /// `multi_min_bytes`. Disabled multi records the reason without toasting.
+    /// `multi_min_bytes`.
     ///
     /// `existing_reason` is the job's last `fallback_reason`. A matching key
     /// (retry / resume) keeps the reason but skips the toast.
@@ -126,16 +124,15 @@ impl TransferPlan {
     }
 }
 
-/// Decide transfer mode. Multi when enabled, size known, ranges supported, size ≥ min.
+/// Decide transfer mode. Multi when size known, ranges supported, and size ≥ min.
 /// A present consistent `segment_map` always forces Multi so resume reuses bounds/`written`.
 /// Legacy v0 partials stay single; v1 map missing/inconsistent is Resume-required.
 pub fn plan_transfer(
     job: &Job,
     preflight: Option<&PreflightInfo>,
-    multi_connection_enabled: bool,
     multi_min_bytes: u64,
 ) -> TransferPlan {
-    let reason = plan_reason(job, preflight, multi_connection_enabled, multi_min_bytes);
+    let reason = plan_reason(job, preflight, multi_min_bytes);
     TransferPlan {
         chosen: if reason.would_qualify_multi() {
             TransferMode::Multi
@@ -155,7 +152,6 @@ fn job_has_resumable_map(job: &Job) -> bool {
 fn plan_reason(
     job: &Job,
     preflight: Option<&PreflightInfo>,
-    multi_connection_enabled: bool,
     multi_min_bytes: u64,
 ) -> TransferPlanReason {
     match multi_resume_policy(job) {
@@ -168,10 +164,6 @@ fn plan_reason(
     // In-progress map must not fall through to single-stream (MultiMap / Restart).
     if job_has_resumable_map(job) {
         return TransferPlanReason::MultiQualified;
-    }
-
-    if !multi_connection_enabled {
-        return TransferPlanReason::MultiDisabled;
     }
 
     let Some(size) = known_size(job, preflight) else {
@@ -222,12 +214,7 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
         return Ok(outcome);
     }
 
-    let plan = plan_transfer(
-        &ctx.job,
-        preflight.as_ref(),
-        ctx.multi_connection_enabled,
-        ctx.multi_min_bytes,
-    );
+    let plan = plan_transfer(&ctx.job, preflight.as_ref(), ctx.multi_min_bytes);
     let existing_reason = ctx.job.fallback_reason.clone();
     if let Some(reason) = plan.fallback_reason() {
         ctx.job.fallback_reason = Some(reason.to_string());
@@ -286,27 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn planner_disabled_stays_single() {
-        let job = sample_job();
-        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), false, 5 * 1024 * 1024);
-        assert_eq!(plan.chosen, TransferMode::Single);
-        assert_eq!(plan.reason, TransferPlanReason::MultiDisabled);
-        assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
-            Some("multi_disabled")
-        );
-        assert_eq!(
-            plan.to_progress_update().transfer_mode,
-            Some(TransferMode::Single)
-        );
-    }
-
-    #[test]
     fn planner_unknown_size_stays_single() {
         let job = sample_job();
         let pf = preflight(None, Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::SizeUnknown);
         assert_eq!(plan.chosen, TransferMode::Single);
     }
@@ -316,7 +286,7 @@ mod tests {
         let mut job = sample_job();
         job.total_bytes = 8 * 1024 * 1024;
         job.resume_supported = true;
-        let plan = plan_transfer(&job, None, true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, None, 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason.as_str(), "multi_qualified");
@@ -327,7 +297,7 @@ mod tests {
     fn planner_ranges_unknown_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), None);
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnknown);
         assert_eq!(
             plan.to_progress_update().fallback_reason.as_deref(),
@@ -339,7 +309,7 @@ mod tests {
     fn planner_ranges_unsupported_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
@@ -352,7 +322,7 @@ mod tests {
     fn planner_below_min_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
@@ -365,7 +335,7 @@ mod tests {
     fn planner_multi_qualifies_chooses_multi() {
         let job = sample_job();
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert!(plan.reason.would_qualify_multi());
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
@@ -380,7 +350,7 @@ mod tests {
         let mut job = sample_job();
         job.total_bytes = 20 * 1024 * 1024;
         job.resume_supported = true;
-        let plan = plan_transfer(&job, None, true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, None, 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
     }
@@ -391,7 +361,7 @@ mod tests {
         job.total_bytes = 9 * 1024 * 1024;
         job.resume_supported = true;
         let pf = preflight(Some(9 * 1024 * 1024), None);
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
     }
@@ -404,13 +374,9 @@ mod tests {
         job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         // Flaky preflight: unknown size / ranges, and min-size raised above total.
         let pf = preflight(None, None);
-        let plan = plan_transfer(&job, Some(&pf), true, 50 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
-
-        // Even if the master switch is off, resume must keep the map path.
-        let plan = plan_transfer(&job, Some(&pf), false, 50 * 1024 * 1024);
-        assert_eq!(plan.chosen, TransferMode::Multi);
     }
 
     #[test]
@@ -421,7 +387,7 @@ mod tests {
         job.resume_supported = true;
         job.transfer_format_version = 0;
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(plan.reason, TransferPlanReason::LegacyContiguousPartial);
         assert_eq!(
@@ -437,7 +403,7 @@ mod tests {
         job.total_bytes = 10 * 1024 * 1024;
         job.resume_supported = true;
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         assert!(plan.reason.is_resume_required());
         assert_eq!(plan.reason, TransferPlanReason::MapMissing);
         assert_eq!(plan.chosen, TransferMode::Single);
@@ -458,7 +424,7 @@ mod tests {
             preallocated: false,
         });
         let pf = preflight(Some(1000), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 1);
+        let plan = plan_transfer(&job, Some(&pf), 1);
         assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
         assert!(plan.reason.is_resume_required());
         assert_eq!(
@@ -468,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_transfer_stays_single_when_multi_disabled() {
+    async fn run_transfer_stays_single_when_below_min() {
         let body = vec![b'x'; 64];
         let head = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -476,7 +442,7 @@ Connection: close\r\n\
 Accept-Ranges: bytes\r\n\
 Content-Length: {}\r\n\
 \r\n",
-            8 * 1024 * 1024
+            body.len()
         );
         let get = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -492,7 +458,7 @@ Accept-Ranges: bytes\r\n\
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
-        let url = format!("{base}/big.bin");
+        let url = format!("{base}/small.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
         let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
@@ -501,14 +467,13 @@ Accept-Ranges: bytes\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let mut ctx = TransferContext::new(
+        let ctx = TransferContext::new(
             job,
             Arc::new(AtomicU8::new(0)),
             on_progress,
             None,
             GlobalBandwidthLimiter::new(None),
         );
-        ctx.multi_connection_enabled = false;
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -521,9 +486,9 @@ Accept-Ranges: bytes\r\n\
         assert_eq!(mode_patch.transfer_mode, Some(TransferMode::Single));
         assert_eq!(
             mode_patch.fallback_reason.as_deref(),
-            Some("multi_disabled")
+            Some("below_multi_min_bytes")
         );
-        assert!(mode_patch.toast.is_none(), "disabled multi must not toast");
+        assert!(mode_patch.toast.is_none());
         assert_eq!(mode_patch.active_connections, Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -533,7 +498,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_large_file_ranges_unsupported_toasts_once() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         let patch = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(patch.transfer_mode, Some(TransferMode::Single));
@@ -549,7 +514,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_small_file_ranges_unsupported_no_toast() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
@@ -557,21 +522,10 @@ Accept-Ranges: bytes\r\n\
     }
 
     #[test]
-    fn visibility_large_file_multi_disabled_reason_without_toast() {
-        let job = sample_job();
-        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), false, 5 * 1024 * 1024);
-        let patch = plan.to_visibility_update(Some(10 * 1024 * 1024), 5 * 1024 * 1024, None);
-        assert_eq!(plan.reason, TransferPlanReason::MultiDisabled);
-        assert_eq!(patch.fallback_reason.as_deref(), Some("multi_disabled"));
-        assert!(patch.toast.is_none());
-    }
-
-    #[test]
     fn visibility_below_min_no_fallback_reason() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
         assert_eq!(
@@ -585,7 +539,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_same_reason_already_set_skips_toast() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), true, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
         let first = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024, None);
         assert_eq!(
             first.toast.as_deref(),
@@ -762,7 +716,6 @@ Accept-Ranges: none\r\n\
             None,
             GlobalBandwidthLimiter::new(None),
         );
-        ctx.multi_connection_enabled = true;
         ctx.multi_min_bytes = 1;
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -833,7 +786,6 @@ Content-Length: {}\r\n\
             None,
             GlobalBandwidthLimiter::new(None),
         );
-        ctx.multi_connection_enabled = true;
         ctx.multi_min_bytes = 1;
 
         let err = run_transfer(ctx)
@@ -913,7 +865,6 @@ Content-Length: 48\r\n\
             None,
             GlobalBandwidthLimiter::new(None),
         );
-        ctx.multi_connection_enabled = true;
         ctx.multi_min_bytes = 1;
         ctx.multi_max_segments = 2;
 
@@ -1017,14 +968,13 @@ Accept-Ranges: bytes\r\n\
         job.expected_sha256 = expected_sha256;
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
+        let ctx = TransferContext::new(
             job,
             Arc::new(AtomicU8::new(0)),
             on_progress,
             None,
             GlobalBandwidthLimiter::new(None),
         );
-        ctx.multi_connection_enabled = false;
         (dir, target, temp, ctx)
     }
 

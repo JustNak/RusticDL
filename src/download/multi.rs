@@ -277,7 +277,7 @@ pub async fn run_multi_segment_download(
         Ok((DownloadOutcome::Completed, map)) => finalize_completed(ctx, writer, &map).await,
         Ok((outcome, map)) => {
             persist_map_exit(ctx, &map, 0);
-            if ctx.fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
+            if matches!(outcome, DownloadOutcome::Paused) {
                 let flush = writer.clone();
                 let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
             }
@@ -512,7 +512,6 @@ struct SegmentTask {
     writer: Arc<SegmentFileWriter>,
     shared: Arc<SharedMulti>,
     validators: ContentValidators,
-    fsync_on_pause: bool,
 }
 
 async fn run_segment_workers(
@@ -555,7 +554,6 @@ async fn run_segment_workers(
             writer: writer.clone(),
             shared: shared.clone(),
             validators: ctx.job.validators.clone(),
-            fsync_on_pause: ctx.fsync_on_pause,
         };
         let client = client.clone();
         handles.push(tokio::spawn(async move { run_segment(client, task).await }));
@@ -884,7 +882,7 @@ async fn stream_segment_body(
 
     loop {
         if let Some(outcome) = control_outcome(&task.control) {
-            if task.fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
+            if matches!(outcome, DownloadOutcome::Paused) {
                 let writer = task.writer.clone();
                 let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
             }
@@ -990,7 +988,7 @@ async fn stream_segment_body(
     }
 
     if let Some(outcome) = control_outcome(&task.control) {
-        if task.fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
+        if matches!(outcome, DownloadOutcome::Paused) {
             let writer = task.writer.clone();
             let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
         }

@@ -236,8 +236,6 @@ pub struct TransferContext {
     /// Memory-only browser session headers (snapshot from `EngineInner`).
     pub handoff_auth: Option<HandoffAuth>,
     pub limiter: Arc<GlobalBandwidthLimiter>,
-    /// Planner input: master switch for multi-segment routing.
-    pub multi_connection_enabled: bool,
     /// Planner input: files smaller than this never qualify for multi.
     pub multi_min_bytes: u64,
     /// Fresh multi partition cap (clamped 1–16 by settings).
@@ -248,8 +246,6 @@ pub struct TransferContext {
     pub resolved_url: String,
     /// Set after a preflight attempt this run so `run_transfer` + single do not double-probe.
     pub preflight_done: bool,
-    /// Flush + `sync_data` on pause (from `EngineRuntimeConfig`).
-    pub fsync_on_pause: bool,
 }
 
 impl TransferContext {
@@ -267,13 +263,11 @@ impl TransferContext {
             on_progress,
             handoff_auth,
             limiter,
-            multi_connection_enabled: true,
             multi_min_bytes: DEFAULT_MULTI_MIN_BYTES,
             multi_max_segments: super::segment::DEFAULT_SEGMENT_COUNT,
             conn_budget: ConnectionBudget::new(32, 8),
             resolved_url,
             preflight_done: false,
-            fsync_on_pause: false,
         }
     }
 }
@@ -284,7 +278,6 @@ pub async fn run_http_download(
     control: Arc<AtomicU8>,
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
-    fsync_on_pause: bool,
 ) -> Result<DownloadOutcome, DownloadError> {
     let mut ctx = TransferContext::new(
         job.clone(),
@@ -293,7 +286,6 @@ pub async fn run_http_download(
         handoff_auth.cloned(),
         limiter,
     );
-    ctx.fsync_on_pause = fsync_on_pause;
     run_http_download_with_ctx(&mut ctx).await
 }
 
@@ -357,7 +349,6 @@ pub async fn run_http_download_with_ctx(
     let on_progress = ctx.on_progress.clone();
     let handoff_auth = ctx.handoff_auth.clone();
     let limiter = ctx.limiter.clone();
-    let fsync_on_pause = ctx.fsync_on_pause;
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
@@ -687,7 +678,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         let body_result: Result<DownloadOutcome, DownloadError> = async {
             loop {
                 if let Some(outcome) = control_outcome(&control) {
-                    flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                    flush_partial_writer(&mut writer, outcome).await?;
                     emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                     return Ok(outcome);
                 }
@@ -743,7 +734,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
                 if !acquired {
                     let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
-                    flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                    flush_partial_writer(&mut writer, outcome).await?;
                     emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                     return Ok(outcome);
                 }
@@ -769,7 +760,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             }
 
             if let Some(outcome) = control_outcome(&control) {
-                flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+                flush_partial_writer(&mut writer, outcome).await?;
                 emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                 return Ok(outcome);
             }
@@ -1632,23 +1623,22 @@ fn disk_write_error(error: std::io::Error) -> DownloadError {
     )
 }
 
-/// Flush buffered writes; optionally `sync_data` on pause (prefer over `sync_all` on Windows).
+/// Flush buffered writes; `sync_data` on pause (prefer over `sync_all` on Windows).
 async fn flush_partial_writer(
     writer: &mut BufWriter<tokio::fs::File>,
-    fsync_on_pause: bool,
     outcome: DownloadOutcome,
 ) -> Result<(), DownloadError> {
     writer.flush().await.map_err(disk_write_error)?;
-    if should_sync_data_on_exit(fsync_on_pause, outcome) {
+    if should_sync_data_on_exit(outcome) {
         // Already flushed to the OS; a failed durability sync must not fail Pause.
         let _ = writer.get_ref().sync_data().await;
     }
     Ok(())
 }
 
-/// `sync_data` only on pause when enabled — cancel/complete skip fsync.
-fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> bool {
-    fsync_on_pause && matches!(outcome, DownloadOutcome::Paused)
+/// `sync_data` only on pause — cancel/complete skip fsync.
+fn should_sync_data_on_exit(outcome: DownloadOutcome) -> bool {
+    matches!(outcome, DownloadOutcome::Paused)
 }
 
 fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, total_bytes: u64) {
@@ -1940,12 +1930,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_data_only_when_pause_and_enabled() {
-        assert!(should_sync_data_on_exit(true, DownloadOutcome::Paused));
-        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Paused));
-        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Canceled));
-        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Completed));
-        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Canceled));
+    fn sync_data_only_on_pause() {
+        assert!(should_sync_data_on_exit(DownloadOutcome::Paused));
+        assert!(!should_sync_data_on_exit(DownloadOutcome::Canceled));
+        assert!(!should_sync_data_on_exit(DownloadOutcome::Completed));
     }
 
     #[test]
