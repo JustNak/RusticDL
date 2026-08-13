@@ -124,7 +124,6 @@ impl DownloadApp {
         self.settings.multi_min_bytes = multi_min_mib.saturating_mul(1024 * 1024);
         self.settings.max_total_connections = max_total_connections;
         self.settings.max_connections_per_host = max_connections_per_host;
-        // multi_connection_enabled / fsync_on_pause are draft-toggled on self.settings.
 
         // Browser capture text lists — drafts until Save; sanitize via extension.sanitize().
         let excluded_hosts = self
@@ -196,26 +195,6 @@ impl DownloadApp {
         ));
 
         self.show_toast("Settings saved.", cx);
-        cx.notify();
-    }
-
-    pub(crate) fn set_multi_connection_enabled(
-        &mut self,
-        on: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings.multi_connection_enabled = on;
-        cx.notify();
-    }
-
-    pub(crate) fn set_fsync_on_pause(
-        &mut self,
-        on: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings.fsync_on_pause = on;
         cx.notify();
     }
 

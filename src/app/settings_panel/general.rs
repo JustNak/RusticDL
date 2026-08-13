@@ -27,8 +27,6 @@ impl DownloadApp {
         let update_channel = self.settings.update_channel;
         let update_busy = self.update_busy;
         let update_label = self.update_action_label();
-        let multi_enabled = self.settings.multi_connection_enabled;
-        let fsync_on_pause = self.settings.fsync_on_pause;
         // Derive from live drafts (same parse fallbacks as Save), not last-committed only.
         let budget_hint = {
             let concurrent = self
@@ -52,7 +50,7 @@ impl DownloadApp {
                 .parse::<u32>()
                 .unwrap_or(self.settings.max_total_connections)
                 .clamp(1, 256);
-            if multi_enabled && concurrent.saturating_mul(segs) > total {
+            if concurrent.saturating_mul(segs) > total {
                 Some(
                     "Max concurrent × multi segments exceeds total connections — segments will queue on budget.",
                 )
@@ -152,56 +150,6 @@ impl DownloadApp {
                     "Speed limit: 0 = unlimited, shared across all downloads. Brief bursts up to ~2× the rate (min 64 KiB) are normal after idle.",
                     cx,
                 ))
-                .child(settings_choice_row(
-                    "Fsync on pause",
-                    Some("Flush partial data to disk when pausing (safer on power loss)."),
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("fsync-pause-off")
-                                .label("Off")
-                                .when(!fsync_on_pause, |b| b.primary())
-                                .when(fsync_on_pause, |b| b.outline())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.set_fsync_on_pause(false, window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("fsync-pause-on")
-                                .label("On")
-                                .when(fsync_on_pause, |b| b.primary())
-                                .when(!fsync_on_pause, |b| b.outline())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.set_fsync_on_pause(true, window, cx);
-                                })),
-                        ),
-                    cx,
-                ))
-                .child(settings_choice_row(
-                    "Multi-connection",
-                    Some("Split large files across parallel Range connections. Off forces new jobs to single-stream."),
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("multi-conn-off")
-                                .label("Off")
-                                .when(!multi_enabled, |b| b.primary())
-                                .when(multi_enabled, |b| b.outline())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.set_multi_connection_enabled(false, window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("multi-conn-on")
-                                .label("On")
-                                .when(multi_enabled, |b| b.primary())
-                                .when(!multi_enabled, |b| b.outline())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.set_multi_connection_enabled(true, window, cx);
-                                })),
-                        ),
-                    cx,
-                ))
                 .child({
                     let defaults = Settings::default();
                     let app = cx.entity();
@@ -238,7 +186,7 @@ impl DownloadApp {
                                     &segs_def,
                                     segs_def.clone(),
                                     app.clone(),
-                                    !multi_enabled,
+                                    false,
                                 )),
                         )
                         .child(
@@ -253,7 +201,7 @@ impl DownloadApp {
                                     &mib_def,
                                     mib_def.clone(),
                                     app.clone(),
-                                    !multi_enabled,
+                                    false,
                                 )),
                         )
                         .child(
@@ -268,7 +216,7 @@ impl DownloadApp {
                                     &total_def,
                                     total_def.clone(),
                                     app.clone(),
-                                    !multi_enabled,
+                                    false,
                                 )),
                         )
                         .child(
@@ -283,7 +231,7 @@ impl DownloadApp {
                                     &host_def,
                                     host_def.clone(),
                                     app,
-                                    !multi_enabled,
+                                    false,
                                 )),
                         )
                 })

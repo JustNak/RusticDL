@@ -338,12 +338,6 @@ pub struct Settings {
     pub max_concurrent_downloads: u32,
     pub auto_retry_attempts: u32,
     pub speed_limit_kib_per_second: u32,
-    /// Flush partial file to durable storage on pause (power-loss safety).
-    #[serde(default = "default_true")]
-    pub fsync_on_pause: bool,
-    /// Multi-connection downloads master switch (behavior lands in later PRs).
-    #[serde(default = "default_true")]
-    pub multi_connection_enabled: bool,
     /// Max parallel segments per multi download (clamped 1–16).
     #[serde(default = "default_multi_max_segments")]
     pub multi_max_segments: u32,
@@ -456,8 +450,6 @@ impl Default for Settings {
             max_concurrent_downloads: 3,
             auto_retry_attempts: 6,
             speed_limit_kib_per_second: 0,
-            fsync_on_pause: true,
-            multi_connection_enabled: true,
             multi_max_segments: default_multi_max_segments(),
             multi_min_bytes: default_multi_min_bytes(),
             max_total_connections: default_max_total_connections(),
@@ -608,9 +600,7 @@ mod tests {
         assert!(s.notify_on_complete);
         assert!(s.notify_on_fail);
         assert!(!s.clipboard_watch_enabled);
-        // Multi / fsync defaults for legacy JSON without those keys.
-        assert!(s.fsync_on_pause);
-        assert!(s.multi_connection_enabled);
+        // Multi limits default when legacy JSON omits those keys.
         assert_eq!(s.multi_max_segments, 8);
         assert_eq!(s.multi_min_bytes, 5 * 1024 * 1024);
         assert_eq!(s.max_total_connections, 32);

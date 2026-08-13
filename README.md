@@ -114,7 +114,7 @@ RusticDL is a **simple, local-first download manager** focused on everyday HTTP/
 - Map-authoritative resume: paused or failed multi jobs reuse the same segment map
 - Mid-transfer reconnect with short backoff
 - Concurrent downloads, auto-retry with exponential backoff, optional global speed limit
-- Optional fsync on pause (flush `.part` to disk)
+- Fsync on pause (flush `.part` to disk)
 - Nested TLS/network error details (helps diagnose flaky networks)
 - Windows completion notifications: tray balloons, OS notify mode (when hidden / always / off), and in-app terminal toasts when the window is visible
 - Unified active-URL duplicate policy: the same URL is not queued again while an active job already exists (manual Add and browser handoff share one rule)
@@ -135,26 +135,24 @@ Large files can split across parallel HTTP Range connections. Smaller files, ser
 
 | Behavior | What it does |
 | --- | --- |
-| **Multi-segment** | Parallel `Range` GETs into one `.part` when the file is at or above **Min size**, the server advertises ranges, and **Multi-connection** is on |
+| **Multi-segment** | Parallel `Range` GETs into one `.part` when the file is at or above **Min size** and preflight proves Range with 206 (including a non-zero offset). HEAD `Accept-Ranges` alone is not enough |
 | **Range resume** | Single-stream jobs append from the existing `.part` length |
 | **Map resume** | Multi jobs persist a segment map in `state.json` and resume each segment from `start + written`. After a map exists, file length is **not** treated as downloaded bytes (preallocate would look “complete”) |
 | **Global speed limit** | One process-wide budget shared by every body reader (single-stream and segments). `0` = unlimited |
-| **Fsync on pause** | Flush `.part` to disk when pausing (on by default; safer on power loss) |
-| **Reconnect** | Transient network/TLS drops retry the same pinned URL with short backoff |
+| **Fsync on pause** | Flush `.part` to disk when pausing (safer on power loss) |
+| **Reconnect** | Transient network/TLS drops retry the same pinned URL with short backoff (per segment for multi; up to 5 times, 200 ms–2 s) |
 
 **Settings → General → Limits**
 
 | Setting | Default | Clamp |
 | --- | --- | --- |
-| Multi-connection | On | Off forces new jobs to single-stream |
 | Max segments | 8 | 1–16 per job |
 | Min size (MiB) | 5 | 1–1024; below this, single connection |
 | Total connections | 32 | 1–256 process-wide body connections |
 | Per-host connections | 8 | 1–64; cannot exceed total |
 | Speed limit (KiB/s) | 0 | Shared; 0 = unlimited |
-| Fsync on pause | On | Flush on pause |
 
-If **Max concurrent × Max segments** exceeds **Total connections**, extra segments wait on the budget — that is expected, not an error. Turn **Multi-connection** Off to roll new jobs back to single-stream. Jobs that already have a segment map keep using that map until they finish or you Restart.
+If **Max concurrent × Max segments** exceeds **Total connections**, extra segments wait on the budget — that is expected, not an error. Jobs that already have a segment map keep using that map until they finish or you Restart. The engine picks multi-connection when the file is large enough and the server supports ranges.
 
 > **Do not downgrade mid multi download.** A 0.3.0 multi job writes `transfer_format_version = 1` and a segment map. Older builds ignore those fields and can mis-resume a preallocated `.part` (holes treated as real bytes). Finish or Restart multi jobs on 0.3.0 before installing an older release.
 

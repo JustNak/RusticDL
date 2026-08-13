@@ -27,8 +27,6 @@ pub struct EngineRuntimeConfig {
     pub max_concurrent: u32,
     pub auto_retry: u32,
     pub speed_limit_kib: u32,
-    pub fsync_on_pause: bool,
-    pub multi_connection_enabled: bool,
     pub multi_max_segments: u32,
     pub multi_min_bytes: u64,
     pub max_total_connections: u32,
@@ -41,8 +39,6 @@ impl EngineRuntimeConfig {
             max_concurrent: s.max_concurrent_downloads,
             auto_retry: s.auto_retry_attempts,
             speed_limit_kib: s.speed_limit_kib_per_second,
-            fsync_on_pause: s.fsync_on_pause,
-            multi_connection_enabled: s.multi_connection_enabled,
             multi_max_segments: s.multi_max_segments,
             multi_min_bytes: s.multi_min_bytes,
             max_total_connections: s.max_total_connections,
@@ -299,12 +295,11 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             // Disk is authoritative for single-stream (v0) resume. Snapshot path
             // under the lock, then await metadata without holding it. v1+ is
             // map-authoritative — skip metadata_len so a sparse `.part` cannot lie.
-            let (temp_path, fsync_on_pause, skip_disk) = {
+            let (temp_path, skip_disk) = {
                 let guard = inner.lock().await;
                 let job = guard.jobs.iter().find(|j| j.id == job_id);
                 (
                     job.map(|j| j.temp_path.clone()),
-                    guard.config.fsync_on_pause,
                     job.map(|j| j.transfer_format_version >= 1 || j.segment_map.is_some())
                         .unwrap_or(false),
                 )
@@ -357,10 +352,9 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             // Re-read live multi knobs so UpdateSettings applies to the next attempt.
             // Mid-transfer reconnect (short backoff, max 5) is nested inside
             // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
-            let (multi_enabled, multi_min, multi_max, conn_budget) = {
+            let (multi_min, multi_max, conn_budget) = {
                 let guard = inner.lock().await;
                 (
-                    guard.config.multi_connection_enabled,
                     guard.config.multi_min_bytes,
                     guard.config.multi_max_segments,
                     guard.conn_budget.clone(),
@@ -373,11 +367,9 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 handoff_auth.clone(),
                 limiter.clone(),
             );
-            ctx.multi_connection_enabled = multi_enabled;
             ctx.multi_min_bytes = multi_min;
             ctx.multi_max_segments = multi_max;
             ctx.conn_budget = conn_budget;
-            ctx.fsync_on_pause = fsync_on_pause;
             let attempt_result = run_transfer(ctx).await;
 
             // Flush remaining patches before any post-attempt state mutation.
