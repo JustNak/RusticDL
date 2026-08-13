@@ -135,12 +135,12 @@ Large files can split across parallel HTTP Range connections. Smaller files, ser
 
 | Behavior | What it does |
 | --- | --- |
-| **Multi-segment** | Parallel `Range` GETs into one `.part` when the file is at or above **Min size** and the server advertises ranges |
+| **Multi-segment** | Parallel `Range` GETs into one `.part` when the file is at or above **Min size** and preflight proves Range with 206 (including a non-zero offset). HEAD `Accept-Ranges` alone is not enough |
 | **Range resume** | Single-stream jobs append from the existing `.part` length |
 | **Map resume** | Multi jobs persist a segment map in `state.json` and resume each segment from `start + written`. After a map exists, file length is **not** treated as downloaded bytes (preallocate would look “complete”) |
 | **Global speed limit** | One process-wide budget shared by every body reader (single-stream and segments). `0` = unlimited |
 | **Fsync on pause** | Flush `.part` to disk when pausing (safer on power loss) |
-| **Reconnect** | Transient network/TLS drops retry the same pinned URL with short backoff |
+| **Reconnect** | Transient network/TLS drops retry the same pinned URL with short backoff (per segment for multi; up to 5 times, 200 ms–2 s) |
 
 **Settings → General → Limits**
 

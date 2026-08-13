@@ -1,7 +1,11 @@
-//! HEAD + optional Range 0-0 preflight (size, Accept-Ranges, validators, URL pin).
+//! HEAD + Range probes (size, real Range support, validators, URL pin).
 //!
 //! Shares the transfer request builder so browser handoff headers apply the same way
 //! as the download path. Best-effort: failures return `None` and never block enqueue.
+//!
+//! Multi-segment is allowed only after a GET `Range` returns 206 — HEAD
+//! `Accept-Ranges: bytes` is not enough (many hosts lie). A second GET at a
+//! non-zero offset confirms later segments can resume.
 
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED,
@@ -29,7 +33,7 @@ pub struct PreflightInfo {
     pub final_url: String,
 }
 
-/// Run HEAD (8s), then GET `Range: bytes=0-0` when length or Accept-Ranges is unknown.
+/// Run HEAD (8s), then confirm Range with GET probes.
 ///
 /// Uses the shared transfer request builder (handoff + referer + identity). Returns
 /// `None` on network/HTTP failure so the transfer can still start without preflight.
@@ -37,6 +41,11 @@ pub struct PreflightInfo {
 /// HEAD transport failure still attempts a Range probe from `start_url` (some CDNs
 /// mishandle HEAD while Range GET works). Filename is only from Content-Disposition
 /// when present — never URL-derived (GET path owns rename + path update).
+///
+/// `Accept-Ranges: none` skips Range confirmation. Otherwise GET `bytes=0-0`
+/// must be 206 to claim ranges; a 200 means the server ignored Range. When
+/// size is known and greater than 1 byte, GET `bytes=1-1` must also be 206
+/// or multi is disabled (single-stream can still start from zero).
 pub async fn run_preflight(
     client: &Client,
     job_url: &str,
@@ -89,9 +98,11 @@ pub async fn run_preflight(
     }
     // HEAD transport failure: still try Range 0-0 from start_url (resolved unchanged).
 
-    let need_probe = total_bytes.is_none() || accept_ranges.is_none();
+    // Confirm Range unless HEAD already said `none`. Size-only hosts still probe
+    // so we can read Content-Range / Content-Length.
+    let need_zero_probe = total_bytes.is_none() || accept_ranges != Some(false);
 
-    if need_probe {
+    if need_zero_probe {
         if let Some((probe_response, probe_url)) = send_with_redirects(
             client,
             TransferRequestKind::RangeProbe,
@@ -103,55 +114,41 @@ pub async fn run_preflight(
         .await
         {
             resolved = probe_url;
-            let probe_status = probe_response.status();
-
-            if probe_status == StatusCode::PARTIAL_CONTENT {
-                // 206 on Range 0-0 proves byte ranges work.
-                accept_ranges = Some(true);
-            } else if accept_ranges.is_none() {
-                // Explicit Accept-Ranges on probe response, if any.
-                if let Some(ar) = parse_accept_ranges(probe_response.headers()) {
-                    accept_ranges = Some(ar);
-                }
-            }
-
-            if total_bytes.is_none() {
-                if let Some(content_range) = probe_response
-                    .headers()
-                    .get(CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                {
-                    if let Some((_start, _end, Some(total))) = parse_content_range(content_range) {
-                        if total > 0 {
-                            total_bytes = Some(total);
-                        }
-                    }
-                }
-                // Full 200 with Content-Length (server ignored Range).
-                if total_bytes.is_none() && probe_status.is_success() {
-                    total_bytes = content_length_header(probe_response.headers());
-                }
-            }
-
-            if etag.is_none() {
-                etag = header_string(probe_response.headers(), ETAG);
-            }
-            if last_modified.is_none() {
-                last_modified = header_string(probe_response.headers(), LAST_MODIFIED);
-            }
-            if filename.is_none() {
-                filename = probe_response
-                    .headers()
-                    .get(CONTENT_DISPOSITION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_content_disposition_filename);
-            }
-
-            // Drop body (1 byte or more); we only needed headers.
+            apply_zero_range_probe(
+                &probe_response,
+                &mut total_bytes,
+                &mut accept_ranges,
+                &mut etag,
+                &mut last_modified,
+                &mut filename,
+            );
             drop(probe_response);
         } else if !head_ok {
             // Neither HEAD (success or transport) nor probe succeeded.
             return None;
+        }
+    }
+
+    // Multi needs a non-zero Range (later segments never start at 0).
+    if accept_ranges == Some(true)
+        && total_bytes.is_some_and(|n| n > 1)
+        && control_outcome(control).is_none()
+    {
+        if let Some((mid_response, mid_url)) = send_with_redirects(
+            client,
+            TransferRequestKind::GetClosed { start: 1, end: 1 },
+            job_url,
+            &resolved,
+            handoff_auth,
+            control,
+        )
+        .await
+        {
+            resolved = mid_url;
+            if mid_response.status() != StatusCode::PARTIAL_CONTENT {
+                accept_ranges = Some(false);
+            }
+            drop(mid_response);
         }
     }
 
@@ -163,6 +160,58 @@ pub async fn run_preflight(
         last_modified,
         final_url: resolved,
     })
+}
+
+fn apply_zero_range_probe(
+    probe_response: &reqwest::Response,
+    total_bytes: &mut Option<u64>,
+    accept_ranges: &mut Option<bool>,
+    etag: &mut Option<String>,
+    last_modified: &mut Option<String>,
+    filename: &mut Option<String>,
+) {
+    let probe_status = probe_response.status();
+    if probe_status == StatusCode::PARTIAL_CONTENT {
+        *accept_ranges = Some(true);
+    } else if probe_status.is_success() {
+        // 200 = full entity; server ignored Range.
+        *accept_ranges = Some(false);
+    } else if accept_ranges.is_none() {
+        if let Some(ar) = parse_accept_ranges(probe_response.headers()) {
+            *accept_ranges = Some(ar);
+        }
+    }
+
+    if total_bytes.is_none() {
+        if let Some(content_range) = probe_response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some((_start, _end, Some(total))) = parse_content_range(content_range) {
+                if total > 0 {
+                    *total_bytes = Some(total);
+                }
+            }
+        }
+        if total_bytes.is_none() && probe_status.is_success() {
+            *total_bytes = content_length_header(probe_response.headers());
+        }
+    }
+
+    if etag.is_none() {
+        *etag = header_string(probe_response.headers(), ETAG);
+    }
+    if last_modified.is_none() {
+        *last_modified = header_string(probe_response.headers(), LAST_MODIFIED);
+    }
+    if filename.is_none() {
+        *filename = probe_response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_disposition_filename);
+    }
 }
 
 /// Parse `Accept-Ranges`: `bytes` → true, `none` → false, absent/other → unknown.
@@ -320,6 +369,17 @@ mod tests {
         (format!("http://{addr}"), rx, handle)
     }
 
+    fn range_206(total: u64, start: u64) -> String {
+        format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Range: bytes {start}-{start}/{total}\r\n\
+Content-Length: 1\r\n\
+\r\nx"
+        )
+    }
+
     #[tokio::test]
     async fn preflight_sends_cookie_handoff_same_origin() {
         let head = "HTTP/1.1 200 OK\r\n\
@@ -330,7 +390,8 @@ ETag: \"v1\"\r\n\
 \r\n"
             .to_string();
 
-        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(1024, 0), range_206(1024, 1)]).await;
         let url = format!("{base}/file.bin");
         let client = download_client().unwrap();
         let control = AtomicU8::new(0);
@@ -372,7 +433,8 @@ Accept-Ranges: bytes\r\n\
 Content-Length: 50\r\n\
 \r\n"
             .to_string();
-        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(50, 0), range_206(50, 1)]).await;
         let request_url = format!("{base}/file.bin");
         // Different host → cross-origin vs request_url.
         let job_url = "https://cdn.example.com/file.bin";
@@ -421,8 +483,9 @@ ETag: \"final\"\r\n\
 
             let (tx, rx) = mpsc::unbounded_channel::<String>();
             let handle = tokio::spawn(async move {
-                let mut replies = vec![redirect, final_head].into_iter();
-                for _ in 0..2 {
+                let mut replies =
+                    vec![redirect, final_head, range_206(4096, 0), range_206(4096, 1)].into_iter();
+                for _ in 0..4 {
                     let Ok((mut socket, _)) = listener.accept().await else {
                         break;
                     };
@@ -478,7 +541,8 @@ ETag: \"probe\"\r\n\
 \r\nx"
             .to_string();
 
-        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head, probe]).await;
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, probe, range_206(8192, 1)]).await;
         let url = format!("{base}/blob.bin");
         let client = download_client().unwrap();
         let control = AtomicU8::new(0);
@@ -515,7 +579,8 @@ Accept-Ranges: bytes\r\n\
 Content-Length: 10\r\n\
 \r\n"
             .to_string();
-        let (base, _reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let (base, _reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(10, 0), range_206(10, 1)]).await;
         let url = format!("{base}/x.bin");
         let client = download_client().unwrap();
         let control = Arc::new(AtomicU8::new(0));
@@ -581,6 +646,24 @@ Content-Length: 1\r\n\
 Accept-Ranges: bytes\r\n\
 \r\nx";
                 let _ = socket.write_all(probe.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+            // Third connection: non-zero Range confirm.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let mid = range_206(2048, 1);
+                let _ = socket.write_all(mid.as_bytes()).await;
                 let _ = socket.shutdown().await;
             }
         });
@@ -727,7 +810,8 @@ Accept-Ranges: bytes\r\n\
 Content-Length: 99\r\n\
 \r\n"
             .to_string();
-        let (base, _reqs, _handle) = spawn_scripted_server(vec![head]).await;
+        let (base, _reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(99, 0), range_206(99, 1)]).await;
         let url = format!("{base}/pin.bin");
         let client = download_client().unwrap();
         let control = Arc::new(AtomicU8::new(0));
@@ -755,5 +839,89 @@ Content-Length: 99\r\n\
         ctx.resolved_url = info.final_url.clone();
         assert_eq!(ctx.resolved_url, url);
         assert_eq!(info.total_bytes, Some(99));
+    }
+
+    #[tokio::test]
+    async fn claimed_ranges_but_zero_probe_200_disables_multi() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let ignored = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![head, ignored]).await;
+        let url = format!("{base}/lie.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("preflight");
+        assert_eq!(info.total_bytes, Some(10485760));
+        assert_eq!(
+            info.accept_ranges,
+            Some(false),
+            "200 on Range 0-0 must not qualify multi"
+        );
+        let _ = reqs.recv().await;
+        let probe = reqs.recv().await.expect("zero probe");
+        assert!(probe.to_ascii_lowercase().contains("range: bytes=0-0"));
+    }
+
+    #[tokio::test]
+    async fn zero_probe_206_but_mid_probe_200_disables_multi() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let mid_ignored = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(10485760, 0), mid_ignored]).await;
+        let url = format!("{base}/half-lie.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("preflight");
+        assert_eq!(info.accept_ranges, Some(false));
+        let _ = reqs.recv().await;
+        let zero = reqs.recv().await.expect("zero");
+        assert!(zero.to_ascii_lowercase().contains("range: bytes=0-0"));
+        let mid = reqs.recv().await.expect("mid");
+        assert!(mid.to_ascii_lowercase().contains("range: bytes=1-1"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_zero_and_mid_range_keeps_multi() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 10485760\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) =
+            spawn_scripted_server(vec![head, range_206(10485760, 0), range_206(10485760, 1)]).await;
+        let url = format!("{base}/real.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("preflight");
+        assert_eq!(info.accept_ranges, Some(true));
+        let _ = reqs.recv().await;
+        let zero = reqs.recv().await.expect("zero");
+        let mid = reqs.recv().await.expect("mid");
+        assert!(zero.to_ascii_lowercase().contains("range: bytes=0-0"));
+        assert!(mid.to_ascii_lowercase().contains("range: bytes=1-1"));
     }
 }
