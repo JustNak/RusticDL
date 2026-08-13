@@ -23,6 +23,7 @@ use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
     TransferMode, WorkerControl,
 };
+use super::segment::SegmentMap;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 const CONTROL_POLL: Duration = Duration::from_millis(200);
@@ -60,6 +61,8 @@ pub struct ProgressUpdate {
     pub fallback_reason: Option<String>,
     /// One-shot UI toast (engine emits `EngineEvent::Toast`; not stored on Job).
     pub toast: Option<String>,
+    /// None = unchanged. Speed ticks must not clear a stored map.
+    pub segment_map: Option<SegmentMap>,
 }
 
 const FULL_REPLACE_NOTICE: &str =
@@ -89,6 +92,7 @@ impl ProgressUpdate {
             transfer_mode: later.transfer_mode.or(self.transfer_mode),
             fallback_reason: later.fallback_reason.or(self.fallback_reason),
             toast: later.toast.or(self.toast),
+            segment_map: later.segment_map.or(self.segment_map),
         }
     }
 
@@ -121,6 +125,7 @@ impl ProgressUpdate {
             transfer_mode: None,
             fallback_reason: None,
             toast: None,
+            segment_map: None,
         }
     }
 
@@ -151,6 +156,7 @@ impl ProgressUpdate {
             transfer_mode: None,
             fallback_reason: None,
             toast: None,
+            segment_map: None,
         }
     }
 
@@ -182,6 +188,7 @@ impl ProgressUpdate {
             transfer_mode: None,
             fallback_reason: None,
             toast: None,
+            segment_map: None,
         }
     }
 }
@@ -282,10 +289,26 @@ pub async fn run_http_download_with_ctx(
         return Ok(outcome);
     }
 
-    // Version gate: v1+ is map-authoritative — never use sparse `.part` length for
-    // Range/progress. v0 uses single-stream metadata_len.
-    let disk_len = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
-    let mut existing_bytes = resume_offset(&ctx.job, disk_len);
+    // Skip metadata_len when map/v1 — preallocate would lie; never invent a Range.
+    let mut existing_bytes = match resume_decision(&ctx.job) {
+        ResumeDecision::NeedDiskLen => metadata_len(&ctx.job.temp_path).await.unwrap_or(0),
+        ResumeDecision::Contiguous { offset } => offset,
+        ResumeDecision::MultiMap => {
+            return Err(download_error(
+                FailureCategory::Resume,
+                "Multi-connection partial; single-stream resume is not supported. Use Restart."
+                    .into(),
+                false,
+            ));
+        }
+        ResumeDecision::RestartRequired => {
+            return Err(download_error(
+                FailureCategory::Resume,
+                "Multi-part incomplete; Restart required.".into(),
+                false,
+            ));
+        }
+    };
 
     // Follow redirects manually (client has Policy::none); start from pinned URL.
     let (response, final_url) = fetch_with_redirects(
@@ -1044,12 +1067,33 @@ fn progress_percent(downloaded: u64, total: u64) -> f64 {
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
 
-/// Resume Range start: v1+ is map-authoritative (`job.downloaded_bytes`); v0 uses `.part` length.
-fn resume_offset(job: &Job, disk_len: u64) -> u64 {
-    if job.transfer_format_version >= 1 {
-        job.downloaded_bytes
-    } else {
-        disk_len
+/// How single-stream should pick a Range start. Never treats `written_sum` as a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeDecision {
+    /// v0, no map — caller should `metadata_len` (contiguous `.part`).
+    NeedDiskLen,
+    /// One consistent segment: Range starts at `start + written`.
+    Contiguous { offset: u64 },
+    /// Consistent multi map — per-segment remaining; single-stream must not seek.
+    MultiMap,
+    /// v1 + missing map, or present map that is inconsistent — do not invent Range.
+    RestartRequired,
+}
+
+fn resume_decision(job: &Job) -> ResumeDecision {
+    match job.segment_map.as_ref() {
+        Some(map) if !map.is_consistent() => ResumeDecision::RestartRequired,
+        Some(map) if map.segments.len() <= 1 => {
+            let offset = map
+                .segments
+                .first()
+                .map(super::segment::Segment::remaining_start)
+                .unwrap_or(0);
+            ResumeDecision::Contiguous { offset }
+        }
+        Some(_) => ResumeDecision::MultiMap,
+        None if job.transfer_format_version >= 1 => ResumeDecision::RestartRequired,
+        None => ResumeDecision::NeedDiskLen,
     }
 }
 
@@ -1321,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_offset_version_gate() {
+    fn resume_decision_v0_uses_disk_len() {
         let mut job = Job::new(
             "https://example.com/f.bin".into(),
             "f.bin".into(),
@@ -1330,10 +1374,114 @@ mod tests {
         );
         job.downloaded_bytes = 42;
         job.transfer_format_version = 0;
-        assert_eq!(resume_offset(&job, 999), 999);
+        assert_eq!(resume_decision(&job), ResumeDecision::NeedDiskLen);
+    }
 
+    #[test]
+    fn resume_decision_v1_no_map_does_not_invent() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
         job.transfer_format_version = 1;
-        assert_eq!(resume_offset(&job, 999), 42);
+        assert_eq!(resume_decision(&job), ResumeDecision::RestartRequired);
+    }
+
+    #[test]
+    fn resume_decision_single_segment_uses_remaining_start() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![crate::download::segment::Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 250,
+                state: crate::download::segment::SegmentState::Active,
+            }],
+            preallocated: true,
+        });
+        assert_eq!(
+            resume_decision(&job),
+            ResumeDecision::Contiguous { offset: 250 }
+        );
+    }
+
+    #[test]
+    fn resume_decision_multi_map_does_not_invent_prefix() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.downloaded_bytes = 42;
+        job.transfer_format_version = 0;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 499,
+                    written: 100,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 500,
+                    end: 999,
+                    written: 25,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        });
+        assert_eq!(resume_decision(&job), ResumeDecision::MultiMap);
+    }
+
+    #[test]
+    fn resume_decision_inconsistent_map_restart_required() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.transfer_format_version = 1;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 499,
+                    written: 100,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 0,
+                    end: 999,
+                    written: 25,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        });
+        assert_eq!(resume_decision(&job), ResumeDecision::RestartRequired);
     }
 
     #[test]
@@ -1344,6 +1492,7 @@ mod tests {
         assert_eq!(tick.speed, Some(10));
         assert!(tick.validators.is_none());
         assert!(tick.transfer_format_version.is_none());
+        assert!(tick.segment_map.is_none());
         assert_eq!(tick.eta_secs, Some(7));
         assert_eq!(tick.progress, Some(25.0));
         assert!(tick.filename.is_none());

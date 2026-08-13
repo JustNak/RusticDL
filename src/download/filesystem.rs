@@ -147,6 +147,21 @@ pub struct ReconcileResult {
     pub used_metadata_len: bool,
     /// True when `transfer_format_version >= 1` skipped the metadata_len path.
     pub version_gated: bool,
+    /// True when `downloaded_bytes` was set from `sum(segment.written)`.
+    pub used_map_sum: bool,
+    /// True when a present map passed `is_consistent`.
+    pub map_consistent: bool,
+    /// v1 + missing map, or present map that is inconsistent — do not invent Range.
+    pub resume_required: bool,
+}
+
+fn apply_progress_from_sum(job: &mut Job, sum: u64) {
+    job.downloaded_bytes = sum;
+    if job.total_bytes > 0 {
+        job.progress = ((sum as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+    } else {
+        job.progress = 0.0;
+    }
 }
 
 /// Align `job.downloaded_bytes` (and progress) with a known on-disk length.
@@ -171,28 +186,64 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
         changed,
         used_metadata_len: true,
         version_gated: false,
+        used_map_sum: false,
+        map_consistent: false,
+        resume_required: false,
     }
 }
 
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
-/// - `transfer_format_version >= 1`: **version gate** — do not use `metadata_len`
-///   for progress/Range (map-authoritative). Leaves `downloaded_bytes` unchanged
-///   (safe no-op when map is still absent).
-/// - version 0: single-stream — set `downloaded_bytes` from `.part` length.
+/// - Consistent `segment_map`: `downloaded_bytes = sum(written)`; **never** `metadata_len`.
+/// - Map present but inconsistent, or `version >= 1` with no map: leave bytes unchanged,
+///   set `resume_required` (Fail Resume — do not invent Range, do not use file len).
+/// - version 0 and no map: single-stream — set `downloaded_bytes` from `.part` length.
 ///
 /// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex
 /// is not held across filesystem I/O; this convenience wrapper remains for tests
 /// and call sites that already own the job exclusively.
 #[allow(dead_code)] // public API; engine prefers lock-split path
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
-    if job.transfer_format_version >= 1 {
+    let version_gated = job.transfer_format_version >= 1;
+    if job.segment_map.is_some() || version_gated {
+        if let Some(map) = job.segment_map.as_ref() {
+            if map.is_consistent() {
+                let sum = map.written_sum();
+                let before = job.downloaded_bytes;
+                apply_progress_from_sum(job, sum);
+                return ReconcileResult {
+                    downloaded_bytes: sum,
+                    on_disk: sum,
+                    changed: before != sum,
+                    used_metadata_len: false,
+                    version_gated,
+                    used_map_sum: true,
+                    map_consistent: true,
+                    resume_required: false,
+                };
+            }
+            // Inconsistent: do not invent progress or Range from the broken map.
+            return ReconcileResult {
+                downloaded_bytes: job.downloaded_bytes,
+                on_disk: job.downloaded_bytes,
+                changed: false,
+                used_metadata_len: false,
+                version_gated,
+                used_map_sum: false,
+                map_consistent: false,
+                resume_required: true,
+            };
+        }
+        // v1+ with no map — Restart required; never metadata_len.
         return ReconcileResult {
             downloaded_bytes: job.downloaded_bytes,
             on_disk: job.downloaded_bytes,
             changed: false,
             used_metadata_len: false,
             version_gated: true,
+            used_map_sum: false,
+            map_consistent: false,
+            resume_required: true,
         };
     }
 
@@ -475,6 +526,8 @@ mod tests {
         let result = reconcile_partial_progress(&mut job).await;
         assert!(result.version_gated);
         assert!(!result.used_metadata_len);
+        assert!(result.resume_required);
+        assert!(!result.map_consistent);
         assert_eq!(result.downloaded_bytes, 42);
         assert_eq!(job.downloaded_bytes, 42); // unchanged — no metadata_len
 
@@ -503,9 +556,173 @@ mod tests {
         let result = reconcile_partial_progress(&mut job).await;
         assert!(!result.version_gated);
         assert!(result.used_metadata_len);
+        assert!(!result.used_map_sum);
+        assert!(!result.resume_required);
         assert_eq!(result.downloaded_bytes, 1234);
         assert_eq!(job.downloaded_bytes, 1234);
         assert!((job.progress - 24.68).abs() < 0.1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_map_sum_ignores_preallocated_file_len() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-map-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        // Preallocated-style file: metadata_len would report full size.
+        std::fs::write(&temp, vec![0u8; 10_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 1;
+        job.downloaded_bytes = 0;
+        job.total_bytes = 10_000;
+        // Hand-built: partition would collapse this below 1 MiB into one segment.
+        let map = crate::download::segment::SegmentMap {
+            total_bytes: 10_000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 4_999,
+                    written: 100,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 5_000,
+                    end: 9_999,
+                    written: 50,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        };
+        job.segment_map = Some(map);
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(result.used_map_sum);
+        assert!(!result.used_metadata_len);
+        assert!(result.version_gated);
+        assert!(result.map_consistent);
+        assert!(!result.resume_required);
+        assert_eq!(result.downloaded_bytes, 150);
+        assert_eq!(job.downloaded_bytes, 150);
+        assert!((job.progress - 1.5).abs() < 0.01);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_map_present_without_version_still_uses_sum() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconcile-map-v0-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0u8; 8_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 0;
+        job.downloaded_bytes = 999;
+        job.total_bytes = 8_000;
+        let map = crate::download::segment::SegmentMap {
+            total_bytes: 8_000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 3_999,
+                    written: 40,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 4_000,
+                    end: 7_999,
+                    written: 10,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: false,
+        };
+        job.segment_map = Some(map);
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(result.used_map_sum);
+        assert!(!result.used_metadata_len);
+        assert!(!result.version_gated);
+        assert!(result.map_consistent);
+        assert!(!result.resume_required);
+        assert_eq!(job.downloaded_bytes, 50);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_inconsistent_map_fails_resume_skips_metadata_len() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconcile-bad-map-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0u8; 8_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.transfer_format_version = 1;
+        job.downloaded_bytes = 77;
+        job.total_bytes = 8_000;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 8_000,
+            segment_count: 2,
+            segments: vec![
+                crate::download::segment::Segment {
+                    index: 0,
+                    start: 0,
+                    end: 3_999,
+                    written: 40,
+                    state: crate::download::segment::SegmentState::Active,
+                },
+                crate::download::segment::Segment {
+                    index: 1,
+                    start: 0, // overlap — inconsistent
+                    end: 7_999,
+                    written: 10,
+                    state: crate::download::segment::SegmentState::Pending,
+                },
+            ],
+            preallocated: true,
+        });
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(result.resume_required);
+        assert!(!result.map_consistent);
+        assert!(!result.used_metadata_len);
+        assert!(!result.used_map_sum);
+        assert_eq!(job.downloaded_bytes, 77); // unchanged — do not invent
 
         let _ = std::fs::remove_dir_all(&dir);
     }
