@@ -81,8 +81,11 @@ pub(crate) fn render_job_row(
 
     // Fixed-height table row: never grows with wrapped text or flex stretch.
     // Horizontal padding matches the header so metric columns share the same grid.
+    // `w_full` is required so the flex-1 name column gets a real width; without
+    // it the row shrink-wraps to metrics and the label is clipped to nothing.
     h_flex()
         .id(SharedString::from(format!("job-row-{}", id)))
+        .w_full()
         .h(row_h)
         .max_h(row_h)
         .flex_shrink_0()
@@ -127,23 +130,23 @@ pub(crate) fn render_job_row(
         .child(
             // Name takes remaining width; metrics stay fixed so every row shares
             // the same name column width (no per-filename width stretch).
+            // Inner h_flex gives the label a horizontal measure. Do not use
+            // GPUI `text_ellipsis` here — it can paint zero glyphs in this
+            // nested flex; `ellipsize_name` supplies the visible "...".
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .max_w_full()
                 .gap_1()
                 .justify_center()
-                .overflow_hidden()
-                .child({
+                .child(h_flex().w_full().min_w_0().items_center().child({
                     // Explicit "..." when too long; hover shows the full name.
                     let tip_color = theme.muted_foreground;
                     div()
                         .id(SharedString::from(format!("job-name-{id}")))
-                        .w_full()
+                        .flex_1()
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .text_ellipsis()
                         .text_sm()
                         .font_semibold()
                         .text_color(theme.foreground)
@@ -151,7 +154,7 @@ pub(crate) fn render_job_row(
                             soft_tooltip(filename_tip.clone(), tip_color, window, cx)
                         })
                         .child(filename_label)
-                })
+                }))
                 .when(show_progress, |el| {
                     el.child(
                         h_flex()

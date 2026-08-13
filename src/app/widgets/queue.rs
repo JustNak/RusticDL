@@ -270,3 +270,33 @@ pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
     let head: String = name.chars().take(keep).collect();
     SharedString::from(format!("{head}..."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ellipsize_name, name_char_budget, QueueColumns};
+
+    #[test]
+    fn ellipsize_keeps_short_names() {
+        assert_eq!(ellipsize_name("readme.txt", 16).as_ref(), "readme.txt");
+    }
+
+    #[test]
+    fn ellipsize_truncates_long_release_names() {
+        let name = "HELLMODE.S02E02.A.NEW.FRIEND.1080p.HIDI.WEB-DL.AAC2.0.H.264-VARYG.mkv.zip";
+        let out = ellipsize_name(name, 20);
+        assert_eq!(out.as_ref(), "HELLMODE.S02E02.A...");
+        assert!(out.as_ref().ends_with("..."));
+        assert!(out.chars().count() <= 20);
+    }
+
+    #[test]
+    fn name_budget_stays_usable_when_metrics_are_open() {
+        let cols = QueueColumns {
+            date: true,
+            speed: true,
+            eta: true,
+        };
+        assert!(name_char_budget(900.0, cols) >= 16);
+        assert!(name_char_budget(0.0, cols) >= 16);
+    }
+}
