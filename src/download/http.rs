@@ -147,6 +147,7 @@ pub async fn run_http_download(
     control: Arc<AtomicU8>,
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
+    fsync_on_pause: bool,
 ) -> Result<DownloadOutcome, DownloadError> {
     ensure_parent_directory(&job.target_path)
         .await
@@ -154,6 +155,7 @@ pub async fn run_http_download(
 
     let client = download_client()?;
     let mut current_url = job.url.clone();
+    // Single-stream Range start = on-disk .part length (authoritative; see reconcile_partial_progress).
     let mut existing_bytes = metadata_len(&job.temp_path).await.unwrap_or(0);
 
     // Follow redirects manually (client has Policy::none).
@@ -349,10 +351,9 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
-            writer
-                .flush()
-                .await
-                .map_err(|error| disk_write_error(error))?;
+            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+            // Align UI with flushed bytes (may be ahead of last PROGRESS_INTERVAL tick).
+            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
             return Ok(outcome);
         }
 
@@ -399,16 +400,10 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         window_bytes = window_bytes.saturating_add(n);
 
         if !acquired {
-            writer.flush().await.map_err(disk_write_error)?;
-            // Keep job/UI counters aligned with what is on disk before pause/cancel.
-            on_progress(ProgressUpdate::downloading_tick(
-                downloaded,
-                total_bytes,
-                0,
-                0,
-                progress_percent(downloaded, total_bytes),
-            ));
-            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
+            let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
+            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
+            return Ok(outcome);
         }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
@@ -434,15 +429,17 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
+    if let Some(outcome) = control_outcome(&control) {
+        flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+        emit_control_exit_progress(&on_progress, downloaded, total_bytes);
+        return Ok(outcome);
+    }
+
     writer
         .flush()
         .await
         .map_err(|error| disk_write_error(error))?;
     drop(writer);
-
-    if let Some(outcome) = control_outcome(&control) {
-        return Ok(outcome);
-    }
 
     if total_bytes > 0 && downloaded < total_bytes {
         return Err(download_error(
@@ -751,6 +748,35 @@ fn disk_write_error(error: std::io::Error) -> DownloadError {
     )
 }
 
+/// Flush buffered writes; optionally `sync_data` on pause (prefer over `sync_all` on Windows).
+async fn flush_partial_writer(
+    writer: &mut BufWriter<tokio::fs::File>,
+    fsync_on_pause: bool,
+    outcome: DownloadOutcome,
+) -> Result<(), DownloadError> {
+    writer.flush().await.map_err(disk_write_error)?;
+    if should_sync_data_on_exit(fsync_on_pause, outcome) {
+        // Already flushed to the OS; a failed durability sync must not fail Pause.
+        let _ = writer.get_ref().sync_data().await;
+    }
+    Ok(())
+}
+
+/// `sync_data` only on pause when enabled — cancel/complete skip fsync (§0.3).
+fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> bool {
+    fsync_on_pause && matches!(outcome, DownloadOutcome::Paused)
+}
+
+fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, total_bytes: u64) {
+    on_progress(ProgressUpdate::downloading_tick(
+        downloaded,
+        total_bytes,
+        0,
+        0,
+        progress_percent(downloaded, total_bytes),
+    ));
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -904,5 +930,14 @@ mod tests {
         assert!(tick.temp_path.is_none());
         assert!(tick.resume_supported.is_none());
         assert_eq!(tick.state_hint, Some(ProgressHint::Downloading));
+    }
+
+    #[test]
+    fn sync_data_only_when_pause_and_enabled() {
+        assert!(should_sync_data_on_exit(true, DownloadOutcome::Paused));
+        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Paused));
+        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Canceled));
+        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Completed));
+        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Canceled));
     }
 }

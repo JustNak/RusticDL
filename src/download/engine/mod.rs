@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::filesystem::remove_partial;
+use super::filesystem::{apply_partial_progress_from_disk, metadata_len, remove_partial};
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{
     run_http_download, store_control, ProgressCallback, ProgressHint, ProgressUpdate,
@@ -18,9 +18,9 @@ use crate::settings::Settings;
 
 mod commands;
 
-/// Live engine knobs (from Settings). Multi / fsync fields are stored early for later PRs.
+/// Live engine knobs (from Settings). Multi fields are stored early for later PRs.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // multi_* / fsync_on_pause reserved until orchestrator / pause fsync land
+#[allow(dead_code)] // multi_* reserved until segment orchestrator lands
 pub struct EngineRuntimeConfig {
     pub max_concurrent: u32,
     pub auto_retry: u32,
@@ -286,13 +286,32 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         // Per-attempt progress pump: drain (flush pending) after each attempt so
         // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
+            // Disk is authoritative for single-stream resume.
+            // Snapshot path under the lock, then await metadata without holding it.
+            let (temp_path, fsync_on_pause) = {
+                let guard = inner.lock().await;
+                let temp_path = guard
+                    .jobs
+                    .iter()
+                    .find(|j| j.id == job_id)
+                    .map(|j| j.temp_path.clone());
+                (temp_path, guard.config.fsync_on_pause)
+            };
+            let on_disk = match temp_path.as_ref() {
+                Some(path) => metadata_len(path).await.unwrap_or(0),
+                None => 0,
+            };
             {
                 let mut guard = inner.lock().await;
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
+                // Restart already unlinked the .part and zeroed counters. Do not
+                // apply a metadata snapshot taken before that unlink.
                 if !restarting {
                     if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                        apply_partial_progress_from_disk(job, on_disk);
                         job.state = JobState::Downloading;
                         job.error = None;
+                        attempt_job = job.clone();
                         emit_jobs_locked(&guard);
                     }
                 }
@@ -315,6 +334,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 control.clone(),
                 on_progress.clone(),
                 handoff_auth.as_ref(),
+                fsync_on_pause,
             )
             .await;
 
