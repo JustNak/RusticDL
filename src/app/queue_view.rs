@@ -255,9 +255,8 @@ impl DownloadApp {
         let can_retry = selected
             .iter()
             .any(|j| matches!(j.state, JobState::Failed | JobState::Canceled));
-        let can_remove = selected
-            .iter()
-            .any(|j| j.state.is_terminal() || j.state == JobState::Paused);
+        let can_remove = selected.iter().any(|j| j.is_removable());
+        let can_delete = selected.iter().any(|j| j.has_deletable_file());
 
         h_flex()
             .id("batch-action-bar")
@@ -332,12 +331,26 @@ impl DownloadApp {
             .when(can_remove, |el| {
                 el.child(
                     Button::new("batch-remove")
+                        .outline()
+                        .small()
+                        .icon(IconName::Close)
+                        .label("Remove…")
+                        .tooltip("Remove from queue, keep files")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_remove_selected(window, cx);
+                        })),
+                )
+            })
+            .when(can_delete, |el| {
+                el.child(
+                    Button::new("batch-delete")
                         .danger()
                         .small()
                         .icon(IconName::Delete)
-                        .label("Remove…")
+                        .label("Delete…")
+                        .tooltip("Delete selected files from disk")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_remove_selected(window, cx);
+                            this.confirm_delete_selected(window, cx);
                         })),
                 )
             })

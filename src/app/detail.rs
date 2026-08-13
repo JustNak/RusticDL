@@ -111,7 +111,8 @@ pub(crate) fn render_detail(
     // failed or canceled transfer, not on completed jobs.
     let can_restart = matches!(job.state, JobState::Failed | JobState::Canceled);
     let can_open = job.state == JobState::Completed && job.target_path.exists();
-    let can_remove = job.state.is_terminal() || job.state == JobState::Paused;
+    let can_remove = job.is_removable();
+    let can_delete = job.has_deletable_file();
     let can_cancel = !job.state.is_terminal() && job.state != JobState::Paused;
 
     // Height-capped inspector: scrolls internally so the job list keeps space.
@@ -454,12 +455,33 @@ pub(crate) fn render_detail(
                                     let filename = filename.clone();
                                     el.child(
                                         Button::new("detail-remove")
+                                            .outline()
+                                            .small()
+                                            .icon(IconName::Close)
+                                            .label("Remove")
+                                            .tooltip("Remove from queue, keep the file")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.confirm_remove(
+                                                    id.clone(),
+                                                    filename.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                })
+                                .when(can_delete, |el| {
+                                    let id = id.clone();
+                                    let filename = filename.clone();
+                                    el.child(
+                                        Button::new("detail-delete")
                                             .danger()
                                             .small()
                                             .icon(IconName::Delete)
-                                            .label("Remove")
+                                            .label("Delete")
+                                            .tooltip("Delete the file from disk")
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.confirm_remove(
+                                                this.confirm_delete(
                                                     id.clone(),
                                                     filename.clone(),
                                                     window,

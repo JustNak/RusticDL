@@ -9,7 +9,7 @@ use gpui_component::{
 };
 
 use super::DownloadApp;
-use crate::download::{EngineCommand, JobState};
+use crate::download::EngineCommand;
 
 /// Stable key for a clipboard URL set so focus flapping does not re-prompt.
 pub(crate) fn clipboard_urls_key(urls: &[String]) -> u64 {
@@ -54,17 +54,58 @@ impl DownloadApp {
                                 .text_sm()
                                 .child(format!("Remove “{filename}” from the queue?")),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child("Any partial .part file will also be deleted."),
-                        ),
+                        .child(div().text_xs().text_color(muted).child(
+                            "The downloaded file is kept. Any leftover .part file is deleted.",
+                        )),
                 )
                 .on_ok(move |_, _, _| {
                     engine.send(EngineCommand::Remove {
                         id: id.clone(),
                         delete_partial: true,
+                        delete_file: false,
+                    });
+                    true
+                })
+        });
+    }
+
+    pub(crate) fn confirm_delete(
+        &mut self,
+        id: String,
+        filename: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let engine = engine.clone();
+            let id = id.clone();
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title("Delete downloaded file?")
+                .confirm()
+                .overlay_closable(true)
+                .keyboard(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete file")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(format!(
+                            "Delete “{filename}” from disk and remove it from the queue?"
+                        )))
+                        .child(div().text_xs().text_color(muted).child(
+                            "This cannot be undone. Leftover .part files are also removed.",
+                        )),
+                )
+                .on_ok(move |_, _, _| {
+                    engine.send(EngineCommand::Remove {
+                        id: id.clone(),
+                        delete_partial: true,
+                        delete_file: true,
                     });
                     true
                 })
@@ -72,15 +113,12 @@ impl DownloadApp {
     }
 
     /// Multi-select remove: one confirm listing count; only removable jobs
-    /// (terminal or paused) are deleted. Active jobs are left alone.
+    /// (terminal or paused) leave the queue. Active jobs are left alone.
     pub(crate) fn confirm_remove_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .jobs
             .iter()
-            .filter(|j| {
-                self.selected_ids.iter().any(|id| id == &j.id)
-                    && (j.state.is_terminal() || j.state == JobState::Paused)
-            })
+            .filter(|j| self.selected_ids.iter().any(|id| id == &j.id) && j.is_removable())
             .map(|j| j.id.clone())
             .collect();
 
@@ -93,7 +131,7 @@ impl DownloadApp {
         let count = ids.len();
         let muted = cx.theme().muted_foreground;
         let body = format!("Remove {count} selected item(s) from the queue?");
-        let note = "Any partial .part files will also be deleted. Active downloads are left alone.";
+        let note = "Downloaded files are kept. Leftover .part files are deleted. Active downloads are left alone.";
 
         window.open_dialog(cx, move |dialog, _, _| {
             let engine = engine.clone();
@@ -119,6 +157,61 @@ impl DownloadApp {
                         engine.send(EngineCommand::Remove {
                             id: id.clone(),
                             delete_partial: true,
+                            delete_file: false,
+                        });
+                    }
+                    true
+                })
+        });
+    }
+
+    /// Multi-select delete: remove selected jobs whose files exist on disk.
+    /// Active downloads are left alone.
+    pub(crate) fn confirm_delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|j| self.selected_ids.iter().any(|id| id == &j.id) && j.has_deletable_file())
+            .map(|j| j.id.clone())
+            .collect();
+
+        if ids.is_empty() {
+            self.show_toast("No deletable files in the selection.", cx);
+            return;
+        }
+
+        let engine = self.engine.clone();
+        let count = ids.len();
+        let muted = cx.theme().muted_foreground;
+        let body =
+            format!("Delete {count} selected file(s) from disk and remove them from the queue?");
+        let note = "This cannot be undone. Leftover .part files are also removed. Active downloads are left alone.";
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let engine = engine.clone();
+            let ids = ids.clone();
+            dialog
+                .title("Delete selected files?")
+                .confirm()
+                .overlay_closable(true)
+                .keyboard(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Delete files")
+                        .ok_variant(ButtonVariant::Danger),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child(body.clone()))
+                        .child(div().text_xs().text_color(muted).child(note)),
+                )
+                .on_ok(move |_, _, _| {
+                    for id in &ids {
+                        engine.send(EngineCommand::Remove {
+                            id: id.clone(),
+                            delete_partial: true,
+                            delete_file: true,
                         });
                     }
                     true
@@ -167,6 +260,7 @@ impl DownloadApp {
                         engine.send(EngineCommand::Remove {
                             id: id.clone(),
                             delete_partial: false,
+                            delete_file: false,
                         });
                     }
                     true

@@ -37,8 +37,12 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
         EngineCommand::Restart(id) => {
             job_control::restart(inner, id).await;
         }
-        EngineCommand::Remove { id, delete_partial } => {
-            job_control::remove(inner, id, delete_partial).await;
+        EngineCommand::Remove {
+            id,
+            delete_partial,
+            delete_file,
+        } => {
+            job_control::remove(inner, id, delete_partial, delete_file).await;
         }
         EngineCommand::PauseAll => {
             bulk::pause_all(inner).await;
@@ -688,6 +692,78 @@ mod tests {
         assert_eq!(failed.failure_category, Some(FailureCategory::Resume));
         assert_eq!(failed.fallback_reason.as_deref(), Some("map_inconsistent"));
         assert!(failed.segment_map.is_some(), "inconsistent map is retained");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_without_delete_file_keeps_completed_file() {
+        let dir = temp_dir();
+        let job = sample_job("https://example.com/keep.bin", JobState::Completed, &dir);
+        std::fs::write(&job.target_path, b"keep-me").expect("write target");
+        let id = job.id.clone();
+        let target = job.target_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        engine.send(EngineCommand::Remove {
+            id: id.clone(),
+            delete_partial: true,
+            delete_file: false,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        assert!(jobs.iter().all(|j| j.id != id), "job removed from queue");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(target.exists(), "completed file kept on Remove");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_with_delete_file_deletes_completed_file() {
+        let dir = temp_dir();
+        let job = sample_job("https://example.com/gone.bin", JobState::Completed, &dir);
+        std::fs::write(&job.target_path, b"delete-me").expect("write target");
+        std::fs::write(&job.temp_path, b"leftover").expect("write part");
+        let id = job.id.clone();
+        let target = job.target_path.clone();
+        let part = job.temp_path.clone();
+
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        engine.send(EngineCommand::Remove {
+            id: id.clone(),
+            delete_partial: true,
+            delete_file: true,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        assert!(jobs.iter().all(|j| j.id != id), "job removed from queue");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!target.exists(), "completed file deleted");
+        assert!(!part.exists(), "leftover .part also deleted");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_with_delete_file_ok_when_target_missing() {
+        let dir = temp_dir();
+        let job = sample_job("https://example.com/missing.bin", JobState::Completed, &dir);
+        let id = job.id.clone();
+        assert!(!job.target_path.exists());
+
+        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        engine.send(EngineCommand::Remove {
+            id,
+            delete_partial: true,
+            delete_file: true,
+        });
+
+        let jobs = next_jobs(&mut events).await;
+        assert!(jobs.is_empty(), "missing target still drops the job");
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
