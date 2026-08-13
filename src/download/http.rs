@@ -32,18 +32,105 @@ const CONTROL_CONTINUE: u8 = 0;
 const CONTROL_PAUSED: u8 = 1;
 const CONTROL_CANCELED: u8 = 2;
 
-#[derive(Debug, Clone)]
+/// Partial progress patch. `None` = leave the field unchanged on apply/merge.
+#[derive(Debug, Clone, Default)]
 pub struct ProgressUpdate {
-    pub downloaded_bytes: u64,
-    pub total_bytes: u64,
-    pub speed: u64,
-    pub eta_secs: u64,
-    pub progress: f64,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub speed: Option<u64>,
+    pub eta_secs: Option<u64>,
+    pub progress: Option<f64>,
     pub filename: Option<String>,
     pub target_path: Option<std::path::PathBuf>,
     pub temp_path: Option<std::path::PathBuf>,
     pub resume_supported: Option<bool>,
-    pub state_hint: ProgressHint,
+    pub state_hint: Option<ProgressHint>,
+}
+
+impl ProgressUpdate {
+    /// Merge two patches in order: `later` wins on `Some` fields (`later.or(self)`).
+    pub fn merge(self, later: Self) -> Self {
+        Self {
+            downloaded_bytes: later.downloaded_bytes.or(self.downloaded_bytes),
+            total_bytes: later.total_bytes.or(self.total_bytes),
+            speed: later.speed.or(self.speed),
+            eta_secs: later.eta_secs.or(self.eta_secs),
+            progress: later.progress.or(self.progress),
+            filename: later.filename.or(self.filename),
+            target_path: later.target_path.or(self.target_path),
+            temp_path: later.temp_path.or(self.temp_path),
+            resume_supported: later.resume_supported.or(self.resume_supported),
+            state_hint: later.state_hint.or(self.state_hint),
+        }
+    }
+
+    /// Starting metadata tick (paths/filename/resume + zero speed).
+    pub fn starting_tick(
+        downloaded: u64,
+        total: u64,
+        filename: Option<String>,
+        target_path: Option<std::path::PathBuf>,
+        temp_path: Option<std::path::PathBuf>,
+        resume_supported: Option<bool>,
+    ) -> Self {
+        Self {
+            downloaded_bytes: Some(downloaded),
+            total_bytes: Some(total),
+            speed: Some(0),
+            eta_secs: Some(0),
+            progress: Some(progress_percent(downloaded, total)),
+            filename,
+            target_path,
+            temp_path,
+            resume_supported,
+            state_hint: Some(ProgressHint::Starting),
+        }
+    }
+
+    /// Periodic downloading scalar tick (no path/filename changes).
+    pub fn downloading_tick(
+        downloaded: u64,
+        total: u64,
+        speed: u64,
+        eta: u64,
+        progress: f64,
+    ) -> Self {
+        Self {
+            downloaded_bytes: Some(downloaded),
+            total_bytes: Some(total),
+            speed: Some(speed),
+            eta_secs: Some(eta),
+            progress: Some(progress),
+            filename: None,
+            target_path: None,
+            temp_path: None,
+            resume_supported: None,
+            state_hint: Some(ProgressHint::Downloading),
+        }
+    }
+
+    /// Final completion patch (100%, zero speed, final paths).
+    pub fn completed_tick(
+        downloaded: u64,
+        total: u64,
+        filename: Option<String>,
+        target_path: Option<std::path::PathBuf>,
+        temp_path: Option<std::path::PathBuf>,
+        resume_supported: Option<bool>,
+    ) -> Self {
+        Self {
+            downloaded_bytes: Some(downloaded),
+            total_bytes: Some(total),
+            speed: Some(0),
+            eta_secs: Some(0),
+            progress: Some(100.0),
+            filename,
+            target_path,
+            temp_path,
+            resume_supported,
+            state_hint: Some(ProgressHint::Downloading),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,18 +292,14 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
-    on_progress(ProgressUpdate {
-        downloaded_bytes: existing_bytes,
+    on_progress(ProgressUpdate::starting_tick(
+        existing_bytes,
         total_bytes,
-        speed: 0,
-        eta_secs: 0,
-        progress: progress_percent(existing_bytes, total_bytes),
-        filename: Some(filename.clone()),
-        target_path: Some(target_path.clone()),
-        temp_path: Some(temp_path.clone()),
-        resume_supported: Some(resume_supported),
-        state_hint: ProgressHint::Starting,
-    });
+        Some(filename.clone()),
+        Some(target_path.clone()),
+        Some(temp_path.clone()),
+        Some(resume_supported),
+    ));
 
     ensure_parent_directory(&temp_path)
         .await
@@ -256,18 +339,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
     let mut window_start = Instant::now();
     let mut window_bytes: u64 = 0;
 
-    on_progress(ProgressUpdate {
-        downloaded_bytes: downloaded,
+    on_progress(ProgressUpdate::downloading_tick(
+        downloaded,
         total_bytes,
-        speed: 0,
-        eta_secs: 0,
-        progress: progress_percent(downloaded, total_bytes),
-        filename: None,
-        target_path: None,
-        temp_path: None,
-        resume_supported: None,
-        state_hint: ProgressHint::Downloading,
-    });
+        0,
+        0,
+        progress_percent(downloaded, total_bytes),
+    ));
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
@@ -323,18 +401,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         if !acquired {
             writer.flush().await.map_err(disk_write_error)?;
             // Keep job/UI counters aligned with what is on disk before pause/cancel.
-            on_progress(ProgressUpdate {
-                downloaded_bytes: downloaded,
+            on_progress(ProgressUpdate::downloading_tick(
+                downloaded,
                 total_bytes,
-                speed: 0,
-                eta_secs: 0,
-                progress: progress_percent(downloaded, total_bytes),
-                filename: None,
-                target_path: None,
-                temp_path: None,
-                resume_supported: None,
-                state_hint: ProgressHint::Downloading,
-            });
+                0,
+                0,
+                progress_percent(downloaded, total_bytes),
+            ));
             return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
         }
 
@@ -350,18 +423,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                 0
             };
 
-            on_progress(ProgressUpdate {
-                downloaded_bytes: downloaded,
+            on_progress(ProgressUpdate::downloading_tick(
+                downloaded,
                 total_bytes,
                 speed,
                 eta_secs,
-                progress: progress_percent(downloaded, total_bytes),
-                filename: None,
-                target_path: None,
-                temp_path: None,
-                resume_supported: None,
-                state_hint: ProgressHint::Downloading,
-            });
+                progress_percent(downloaded, total_bytes),
+            ));
             last_progress = Instant::now();
         }
     }
@@ -388,25 +456,21 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-    on_progress(ProgressUpdate {
-        downloaded_bytes: downloaded,
-        total_bytes: if total_bytes == 0 {
+    on_progress(ProgressUpdate::completed_tick(
+        downloaded,
+        if total_bytes == 0 {
             downloaded
         } else {
             total_bytes
         },
-        speed: 0,
-        eta_secs: 0,
-        progress: 100.0,
-        filename: final_path
+        final_path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string()),
-        target_path: Some(final_path),
-        temp_path: Some(temp_path),
-        resume_supported: Some(resume_supported),
-        state_hint: ProgressHint::Downloading,
-    });
+        Some(final_path),
+        Some(temp_path),
+        Some(resume_supported),
+    ));
 
     Ok(DownloadOutcome::Completed)
 }
@@ -766,6 +830,7 @@ pub async fn preflight(url: &str) -> Option<(Option<u64>, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn progress_clamps() {
@@ -783,5 +848,61 @@ mod tests {
             "The token supplied to the function is invalid (os error -2146893048)"
         ));
         assert!(!looks_like_tls_interference("connection refused"));
+    }
+
+    /// Coalesce merge order: later patch wins on Some; earlier Some preserved when later is None.
+    #[test]
+    fn progress_update_merge_later_wins() {
+        let earlier = ProgressUpdate {
+            downloaded_bytes: Some(10),
+            total_bytes: Some(100),
+            speed: Some(1),
+            eta_secs: Some(90),
+            progress: Some(10.0),
+            filename: Some("a.bin".into()),
+            target_path: Some(PathBuf::from("/tmp/a")),
+            temp_path: Some(PathBuf::from("/tmp/a.part")),
+            resume_supported: Some(true),
+            state_hint: Some(ProgressHint::Starting),
+        };
+        let later = ProgressUpdate {
+            downloaded_bytes: Some(50),
+            total_bytes: None,
+            speed: Some(5),
+            eta_secs: None,
+            progress: Some(50.0),
+            filename: None,
+            target_path: None,
+            temp_path: None,
+            resume_supported: None,
+            state_hint: Some(ProgressHint::Downloading),
+        };
+
+        let merged = earlier.merge(later);
+        assert_eq!(merged.downloaded_bytes, Some(50));
+        assert_eq!(merged.total_bytes, Some(100)); // preserved from earlier
+        assert_eq!(merged.speed, Some(5));
+        assert_eq!(merged.eta_secs, Some(90)); // preserved from earlier
+        assert_eq!(merged.progress, Some(50.0));
+        assert_eq!(merged.filename.as_deref(), Some("a.bin"));
+        assert_eq!(merged.target_path, Some(PathBuf::from("/tmp/a")));
+        assert_eq!(merged.temp_path, Some(PathBuf::from("/tmp/a.part")));
+        assert_eq!(merged.resume_supported, Some(true));
+        assert_eq!(merged.state_hint, Some(ProgressHint::Downloading));
+    }
+
+    #[test]
+    fn downloading_tick_sets_scalars_only() {
+        let tick = ProgressUpdate::downloading_tick(25, 100, 10, 7, 25.0);
+        assert_eq!(tick.downloaded_bytes, Some(25));
+        assert_eq!(tick.total_bytes, Some(100));
+        assert_eq!(tick.speed, Some(10));
+        assert_eq!(tick.eta_secs, Some(7));
+        assert_eq!(tick.progress, Some(25.0));
+        assert!(tick.filename.is_none());
+        assert!(tick.target_path.is_none());
+        assert!(tick.temp_path.is_none());
+        assert!(tick.resume_supported.is_none());
+        assert_eq!(tick.state_hint, Some(ProgressHint::Downloading));
     }
 }
