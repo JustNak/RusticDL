@@ -2,7 +2,8 @@
 //!
 //! Channel selection (`UpdateChannel`):
 //! - **Stable** — `GET …/releases/latest` (GitHub’s latest non-prerelease).
-//! - **Nightly** — list releases and pick the newest published prerelease with a setup asset.
+//! - **Nightly** — list releases and pick the newest published `vX.Y.Z-nightly.*`
+//!   pre-release that includes the setup installer.
 //!
 //! Staged flow (main app UI in `update_flow`):
 //! 1. Query the GitHub Releases API for the latest tag + assets on the chosen channel.
@@ -31,14 +32,19 @@ pub fn latest_release_api() -> String {
     format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest")
 }
 
-/// GitHub API: recent releases list (used to find nightly/prerelease builds).
+/// GitHub API: recent releases list (used to find nightly builds).
 pub fn releases_list_api() -> String {
-    format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=30")
+    format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=100")
 }
 
-/// Human-facing releases page (opens in browser).
+/// Human-facing latest stable release page.
 pub fn latest_release_page() -> String {
     format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest")
+}
+
+/// Human-facing releases list (stable + nightly pre-releases).
+pub fn releases_page() -> String {
+    format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases")
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -100,7 +106,7 @@ pub async fn check_for_update(channel: UpdateChannel) -> Result<UpdateCheck, Str
         UpdateChannel::Stable => fetch_stable_release(&client).await?,
         UpdateChannel::Nightly => fetch_nightly_release(&client).await?,
     };
-    compare_release(release)
+    compare_release(release, channel)
 }
 
 async fn fetch_stable_release(client: &reqwest::Client) -> Result<GhRelease, String> {
@@ -152,27 +158,29 @@ async fn fetch_nightly_release(client: &reqwest::Client) -> Result<GhRelease, St
         .await
         .map_err(|e| format!("Could not parse GitHub releases list: {e}"))?;
 
-    // GitHub returns newest first; take the first published prerelease with a setup asset.
+    // GitHub returns newest first; take the first published nightly with a setup asset.
     releases
         .into_iter()
-        .find(|r| {
-            !r.draft
-                && r.prerelease
-                && r.assets
-                    .iter()
-                    .any(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
-        })
-        .ok_or_else(|| {
-            "No Nightly (pre-release) build with a setup installer was found on GitHub.".into()
-        })
+        .find(is_published_nightly)
+        .ok_or_else(|| "No Nightly build with a setup installer was found on GitHub.".into())
 }
 
-fn compare_release(release: GhRelease) -> Result<UpdateCheck, String> {
+fn is_published_nightly(release: &GhRelease) -> bool {
+    !release.draft
+        && release.prerelease
+        && is_nightly_version(&release.tag_name)
+        && release
+            .assets
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
+}
+
+fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateCheck, String> {
     let latest_raw = release.tag_name.trim();
     let latest = normalize_version(latest_raw);
     let current = normalize_version(APP_VERSION);
 
-    if !is_newer(&latest, &current) {
+    if !is_newer_on_channel(&latest, &current, channel) {
         return Ok(UpdateCheck::UpToDate {
             current: current.clone(),
             latest,
@@ -258,9 +266,9 @@ pub async fn download_installer(download_url: &str) -> Result<PathBuf, String> {
     Ok(installer_path)
 }
 
-/// Open the latest release page in the default browser.
+/// Open the releases list in the default browser (includes nightly pre-releases).
 pub fn open_release_page() -> Result<(), String> {
-    open_url(&latest_release_page())
+    open_url(&releases_page())
 }
 
 /// Open a URL (release page or similar) in the default browser.
@@ -549,10 +557,25 @@ pub fn normalize_version(raw: &str) -> String {
     s.trim().to_string()
 }
 
+/// True when `raw` is a nightly stamp (`X.Y.Z-nightly.*`, optional `v` prefix).
+pub fn is_nightly_version(raw: &str) -> bool {
+    let version = normalize_version(raw);
+    version
+        .split_once('-')
+        .map(|(_, pre)| {
+            pre.split('.')
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case("nightly")
+        })
+        .unwrap_or(false)
+}
+
 /// True when `latest` is a greater semver-like triple than `current`.
 ///
 /// Accepts optional pre-release suffix (`1.2.3-beta`); pre-release of the same
-/// core version is treated as older than the plain release.
+/// core version is treated as older than the plain release. Distinct pre-release
+/// identifiers are compared (so `0.3.1-nightly.2` > `0.3.1-nightly.1`).
 pub fn is_newer(latest: &str, current: &str) -> bool {
     match (parse_semverish(latest), parse_semverish(current)) {
         (Some(l), Some(c)) => l > c,
@@ -560,13 +583,83 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Channel-aware comparison used by the in-app updater.
+///
+/// Nightly treats a `*-nightly.*` of the same core version as newer than a
+/// stable install, so switching to Nightly on `0.3.1` can pick up
+/// `0.3.1-nightly.20260813…`. It never offers a lower core version.
+pub fn is_newer_on_channel(latest: &str, current: &str, channel: UpdateChannel) -> bool {
+    match channel {
+        UpdateChannel::Stable => is_newer(latest, current),
+        UpdateChannel::Nightly => is_newer_nightly(latest, current),
+    }
+}
+
+fn is_newer_nightly(latest: &str, current: &str) -> bool {
+    match (parse_semverish(latest), parse_semverish(current)) {
+        (Some(l), Some(c)) => {
+            if (l.major, l.minor, l.patch) != (c.major, c.minor, c.patch) {
+                return (l.major, l.minor, l.patch) > (c.major, c.minor, c.patch);
+            }
+            match (&l.pre, &c.pre) {
+                (Some(_), None) => is_nightly_version(latest),
+                (Some(lp), Some(cp)) => lp > cp,
+                (None, _) => false,
+            }
+        }
+        _ => latest != current && !latest.is_empty(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Semverish {
     major: u64,
     minor: u64,
     patch: u64,
-    /// 1 = plain release, 0 = pre-release (so 1.0.0 > 1.0.0-beta).
-    release_rank: u8,
+    /// `None` = release (newer than any pre-release of the same core).
+    pre: Option<Vec<PreIdent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreIdent {
+    Num(u64),
+    Text(String),
+}
+
+impl PartialOrd for PreIdent {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PreIdent {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Num(a), Self::Num(b)) => a.cmp(b),
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            (Self::Num(_), Self::Text(_)) => std::cmp::Ordering::Less,
+            (Self::Text(_), Self::Num(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for Semverish {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Semverish {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (&self.pre, &other.pre) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => a.cmp(b),
+            })
+    }
 }
 
 fn parse_semverish(s: &str) -> Option<Semverish> {
@@ -574,25 +667,34 @@ fn parse_semverish(s: &str) -> Option<Semverish> {
     if s.is_empty() {
         return None;
     }
-    let (core, pre) = match s.split_once(['-', '+']) {
-        Some((core, rest)) => (core, Some(rest)),
-        None => (s, None),
+    // Build metadata (`+…`) is ignored for precedence.
+    let s = s.split_once('+').map(|(core, _)| core).unwrap_or(s);
+    let (core, pre) = match s.split_once('-') {
+        Some((core, rest)) if !rest.is_empty() => (core, Some(rest)),
+        _ => (s, None),
     };
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().unwrap_or("0").parse().ok()?;
     let patch = parts.next().unwrap_or("0").parse().ok()?;
-    // Extra numeric segments ignored.
-    let release_rank = if pre.is_some_and(|p| !p.is_empty()) {
-        0
-    } else {
-        1
+    let pre = pre.map(|p| {
+        p.split('.')
+            .filter(|part| !part.is_empty())
+            .map(|part| match part.parse::<u64>() {
+                Ok(n) => PreIdent::Num(n),
+                Err(_) => PreIdent::Text(part.to_string()),
+            })
+            .collect::<Vec<_>>()
+    });
+    let pre = match pre {
+        Some(parts) if parts.is_empty() => None,
+        other => other,
     };
     Some(Semverish {
         major,
         minor,
         patch,
-        release_rank,
+        pre,
     })
 }
 
@@ -625,18 +727,69 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.1"));
         assert!(is_newer("0.1.1", "0.1.1-beta"));
         assert!(!is_newer("0.1.1-beta", "0.1.1"));
+        assert!(is_newer(
+            "0.3.1-nightly.20260814120000",
+            "0.3.1-nightly.20260813120000"
+        ));
+        assert!(!is_newer(
+            "0.3.1-nightly.20260813120000",
+            "0.3.1-nightly.20260814120000"
+        ));
+        assert!(!is_newer("0.3.1-nightly.20260813120000", "0.3.1"));
+    }
+
+    #[test]
+    fn nightly_channel_offers_same_core_nightly_over_stable() {
+        assert!(is_newer_on_channel(
+            "0.3.1-nightly.20260813155600",
+            "0.3.1",
+            UpdateChannel::Nightly
+        ));
+        assert!(!is_newer_on_channel(
+            "0.3.1-nightly.20260813155600",
+            "0.3.1",
+            UpdateChannel::Stable
+        ));
+        assert!(!is_newer_on_channel(
+            "0.3.1-nightly.20260813155600",
+            "0.3.1-nightly.20260813155600",
+            UpdateChannel::Nightly
+        ));
+        assert!(!is_newer_on_channel(
+            "0.3.0-nightly.20260813155600",
+            "0.3.1",
+            UpdateChannel::Nightly
+        ));
+        assert!(is_newer_on_channel(
+            "0.3.2-nightly.20260813155600",
+            "0.3.1-nightly.20260812000000",
+            UpdateChannel::Nightly
+        ));
+    }
+
+    #[test]
+    fn nightly_tag_detection() {
+        assert!(is_nightly_version("v0.3.1-nightly.20260813155600"));
+        assert!(is_nightly_version("0.3.1-nightly.1"));
+        assert!(!is_nightly_version("0.3.1"));
+        assert!(!is_nightly_version("0.3.1-beta.1"));
+        assert!(!is_nightly_version("nightly"));
     }
 
     #[test]
     fn endpoints_point_at_github() {
         let api = latest_release_api();
         let page = latest_release_page();
+        let list = releases_page();
         assert!(api.contains(GITHUB_OWNER));
         assert!(api.contains(GITHUB_REPO));
         assert!(api.ends_with("/releases/latest"));
         assert!(page.contains("github.com"));
         assert!(page.contains(GITHUB_REPO));
+        assert!(list.ends_with("/releases"));
+        assert!(releases_list_api().contains("per_page=100"));
         assert!(SETUP_ASSET_NAME.ends_with(".exe"));
         assert!(!APP_VERSION.is_empty());
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
     }
 }

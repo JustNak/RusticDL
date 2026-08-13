@@ -16,6 +16,7 @@ impl DownloadApp {
         let app_view = cx.entity().clone();
         let update_busy = self.update_busy;
         let update_action_label = self.update_action_label();
+        let channel_label = self.settings.update_channel.label();
         window.open_dialog(cx, move |dialog, window, cx| {
             let theme = cx.theme().clone();
             let muted = theme.muted_foreground;
@@ -46,6 +47,7 @@ impl DownloadApp {
                                 .bordered(false)
                                 .label_width(px(96.))
                                 .item("Version", APP_VERSION, 1)
+                                .item("Channel", channel_label, 1)
                                 .item("Engine", "Multi-segment + Range resume", 1)
                                 .item("License", "MIT", 1)
                                 .item("Updates", "GitHub Releases", 1),

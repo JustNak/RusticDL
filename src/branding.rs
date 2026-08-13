@@ -11,8 +11,11 @@
 /// User-facing product name for the main desktop application.
 pub const APP_NAME: &str = "RusticDL";
 
-/// Built-in app version from `Cargo.toml` (shown in About / update checks).
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Built-in app version (About, update checks).
+///
+/// Defaults to `Cargo.toml`. Nightly CI sets `RUSTICDL_VERSION` so the binary
+/// reports `X.Y.Z-nightly.YYYYMMDDHHMMSS` without rewriting the crate version.
+pub const APP_VERSION: &str = env!("RUSTICDL_VERSION");
 
 /// User-facing name for the native messaging host (backend bridge process).
 ///
