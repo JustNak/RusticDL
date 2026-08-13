@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::appearance::appearance_settings_dto;
+use crate::branding::APP_VERSION;
 use crate::download::{EnqueueOutcome, Job, JobState};
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::settings::Settings;
@@ -99,7 +100,7 @@ impl HostResponse {
             message_type: "ready".into(),
             payload: Some(json!({
                 "appState": "running",
-                "appVersion": env!("CARGO_PKG_VERSION"),
+                "appVersion": APP_VERSION,
                 "connectionState": "connected",
                 "queueSummary": queue_summary(jobs),
                 "extensionSettings": extension.to_protocol_json(),

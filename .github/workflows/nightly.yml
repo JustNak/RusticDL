@@ -16,7 +16,8 @@ permissions:
 
 concurrency:
   group: nightly
-  cancel-in-progress: true
+  # Queue instead of cancelling: a mid-publish cancel can leave a partial Nightly.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +27,7 @@ jobs:
   decide:
     name: Resolve nightly version
     runs-on: ubuntu-latest
-    if: github.repository == 'JustNak/RusticDL'
+    if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master'
     outputs:
       skip: ${{ steps.meta.outputs.skip }}
       version: ${{ steps.meta.outputs.version }}
@@ -85,7 +86,7 @@ jobs:
   release-windows:
     name: Build & publish nightly (Windows)
     needs: decide
-    if: github.repository == 'JustNak/RusticDL' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true'
+    if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true'
     runs-on: windows-latest
     env:
       RUSTICDL_VERSION: ${{ needs.decide.outputs.version }}
