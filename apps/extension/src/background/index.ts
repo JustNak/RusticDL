@@ -6,7 +6,7 @@ import {
   type HostToExtensionResponse,
 } from '@rusticdl/protocol';
 import browser from './browser';
-import { shouldCaptureDownloadItem } from './captureFilter';
+import { downloadCreatedAction, knownDownloadBytes, shouldCaptureDownloadItem } from './captureFilter';
 import {
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
@@ -15,6 +15,7 @@ import {
 } from './firefoxCapture';
 import {
   buildContextMenuPayload,
+  collectHandoffAuth,
   connectionForErrorCode,
   handoffDownload,
   openApp,
@@ -36,7 +37,15 @@ const CONTEXT_MENU_ID = 'download-with-rusticdl';
 /** Periodic desktop connection / queue badge refresh (not appearance sync). */
 const CONNECTION_HEALTH_ALARM_NAME = 'connection-health';
 const CAPTURE_DEDUPE_TTL_MS = 15_000;
+/** Wait for Firefox to fill in totalBytes before capturing unknown-size items. */
+const SIZE_WAIT_MS = 1_500;
 const captureClaims = new Map<string, number>();
+
+type PendingSizeWait = {
+  item: CapturedDownloadItem;
+  timer: ReturnType<typeof setTimeout>;
+};
+const pendingSizeWaits = new Map<number, PendingSizeWait>();
 
 let cachedSettings: ExtensionIntegrationSettings | null = null;
 
@@ -135,6 +144,9 @@ function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
 type CapturedDownloadItem = browser.downloads.DownloadItem & {
   finalUrl?: string;
   byExtensionId?: string;
+  cookieStoreId?: string;
+  fileSize?: number;
+  bytesReceived?: number;
 };
 
 async function handOffUrl(
@@ -145,6 +157,7 @@ async function handOffUrl(
     pageUrl?: string;
     referrer?: string;
     incognito?: boolean;
+    cookieStoreId?: string;
   } = {},
 ): Promise<boolean> {
   if (!claimCapture(url)) return false;
@@ -157,8 +170,16 @@ async function handOffUrl(
     incognito: extra.incognito,
   };
 
-  // Automatic capture always uses ask/auto from settings.
-  const response = await handoffDownload(url, source, settings.downloadHandoffMode, metadata);
+  const handoffAuth = await collectHandoffAuth(url, {
+    referrer: extra.referrer,
+    pageUrl: extra.pageUrl,
+    incognito: extra.incognito,
+    cookieStoreId: extra.cookieStoreId,
+  });
+  const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
+    ...metadata,
+    handoffAuth: metadata.handoffAuth ?? handoffAuth,
+  });
 
   if (isErrorResponse(response) || !isSuccessfulHandoff(response)) {
     // Allow a later retry if the desktop rejected or timed out the handoff.
@@ -192,11 +213,12 @@ async function handoffBrowserDownload(
   // so a down desktop / dismissed ask prompt does not lose the file.
   const ok = await handOffUrl(url, settings, {
     suggestedFilename: item.filename?.split(/[\\/]/).pop(),
-    totalBytes: item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined,
+    totalBytes: knownDownloadBytes(item),
   }, {
     pageUrl: item.referrer,
     referrer: item.referrer,
     incognito: item.incognito,
+    cookieStoreId: item.cookieStoreId,
   });
   if (!ok) return;
 
@@ -212,10 +234,117 @@ async function handoffBrowserDownload(
   }
 }
 
-async function onDownloadCreated(item: CapturedDownloadItem) {
+function deltaCurrent<T>(field: { current?: T } | T | undefined): T | undefined {
+  if (field == null) return undefined;
+  if (typeof field === 'object' && 'current' in (field as object)) {
+    return (field as { current?: T }).current;
+  }
+  return field as T;
+}
+
+type DownloadChangeDelta = {
+  id: number;
+  url?: { current?: string };
+  filename?: { current?: string };
+  mime?: { current?: string };
+  state?: { current?: string };
+  totalBytes?: { current?: number };
+  fileSize?: { current?: number };
+};
+
+function mergeDownloadDelta(
+  item: CapturedDownloadItem,
+  delta: DownloadChangeDelta,
+): CapturedDownloadItem {
+  const totalBytes = deltaCurrent(delta.totalBytes);
+  const fileSize = deltaCurrent(delta.fileSize);
+  const filename = deltaCurrent(delta.filename);
+  const mime = deltaCurrent(delta.mime);
+  const url = deltaCurrent(delta.url);
+  const next: CapturedDownloadItem = {
+    ...item,
+    ...(url ? { url } : {}),
+    ...(filename ? { filename } : {}),
+    ...(mime ? { mime } : {}),
+    ...(typeof fileSize === 'number' && fileSize > 0 ? { fileSize } : {}),
+    ...(typeof totalBytes === 'number' && totalBytes > 0 ? { totalBytes } : {}),
+  };
+  const known = knownDownloadBytes(next);
+  if (known != null) next.totalBytes = known;
+  return next;
+}
+
+function clearPendingSizeWait(id: number): PendingSizeWait | undefined {
+  const pending = pendingSizeWaits.get(id);
+  if (!pending) return undefined;
+  clearTimeout(pending.timer);
+  pendingSizeWaits.delete(id);
+  return pending;
+}
+
+async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<CapturedDownloadItem> {
+  try {
+    const found = await browser.downloads.search({ id: item.id });
+    const latest = found[0] as CapturedDownloadItem | undefined;
+    if (!latest) return item;
+    const merged: CapturedDownloadItem = {
+      ...item,
+      ...latest,
+      cookieStoreId: latest.cookieStoreId ?? item.cookieStoreId,
+      fileSize: latest.fileSize && latest.fileSize > 0 ? latest.fileSize : item.fileSize,
+    };
+    const known = knownDownloadBytes(merged)
+      ?? (latest.state === 'complete' && latest.bytesReceived && latest.bytesReceived > 0
+        ? latest.bytesReceived
+        : undefined);
+    if (known != null) merged.totalBytes = known;
+    return merged;
+  } catch {
+    return item;
+  }
+}
+
+async function finalizePendingCapture(item: CapturedDownloadItem) {
   const settings = await getCachedSettings();
   if (!shouldCaptureDownloadItem(item, settings)) return;
   await handoffBrowserDownload(item, settings);
+}
+
+async function onDownloadCreated(item: CapturedDownloadItem) {
+  const settings = await getCachedSettings();
+  const action = downloadCreatedAction(item, settings);
+  if (action === 'capture') {
+    await handoffBrowserDownload(item, settings);
+    return;
+  }
+  if (action !== 'wait') return;
+
+  const timer = setTimeout(() => {
+    const pending = pendingSizeWaits.get(item.id);
+    if (!pending) return;
+    pendingSizeWaits.delete(item.id);
+    void latestDownloadSnapshot(pending.item).then((latest) => finalizePendingCapture(latest));
+  }, SIZE_WAIT_MS);
+  pendingSizeWaits.set(item.id, { item, timer });
+}
+
+function onDownloadChanged(delta: DownloadChangeDelta) {
+  const pending = pendingSizeWaits.get(delta.id);
+  if (!pending) return;
+
+  const merged = mergeDownloadDelta(pending.item, delta);
+  pending.item = merged;
+
+  const known = knownDownloadBytes(merged);
+  const state = deltaCurrent(delta.state);
+  if (known == null && state !== 'complete') return;
+
+  clearPendingSizeWait(delta.id);
+  if (known == null && state === 'complete') {
+    void latestDownloadSnapshot(merged).then((latest) => finalizePendingCapture(latest));
+    return;
+  }
+  void finalizePendingCapture(merged);
 }
 
 async function handoffFirefoxCandidate(
@@ -229,6 +358,7 @@ async function handoffFirefoxCandidate(
     pageUrl: candidate.pageUrl,
     referrer: candidate.referrer,
     incognito: candidate.incognito,
+    cookieStoreId: candidate.cookieStoreId,
   });
 }
 
@@ -243,11 +373,10 @@ function registerFirefoxWebRequestInterception() {
     },
     {
       urls: ['http://*/*', 'https://*/*'],
-      // Intentionally omit xmlhttprequest + sub_frame: those are full of false positives
-      // (YouTube suggestqueries, beacons, ads). Real file navigations use main_frame /
-      // object / other; everything else still hits downloads.onCreated when Firefox
-      // treats the response as a download.
-      types: ['main_frame', 'object', 'other'],
+      // xmlhttprequest is included so file-host CDNs (Gofile/Pixeldrain fetch)
+      // can be handed off before they become an uncatchable blob: download.
+      // Heuristics still reject tiny/XHR-API noise (see firefoxCapture).
+      types: ['main_frame', 'object', 'other', 'xmlhttprequest'],
     },
     ['blocking', 'responseHeaders'],
   );
@@ -310,7 +439,13 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
     }
     await updatePopupState({ isSubmitting: true });
     const mode = settings.downloadHandoffMode === 'auto' ? 'auto' : 'ask';
-    const response = await handoffDownload(payload.url, payload.source, mode);
+    const handoffAuth = await collectHandoffAuth(payload.url, {
+      referrer: payload.source.referrer,
+      pageUrl: payload.source.pageUrl,
+      incognito: payload.source.incognito,
+      cookieStoreId: (tab as { cookieStoreId?: string } | undefined)?.cookieStoreId,
+    });
+    const response = await handoffDownload(payload.url, payload.source, mode, { handoffAuth });
     if (isErrorResponse(response)) {
       const connection = connectionForErrorCode(response.code);
       const state = await setHostError(
@@ -331,6 +466,11 @@ registerFirefoxWebRequestInterception();
 if (browser.downloads?.onCreated) {
   browser.downloads.onCreated.addListener((item) => {
     void onDownloadCreated(item);
+  });
+}
+if (browser.downloads?.onChanged) {
+  browser.downloads.onChanged.addListener((delta) => {
+    onDownloadChanged(delta);
   });
 }
 

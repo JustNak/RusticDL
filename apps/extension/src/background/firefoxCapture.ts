@@ -3,9 +3,10 @@
  * Cancels eligible responses before the browser commits the file, then hands off.
  *
  * Heuristics intentionally err on the side of *not* capturing. False positives
- * (e.g. YouTube suggestqueries / analytics junk with Content-Disposition) are
- * far more annoying than missing an exotic download — those still fall through
- * to downloads.onCreated or the context menu.
+ * (YouTube suggestqueries, Nexus stats CSVs, 3 KB HTML wait-pages named .rar)
+ * are far more annoying than missing an exotic download — those still fall
+ * through to downloads.onCreated or the context menu. Large file-host XHRs
+ * (Gofile / Pixeldrain) are intercepted so they do not become blob: downloads.
  */
 import {
   isUrlHostExcludedByPatterns,
@@ -17,6 +18,9 @@ import {
   isWeakCaptureExtension,
 } from './captureFilter';
 import browser from './browser';
+
+/** XHR is noisy; only intercept when the body is clearly a large file. */
+export const MIN_XHR_CAPTURE_BYTES = 64 * 1024;
 
 export type FirefoxWebRequestHeader = { name: string; value?: string };
 
@@ -30,6 +34,7 @@ export type FirefoxHeadersReceivedDetails = {
   statusCode?: number;
   responseHeaders?: FirefoxWebRequestHeader[];
   incognito?: boolean;
+  cookieStoreId?: string;
 };
 
 export type FirefoxCaptureCandidate = {
@@ -39,10 +44,17 @@ export type FirefoxCaptureCandidate = {
   pageUrl?: string;
   referrer?: string;
   incognito?: boolean;
+  cookieStoreId?: string;
   reason: string;
 };
 
-export { MIN_CAPTURE_BYTES, shouldCaptureDownloadItem } from './captureFilter';
+export {
+  MIN_CAPTURE_BYTES,
+  downloadCreatedAction,
+  knownDownloadBytes,
+  shouldCaptureDownloadItem,
+  shouldWaitForDownloadSize,
+} from './captureFilter';
 
 const DOWNLOAD_MIME = new Set([
   'application/zip',
@@ -221,9 +233,14 @@ export function firefoxWebRequestDownloadCandidate(
     return null;
   }
 
-  // Only navigation / plugin / opaque "other" responses. XHR/fetch and sub-frame
-  // traffic is full of attachment-ish noise (autocomplete, beacons, ads) that is
-  // not a user download. Real save-as downloads still surface via downloads.onCreated.
+  // POST/PUT/HEAD cannot be replayed as a desktop GET (wait forms / size probes).
+  const method = (details.method ?? 'GET').toUpperCase();
+  if (method !== 'GET') {
+    return null;
+  }
+
+  // Navigation / plugin / opaque "other", plus large XHR file-host CDNs.
+  // Tiny XHR (suggestqueries, stats) is rejected later by size + MIME.
   const resourceType = (details.type ?? '').toLowerCase();
   if (
     [
@@ -235,7 +252,6 @@ export function firefoxWebRequestDownloadCandidate(
       'websocket',
       'ping',
       'csp_report',
-      'xmlhttprequest',
       'sub_frame',
       'imageset',
       'web_manifest',
@@ -269,30 +285,43 @@ export function firefoxWebRequestDownloadCandidate(
   // Present but non-captured extension is a veto for MIME-only capture (e.g. f.txt + octet-stream).
   const knownNonCapturedExt = Boolean(ext && !captured.has(ext));
   const isMainFrame = resourceType === 'main_frame';
+  const isXhr = resourceType === 'xmlhttprequest';
   const navType = isMainFrame || resourceType === 'object' || resourceType === 'other';
 
-  // File CDNs often send ACAO without attachment; only drop page-data CORS.
-  if (hasCorsAllowOrigin(headers) && !hasAttachment && !(strongMime || strongExt)) {
+  // CORS without attachment is usually a page data fetch (Nexus stats CSVs).
+  // File-host CDNs also send ACAO on huge octet-stream bodies — those are real.
+  const corsLooksLikePageData =
+    hasCorsAllowOrigin(headers) &&
+    !hasAttachment &&
+    !((strongMime || strongExt) && (totalBytes == null || totalBytes >= MIN_CAPTURE_BYTES));
+  if (corsLooksLikePageData) {
     return null;
   }
 
-  // Page documents / API payloads are never downloads unless the server forces
-  // a saved file with a recognized *strong* captured extension.
+  // HTML / JSON / text named `Game.rar` is a wait-page stub, not a file.
   if (isNonDownloadMime(mime)) {
-    if (!(hasAttachment && strongExt && dispositionName)) {
+    return null;
+  }
+
+  // Tiny bodies are wait-page stubs / trackers, even with a .rar filename.
+  if (totalBytes != null && totalBytes > 0 && totalBytes < MIN_CAPTURE_BYTES) {
+    return null;
+  }
+
+  // fetch() + blob on Gofile/Pixeldrain never hits downloads.onCreated with an
+  // http(s) URL. Intercept only large, obvious file XHRs so we can hand off
+  // the real CDN link instead of a 3 KB HTML ticket.
+  if (isXhr) {
+    if (totalBytes != null && totalBytes < MIN_XHR_CAPTURE_BYTES) {
       return null;
     }
-  }
-
-  // Tiny bodies are almost always trackers / autocomplete / error stubs.
-  // Allow only when both MIME and extension scream "real file" with attachment.
-  if (
-    totalBytes != null &&
-    totalBytes > 0 &&
-    totalBytes < MIN_CAPTURE_BYTES &&
-    !(hasAttachment && strongMime && strongExt)
-  ) {
-    return null;
+    if (!strongExt || !(hasAttachment || strongMime)) {
+      return null;
+    }
+    // Chunked CDNs omit Content-Length; only take obvious file XHRs.
+    if (totalBytes == null && !(hasAttachment && strongMime)) {
+      return null;
+    }
   }
 
   let reason: string | null = null;
@@ -303,8 +332,8 @@ export function firefoxWebRequestDownloadCandidate(
     reason = 'attachment_disposition';
   } else if (hasAttachment && strongMime && !knownNonCapturedExt) {
     reason = dispositionName ? 'attachment_disposition' : 'download_mime';
-  } else if (strongMime && navType && !knownNonCapturedExt) {
-    // Direct navigation / plugin / opaque hit on a binary MIME (e.g. clicking a .zip / .pdf link).
+  } else if (strongMime && (navType || isXhr) && !knownNonCapturedExt) {
+    // Direct navigation / plugin / opaque / large XHR hit on a binary MIME.
     reason = 'download_mime_navigation';
   } else if (strongExt && isMainFrame && dispositionName) {
     // Top-level navigation with disposition filename matching a captured extension.
@@ -326,6 +355,7 @@ export function firefoxWebRequestDownloadCandidate(
     pageUrl: details.documentUrl || details.originUrl,
     referrer: details.originUrl || details.documentUrl,
     incognito: details.incognito,
+    cookieStoreId: details.cookieStoreId,
     reason,
   };
 }

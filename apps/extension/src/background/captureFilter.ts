@@ -3,14 +3,22 @@
  *
  * Bias: miss an exotic file rather than steal page data fetches. Sites routinely
  * serve `.csv` / `.json` as live APIs (Nexus Mods download-count stats, etc.).
+ *
+ * File hosts (Gofile, Buzzheavier, SteamRIP mirrors) often emit a tiny HTML
+ * "ticket" / wait page with `Content-Disposition: filename="Game.rar"` (~3 KB)
+ * *before* the real archive. Catching that stub cancels the real transfer and
+ * completes a 3 KB `.rar` of HTML. Known-small bodies are never captured.
  */
 import {
   isUrlHostExcludedByPatterns,
   type ExtensionIntegrationSettings,
 } from '@rusticdl/protocol';
 
-/** Skip known-size responses smaller than this unless they look like a real file. */
-export const MIN_CAPTURE_BYTES = 1024;
+/**
+ * Skip known-size responses smaller than this. A 3 KB `.rar` is a wait-page
+ * stub, not a user file. Context-menu still works for tiny legit files.
+ */
+export const MIN_CAPTURE_BYTES = 8 * 1024;
 
 /**
  * Extensions that pages commonly fetch as data, not as user-initiated files.
@@ -62,10 +70,20 @@ export type DownloadItemLike = {
   filename?: string;
   mime?: string;
   totalBytes?: number;
+  fileSize?: number;
+  bytesReceived?: number;
   referrer?: string;
   byExtensionId?: string;
   incognito?: boolean;
+  cookieStoreId?: string;
 };
+
+/** Prefer Firefox totalBytes, then fileSize (totalBytes is often -1 onCreated). */
+export function knownDownloadBytes(item: DownloadItemLike): number | undefined {
+  if (item.totalBytes && item.totalBytes > 0) return item.totalBytes;
+  if (item.fileSize && item.fileSize > 0) return item.fileSize;
+  return undefined;
+}
 
 export function filenameExtension(filename: string | undefined): string | undefined {
   if (!filename) return undefined;
@@ -153,8 +171,9 @@ export function shouldCaptureDownloadItem(
     return false;
   }
 
-  const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
-  if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES && !strongName) {
+  const knownBytes = knownDownloadBytes(item);
+  // Known-small bodies are stubs even with a captured extension.
+  if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES) {
     return false;
   }
 
@@ -165,4 +184,46 @@ export function shouldCaptureDownloadItem(
   if (strongName) return true;
   if (ext) return false;
   return dispositionHint;
+}
+
+/**
+ * True when onCreated fired before Firefox filled in `totalBytes` for a
+ * would-be capture. Wait for downloads.onChanged so we can reject a 3 KB stub
+ * instead of handing it off at `totalBytes: -1`.
+ */
+export function shouldWaitForDownloadSize(
+  item: DownloadItemLike,
+  settings: ExtensionIntegrationSettings,
+): boolean {
+  if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
+  const url = item.finalUrl || item.url;
+  if (!url || !(url.startsWith('http://') || url.startsWith('https://'))) return false;
+  if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
+  if (item.byExtensionId) return false;
+  if (url.startsWith('blob:') || url.startsWith('data:')) return false;
+
+  const mime = (item.mime || '').toLowerCase().split(';')[0].trim();
+  if (isPageOrApiMime(mime)) return false;
+
+  const ext = filenameExtension(item.filename);
+  const ignored = new Set(
+    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
+  );
+  if (ext && ignored.has(ext)) return false;
+
+  const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
+  const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
+  if (!strongName && !mimeLooksLikeDownload(mime)) return false;
+
+  return knownDownloadBytes(item) == null;
+}
+
+/** Wait for size before capturing unknown-size strong names (3 KB wait-page stubs). */
+export function downloadCreatedAction(
+  item: DownloadItemLike,
+  settings: ExtensionIntegrationSettings,
+): 'wait' | 'capture' | 'ignore' {
+  if (shouldWaitForDownloadSize(item, settings)) return 'wait';
+  if (shouldCaptureDownloadItem(item, settings)) return 'capture';
+  return 'ignore';
 }
