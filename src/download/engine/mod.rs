@@ -951,10 +951,6 @@ mod tests {
                 }),
                 replace_validators: Some(true),
                 transfer_format_version: Some(0),
-                fallback_reason: Some(
-                    "Remote file changed or server ignored resume; restarting download from the beginning."
-                        .into(),
-                ),
                 ..Default::default()
             },
         );
@@ -966,7 +962,7 @@ mod tests {
         );
         assert_eq!(job.validators.expected_size, Some(2000));
         assert_eq!(job.transfer_format_version, 0);
-        assert!(job.fallback_reason.is_some());
+        assert!(job.fallback_reason.is_none());
     }
 
     #[test]

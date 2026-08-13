@@ -275,7 +275,6 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         let _ = tokio::fs::remove_file(&job.temp_path).await;
     }
 
-    // Parse Content-Range once (206 resume + optional * total).
     let parsed_range = response
         .headers()
         .get(CONTENT_RANGE)
@@ -286,7 +285,17 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
     // (fail-closed — RFC requires Content-Range on 206; misaligned append is worse).
     if status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
         match parsed_range {
-            Some((start, _end, _total)) if start == existing_bytes => {}
+            Some((start, _end, _total)) if start == existing_bytes => {
+                let incoming = content_validators_from_headers(response.headers(), 0);
+                if resume_identity_mismatch(&job.validators, &incoming) {
+                    return Err(download_error(
+                        FailureCategory::Resume,
+                        "Remote content identity changed (ETag or Last-Modified). Use Restart."
+                            .into(),
+                        false,
+                    ));
+                }
+            }
             Some((start, _end, _total)) => {
                 return Err(download_error(
                     FailureCategory::Resume,
@@ -395,10 +404,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         validators,
     );
     if full_replace {
-        // Replace identity + clear multi version; surface a non-fatal user notice.
         starting.replace_validators = Some(true);
         starting.transfer_format_version = Some(0);
-        starting.fallback_reason = Some(FULL_REPLACE_NOTICE.into());
         starting.toast = Some(FULL_REPLACE_NOTICE.into());
     }
     on_progress(starting);
@@ -695,7 +702,6 @@ fn build_download_request(
 
     if existing_bytes > 0 {
         request = request.header(RANGE, format!("bytes={existing_bytes}-"));
-        // Strong ETag preferred; weak → Last-Modified; else bare Range (no If-Range).
         if let Some(if_range) = if_range_header_value(validators) {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
                 request = request.header(IF_RANGE, value);
@@ -896,13 +902,31 @@ fn if_range_header_value(validators: &ContentValidators) -> Option<&str> {
         if is_strong_etag(etag) {
             return Some(etag);
         }
-        // Weak ETag: do not use for If-Range; fall through to Last-Modified.
     }
     validators
         .last_modified
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// Both sides present and differ. Missing 206 headers are not a mismatch
+/// (CDN 206 without identity still continues).
+fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
+    if let (Some(a), Some(b)) = (stored.etag.as_deref(), incoming.etag.as_deref()) {
+        if a.trim() != b.trim() {
+            return true;
+        }
+    }
+    if let (Some(a), Some(b)) = (
+        stored.last_modified.as_deref(),
+        incoming.last_modified.as_deref(),
+    ) {
+        if a.trim() != b.trim() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Size mismatch when both stored expected_size and a numeric Content-Range total are known.
@@ -1299,6 +1323,41 @@ mod tests {
         // `*` total → None total → no mismatch.
         assert_eq!(content_range_size_mismatch(None, Some(1000)), None);
         assert_eq!(content_range_size_mismatch(Some(1000), None), None);
+    }
+
+    #[test]
+    fn resume_identity_mismatch_compares_present_fields_only() {
+        let stored = ContentValidators {
+            etag: Some("\"a\"".into()),
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: Some(1000),
+        };
+        let same = ContentValidators {
+            etag: Some("\"a\"".into()),
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: None,
+        };
+        assert!(!resume_identity_mismatch(&stored, &same));
+
+        let missing = ContentValidators::default();
+        assert!(
+            !resume_identity_mismatch(&stored, &missing),
+            "absent 206 headers are not a mismatch"
+        );
+
+        let weak_changed = ContentValidators {
+            etag: Some("W/\"b\"".into()),
+            last_modified: None,
+            expected_size: None,
+        };
+        assert!(resume_identity_mismatch(&stored, &weak_changed));
+
+        let lm_changed = ContentValidators {
+            etag: None,
+            last_modified: Some("Wed, 16 Nov 1994 12:45:26 GMT".into()),
+            expected_size: None,
+        };
+        assert!(resume_identity_mismatch(&stored, &lm_changed));
     }
 
     #[test]
