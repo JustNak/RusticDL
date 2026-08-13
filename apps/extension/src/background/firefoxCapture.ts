@@ -34,6 +34,7 @@ export type FirefoxHeadersReceivedDetails = {
   statusCode?: number;
   responseHeaders?: FirefoxWebRequestHeader[];
   incognito?: boolean;
+  cookieStoreId?: string;
 };
 
 export type FirefoxCaptureCandidate = {
@@ -43,11 +44,14 @@ export type FirefoxCaptureCandidate = {
   pageUrl?: string;
   referrer?: string;
   incognito?: boolean;
+  cookieStoreId?: string;
   reason: string;
 };
 
 export {
   MIN_CAPTURE_BYTES,
+  downloadCreatedAction,
+  knownDownloadBytes,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
 } from './captureFilter';
@@ -229,9 +233,9 @@ export function firefoxWebRequestDownloadCandidate(
     return null;
   }
 
-  // POST/PUT bodies cannot be replayed as a desktop GET (1Fichier wait forms).
+  // POST/PUT/HEAD cannot be replayed as a desktop GET (wait forms / size probes).
   const method = (details.method ?? 'GET').toUpperCase();
-  if (method !== 'GET' && method !== 'HEAD') {
+  if (method !== 'GET') {
     return null;
   }
 
@@ -295,7 +299,6 @@ export function firefoxWebRequestDownloadCandidate(
   }
 
   // HTML / JSON / text named `Game.rar` is a wait-page stub, not a file.
-  // The previous exception (attachment + strong ext) is exactly SteamRIP/Gofile.
   if (isNonDownloadMime(mime)) {
     return null;
   }
@@ -309,8 +312,14 @@ export function firefoxWebRequestDownloadCandidate(
   // http(s) URL. Intercept only large, obvious file XHRs so we can hand off
   // the real CDN link instead of a 3 KB HTML ticket.
   if (isXhr) {
-    const largeEnough = totalBytes != null && totalBytes >= MIN_XHR_CAPTURE_BYTES;
-    if (!largeEnough || !strongExt || !(hasAttachment || strongMime)) {
+    if (totalBytes != null && totalBytes < MIN_XHR_CAPTURE_BYTES) {
+      return null;
+    }
+    if (!strongExt || !(hasAttachment || strongMime)) {
+      return null;
+    }
+    // Chunked CDNs omit Content-Length; only take obvious file XHRs.
+    if (totalBytes == null && !(hasAttachment && strongMime)) {
       return null;
     }
   }
@@ -346,6 +355,7 @@ export function firefoxWebRequestDownloadCandidate(
     pageUrl: details.documentUrl || details.originUrl,
     referrer: details.originUrl || details.documentUrl,
     incognito: details.incognito,
+    cookieStoreId: details.cookieStoreId,
     reason,
   };
 }

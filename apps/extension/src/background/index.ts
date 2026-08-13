@@ -6,7 +6,7 @@ import {
   type HostToExtensionResponse,
 } from '@rusticdl/protocol';
 import browser from './browser';
-import { shouldCaptureDownloadItem, shouldWaitForDownloadSize } from './captureFilter';
+import { downloadCreatedAction, knownDownloadBytes, shouldCaptureDownloadItem } from './captureFilter';
 import {
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
@@ -144,6 +144,9 @@ function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
 type CapturedDownloadItem = browser.downloads.DownloadItem & {
   finalUrl?: string;
   byExtensionId?: string;
+  cookieStoreId?: string;
+  fileSize?: number;
+  bytesReceived?: number;
 };
 
 async function handOffUrl(
@@ -154,6 +157,7 @@ async function handOffUrl(
     pageUrl?: string;
     referrer?: string;
     incognito?: boolean;
+    cookieStoreId?: string;
   } = {},
 ): Promise<boolean> {
   if (!claimCapture(url)) return false;
@@ -170,6 +174,7 @@ async function handOffUrl(
     referrer: extra.referrer,
     pageUrl: extra.pageUrl,
     incognito: extra.incognito,
+    cookieStoreId: extra.cookieStoreId,
   });
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
     ...metadata,
@@ -208,11 +213,12 @@ async function handoffBrowserDownload(
   // so a down desktop / dismissed ask prompt does not lose the file.
   const ok = await handOffUrl(url, settings, {
     suggestedFilename: item.filename?.split(/[\\/]/).pop(),
-    totalBytes: item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined,
+    totalBytes: knownDownloadBytes(item),
   }, {
     pageUrl: item.referrer,
     referrer: item.referrer,
     incognito: item.incognito,
+    cookieStoreId: item.cookieStoreId,
   });
   if (!ok) return;
 
@@ -255,16 +261,17 @@ function mergeDownloadDelta(
   const filename = deltaCurrent(delta.filename);
   const mime = deltaCurrent(delta.mime);
   const url = deltaCurrent(delta.url);
-  return {
+  const next: CapturedDownloadItem = {
     ...item,
     ...(url ? { url } : {}),
     ...(filename ? { filename } : {}),
     ...(mime ? { mime } : {}),
+    ...(typeof fileSize === 'number' && fileSize > 0 ? { fileSize } : {}),
     ...(typeof totalBytes === 'number' && totalBytes > 0 ? { totalBytes } : {}),
-    ...(typeof fileSize === 'number' && fileSize > 0 && !(item.totalBytes && item.totalBytes > 0)
-      ? { totalBytes: fileSize }
-      : {}),
   };
+  const known = knownDownloadBytes(next);
+  if (known != null) next.totalBytes = known;
+  return next;
 }
 
 function clearPendingSizeWait(id: number): PendingSizeWait | undefined {
@@ -275,6 +282,28 @@ function clearPendingSizeWait(id: number): PendingSizeWait | undefined {
   return pending;
 }
 
+async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<CapturedDownloadItem> {
+  try {
+    const found = await browser.downloads.search({ id: item.id });
+    const latest = found[0] as CapturedDownloadItem | undefined;
+    if (!latest) return item;
+    const merged: CapturedDownloadItem = {
+      ...item,
+      ...latest,
+      cookieStoreId: latest.cookieStoreId ?? item.cookieStoreId,
+      fileSize: latest.fileSize && latest.fileSize > 0 ? latest.fileSize : item.fileSize,
+    };
+    const known = knownDownloadBytes(merged)
+      ?? (latest.state === 'complete' && latest.bytesReceived && latest.bytesReceived > 0
+        ? latest.bytesReceived
+        : undefined);
+    if (known != null) merged.totalBytes = known;
+    return merged;
+  } catch {
+    return item;
+  }
+}
+
 async function finalizePendingCapture(item: CapturedDownloadItem) {
   const settings = await getCachedSettings();
   if (!shouldCaptureDownloadItem(item, settings)) return;
@@ -283,17 +312,18 @@ async function finalizePendingCapture(item: CapturedDownloadItem) {
 
 async function onDownloadCreated(item: CapturedDownloadItem) {
   const settings = await getCachedSettings();
-  if (shouldCaptureDownloadItem(item, settings)) {
+  const action = downloadCreatedAction(item, settings);
+  if (action === 'capture') {
     await handoffBrowserDownload(item, settings);
     return;
   }
-  if (!shouldWaitForDownloadSize(item, settings)) return;
+  if (action !== 'wait') return;
 
   const timer = setTimeout(() => {
     const pending = pendingSizeWaits.get(item.id);
     if (!pending) return;
     pendingSizeWaits.delete(item.id);
-    void finalizePendingCapture(pending.item);
+    void latestDownloadSnapshot(pending.item).then((latest) => finalizePendingCapture(latest));
   }, SIZE_WAIT_MS);
   pendingSizeWaits.set(item.id, { item, timer });
 }
@@ -305,10 +335,15 @@ function onDownloadChanged(delta: DownloadChangeDelta) {
   const merged = mergeDownloadDelta(pending.item, delta);
   pending.item = merged;
 
-  const known = merged.totalBytes && merged.totalBytes > 0 ? merged.totalBytes : undefined;
-  if (known == null && deltaCurrent(delta.state) !== 'complete') return;
+  const known = knownDownloadBytes(merged);
+  const state = deltaCurrent(delta.state);
+  if (known == null && state !== 'complete') return;
 
   clearPendingSizeWait(delta.id);
+  if (known == null && state === 'complete') {
+    void latestDownloadSnapshot(merged).then((latest) => finalizePendingCapture(latest));
+    return;
+  }
   void finalizePendingCapture(merged);
 }
 
@@ -323,6 +358,7 @@ async function handoffFirefoxCandidate(
     pageUrl: candidate.pageUrl,
     referrer: candidate.referrer,
     incognito: candidate.incognito,
+    cookieStoreId: candidate.cookieStoreId,
   });
 }
 
@@ -407,6 +443,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
       referrer: payload.source.referrer,
       pageUrl: payload.source.pageUrl,
       incognito: payload.source.incognito,
+      cookieStoreId: (tab as { cookieStoreId?: string } | undefined)?.cookieStoreId,
     });
     const response = await handoffDownload(payload.url, payload.source, mode, { handoffAuth });
     if (isErrorResponse(response)) {

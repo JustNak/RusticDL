@@ -70,10 +70,20 @@ export type DownloadItemLike = {
   filename?: string;
   mime?: string;
   totalBytes?: number;
+  fileSize?: number;
+  bytesReceived?: number;
   referrer?: string;
   byExtensionId?: string;
   incognito?: boolean;
+  cookieStoreId?: string;
 };
+
+/** Prefer Firefox totalBytes, then fileSize (totalBytes is often -1 onCreated). */
+export function knownDownloadBytes(item: DownloadItemLike): number | undefined {
+  if (item.totalBytes && item.totalBytes > 0) return item.totalBytes;
+  if (item.fileSize && item.fileSize > 0) return item.fileSize;
+  return undefined;
+}
 
 export function filenameExtension(filename: string | undefined): string | undefined {
   if (!filename) return undefined;
@@ -161,10 +171,8 @@ export function shouldCaptureDownloadItem(
     return false;
   }
 
-  const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
-  // Strong names used to bypass this — that's how a 3 KB HTML stub named
-  // `Game.rar` became a "successful" capture. Tiny known-size bodies are never
-  // a real archive/installer, even with a matching extension.
+  const knownBytes = knownDownloadBytes(item);
+  // Known-small bodies are stubs even with a captured extension.
   if (knownBytes != null && knownBytes < MIN_CAPTURE_BYTES) {
     return false;
   }
@@ -207,6 +215,15 @@ export function shouldWaitForDownloadSize(
   const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
   if (!strongName && !mimeLooksLikeDownload(mime)) return false;
 
-  const knownBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : undefined;
-  return knownBytes == null;
+  return knownDownloadBytes(item) == null;
+}
+
+/** Wait for size before capturing unknown-size strong names (3 KB wait-page stubs). */
+export function downloadCreatedAction(
+  item: DownloadItemLike,
+  settings: ExtensionIntegrationSettings,
+): 'wait' | 'capture' | 'ignore' {
+  if (shouldWaitForDownloadSize(item, settings)) return 'wait';
+  if (shouldCaptureDownloadItem(item, settings)) return 'capture';
+  return 'ignore';
 }

@@ -40,6 +40,8 @@ const {
   firefoxWebRequestDownloadCandidate,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
+  downloadCreatedAction,
+  knownDownloadBytes,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
@@ -523,6 +525,120 @@ assert(
       { name: 'content-length', value: '12000000' },
     ],
   }) === null,
+);
+
+assert(
+  'rejects HEAD size probes even when they look like a large zip',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'xmlhttprequest',
+    method: 'HEAD',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 1_000_000) },
+    ],
+  }) === null,
+);
+
+assert(
+  'captures chunked xhr zip when attachment + strong mime (no Content-Length)',
+  candidate({
+    url: 'https://store1.gofile.io/download/web/token/app.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+    ],
+  })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'rejects chunked xhr zip without attachment (too noisy)',
+  candidate({
+    url: 'https://cdn.example.com/files/app.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+    ],
+  }) === null,
+);
+
+assert(
+  'onCreated waits when strong-name .rar has unknown totalBytes',
+  downloadCreatedAction(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: -1,
+    },
+    defaultSettings,
+  ) === 'wait',
+);
+
+assert(
+  'onCreated ignores known 3 KB .rar instead of capturing',
+  downloadCreatedAction(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 3280,
+    },
+    defaultSettings,
+  ) === 'ignore',
+);
+
+assert(
+  'onCreated captures a large .rar once size is known',
+  downloadCreatedAction(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 381 * 1024 * 1024,
+    },
+    defaultSettings,
+  ) === 'capture',
+);
+
+assert(
+  'treats Firefox fileSize as known bytes when totalBytes is -1',
+  knownDownloadBytes({ url: steamripStub.url, totalBytes: -1, fileSize: 3280 }) === 3280,
+);
+
+assert(
+  'does not wait when fileSize already shows a 3 KB stub',
+  shouldWaitForDownloadSize(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: -1,
+      fileSize: 3280,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'rejects 3 KB .rar when only fileSize is known',
+  shouldCaptureDownloadItem(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: -1,
+      fileSize: 3280,
+    },
+    defaultSettings,
+  ) === false,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

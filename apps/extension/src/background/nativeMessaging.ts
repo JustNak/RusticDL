@@ -161,20 +161,27 @@ export async function saveExtensionSettings(
  */
 export async function collectHandoffAuth(
   url: string,
-  extra: { referrer?: string; pageUrl?: string; incognito?: boolean } = {},
+  extra: {
+    referrer?: string;
+    pageUrl?: string;
+    incognito?: boolean;
+    cookieStoreId?: string;
+  } = {},
 ): Promise<DownloadRequestMetadata['handoffAuth']> {
   const headers: NonNullable<DownloadRequestMetadata['handoffAuth']>['headers'] = [];
 
   try {
-    let storeId: string | undefined;
-    try {
-      const stores = await browser.cookies.getAllCookieStores();
-      const match = extra.incognito
-        ? stores.find((store) => store.incognito)
-        : stores.find((store) => !store.incognito);
-      storeId = match?.id;
-    } catch {
-      // Chromium may omit getAllCookieStores in some contexts.
+    let storeId: string | undefined = extra.cookieStoreId;
+    if (!storeId) {
+      try {
+        const stores = await browser.cookies.getAllCookieStores();
+        const match = extra.incognito
+          ? stores.find((store) => store.incognito)
+          : stores.find((store) => !store.incognito);
+        storeId = match?.id;
+      } catch {
+        // Chromium may omit getAllCookieStores in some contexts.
+      }
     }
     const cookies = await browser.cookies.getAll(storeId ? { url, storeId } : { url });
     if (cookies.length > 0) {
