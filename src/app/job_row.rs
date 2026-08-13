@@ -22,7 +22,6 @@ use crate::settings::{ProgressStyle, UiDensity};
 pub(crate) fn render_job_row(
     job: Job,
     selected: bool,
-    index: usize,
     cols: QueueColumns,
     main_w: f32,
     density: UiDensity,
@@ -65,16 +64,9 @@ pub(crate) fn render_job_row(
     } else {
         theme.progress_bar
     };
-    let row_h = if show_progress {
-        px(density.row_h_progress())
-    } else {
-        px(density.row_h())
-    };
-
+    let row_h = px(density.row_h());
     let row_bg = if selected {
         theme.list_active
-    } else if index % 2 == 1 {
-        theme.list_even
     } else {
         theme.list
     };
@@ -87,6 +79,7 @@ pub(crate) fn render_job_row(
         .id(SharedString::from(format!("job-row-{}", id)))
         .w_full()
         .h(row_h)
+        .min_h(row_h)
         .max_h(row_h)
         .flex_shrink_0()
         .px_4()
