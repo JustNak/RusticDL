@@ -11,7 +11,7 @@ use super::super::super::multi::{multi_resume_policy, RESUME_RESTART_MESSAGE};
 use super::super::{emit_jobs_locked, find_job_mut, EngineInner};
 
 /// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
-fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
+pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
     let policy = multi_resume_policy(job);
     if !policy.is_resume_error() {
         return false;

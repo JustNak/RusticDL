@@ -186,8 +186,7 @@ pub fn spawn_engine(
         // Recover in-flight states after restart.
         if matches!(job.state, JobState::Starting | JobState::Downloading) {
             job.state = JobState::Queued;
-            job.speed = 0;
-            job.eta_secs = 0;
+            clear_live_metrics(job);
         }
     }
 
@@ -692,6 +691,9 @@ fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
     }
     if let Some(mode) = update.transfer_mode {
         job.transfer_mode = Some(mode);
+        if mode == super::job::TransferMode::Multi && update.fallback_reason.is_none() {
+            job.fallback_reason = None;
+        }
     }
     if let Some(reason) = update.fallback_reason {
         job.fallback_reason = Some(reason);
