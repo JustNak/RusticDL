@@ -3,8 +3,6 @@
 //! Network work is parallel; disk writes are intentionally serialized under a
 //! short `std::sync::Mutex` around `seek_write` (Windows) / seek+write (other).
 //!
-//! Consumed by multi-segment transfer (later PR); keep public API live.
-//!
 //! # Async runtime
 //! All methods take a blocking mutex and perform disk IO. Call from a blocking
 //! context (`tokio::task::spawn_blocking` / dedicated pool), not on a tokio
@@ -50,6 +48,7 @@ impl SegmentFileWriter {
     /// committed (short OS writes are retried inside the lock). Zero-length
     /// `data` is a no-op. Writing with `offset` past the end-cap returns
     /// `InvalidInput`.
+    #[must_use = "short count means the end-cap truncated; credit only the returned length"]
     pub fn write_at(&self, offset: u64, data: &[u8], end_inclusive: u64) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -157,8 +156,6 @@ pub fn preallocate_decision(
 /// - `Ok(false)` — free space unknown or below preallocate margin; caller may
 ///   extend-on-write (`preallocated = false`)
 /// - `Err` — free space known and insufficient for remaining bytes (Disk)
-///
-/// Used by multi-segment start (PR 11); kept exported for early integration.
 pub async fn try_preallocate(
     path: &Path,
     total_bytes: u64,

@@ -37,24 +37,58 @@ pub async fn free_space_bytes(path: &Path) -> Option<u64> {
         .flatten()
 }
 
+/// True when `path` is a UNC share root (`\\server\share` or `\\server\share\`).
+#[cfg(windows)]
+fn is_unc_share_root(path: &Path) -> bool {
+    let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
+    let trimmed = raw.trim_end_matches('\\');
+    let Some(rest) = trimmed.strip_prefix("\\\\") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('\\').filter(|p| !p.is_empty()).collect();
+    parts.len() == 2
+}
+
+/// `GetDiskFreeSpaceExW` needs a directory; UNC share roots need a trailing `\`.
+#[cfg(windows)]
+fn disk_free_query_path(path: &Path) -> PathBuf {
+    let mut query = path.to_path_buf();
+    while !query.exists() {
+        if is_unc_share_root(&query) {
+            break;
+        }
+        match query.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() && parent != query.as_path() => {
+                query = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    if query.is_file() {
+        if let Some(parent) = query.parent().filter(|p| !p.as_os_str().is_empty()) {
+            query = parent.to_path_buf();
+        }
+    }
+    let raw = query.as_os_str().to_string_lossy();
+    if (raw.starts_with("\\\\") || raw.starts_with("//"))
+        && !raw.ends_with('\\')
+        && !raw.ends_with('/')
+    {
+        let mut owned = query.into_os_string();
+        owned.push("\\");
+        PathBuf::from(owned)
+    } else {
+        query
+    }
+}
+
 #[cfg(windows)]
 fn free_space_bytes_sync(path: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-    // Prefer an existing directory for the query; fall back to parent or path.
-    let query = if path.is_dir() {
-        path.to_path_buf()
-    } else if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if parent.exists() {
-            parent.to_path_buf()
-        } else {
-            path.to_path_buf()
-        }
-    } else {
-        path.to_path_buf()
-    };
+    let query = disk_free_query_path(path);
 
     let wide: Vec<u16> = query
         .as_os_str()
@@ -373,6 +407,27 @@ mod tests {
     #[test]
     fn sanitizes_unsafe_names() {
         assert_eq!(sanitize_filename("a/b\\c:d?.zip"), "a_b_c_d_.zip");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disk_free_query_path_adds_unc_trailing_sep() {
+        let q = disk_free_query_path(Path::new(r"\\server\share\file.part"));
+        let s = q.to_string_lossy();
+        assert!(s.ends_with('\\'), "UNC query must end with \\, got {s}");
+        assert!(
+            is_unc_share_root(Path::new(s.trim_end_matches('\\'))),
+            "should stop at share root, got {s}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disk_free_query_path_walks_to_existing_ancestor() {
+        let dir = std::env::temp_dir();
+        let missing = dir.join("no-such-dir-rusticdl-free-space").join("file.part");
+        let q = disk_free_query_path(&missing);
+        assert!(q.exists(), "query path should exist: {}", q.display());
     }
 
     #[tokio::test]

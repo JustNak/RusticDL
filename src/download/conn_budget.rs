@@ -3,8 +3,6 @@
 //! Job scheduler still limits concurrent jobs; this limits simultaneous
 //! request bodies (single-stream job or multi-segment workers).
 //!
-//! Wired into the multi-segment orchestrator in a later PR; keep public API live.
-//!
 //! # Acquire order
 //! Host permit first, then global. Waiters blocked on the global pool only hold a
 //! host slot (same-host backpressure), so one saturated host cannot exhaust the
@@ -31,6 +29,7 @@ pub struct ConnectionBudget {
 }
 
 /// RAII permits for both global and per-host slots. Drop to release.
+#[must_use = "the permit is released when dropped"]
 pub struct ConnectionPermit {
     _host: OwnedSemaphorePermit,
     _global: OwnedSemaphorePermit,
@@ -75,9 +74,10 @@ impl ConnectionBudget {
     /// Block until both a per-host and a global slot are held for `host`.
     ///
     /// Host is acquired first, then global (see module docs).
+    #[must_use = "the permit is released when dropped"]
     pub async fn acquire(self: &Arc<Self>, host: &str) -> ConnectionPermit {
         let key = Self::normalize_host(host);
-        let host_sem = self.host_semaphore(&key).await;
+        let host_sem = self.host_semaphore(key).await;
 
         let host = host_sem
             .acquire_owned()
@@ -101,9 +101,10 @@ impl ConnectionBudget {
     ///
     /// Host first: if global is exhausted after host succeeds, the host permit
     /// is dropped and released immediately.
+    #[must_use = "the permit is released when dropped"]
     pub async fn try_acquire(self: &Arc<Self>, host: &str) -> Option<ConnectionPermit> {
         let key = Self::normalize_host(host);
-        let host_sem = self.host_semaphore(&key).await;
+        let host_sem = self.host_semaphore(key).await;
         let host = host_sem.try_acquire_owned().ok()?;
 
         match self.global.clone().try_acquire_owned() {
@@ -115,10 +116,10 @@ impl ConnectionBudget {
         }
     }
 
-    async fn host_semaphore(&self, key: &str) -> Arc<Semaphore> {
+    async fn host_semaphore(&self, key: String) -> Arc<Semaphore> {
         let mut hosts = self.hosts.lock().await;
         hosts
-            .entry(key.to_string())
+            .entry(key)
             .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
             .clone()
     }
