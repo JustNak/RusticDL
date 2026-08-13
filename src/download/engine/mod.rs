@@ -692,7 +692,7 @@ mod tests {
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
             config: EngineRuntimeConfig::default(),
-            limiter: Arc::new(GlobalBandwidthLimiter::new(None)),
+            limiter: GlobalBandwidthLimiter::new(None),
             event_tx,
             wake: Arc::new(Notify::new()),
         }))
