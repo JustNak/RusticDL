@@ -146,8 +146,10 @@ impl BrowserPromptWindow {
         if self.fitted_height.is_some_and(|h| (h - target).abs() < 0.5) {
             return;
         }
-        window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
+        // Record first so a synchronous resize→re-render does not loop.
         self.fitted_height = Some(target);
+        window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
+        crate::window_placement::center_window(window);
     }
 
     fn title_for_phase(&self) -> &'static str {

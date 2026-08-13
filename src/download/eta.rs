@@ -50,6 +50,16 @@ impl EtaSmoother {
         (speed, eta)
     }
 
+    /// Last EMA throughput, if any sample has been accepted.
+    pub fn last_speed(&self) -> Option<u64> {
+        self.ema_bps.map(|s| s.round() as u64)
+    }
+
+    /// Last stabilized ETA, if any.
+    pub fn last_eta(&self) -> Option<u64> {
+        self.shown_eta
+    }
+
     fn push_speed(&mut self, instant_bps: u64) -> u64 {
         if instant_bps == 0 {
             return self.ema_bps.map(|s| s.round() as u64).unwrap_or(0);
@@ -71,7 +81,6 @@ impl EtaSmoother {
                     && raw <= prev.saturating_add(Self::RAISE_FLOOR_SECS)
                     && (raw as f64) <= (prev as f64) * Self::RAISE_RATIO
                 {
-                    // Noise-sized increase: keep the previous number.
                     prev
                 } else {
                     let blended = (prev as f64) * (1.0 - Self::DISPLAY_ALPHA)
@@ -149,9 +158,11 @@ mod tests {
     #[test]
     fn small_upward_noise_does_not_raise_display() {
         let mut s = EtaSmoother::new();
-        let (_, first) = s.observe(10_000_000, 100_000_000); // 10s
-                                                             // Slightly slower window, remaining almost unchanged → raw ~10.6s.
-        let (_, second) = s.observe(7_000_000, 99_000_000);
+        let (_, first) = s.observe(10_000_000, 100_000_000);
+        assert_eq!(first, 10);
+        // Instant 2_424_241 bps → EMA 8_333_333; 100_000_000 / 8_333_333 == 12.
+        // 12 > 10 but inside RAISE_FLOOR_SECS (8) and RAISE_RATIO (1.35).
+        let (_, second) = s.observe(2_424_241, 100_000_000);
         assert_eq!(
             second, first,
             "sub-threshold raise should hold the previous ETA"

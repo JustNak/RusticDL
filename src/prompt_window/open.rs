@@ -8,7 +8,7 @@ use gpui_component::Root;
 
 use super::{BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W};
 use crate::branding::APP_NAME;
-use crate::download::{EngineHandle, Job};
+use crate::download::{EngineHandle, Job, JobState};
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
 use crate::window_placement::center_window;
@@ -50,9 +50,17 @@ pub fn open_browser_progress_window(
     if !ipc.try_own_progress_job(&job_id) {
         return None;
     }
+    let already_complete = ipc
+        .jobs_snapshot()
+        .iter()
+        .any(|j| j.id == job_id && j.state == JobState::Completed);
     let opened = open_capture_window(
         format!("{APP_NAME} — Downloading"),
-        CAPTURE_WINDOW_H,
+        if already_complete {
+            CAPTURE_COMPLETE_H
+        } else {
+            CAPTURE_WINDOW_H
+        },
         {
             let job_id = job_id.clone();
             let ipc = ipc.clone();
