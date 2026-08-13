@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::FluentBuilder, px, ClickEvent, Context, Corner, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    div, prelude::FluentBuilder, px, ClickEvent, Context, Corner, Hsla, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -327,13 +327,13 @@ pub(crate) fn render_job_row(
                                         }),
                                 );
 
+                                let danger = menu_cx.theme().danger;
                                 menu = menu.separator().item(
-                                    PopupMenuItem::new(if can_remove {
-                                        "Remove"
+                                    if can_remove {
+                                        danger_popup_item("Remove", IconName::Close, danger)
                                     } else {
-                                        "Cancel"
-                                    })
-                                    .icon(IconName::Close)
+                                        PopupMenuItem::new("Cancel").icon(IconName::Close)
+                                    }
                                     .on_click({
                                         let view = view.clone();
                                         let engine = engine.clone();
@@ -361,8 +361,7 @@ pub(crate) fn render_job_row(
 
                                 if can_delete {
                                     menu = menu.item(
-                                        PopupMenuItem::new("Delete file")
-                                            .icon(IconName::Delete)
+                                        danger_popup_item("Delete file", IconName::Delete, danger)
                                             .on_click({
                                                 let view = view.clone();
                                                 let id = id.clone();
@@ -391,4 +390,15 @@ pub(crate) fn render_job_row(
 /// Circular arrow — reads as “start over”, unlike redo’s curved arrow.
 pub(crate) fn restart_icon() -> Icon {
     Icon::empty().path("icons/rotate-cw.svg")
+}
+
+/// Destructive queue action (Remove / Delete) — red label and icon.
+fn danger_popup_item(
+    label: impl Into<SharedString>,
+    icon: IconName,
+    danger: Hsla,
+) -> PopupMenuItem {
+    let label = label.into();
+    PopupMenuItem::element(move |_, cx| div().text_color(cx.theme().danger).child(label.clone()))
+        .icon(Icon::new(icon).text_color(danger))
 }
