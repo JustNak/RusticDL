@@ -206,6 +206,9 @@ pub enum ProgressHint {
 
 pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
+/// Default multi min-size used when a context is built without engine settings.
+pub const DEFAULT_MULTI_MIN_BYTES: u64 = 5 * 1024 * 1024;
+
 /// Attempt-scoped transfer inputs shared by preflight, single-stream, reconnect, and
 /// (later) multi-segment workers. `resolved_url` is pinned after a successful redirect
 /// chain so subsequent requests do not re-walk independent redirect races.
@@ -217,8 +220,14 @@ pub struct TransferContext {
     /// Memory-only browser session headers (snapshot from `EngineInner`).
     pub handoff_auth: Option<HandoffAuth>,
     pub limiter: Arc<GlobalBandwidthLimiter>,
+    /// Planner input (PR 10 records only; routing stays single-stream).
+    pub multi_connection_enabled: bool,
+    /// Planner input: files smaller than this never qualify for multi.
+    pub multi_min_bytes: u64,
     /// Attempt-local; updated only when redirect follow succeeds. Init = `job.url`.
     pub resolved_url: String,
+    /// Set after a preflight attempt this run so `run_transfer` + single do not double-probe.
+    pub preflight_done: bool,
     /// Flush + `sync_data` on pause (from `EngineRuntimeConfig`).
     pub fsync_on_pause: bool,
 }
@@ -238,7 +247,10 @@ impl TransferContext {
             on_progress,
             handoff_auth,
             limiter,
+            multi_connection_enabled: true,
+            multi_min_bytes: DEFAULT_MULTI_MIN_BYTES,
             resolved_url,
+            preflight_done: false,
             fsync_on_pause: false,
         }
     }
@@ -273,19 +285,8 @@ pub async fn run_http_download_with_ctx(
 
     let client = download_client()?;
 
-    // Best-effort preflight: size / Accept-Ranges / validators + pin resolved URL.
-    if let Some(info) = super::preflight::run_preflight(
-        &client,
-        &ctx.job.url,
-        &ctx.resolved_url,
-        ctx.handoff_auth.as_ref(),
-        &ctx.control,
-    )
-    .await
-    {
-        ctx.resolved_url = info.final_url.clone();
-        (ctx.on_progress)(preflight_progress_patch(&ctx.job, &info));
-    }
+    // Best-effort preflight: skipped when `run_transfer` already probed this attempt.
+    apply_preflight(ctx).await;
 
     if let Some(outcome) = control_outcome(&ctx.control) {
         return Ok(outcome);
@@ -1128,11 +1129,37 @@ pub(crate) fn resolve_redirect_location(
     }
 }
 
+/// Best-effort preflight: pin `resolved_url` and publish an early progress patch.
+/// No-op (returns `None`) when this attempt already probed.
+pub(crate) async fn apply_preflight(
+    ctx: &mut TransferContext,
+) -> Option<super::preflight::PreflightInfo> {
+    if ctx.preflight_done {
+        return None;
+    }
+    ctx.preflight_done = true;
+    let client = download_client().ok()?;
+    let info = super::preflight::run_preflight(
+        &client,
+        &ctx.job.url,
+        &ctx.resolved_url,
+        ctx.handoff_auth.as_ref(),
+        &ctx.control,
+    )
+    .await?;
+    ctx.resolved_url = info.final_url.clone();
+    (ctx.on_progress)(preflight_progress_patch(&ctx.job, &info));
+    Some(info)
+}
+
 /// Early ProgressUpdate from preflight (size / validators / resume hint).
 ///
 /// Sparse only: never forces `progress` (would zero a resume job) or overwrites a
 /// user/uniquified `filename` — GET `starting_tick` owns rename + path updates.
-fn preflight_progress_patch(job: &Job, info: &super::preflight::PreflightInfo) -> ProgressUpdate {
+pub(crate) fn preflight_progress_patch(
+    job: &Job,
+    info: &super::preflight::PreflightInfo,
+) -> ProgressUpdate {
     let total = info.total_bytes.filter(|&n| n > 0);
     let validators = {
         let captured = ContentValidators {

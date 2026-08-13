@@ -618,8 +618,9 @@ Accept-Ranges: bytes\r\n\
     /// Soft-fail path: preflight None, then transfer GET still completes.
     #[tokio::test]
     async fn preflight_soft_fail_does_not_abort_transfer() {
-        use crate::download::http::{run_http_download, ProgressUpdate};
+        use crate::download::http::{ProgressUpdate, TransferContext};
         use crate::download::job::Job;
+        use crate::download::transfer::run_transfer;
         use std::path::PathBuf;
         use std::sync::Mutex;
 
@@ -686,7 +687,14 @@ Accept-Ranges: bytes\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let outcome = run_http_download(&job, None, control, on_progress, None)
+        let ctx = TransferContext::new(
+            job,
+            control,
+            on_progress,
+            None,
+            crate::download::bandwidth::GlobalBandwidthLimiter::new(None),
+        );
+        let outcome = run_transfer(ctx)
             .await
             .expect("transfer should succeed after preflight soft-fail");
         assert!(matches!(
@@ -731,7 +739,13 @@ Content-Length: 99\r\n\
             PathBuf::from("C:\\dl\\pin.bin"),
             PathBuf::from("C:\\dl\\pin.bin.part"),
         );
-        let mut ctx = TransferContext::new(job, control.clone(), on_progress, None, None);
+        let mut ctx = TransferContext::new(
+            job,
+            control.clone(),
+            on_progress,
+            None,
+            crate::download::bandwidth::GlobalBandwidthLimiter::new(None),
+        );
         assert_eq!(ctx.resolved_url, url);
 
         let info = run_preflight(&client, &ctx.job.url, &ctx.resolved_url, None, &ctx.control)

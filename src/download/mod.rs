@@ -11,6 +11,7 @@ pub mod job;
 pub mod preflight;
 pub mod segment;
 pub mod segment_io;
+pub mod transfer;
 pub mod urls;
 
 pub use drop_files::extract_urls_from_dropped_paths;
