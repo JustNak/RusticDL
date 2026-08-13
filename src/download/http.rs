@@ -353,6 +353,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
     loop {
         if let Some(outcome) = control_outcome(&control) {
             flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+            // Align UI with flushed bytes (may be ahead of last PROGRESS_INTERVAL tick).
+            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
             return Ok(outcome);
         }
 
@@ -401,14 +403,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         if !acquired {
             let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
             flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
-            // Keep job/UI counters aligned with what is on disk before pause/cancel.
-            on_progress(ProgressUpdate::downloading_tick(
-                downloaded,
-                total_bytes,
-                0,
-                0,
-                progress_percent(downloaded, total_bytes),
-            ));
+            emit_control_exit_progress(&on_progress, downloaded, total_bytes);
             return Ok(outcome);
         }
 
@@ -437,6 +432,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
     if let Some(outcome) = control_outcome(&control) {
         flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+        emit_control_exit_progress(&on_progress, downloaded, total_bytes);
         return Ok(outcome);
     }
 
@@ -760,7 +756,7 @@ async fn flush_partial_writer(
     outcome: DownloadOutcome,
 ) -> Result<(), DownloadError> {
     writer.flush().await.map_err(disk_write_error)?;
-    if fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
+    if should_sync_data_on_exit(fsync_on_pause, outcome) {
         writer
             .get_ref()
             .sync_data()
@@ -768,6 +764,26 @@ async fn flush_partial_writer(
             .map_err(disk_write_error)?;
     }
     Ok(())
+}
+
+/// `sync_data` only on pause when enabled — cancel/complete skip fsync (§0.3).
+fn should_sync_data_on_exit(fsync_on_pause: bool, outcome: DownloadOutcome) -> bool {
+    fsync_on_pause && matches!(outcome, DownloadOutcome::Paused)
+}
+
+fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, total_bytes: u64) {
+    on_progress(ProgressUpdate {
+        downloaded_bytes: downloaded,
+        total_bytes,
+        speed: 0,
+        eta_secs: 0,
+        progress: progress_percent(downloaded, total_bytes),
+        filename: None,
+        target_path: None,
+        temp_path: None,
+        resume_supported: None,
+        state_hint: ProgressHint::Downloading,
+    });
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -923,5 +939,14 @@ mod tests {
         assert!(tick.temp_path.is_none());
         assert!(tick.resume_supported.is_none());
         assert_eq!(tick.state_hint, Some(ProgressHint::Downloading));
+    }
+
+    #[test]
+    fn sync_data_only_when_pause_and_enabled() {
+        assert!(should_sync_data_on_exit(true, DownloadOutcome::Paused));
+        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Paused));
+        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Canceled));
+        assert!(!should_sync_data_on_exit(true, DownloadOutcome::Completed));
+        assert!(!should_sync_data_on_exit(false, DownloadOutcome::Canceled));
     }
 }

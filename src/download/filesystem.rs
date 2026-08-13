@@ -27,27 +27,42 @@ pub struct ReconcileResult {
     pub changed: bool,
 }
 
+/// Align `job.downloaded_bytes` (and progress) with a known on-disk length.
+///
+/// Split from the async I/O so callers can `metadata_len` without holding locks.
+pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> ReconcileResult {
+    let mut changed = job.downloaded_bytes != on_disk;
+    if changed {
+        job.downloaded_bytes = on_disk;
+    }
+    // Repair stale progress even when bytes already match (corrupt/partial state.json).
+    if job.total_bytes > 0 {
+        let expected = ((on_disk as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+        if (job.progress - expected).abs() > 1e-9 {
+            job.progress = expected;
+            changed = true;
+        }
+    }
+    ReconcileResult { on_disk, changed }
+}
+
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
-/// **PR 2 scope:** single-stream / legacy only (`metadata_len`). Call from
-/// `start_worker` before transfer so UI state and Range start agree.
+/// **PR 2 scope:** single-stream / legacy only (`metadata_len`).
+/// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex
+/// is not held across filesystem I/O; this convenience wrapper remains for tests
+/// and call sites that already own the job exclusively.
 ///
 /// Future branches (not yet — Job lacks these fields in PR 2):
 /// - **PR 4:** if `transfer_format_version >= 1`, skip `metadata_len` (version gate).
 /// - **PR 8:** if `segment_map.is_some()`, `downloaded_bytes = sum(written)` only.
+#[allow(dead_code)] // public API; engine prefers lock-split path
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
     // PR4: if job.transfer_format_version >= 1 { /* no metadata_len */ }
     // PR8: if job.segment_map.is_some() { /* sum(segment.written); return */ }
 
     let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
-    let changed = job.downloaded_bytes != on_disk;
-    if changed {
-        job.downloaded_bytes = on_disk;
-        if job.total_bytes > 0 {
-            job.progress = ((on_disk as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);
-        }
-    }
-    ReconcileResult { on_disk, changed }
+    apply_partial_progress_from_disk(job, on_disk)
 }
 
 pub async fn move_to_final_path(temp_path: &Path, target_path: &Path) -> Result<PathBuf, String> {
@@ -366,5 +381,52 @@ mod tests {
         assert_eq!(job.progress, 12.5);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconciles_downward_when_counters_ahead_of_disk() {
+        // Crash-relevant: progress tick / state.json ahead of durable .part length.
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-down-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("payload.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0u8; 50]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/payload.bin".into(),
+            "payload.bin".into(),
+            target,
+            temp,
+        );
+        job.downloaded_bytes = 900;
+        job.total_bytes = 1000;
+        job.progress = 90.0;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert_eq!(result.on_disk, 50);
+        assert!(result.changed);
+        assert_eq!(job.downloaded_bytes, 50);
+        assert!((job.progress - 5.0).abs() < 1e-9);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repairs_progress_when_bytes_match_but_percent_stale() {
+        let mut job = Job::new(
+            "https://example.com/x.bin".into(),
+            "x.bin".into(),
+            PathBuf::from("x.bin"),
+            PathBuf::from("x.bin.part"),
+        );
+        job.downloaded_bytes = 250;
+        job.total_bytes = 1000;
+        job.progress = 99.0; // corrupt relative to bytes
+
+        let result = apply_partial_progress_from_disk(&mut job, 250);
+        assert!(result.changed);
+        assert_eq!(job.downloaded_bytes, 250);
+        assert!((job.progress - 25.0).abs() < 1e-9);
     }
 }

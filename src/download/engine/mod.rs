@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::filesystem::{reconcile_partial_progress, remove_partial};
+use super::filesystem::{apply_partial_progress_from_disk, metadata_len, remove_partial};
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{
     run_http_download, store_control, ProgressCallback, ProgressHint, ProgressUpdate,
@@ -287,28 +287,33 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
             // Disk is authoritative for single-stream resume (PR4/PR8 map/version later).
-            let fsync_on_pause = {
+            // Snapshot path under the lock, then await metadata without holding it.
+            let (temp_path, fsync_on_pause) = {
+                let guard = inner.lock().await;
+                let temp_path = guard
+                    .jobs
+                    .iter()
+                    .find(|j| j.id == job_id)
+                    .map(|j| j.temp_path.clone());
+                (temp_path, guard.config.fsync_on_pause)
+            };
+            let on_disk = match temp_path.as_ref() {
+                Some(path) => metadata_len(path).await.unwrap_or(0),
+                None => 0,
+            };
+            {
                 let mut guard = inner.lock().await;
-                let fsync_on_pause = guard.config.fsync_on_pause;
-                let mut progress_changed = false;
-                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                    let result = reconcile_partial_progress(job).await;
-                    progress_changed = result.changed;
-                    attempt_job = job.clone();
-                }
-                if progress_changed {
-                    emit_jobs_locked(&guard);
-                }
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
-                if !restarting {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                    apply_partial_progress_from_disk(job, on_disk);
+                    if !restarting {
                         job.state = JobState::Downloading;
                         job.error = None;
-                        emit_jobs_locked(&guard);
                     }
+                    attempt_job = job.clone();
+                    emit_jobs_locked(&guard);
                 }
-                fsync_on_pause
-            };
+            }
 
             // Reset control to continue for each attempt unless user paused/canceled.
             if control.load(Ordering::Relaxed) == 0 {
