@@ -401,18 +401,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         if !acquired {
             writer.flush().await.map_err(disk_write_error)?;
             // Keep job/UI counters aligned with what is on disk before pause/cancel.
-            on_progress(ProgressUpdate {
-                downloaded_bytes: downloaded,
+            on_progress(ProgressUpdate::downloading_tick(
+                downloaded,
                 total_bytes,
-                speed: 0,
-                eta_secs: 0,
-                progress: progress_percent(downloaded, total_bytes),
-                filename: None,
-                target_path: None,
-                temp_path: None,
-                resume_supported: None,
-                state_hint: ProgressHint::Downloading,
-            });
+                0,
+                0,
+                progress_percent(downloaded, total_bytes),
+            ));
             return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
         }
 

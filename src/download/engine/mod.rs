@@ -92,7 +92,7 @@ const RETRY_DELAYS: [Duration; 8] = [
     Duration::from_secs(45),
 ];
 
-/// Coalesce window for progress patches (150–250 ms band).
+/// Progress patches are applied at most this often.
 const PROGRESS_COALESCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
@@ -660,6 +660,24 @@ mod tests {
         job
     }
 
+    fn test_inner(
+        job: Job,
+        event_tx: mpsc::UnboundedSender<EngineEvent>,
+    ) -> Arc<Mutex<EngineInner>> {
+        Arc::new(Mutex::new(EngineInner {
+            jobs: vec![job],
+            controls: HashMap::new(),
+            active: HashMap::new(),
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: EngineRuntimeConfig::default(),
+            limiter: Arc::new(GlobalBandwidthLimiter::new(None)),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+        }))
+    }
+
     #[test]
     fn state_hint_none_does_not_clobber_state() {
         let mut job = sample_job(JobState::Downloading);
@@ -820,21 +838,7 @@ mod tests {
         job.id = "pump-test".into();
         let job_id = job.id.clone();
 
-        let inner = Arc::new(Mutex::new(EngineInner {
-            jobs: vec![job],
-            controls: HashMap::new(),
-            active: HashMap::new(),
-            handoff_auth: HashMap::new(),
-            requeue_on_cancel: HashMap::new(),
-            pending_partial_deletes: HashMap::new(),
-            config: EngineConfig {
-                max_concurrent: 1,
-                auto_retry: 0,
-                speed_limit_kib: 0,
-            },
-            event_tx,
-            wake: Arc::new(Notify::new()),
-        }));
+        let inner = test_inner(job, event_tx);
 
         let (tx, rx) = mpsc::unbounded_channel();
         let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
@@ -877,21 +881,7 @@ mod tests {
         job.speed = 0;
         let job_id = job.id.clone();
 
-        let inner = Arc::new(Mutex::new(EngineInner {
-            jobs: vec![job],
-            controls: HashMap::new(),
-            active: HashMap::new(),
-            handoff_auth: HashMap::new(),
-            requeue_on_cancel: HashMap::new(),
-            pending_partial_deletes: HashMap::new(),
-            config: EngineConfig {
-                max_concurrent: 1,
-                auto_retry: 0,
-                speed_limit_kib: 0,
-            },
-            event_tx,
-            wake: Arc::new(Notify::new()),
-        }));
+        let inner = test_inner(job, event_tx);
 
         let (tx, rx) = mpsc::unbounded_channel();
         let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
