@@ -29,6 +29,8 @@ use crate::settings::ProgressStyle;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
+/// Complete phase has no sparkline or form — hug the file row + actions.
+const CAPTURE_COMPLETE_H: f32 = 196.0;
 /// Rolling speed samples for the Progress sparkline (~9s at 100ms tick).
 const SPEED_SAMPLE_CAP: usize = 90;
 
@@ -77,6 +79,8 @@ pub struct BrowserPromptWindow {
     speed_samples: VecDeque<u64>,
     /// When true, skip animating sample growth (settings reduce_motion).
     reduce_motion: bool,
+    /// Last height we applied via `resize` so Complete/Progress don't fight.
+    fitted_height: Option<f32>,
 }
 
 impl BrowserPromptWindow {
@@ -130,6 +134,24 @@ impl BrowserPromptWindow {
         }
     }
 
+    fn target_window_height(&self) -> f32 {
+        match self.phase {
+            CapturePhase::Complete { .. } => CAPTURE_COMPLETE_H,
+            _ => CAPTURE_WINDOW_H,
+        }
+    }
+
+    fn fit_window_to_phase(&mut self, window: &mut Window) {
+        let target = self.target_window_height();
+        if self.fitted_height.is_some_and(|h| (h - target).abs() < 0.5) {
+            return;
+        }
+        // Record first so a synchronous resize→re-render does not loop.
+        self.fitted_height = Some(target);
+        window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
+        crate::window_placement::center_window(window);
+    }
+
     fn title_for_phase(&self) -> &'static str {
         match &self.phase {
             CapturePhase::Confirm => "Confirm browser download",
@@ -171,6 +193,7 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
 
 impl Render for BrowserPromptWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fit_window_to_phase(window);
         let theme = cx.theme().clone();
         let title = self.title_for_phase().to_string();
         let dialog_layer = Root::render_dialog_layer(window, cx);

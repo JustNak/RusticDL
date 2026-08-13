@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
+use gpui::{div, prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
@@ -10,7 +10,7 @@ use gpui_component::{
 
 use super::helpers::shorten_path;
 use super::start_sync_timer;
-use super::{BrowserPromptWindow, CapturePhase};
+use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H};
 use crate::appearance::apply_appearance;
 use crate::download::{open_path, reveal_in_folder, EngineHandle, Job};
 use crate::format::{format_bytes, format_size};
@@ -52,6 +52,7 @@ impl BrowserPromptWindow {
             canceling: false,
             speed_samples: VecDeque::new(),
             reduce_motion: settings.reduce_motion,
+            fitted_height: Some(CAPTURE_COMPLETE_H),
         }
     }
 
@@ -105,29 +106,51 @@ impl BrowserPromptWindow {
         let action_error = self.action_error.clone();
 
         v_flex()
-            .gap_3()
             .size_full()
-            .justify_center()
             .child(
                 h_flex()
-                    .gap_2()
+                    .w_full()
+                    .flex_1()
+                    .gap_3()
                     .items_center()
+                    .px_1()
                     .child(
-                        div()
-                            .text_color(success)
-                            .child(Icon::new(IconName::CircleCheck).large()),
+                        h_flex()
+                            .size(px(40.))
+                            .rounded_full()
+                            .bg(success.opacity(0.16))
+                            .items_center()
+                            .justify_center()
+                            .flex_shrink_0()
+                            .child(Icon::new(IconName::CircleCheck).large().text_color(success)),
                     )
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
-                            .child(div().text_sm().font_medium().child(filename))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_medium()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(filename),
+                            )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(muted)
                                     .child(format!("{size_label} · finished")),
                             )
-                            .child(div().text_xs().text_color(muted).child(path_preview)),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(path_preview),
+                            ),
                     ),
             )
             .when_some(action_error, |el, msg| {
@@ -139,6 +162,7 @@ impl BrowserPromptWindow {
                     .justify_end()
                     .gap_2()
                     .pt_2()
+                    .flex_shrink_0()
                     .child(
                         Button::new("capture-show")
                             .label("Show")

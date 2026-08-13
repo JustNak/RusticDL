@@ -15,6 +15,7 @@ use tokio::time::sleep;
 
 use super::client::download_client;
 use super::conn_budget::ConnectionBudget;
+use super::eta::EtaSmoother;
 use super::filesystem::{
     ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
 };
@@ -457,6 +458,7 @@ struct SharedMulti {
 struct SpeedWindow {
     start: Instant,
     bytes: u64,
+    eta: EtaSmoother,
 }
 
 fn lock_map(map: &Mutex<SegmentMap>) -> std::sync::MutexGuard<'_, SegmentMap> {
@@ -471,18 +473,30 @@ fn record_window_bytes(shared: &SharedMulti, n: u64) {
     window.bytes = window.bytes.saturating_add(n);
 }
 
-fn take_aggregate_speed(shared: &SharedMulti) -> u64 {
+/// Sample the shared 400ms window and feed the smoother. `None` if another
+/// worker already reset this window (elapsed still below the interval).
+fn take_due_sample(shared: &SharedMulti, remaining: u64) -> Option<(u64, u64)> {
     let mut window = shared
         .window
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if window.start.elapsed() < PROGRESS_INTERVAL {
+        return None;
+    }
     let elapsed = window.start.elapsed().as_secs_f64().max(0.001);
     let speed = (window.bytes as f64 / elapsed) as u64;
-    if window.start.elapsed() >= PROGRESS_INTERVAL {
-        window.start = Instant::now();
-        window.bytes = 0;
-    }
-    speed
+    window.start = Instant::now();
+    window.bytes = 0;
+    let (_, eta) = window.eta.observe(speed, remaining);
+    Some((speed, eta))
+}
+
+fn last_smoothed(shared: &SharedMulti) -> (Option<u64>, Option<u64>) {
+    let window = shared
+        .window
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (window.eta.last_speed(), window.eta.last_eta())
 }
 
 struct SegmentTask {
@@ -519,6 +533,7 @@ async fn run_segment_workers(
         window: Mutex::new(SpeedWindow {
             start: Instant::now(),
             bytes: 0,
+            eta: EtaSmoother::new(),
         }),
     });
 
@@ -611,10 +626,10 @@ async fn run_segment(client: reqwest::Client, task: SegmentTask) -> Result<(), D
     };
 
     task.active_add();
-    emit_progress(&task, None);
+    emit_progress(&task, false);
     let result = run_segment_loop(&client, &task).await;
     task.active_sub();
-    emit_progress(&task, None);
+    emit_progress(&task, false);
     drop(permit);
     result
 }
@@ -834,7 +849,7 @@ async fn run_segment_loop(
                 mark_segment(&task.shared, task.index, |s| {
                     s.state = SegmentState::Completed;
                 });
-                emit_progress(task, None);
+                emit_progress(task, false);
                 return Ok(());
             }
             Ok(false) => return Ok(()), // pause/cancel
@@ -873,7 +888,7 @@ async fn stream_segment_body(
                 let writer = task.writer.clone();
                 let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
             }
-            emit_progress(task, None);
+            emit_progress(task, false);
             return Ok(false);
         }
 
@@ -959,7 +974,7 @@ async fn stream_segment_body(
         };
 
         if !acquired {
-            emit_progress(task, None);
+            emit_progress(task, false);
             return Ok(false);
         }
 
@@ -969,7 +984,7 @@ async fn stream_segment_body(
         }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            emit_progress(task, Some(take_aggregate_speed(&task.shared)));
+            emit_progress(task, true);
             last_progress = Instant::now();
         }
     }
@@ -979,7 +994,7 @@ async fn stream_segment_body(
             let writer = task.writer.clone();
             let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
         }
-        emit_progress(task, None);
+        emit_progress(task, false);
         return Ok(false);
     }
 
@@ -1027,7 +1042,7 @@ async fn try_segment_reconnect(
 
     *short_reconnects = next;
     let total = task.shared.reconnects.fetch_add(1, Ordering::Relaxed) + 1;
-    emit_progress(task, None);
+    emit_progress(task, false);
     (task.on_progress)(ProgressUpdate {
         reconnect_count: Some(total),
         state_hint: Some(ProgressHint::Starting),
@@ -1043,18 +1058,20 @@ fn mark_segment(shared: &SharedMulti, index: u32, f: impl FnOnce(&mut super::seg
     }
 }
 
-fn emit_progress(task: &SegmentTask, speed: Option<u64>) {
+fn emit_progress(task: &SegmentTask, sample_window: bool) {
     let (map, downloaded, total) = {
         let map = lock_map(&task.shared.map);
         let downloaded = map.written_sum();
         let total = map.total_bytes;
         (map.clone(), downloaded, total)
     };
-    let speed = speed.or_else(|| Some(take_aggregate_speed(&task.shared)));
-    let eta = match speed {
-        Some(s) if s > 0 && total > downloaded => Some((total - downloaded) / s),
-        Some(_) => Some(0),
-        None => None,
+    let remaining = total.saturating_sub(downloaded);
+    let (speed, eta) = if sample_window {
+        take_due_sample(&task.shared, remaining)
+            .map(|(s, e)| (Some(s), Some(e)))
+            .unwrap_or_else(|| last_smoothed(&task.shared))
+    } else {
+        last_smoothed(&task.shared)
     };
     (task.on_progress)(ProgressUpdate {
         downloaded_bytes: Some(downloaded),

@@ -33,15 +33,35 @@ pub fn format_eta(secs: u64) -> String {
     if secs == 0 {
         return "—".into();
     }
+    let secs = quantize_eta(secs);
     let hours = secs / 3600;
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
     if hours > 0 {
         format!("{hours}h {minutes:02}m")
+    } else if minutes >= 2 {
+        // Drop seconds once the estimate is minutes-scale — they only jitter.
+        format!("{minutes}m")
     } else if minutes > 0 {
         format!("{minutes}m {seconds:02}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+/// Snap remaining-time to coarse buckets so a 1–2s engine wiggle does not
+/// rewrite the label every tick.
+fn quantize_eta(secs: u64) -> u64 {
+    if secs < 10 {
+        secs
+    } else if secs < 60 {
+        secs / 5 * 5
+    } else if secs < 10 * 60 {
+        secs / 15 * 15
+    } else if secs < 60 * 60 {
+        secs / 30 * 30
+    } else {
+        secs / 60 * 60
     }
 }
 
@@ -314,5 +334,34 @@ mod tests {
         // 2020-01-15 00:00:00 UTC
         let s = format_absolute_date_fallback(1_579_046_400);
         assert_eq!(s, "01/15/2020");
+    }
+
+    #[test]
+    fn eta_unknown_is_em_dash() {
+        assert_eq!(format_eta(0), "—");
+    }
+
+    #[test]
+    fn eta_under_ten_seconds_is_exact() {
+        assert_eq!(format_eta(7), "7s");
+    }
+
+    #[test]
+    fn eta_seconds_snap_to_five() {
+        assert_eq!(format_eta(54), "50s");
+        assert_eq!(format_eta(53), "50s");
+        assert_eq!(format_eta(56), "55s");
+    }
+
+    #[test]
+    fn eta_minutes_drop_seconds_after_two() {
+        assert_eq!(format_eta(125), "2m");
+        assert_eq!(format_eta(190), "3m");
+    }
+
+    #[test]
+    fn eta_one_minute_keeps_quantized_seconds() {
+        assert_eq!(format_eta(70), "1m 00s");
+        assert_eq!(format_eta(80), "1m 15s");
     }
 }
