@@ -2,6 +2,8 @@ use percent_encoding::percent_decode_str;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+use super::job::Job;
+
 pub async fn ensure_parent_directory(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
@@ -14,6 +16,38 @@ pub async fn ensure_parent_directory(path: &Path) -> Result<(), String> {
 
 pub async fn metadata_len(path: &Path) -> Option<u64> {
     fs::metadata(path).await.ok().map(|metadata| metadata.len())
+}
+
+/// Result of aligning job progress with on-disk partial state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileResult {
+    /// Authoritative byte offset for single-stream Range resume.
+    pub on_disk: u64,
+    /// True when `job.downloaded_bytes` / progress were updated.
+    pub changed: bool,
+}
+
+/// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
+///
+/// **PR 2 scope:** single-stream / legacy only (`metadata_len`). Call from
+/// `start_worker` before transfer so UI state and Range start agree.
+///
+/// Future branches (not yet — Job lacks these fields in PR 2):
+/// - **PR 4:** if `transfer_format_version >= 1`, skip `metadata_len` (version gate).
+/// - **PR 8:** if `segment_map.is_some()`, `downloaded_bytes = sum(written)` only.
+pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
+    // PR4: if job.transfer_format_version >= 1 { /* no metadata_len */ }
+    // PR8: if job.segment_map.is_some() { /* sum(segment.written); return */ }
+
+    let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
+    let changed = job.downloaded_bytes != on_disk;
+    if changed {
+        job.downloaded_bytes = on_disk;
+        if job.total_bytes > 0 {
+            job.progress = ((on_disk as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);
+        }
+    }
+    ReconcileResult { on_disk, changed }
 }
 
 pub async fn move_to_final_path(temp_path: &Path, target_path: &Path) -> Result<PathBuf, String> {
@@ -257,6 +291,80 @@ mod tests {
         assert_eq!(n2, "file (1).zip");
         assert_ne!(t1, t2);
         assert_ne!(p1, p2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconciles_downloaded_bytes_from_temp_file_length() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reconcile-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("payload.bin");
+        let temp = temp_path_for(&target);
+        let on_disk_len = 1234u64;
+        std::fs::write(&temp, vec![0u8; on_disk_len as usize]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/payload.bin".into(),
+            "payload.bin".into(),
+            target,
+            temp.clone(),
+        );
+        // Stale UI/state counters (e.g. after crash while .part grew).
+        job.downloaded_bytes = 100;
+        job.total_bytes = 5000;
+        job.progress = 2.0;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert_eq!(result.on_disk, on_disk_len);
+        assert!(result.changed);
+        assert_eq!(job.downloaded_bytes, on_disk_len);
+        let expected_progress = (on_disk_len as f64 / 5000.0) * 100.0;
+        assert!((job.progress - expected_progress).abs() < 1e-9);
+
+        // Idempotent when already aligned.
+        let again = reconcile_partial_progress(&mut job).await;
+        assert_eq!(again.on_disk, on_disk_len);
+        assert!(!again.changed);
+
+        // Missing .part → zero bytes.
+        std::fs::remove_file(&temp).unwrap();
+        let missing = reconcile_partial_progress(&mut job).await;
+        assert_eq!(missing.on_disk, 0);
+        assert!(missing.changed);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(job.progress, 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_total_leaves_progress_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconcile-nototal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("unknown.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![1u8; 50]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/unknown.bin".into(),
+            "unknown.bin".into(),
+            target,
+            temp,
+        );
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 12.5;
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(result.changed);
+        assert_eq!(job.downloaded_bytes, 50);
+        // No total → leave progress as-is (unknown size).
+        assert_eq!(job.progress, 12.5);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

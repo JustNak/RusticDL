@@ -147,6 +147,7 @@ pub async fn run_http_download(
     control: Arc<AtomicU8>,
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
+    fsync_on_pause: bool,
 ) -> Result<DownloadOutcome, DownloadError> {
     ensure_parent_directory(&job.target_path)
         .await
@@ -154,6 +155,8 @@ pub async fn run_http_download(
 
     let client = download_client()?;
     let mut current_url = job.url.clone();
+    // Single-stream Range start = on-disk .part length (authoritative; see reconcile_partial_progress).
+    // PR4/PR8: map/version jobs must not use metadata_len for offsets.
     let mut existing_bytes = metadata_len(&job.temp_path).await.unwrap_or(0);
 
     // Follow redirects manually (client has Policy::none).
@@ -349,10 +352,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
-            writer
-                .flush()
-                .await
-                .map_err(|error| disk_write_error(error))?;
+            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
             return Ok(outcome);
         }
 
@@ -399,7 +399,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         window_bytes = window_bytes.saturating_add(n);
 
         if !acquired {
-            writer.flush().await.map_err(disk_write_error)?;
+            let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
+            flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
             // Keep job/UI counters aligned with what is on disk before pause/cancel.
             on_progress(ProgressUpdate::downloading_tick(
                 downloaded,
@@ -408,7 +409,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                 0,
                 progress_percent(downloaded, total_bytes),
             ));
-            return Ok(control_outcome(&control).unwrap_or(DownloadOutcome::Paused));
+            return Ok(outcome);
         }
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
@@ -434,15 +435,16 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         }
     }
 
+    if let Some(outcome) = control_outcome(&control) {
+        flush_partial_writer(&mut writer, fsync_on_pause, outcome).await?;
+        return Ok(outcome);
+    }
+
     writer
         .flush()
         .await
         .map_err(|error| disk_write_error(error))?;
     drop(writer);
-
-    if let Some(outcome) = control_outcome(&control) {
-        return Ok(outcome);
-    }
 
     if total_bytes > 0 && downloaded < total_bytes {
         return Err(download_error(
@@ -749,6 +751,23 @@ fn disk_write_error(error: std::io::Error) -> DownloadError {
         format!("Could not write download data: {error}"),
         false,
     )
+}
+
+/// Flush buffered writes; optionally `sync_data` on pause (prefer over `sync_all` on Windows).
+async fn flush_partial_writer(
+    writer: &mut BufWriter<tokio::fs::File>,
+    fsync_on_pause: bool,
+    outcome: DownloadOutcome,
+) -> Result<(), DownloadError> {
+    writer.flush().await.map_err(disk_write_error)?;
+    if fsync_on_pause && matches!(outcome, DownloadOutcome::Paused) {
+        writer
+            .get_ref()
+            .sync_data()
+            .await
+            .map_err(disk_write_error)?;
+    }
+    Ok(())
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
