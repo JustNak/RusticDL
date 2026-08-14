@@ -73,6 +73,7 @@ impl BrowserPromptWindow {
             waiting_url_noted: false,
             canceling: false,
             speed_samples: VecDeque::new(),
+            peak_speed: 0,
             reduce_motion: settings.reduce_motion,
             fitted_height: Some(CAPTURE_WINDOW_H),
         }
