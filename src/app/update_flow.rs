@@ -3,8 +3,8 @@
 //! Toast stages (interactive + silent when an update exists):
 //! 1. **Checking for update…**
 //! 2a. **You're up to date** — or —
-//! 2b. **Update available vX.Y.Z** `[Update]` → **Restart to update** `[Restart]`
-//! 3. On Restart: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
+//! 2b. **Update available vX.Y.Z** `[Update]`
+//! 3. On Update: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
 //! 4. Updater downloads, runs NSIS `/S`, relaunches the main app.
 //! 5. **What’s new** — post-relaunch dialog with the release changelog.
 //!
@@ -46,7 +46,7 @@ impl DownloadApp {
         }
     }
 
-    /// Brand menu / About: check when unknown, else show restart confirmation toast.
+    /// Brand menu / About: check when unknown, else re-show the Update toast.
     pub(crate) fn begin_update_action(
         &mut self,
         _window: &mut gpui::Window,
@@ -56,8 +56,8 @@ impl DownloadApp {
             self.show_toast("An update is already in progress…", cx);
             return;
         }
-        if self.available_update.is_some() {
-            self.show_restart_to_update_toast(cx);
+        if let Some(info) = self.available_update.clone() {
+            self.show_update_available_toast(&info, cx);
             return;
         }
         self.begin_update_check(true, cx);
@@ -132,20 +132,7 @@ impl DownloadApp {
         self.replace_update_toast(
             format!("Update available v{}", info.latest_version),
             ToastKind::Info,
-            Some(("Update", ToastActionKind::ConfirmUpdate)),
-            cx,
-        );
-    }
-
-    /// “Restart to update” with a Restart action button.
-    pub(crate) fn show_restart_to_update_toast(&mut self, cx: &mut Context<Self>) {
-        if self.available_update.is_none() {
-            return;
-        }
-        self.replace_update_toast(
-            "Restart to update",
-            ToastKind::Info,
-            Some(("Restart", ToastActionKind::RestartToUpdate)),
+            Some(("Update", ToastActionKind::ApplyUpdate)),
             cx,
         );
     }
@@ -153,12 +140,7 @@ impl DownloadApp {
     /// Handle primary actions from update toasts.
     pub(crate) fn on_update_toast_action(&mut self, kind: ToastActionKind, cx: &mut Context<Self>) {
         match kind {
-            ToastActionKind::ConfirmUpdate => {
-                if self.available_update.is_some() {
-                    self.show_restart_to_update_toast(cx);
-                }
-            }
-            ToastActionKind::RestartToUpdate => {
+            ToastActionKind::ApplyUpdate => {
                 let Some(info) = self.available_update.clone() else {
                     self.show_toast("No update is ready to install.", cx);
                     return;
