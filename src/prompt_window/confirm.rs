@@ -10,13 +10,13 @@ use gpui::{
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputState, SelectAll},
     v_flex, ActiveTheme, IconName, StyledExt,
 };
 
 use super::helpers::{default_prompt_filename, shorten_path, truncate_middle};
 use super::start_sync_timer;
-use super::{BrowserPromptWindow, CapturePhase, CAPTURE_WINDOW_H};
+use super::{BrowserPromptWindow, CapturePhase, CAPTURE_CONFLICT_H, CAPTURE_WINDOW_H};
 use crate::appearance::apply_appearance;
 use crate::download::EngineHandle;
 use crate::format::format_bytes;
@@ -59,6 +59,7 @@ impl BrowserPromptWindow {
             name_input.update(cx, |state, cx| {
                 state.focus(window, cx);
             });
+            window.dispatch_action(Box::new(SelectAll), cx);
         }
 
         window.activate_window();
@@ -84,7 +85,11 @@ impl BrowserPromptWindow {
             speed_samples: VecDeque::new(),
             peak_speed: 0,
             reduce_motion: settings.reduce_motion,
-            fitted_height: Some(CAPTURE_WINDOW_H),
+            fitted_height: Some(if opens_conflict {
+                CAPTURE_CONFLICT_H
+            } else {
+                CAPTURE_WINDOW_H
+            }),
         }
     }
 

@@ -30,6 +30,8 @@ use crate::settings::ProgressStyle;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
+/// Conflict adds a rejection row + four actions; keep the button row on-screen.
+const CAPTURE_CONFLICT_H: f32 = 352.0;
 /// Complete phase has no sparkline or form — hug the file row + actions.
 const CAPTURE_COMPLETE_H: f32 = 196.0;
 /// Rolling speed samples for the Progress sparkline (~9s at 100ms tick).
@@ -147,6 +149,7 @@ impl BrowserPromptWindow {
     fn target_window_height(&self) -> f32 {
         match self.phase {
             CapturePhase::Complete { .. } => CAPTURE_COMPLETE_H,
+            CapturePhase::Conflict => CAPTURE_CONFLICT_H,
             _ => CAPTURE_WINDOW_H,
         }
     }

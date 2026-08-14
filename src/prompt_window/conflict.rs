@@ -20,12 +20,20 @@ use crate::download::{find_filename_collision, FilenameCollision};
 use crate::format::format_bytes;
 
 impl BrowserPromptWindow {
-    fn current_conflict_name(&self, cx: &Context<Self>) -> String {
+    fn typed_conflict_name(&self, cx: &Context<Self>) -> String {
         self.name_input
             .as_ref()
             .map(|input| input.read(cx).value().trim().to_string())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "download.bin".into())
+            .unwrap_or_default()
+    }
+
+    fn current_conflict_name(&self, cx: &Context<Self>) -> String {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() {
+            "download.bin".into()
+        } else {
+            name
+        }
     }
 
     fn current_conflict_dir(&self, cx: &Context<Self>) -> PathBuf {
@@ -36,34 +44,35 @@ impl BrowserPromptWindow {
     }
 
     pub(super) fn current_collision(&self, cx: &Context<Self>) -> Option<FilenameCollision> {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() {
+            return None;
+        }
         find_filename_collision(
             &self.current_conflict_dir(cx),
-            &self.current_conflict_name(cx),
+            &name,
             &self.ipc.jobs_snapshot(),
         )
     }
 
-    /// Put a free `file (n).ext` into the filename field. Does not start the job.
     pub(super) fn apply_suggested_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(suggested) = self.current_collision(cx).map(|c| c.suggested_unique_name) else {
             return;
         };
-        let Some(input) = self.name_input.clone() else {
+        let Some(input) = self.name_input.as_ref() else {
             return;
         };
         input.update(cx, |state, cx| {
             state.set_value(suggested, window, cx);
             state.focus(window, cx);
         });
+        window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
         cx.notify();
     }
 
     pub(super) fn resolve_start_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current_collision(cx).is_some() {
-            return;
-        }
-        let name = self.current_conflict_name(cx);
-        if name.is_empty() {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() || self.current_collision(cx).is_some() {
             return;
         }
         self.resolve_accept(Some(name), false, window, cx);
@@ -86,6 +95,8 @@ impl BrowserPromptWindow {
         let prompt = self.prompt.as_ref();
         let collision = self.current_collision(cx);
         let name_taken = collision.is_some();
+        let name_empty = self.typed_conflict_name(cx).is_empty();
+        let start_blocked = name_taken || name_empty;
         let blocks_overwrite = collision.as_ref().is_some_and(|c| c.blocks_overwrite);
         let unique_preview = collision
             .as_ref()
@@ -120,16 +131,20 @@ impl BrowserPromptWindow {
         } else {
             format!("“{display_name}” is available.")
         };
-        let hint = if name_taken {
+        let hint = if name_taken && blocks_overwrite {
+            format!("Another download is using this name. Click Rename for {unique_preview}.")
+        } else if name_taken {
             format!("Pick a different name, or click Rename for {unique_preview}.")
+        } else if name_empty {
+            "Enter a filename to start the download.".into()
         } else {
             "This name is available. Click Start download to keep it.".into()
         };
-        let hint_color = if name_taken { theme.danger } else { muted };
+        let hint_color = if start_blocked { theme.danger } else { muted };
         let start_button = Button::new("conflict-start")
             .label("Start download")
-            .disabled(name_taken)
-            .when(!name_taken, |btn| btn.primary())
+            .disabled(start_blocked)
+            .when(!start_blocked, |btn| btn.primary())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.resolve_start_download(window, cx);
             }));
@@ -236,6 +251,16 @@ impl BrowserPromptWindow {
                                 let danger = theme.danger;
                                 el.tooltip(move |window, cx| {
                                     Tooltip::new("Duplicate Name")
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(danger)
+                                        .build(window, cx)
+                                })
+                            })
+                            .when(name_empty && !name_taken, |el| {
+                                let danger = theme.danger;
+                                el.tooltip(move |window, cx| {
+                                    Tooltip::new("Enter a filename")
                                         .text_xs()
                                         .font_medium()
                                         .text_color(danger)
