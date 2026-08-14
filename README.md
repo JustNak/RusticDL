@@ -387,7 +387,7 @@ To publish a **nightly** (when you want testers to try new work):
 1. Actions → **Nightly** → **Run workflow**
 2. Optionally check **Publish even if this commit already has a nightly**
 
-The in-app updater on the Nightly channel follows tags matching `vX.Y.Z-nightly.*`. Stable still uses `/releases/latest`.
+The in-app updater on the Nightly channel follows tags matching `vX.Y.Z-nightly.*`. Stable still uses `/releases/latest`. Switching channels installs that stream’s current build even when its version number is lower.
 
 ---
 

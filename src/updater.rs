@@ -7,7 +7,8 @@
 //!
 //! Staged flow (main app UI in `update_flow`):
 //! 1. Query the GitHub Releases API for the latest tag + assets on the chosen channel.
-//! 2. Compare against the built-in app version and surface toast stages:
+//! 2. Offer that channel’s current build when this install is not already it
+//!    (channel switch is not a semver “newer” check). Toast stages:
 //!    Checking → You're up to date | Update available [Update] → Restart [Restart].
 //! 3. On Restart, flush app state, spawn **RusticDL Updater** with the setup
 //!    download URL, then quit. The updater shows progress, runs NSIS `/S`, and
@@ -180,7 +181,7 @@ fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateC
     let latest = normalize_version(latest_raw);
     let current = normalize_version(APP_VERSION);
 
-    if !is_newer_on_channel(&latest, &current, channel) {
+    if !should_offer_on_channel(&latest, &current, channel) {
         return Ok(UpdateCheck::UpToDate {
             current: current.clone(),
             latest,
@@ -583,31 +584,43 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Channel-aware comparison used by the in-app updater.
+/// Whether the in-app updater should offer `latest` for `channel`.
 ///
-/// Nightly treats a `*-nightly.*` of the same core version as newer than a
-/// stable install, so switching to Nightly on `0.3.1` can pick up
-/// `0.3.1-nightly.20260813…`. It never offers a lower core version.
-pub fn is_newer_on_channel(latest: &str, current: &str, channel: UpdateChannel) -> bool {
-    match channel {
-        UpdateChannel::Stable => is_newer(latest, current),
-        UpdateChannel::Nightly => is_newer_nightly(latest, current),
+/// The channel is the source of truth, not semver order:
+/// - **Switching to Nightly** offers that channel’s current nightly even when
+///   its core version is lower than the installed Stable.
+/// - **Switching back to Stable** offers `/releases/latest` even when the
+///   installed Nightly has a higher version (otherwise users get stuck).
+/// - **Staying on a channel** still requires `latest` to be newer, so a local
+///   or newer install is not treated as an update.
+pub fn should_offer_on_channel(latest: &str, current: &str, channel: UpdateChannel) -> bool {
+    let latest = normalize_version(latest);
+    let current = normalize_version(current);
+    if latest.is_empty() || latest == current {
+        return false;
     }
-}
-
-fn is_newer_nightly(latest: &str, current: &str) -> bool {
-    match (parse_semverish(latest), parse_semverish(current)) {
-        (Some(l), Some(c)) => {
-            if (l.major, l.minor, l.patch) != (c.major, c.minor, c.patch) {
-                return (l.major, l.minor, l.patch) > (c.major, c.minor, c.patch);
+    let current_is_nightly = is_nightly_version(&current);
+    match channel {
+        UpdateChannel::Stable => {
+            if is_nightly_version(&latest) {
+                return false;
             }
-            match (&l.pre, &c.pre) {
-                (Some(_), None) => is_nightly_version(latest),
-                (Some(lp), Some(cp)) => lp > cp,
-                (None, _) => false,
+            if current_is_nightly {
+                true
+            } else {
+                is_newer(&latest, &current)
             }
         }
-        _ => latest != current && !latest.is_empty(),
+        UpdateChannel::Nightly => {
+            if !is_nightly_version(&latest) {
+                return false;
+            }
+            if current_is_nightly {
+                is_newer(&latest, &current)
+            } else {
+                true
+            }
+        }
     }
 }
 
@@ -739,30 +752,82 @@ mod tests {
     }
 
     #[test]
-    fn nightly_channel_offers_same_core_nightly_over_stable() {
-        assert!(is_newer_on_channel(
+    fn channel_switch_offers_that_stream_regardless_of_semver() {
+        // Stable → Nightly: take nightly even when its core version is lower.
+        assert!(should_offer_on_channel(
+            "0.3.1-nightly.20260813155600",
+            "0.3.2",
+            UpdateChannel::Nightly
+        ));
+        // Nightly → Stable: take stable even when the nightly is “ahead”.
+        assert!(should_offer_on_channel(
+            "0.3.1",
+            "0.3.2-nightly.20260813155600",
+            UpdateChannel::Stable
+        ));
+        assert!(should_offer_on_channel(
+            "0.3.2",
+            "0.3.2-nightly.20260813155600",
+            UpdateChannel::Stable
+        ));
+        // Same-core Nightly over the matching Stable (toggle to Nightly).
+        assert!(should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.1",
             UpdateChannel::Nightly
         ));
-        assert!(!is_newer_on_channel(
+        // Nightly must not be offered on the Stable channel.
+        assert!(!should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.1",
             UpdateChannel::Stable
         ));
-        assert!(!is_newer_on_channel(
+        // Already on that exact nightly.
+        assert!(!should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.1-nightly.20260813155600",
             UpdateChannel::Nightly
         ));
-        assert!(!is_newer_on_channel(
-            "0.3.0-nightly.20260813155600",
+    }
+
+    #[test]
+    fn same_channel_still_requires_a_newer_build() {
+        assert!(should_offer_on_channel(
+            "0.3.2",
             "0.3.1",
-            UpdateChannel::Nightly
+            UpdateChannel::Stable
         ));
-        assert!(is_newer_on_channel(
+        assert!(!should_offer_on_channel(
+            "0.3.1",
+            "0.3.2",
+            UpdateChannel::Stable
+        ));
+        assert!(!should_offer_on_channel(
+            "0.3.2",
+            "0.3.2",
+            UpdateChannel::Stable
+        ));
+        // Newer local/dev Stable is not downgraded while staying on Stable.
+        assert!(!should_offer_on_channel(
+            "0.3.2",
+            "0.3.3",
+            UpdateChannel::Stable
+        ));
+        assert!(should_offer_on_channel(
             "0.3.2-nightly.20260813155600",
             "0.3.1-nightly.20260812000000",
+            UpdateChannel::Nightly
+        ));
+        // Already on a newer nightly: do not roll back while staying on Nightly.
+        assert!(!should_offer_on_channel(
+            "0.3.1-nightly.20260813155600",
+            "0.3.2-nightly.20260813155600",
+            UpdateChannel::Nightly
+        ));
+        // Stable must not be offered as a Nightly target.
+        assert!(!should_offer_on_channel(
+            "0.3.2",
+            "0.3.1-nightly.20260813155600",
             UpdateChannel::Nightly
         ));
     }

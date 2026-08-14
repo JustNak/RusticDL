@@ -252,7 +252,7 @@ impl DownloadApp {
                 .child(settings_choice_row(
                     "Update channel",
                     Some(
-                        "Stable follows the latest full release. Nightly is a testing pre-release of upcoming work (may be unstable).",
+                        "Each channel follows its own stream. Switching installs that stream’s current build, even if the version number is lower.",
                     ),
                     h_flex()
                         .gap_2()
