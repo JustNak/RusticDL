@@ -889,4 +889,36 @@ mod tests {
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn overwrite_add_falls_back_when_failed_job_owns_name() {
+        let dir = temp_dir();
+        let existing = sample_job("https://example.com/failed.bin", JobState::Failed, &dir);
+        let existing_name = existing.filename.clone();
+
+        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/other.bin".into(),
+            filename: Some(existing_name),
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "file (1).bin");
+
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs
+            .iter()
+            .find(|j| j.url == "https://example.com/other.bin")
+            .expect("new job");
+        assert!(!added.replace_existing);
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

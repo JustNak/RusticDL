@@ -105,7 +105,12 @@ pub(super) async fn handle(
                 policy,
             );
             if replace_existing && temp.exists() {
-                let _ = std::fs::remove_file(&temp);
+                if let Err(error) = std::fs::remove_file(&temp) {
+                    last_error = Some(format!(
+                        "Could not replace leftover partial file for {name}: {error}"
+                    ));
+                    continue;
+                }
             }
             occupied_targets.push(target.clone());
             occupied_temps.push(temp.clone());

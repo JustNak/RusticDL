@@ -284,12 +284,8 @@ pub async fn move_to_final_path(
     replace: bool,
 ) -> Result<PathBuf, String> {
     let final_path = if replace {
-        if target_path.exists() {
-            fs::remove_file(target_path)
-                .await
-                .map_err(|error| format!("Could not replace existing download file: {error}"))?;
-        }
-        target_path.to_path_buf()
+        replace_final_path(temp_path, target_path).await?;
+        return Ok(target_path.to_path_buf());
     } else {
         allocate_final_path(target_path).await?
     };
@@ -299,6 +295,41 @@ pub async fn move_to_final_path(
         .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
 
     Ok(final_path)
+}
+
+/// Move `.part` into place without deleting the original first.
+///
+/// Original is renamed aside; if the final rename fails it is restored.
+async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), String> {
+    if !target_path.exists() {
+        fs::rename(temp_path, target_path)
+            .await
+            .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
+        return Ok(());
+    }
+
+    let mut sidecar = target_path.as_os_str().to_os_string();
+    sidecar.push(".replaced");
+    let sidecar = PathBuf::from(sidecar);
+    if sidecar.exists() {
+        fs::remove_file(&sidecar)
+            .await
+            .map_err(|error| format!("Could not clear leftover replacement backup: {error}"))?;
+    }
+
+    fs::rename(target_path, &sidecar)
+        .await
+        .map_err(|error| format!("Could not move existing download aside: {error}"))?;
+
+    if let Err(error) = fs::rename(temp_path, target_path).await {
+        let _ = fs::rename(&sidecar, target_path).await;
+        return Err(format!(
+            "Could not finalize downloaded file: {error}. The original file was kept."
+        ));
+    }
+
+    let _ = fs::remove_file(&sidecar).await;
+    Ok(())
 }
 
 pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> {
@@ -449,8 +480,8 @@ pub struct FilenameCollision {
     pub filename: String,
     pub target_path: PathBuf,
     pub temp_path: PathBuf,
-    /// True when an active job already owns this target or leftover `.part`.
-    pub owned_by_active_job: bool,
+    /// True when overwrite is unsafe (non-completed job or pending `.part` delete).
+    pub blocks_overwrite: bool,
     /// Next free `stem (n).ext` (or uuid fallback).
     pub suggested_unique_name: String,
 }
@@ -483,9 +514,31 @@ fn paths_are_taken(
         || temp.exists()
 }
 
-fn active_job_owns_paths(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
-    jobs.iter()
-        .any(|job| job.state.is_active() && (job.target_path == target || job.temp_path == temp))
+fn job_owns_paths(job: &Job, target: &Path, temp: &Path) -> bool {
+    job.target_path == target || job.temp_path == temp
+}
+
+/// Completed jobs may be overwritten; retryable / live jobs may not.
+fn job_blocks_overwrite(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
+    jobs.iter().any(|job| {
+        job.state != super::job::JobState::Completed && job_owns_paths(job, target, temp)
+    })
+}
+
+/// A `.part` still being deleted after Remove is not safe to reuse.
+fn pending_temp_blocks_overwrite(
+    temp: &Path,
+    occupied_temps: &[PathBuf],
+    jobs: &[Job],
+    extra_jobs: &[Job],
+) -> bool {
+    if !occupied_temps.iter().any(|path| path == temp) {
+        return false;
+    }
+    !jobs
+        .iter()
+        .chain(extra_jobs.iter())
+        .any(|job| job.temp_path == temp)
 }
 
 /// First collision for `preferred_name` against disk, leftover `.part`, and jobs.
@@ -519,7 +572,7 @@ fn find_filename_collision_occupied(
     let (suggested_unique_name, _, _) =
         allocate_unique_download_paths(directory, &filename, occupied_targets, occupied_temps);
     Some(FilenameCollision {
-        owned_by_active_job: active_job_owns_paths(&target, &temp, jobs),
+        blocks_overwrite: job_blocks_overwrite(&target, &temp, jobs),
         filename,
         target_path: target,
         temp_path: temp,
@@ -529,8 +582,8 @@ fn find_filename_collision_occupied(
 
 /// Pick target paths, uniquifying or keeping the exact name per `policy`.
 ///
-/// Overwrite still uniquifies when an active job owns the preferred target or
-/// `.part`. The returned bool is `replace_existing` for the new job.
+/// Overwrite still uniquifies when a non-completed job owns the preferred
+/// target / `.part`, or a pending partial delete still occupies the temp path.
 pub fn allocate_download_paths(
     directory: &Path,
     preferred_name: &str,
@@ -542,8 +595,9 @@ pub fn allocate_download_paths(
 ) -> (String, PathBuf, PathBuf, bool) {
     if policy == FilenameConflictPolicy::Overwrite {
         let (name, target, temp) = preferred_download_paths(directory, preferred_name);
-        let blocked = active_job_owns_paths(&target, &temp, jobs)
-            || active_job_owns_paths(&target, &temp, extra_jobs);
+        let blocked = job_blocks_overwrite(&target, &temp, jobs)
+            || job_blocks_overwrite(&target, &temp, extra_jobs)
+            || pending_temp_blocks_overwrite(&temp, occupied_temps, jobs, extra_jobs);
         if !blocked {
             return (name, target, temp, true);
         }
@@ -995,7 +1049,7 @@ mod tests {
         std::fs::write(dir.join("report.pdf"), b"old").unwrap();
         let found = find_filename_collision(&dir, "report.pdf", &[]).expect("collision");
         assert_eq!(found.filename, "report.pdf");
-        assert!(!found.owned_by_active_job);
+        assert!(!found.blocks_overwrite);
         assert_eq!(found.suggested_unique_name, "report (1).pdf");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1017,7 +1071,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let job = collision_job(&dir, "taken.zip", super::super::job::JobState::Completed);
         let found = find_filename_collision(&dir, "taken.zip", &[job]).expect("collision");
-        assert!(!found.owned_by_active_job);
+        assert!(!found.blocks_overwrite);
         assert_eq!(found.suggested_unique_name, "taken (1).zip");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1028,7 +1082,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let job = collision_job(&dir, "busy.iso", super::super::job::JobState::Downloading);
         let found = find_filename_collision(&dir, "busy.iso", &[job]).expect("collision");
-        assert!(found.owned_by_active_job);
+        assert!(found.blocks_overwrite);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collision_failed_job_blocks_overwrite() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-col-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "retry.bin", super::super::job::JobState::Failed);
+        let found = find_filename_collision(&dir, "retry.bin", &[job]).expect("collision");
+        assert!(found.blocks_overwrite);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1053,10 +1117,52 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_allocate_keeps_name_when_completed_job_owns_path() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-ow-done-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "file.zip", super::super::job::JobState::Completed);
+        let occupied = vec![job.target_path.clone()];
+        let occupied_temps = vec![job.temp_path.clone()];
+        let (name, _, _, replace) = allocate_download_paths(
+            &dir,
+            "file.zip",
+            &occupied,
+            &occupied_temps,
+            &[job],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert_eq!(name, "file.zip");
+        assert!(replace);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn overwrite_allocate_falls_back_when_active_job_owns_path() {
         let dir = std::env::temp_dir().join(format!("rusticdl-ow-act-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let job = collision_job(&dir, "file.zip", super::super::job::JobState::Paused);
+        let occupied = vec![job.target_path.clone()];
+        let occupied_temps = vec![job.temp_path.clone()];
+        let (name, _, _, replace) = allocate_download_paths(
+            &dir,
+            "file.zip",
+            &occupied,
+            &occupied_temps,
+            &[job],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert_eq!(name, "file (1).zip");
+        assert!(!replace);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_allocate_falls_back_when_failed_job_owns_path() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-ow-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "file.zip", super::super::job::JobState::Failed);
         let occupied = vec![job.target_path.clone()];
         let occupied_temps = vec![job.temp_path.clone()];
         let (name, _, _, replace) = allocate_download_paths(
@@ -1085,6 +1191,12 @@ mod tests {
         assert_eq!(final_path, target);
         assert_eq!(std::fs::read(&target).unwrap(), b"new-bytes");
         assert!(!temp.exists());
+        let sidecar = {
+            let mut p = target.as_os_str().to_os_string();
+            p.push(".replaced");
+            std::path::PathBuf::from(p)
+        };
+        assert!(!sidecar.exists(), "replacement backup must be removed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

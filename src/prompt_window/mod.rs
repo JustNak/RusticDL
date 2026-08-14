@@ -204,6 +204,13 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
 
 impl Render for BrowserPromptWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Live name/folder edits can collide after Confirm opened on a free name.
+        if matches!(self.phase, CapturePhase::Confirm)
+            && !self.resolved
+            && self.current_collision(cx).is_some()
+        {
+            self.phase = CapturePhase::Conflict;
+        }
         self.fit_window_to_phase(window);
         let theme = cx.theme().clone();
         let title = self.title_for_phase().to_string();

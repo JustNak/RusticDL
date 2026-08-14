@@ -31,7 +31,7 @@ impl BrowserPromptWindow {
             .unwrap_or_default()
     }
 
-    fn current_collision(&self, cx: &Context<Self>) -> Option<FilenameCollision> {
+    pub(super) fn current_collision(&self, cx: &Context<Self>) -> Option<FilenameCollision> {
         find_filename_collision(
             &self.current_conflict_dir(cx),
             &self.current_conflict_name(cx),
@@ -57,7 +57,7 @@ impl BrowserPromptWindow {
     pub(super) fn resolve_overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .current_collision(cx)
-            .is_some_and(|c| c.owned_by_active_job)
+            .is_some_and(|c| c.blocks_overwrite)
         {
             return;
         }
@@ -71,7 +71,7 @@ impl BrowserPromptWindow {
         let prompt = self.prompt.as_ref();
         let collision = self.current_collision(cx);
         let name_taken = collision.is_some();
-        let owned_by_active = collision.as_ref().is_some_and(|c| c.owned_by_active_job);
+        let blocks_overwrite = collision.as_ref().is_some_and(|c| c.blocks_overwrite);
         let unique_preview = collision
             .as_ref()
             .map(|c| c.suggested_unique_name.clone())
@@ -98,14 +98,14 @@ impl BrowserPromptWindow {
             .map(|d| shorten_path(&d.read(cx).value()))
             .unwrap_or_else(|| "default folder".into());
 
-        let banner = if name_taken && owned_by_active {
+        let banner = if name_taken && blocks_overwrite {
             format!("“{display_name}” is used by another download.")
         } else if name_taken {
             format!("“{display_name}” already exists in this folder.")
         } else {
             format!("“{display_name}” is available.")
         };
-        let hint = if name_taken && owned_by_active {
+        let hint = if name_taken && blocks_overwrite {
             format!("Rename will save as {unique_preview}. Overwrite is unavailable.")
         } else if name_taken {
             format!("Rename will save as {unique_preview}.")
@@ -190,7 +190,7 @@ impl BrowserPromptWindow {
                             Button::new("conflict-overwrite")
                                 .label("Overwrite")
                                 .danger()
-                                .disabled(owned_by_active)
+                                .disabled(blocks_overwrite)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.resolve_overwrite(window, cx);
                                 })),
