@@ -366,11 +366,18 @@ export function firefoxWebRequestDownloadCandidate(
 }
 
 /**
- * File-host CDNs whose object URLs are the real file (not an HTML ticket).
- * Used for onBeforeRequest cancel so Firefox never starts the body.
+ * Object CDNs only. Apex /dl/ hosts (buzzheavier.com, gofile.io) serve HTML
+ * wait-pages that can still be named Game.rar — those stay on headersReceived.
  */
-export const FILE_HOST_CDN_HOST_RE =
-  /(?:^|\.)(?:gofile\.io|pixeldrain\.com|buzzheavier\.com)$/i;
+export function isFileHostObjectCdnHost(host: string): boolean {
+  const name = host.toLowerCase();
+  if (name === 'gofile.io' || name === 'www.gofile.io') return false;
+  if (name === 'buzzheavier.com' || name === 'www.buzzheavier.com') return false;
+  if (name.endsWith('.gofile.io')) return true;
+  if (name === 'pixeldrain.com' || name.endsWith('.pixeldrain.com')) return true;
+  if (name === 'cdn.buzzheavier.com' || name.endsWith('.cdn.buzzheavier.com')) return true;
+  return false;
+}
 
 export type FirefoxBeforeRequestDetails = {
   requestId?: string;
@@ -413,13 +420,19 @@ export function firefoxBeforeRequestDownloadCandidate(
   } catch {
     return null;
   }
-  if (!FILE_HOST_CDN_HOST_RE.test(host)) {
+  if (!isFileHostObjectCdnHost(host)) {
     return null;
   }
 
   const filename = basenameFromUrl(url);
   const ext = extensionOf(filename);
   if (!ext || isWeakCaptureExtension(ext)) {
+    return null;
+  }
+  const ignored = new Set(
+    (settings.ignoredFileExtensions ?? []).map((value) => value.toLowerCase()),
+  );
+  if (ignored.has(ext)) {
     return null;
   }
   const captured = new Set(settings.capturedFileExtensions.map((value) => value.toLowerCase()));

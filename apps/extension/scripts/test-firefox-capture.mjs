@@ -821,6 +821,22 @@ assert(
 );
 
 assert(
+  'cancels Buzzheavier object CDN .rar on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'does not cancel Buzzheavier /dl wait-page named as .rar on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(steamripStub, defaultSettings) === null,
+);
+
+assert(
   'does not cancel Gofile listing pages that are not a file URL',
   firefoxBeforeRequestDownloadCandidate(
     {
@@ -840,6 +856,17 @@ assert(
       method: 'GET',
     },
     defaultSettings,
+  ) === null,
+);
+
+assert(
+  'respects ignoredFileExtensions on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    { ...defaultSettings, ignoredFileExtensions: ['rar'] },
   ) === null,
 );
 

@@ -16,7 +16,7 @@ import {
   urlIsClaimed,
   type InterceptedDownload,
 } from './captureFilter';
-import { createDefaultExtensionSettings } from '../shared/defaultExtensionSettings';
+
 import {
   abortFirefoxResponseBody,
   firefoxBeforeRequestDownloadCandidate,
@@ -62,12 +62,14 @@ type PendingSizeWait = {
 };
 const pendingSizeWaits = new Map<number, PendingSizeWait>();
 const pausedForCapture = new Set<number>();
+/** URLs we put back in Firefox after a dismissed/failed handoff — do not recapture. */
+const restoreSkipUrls = new Map<string, number>();
 
 let cachedSettings: ExtensionIntegrationSettings | null = null;
 
-/** Blocking webRequest must not await; use cache or defaults so cancel is synchronous. */
-function settingsForSyncCapture(): ExtensionIntegrationSettings {
-  return cachedSettings ?? createDefaultExtensionSettings();
+/** Blocking listeners stay sync. Null until storage loads so we do not override Off/ignore. */
+function settingsForSyncCapture(): ExtensionIntegrationSettings | null {
+  return cachedSettings;
 }
 
 async function getCachedSettings(): Promise<ExtensionIntegrationSettings> {
@@ -145,6 +147,20 @@ function pruneStaleClaims(now = Date.now()): void {
   for (const [key, entry] of interceptedDownloads) {
     if (now - entry.ts > CAPTURE_DEDUPE_TTL_MS) interceptedDownloads.delete(key);
   }
+  for (const [key, ts] of restoreSkipUrls) {
+    if (now - ts > CAPTURE_DEDUPE_TTL_MS) restoreSkipUrls.delete(key);
+  }
+}
+
+function rememberRestoreSkip(url: string): void {
+  pruneStaleClaims();
+  restoreSkipUrls.set(normalizeCaptureUrl(url), Date.now());
+}
+
+function shouldSkipRestoredUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  pruneStaleClaims();
+  return restoreSkipUrls.has(normalizeCaptureUrl(url));
 }
 
 function claimCapture(url: string): boolean {
@@ -243,6 +259,7 @@ function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
     return;
   }
   const settings = settingsForSyncCapture();
+  if (!settings) return;
   const action = downloadCreatedAction(item, settings);
   if (action === 'capture') {
     void eraseBrowserDownload(item.id);
@@ -257,6 +274,7 @@ async function restoreBrowserDownload(snapshot: {
   url: string;
   filename?: string;
 }): Promise<void> {
+  rememberRestoreSkip(snapshot.url);
   try {
     const options: { url: string; filename?: string } = { url: snapshot.url };
     const name = snapshot.filename?.split(/[\\/]/).pop();
@@ -265,7 +283,7 @@ async function restoreBrowserDownload(snapshot: {
     }
     await browser.downloads.download(options);
   } catch {
-    // nothing left to give back to Firefox
+    restoreSkipUrls.delete(normalizeCaptureUrl(snapshot.url));
   }
 }
 
@@ -523,7 +541,7 @@ async function handoffFirefoxCandidate(
   candidate: FirefoxCaptureCandidate,
   settings: ExtensionIntegrationSettings,
 ) {
-  await handOffUrl(candidate.url, settings, {
+  const attempt = await handOffUrl(candidate.url, settings, {
     suggestedFilename: candidate.filename,
     totalBytes: candidate.totalBytes,
   }, {
@@ -532,6 +550,12 @@ async function handoffFirefoxCandidate(
     incognito: candidate.incognito,
     cookieStoreId: candidate.cookieStoreId,
   });
+  if (attempt === 'rejected') {
+    await restoreBrowserDownload({
+      url: candidate.url,
+      filename: candidate.filename,
+    });
+  }
 }
 
 function registerFirefoxWebRequestInterception() {
@@ -583,7 +607,13 @@ function handleFirefoxBeforeRequestSync(
   details: FirefoxBeforeRequestDetails,
 ): { cancel?: boolean } {
   try {
+    if (shouldSkipRestoredUrl(details.url)) {
+      return {};
+    }
     const settings = settingsForSyncCapture();
+    if (!settings) {
+      return {};
+    }
     const candidate = firefoxBeforeRequestDownloadCandidate(details, settings);
     if (!candidate) {
       return {};
@@ -603,7 +633,13 @@ function handleFirefoxHeadersReceivedSync(
   webRequest: NonNullable<ReturnType<typeof getFirefoxBlockingWebRequest>>,
 ): { cancel?: boolean } {
   try {
+    if (shouldSkipRestoredUrl(details.url)) {
+      return {};
+    }
     const settings = settingsForSyncCapture();
+    if (!settings) {
+      return {};
+    }
     const candidate = firefoxWebRequestDownloadCandidate(details, settings);
     if (!candidate) {
       return {};
