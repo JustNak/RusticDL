@@ -38,10 +38,17 @@ await esbuild.build({
 const require = createRequire(import.meta.url);
 const {
   firefoxWebRequestDownloadCandidate,
+  firefoxBeforeRequestDownloadCandidate,
+  abortFirefoxResponseBody,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
   downloadCreatedAction,
   knownDownloadBytes,
+  matchesInterceptedDownload,
+  canonicalDownloadFilename,
+  normalizeCaptureUrl,
+  shouldPauseDownloadItem,
+  urlIsClaimed,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
@@ -639,6 +646,247 @@ assert(
     },
     defaultSettings,
   ) === false,
+);
+
+console.log('\nFirefox ghost download suppression\n');
+
+assert(
+  'strips Firefox (1) collision suffix without a space',
+  canonicalDownloadFilename('Shift-At-Midnight-SteamRIP.com(1).rar')
+    === 'Shift-At-Midnight-SteamRIP.com.rar',
+);
+
+assert(
+  'strips Firefox (1) collision suffix with a space',
+  canonicalDownloadFilename('C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\Shift-At-Midnight-SteamRIP.com (1).rar')
+    === 'Shift-At-Midnight-SteamRIP.com.rar',
+);
+
+assert(
+  'does not strip a 4-digit year in the filename',
+  canonicalDownloadFilename('Game (2024).rar') === 'Game (2024).rar',
+);
+
+assert(
+  'normalizes capture URLs by dropping the hash',
+  normalizeCaptureUrl('https://cdn.example.com/file.rar#frag')
+    === 'https://cdn.example.com/file.rar',
+);
+
+const intercepted = [
+  {
+    url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+    filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+    ts: Date.now(),
+  },
+];
+
+assert(
+  'matches a ghost download item by URL after webRequest cancel',
+  matchesInterceptedDownload(
+    {
+      url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+      filename: 'Shift-At-Midnight-SteamRIP.com(1).rar',
+    },
+    intercepted,
+  ) === true,
+);
+
+assert(
+  'matches a ghost download item by filename when Firefox used a redirected URL',
+  matchesInterceptedDownload(
+    {
+      url: 'https://download.pixeldrain.com/u/eFKBSa/Skedule-I-SteamRIP.com.rar',
+      filename: 'C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\Shift-At-Midnight-SteamRIP.com(1).rar',
+    },
+    intercepted,
+  ) === true,
+);
+
+assert(
+  'does not match an unrelated download',
+  matchesInterceptedDownload(
+    {
+      url: 'https://cdn.example.com/other.zip',
+      filename: 'other.zip',
+    },
+    intercepted,
+  ) === false,
+);
+
+assert(
+  'does not match an expired intercept record',
+  matchesInterceptedDownload(
+    {
+      url: intercepted[0].url,
+      filename: intercepted[0].filename,
+    },
+    [{ ...intercepted[0], ts: Date.now() - 30_000 }],
+  ) === false,
+);
+
+assert(
+  'treats a claimed URL as already handed off',
+  urlIsClaimed(
+    'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar#x',
+    ['https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar'],
+  ) === true,
+);
+
+const gofileCdn = {
+  url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/REPO-SteamRIP.com.rar',
+  method: 'GET',
+  statusCode: 200,
+  originUrl: 'https://gofile.io/d/eFKBSa',
+  documentUrl: 'https://gofile.io/d/eFKBSa',
+  responseHeaders: [
+    { name: 'content-type', value: 'application/octet-stream' },
+    { name: 'access-control-allow-origin', value: '*' },
+    { name: 'content-length', value: String(596 * 1024 * 1024) },
+    {
+      name: 'content-disposition',
+      value: 'attachment; filename="REPO-SteamRIP.com.rar"',
+    },
+  ],
+};
+
+assert(
+  'captures Gofile CDN xhr .rar (SteamRIP-style fetch)',
+  candidate({ ...gofileCdn, type: 'xmlhttprequest' })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures Gofile CDN .rar as type=other without waiting for onCreated',
+  candidate({ ...gofileCdn, type: 'other' })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures Gofile CDN .rar even when Content-Disposition is omitted',
+  candidate({
+    ...gofileCdn,
+    type: 'xmlhttprequest',
+    responseHeaders: gofileCdn.responseHeaders.filter(
+      (header) => header.name !== 'content-disposition',
+    ),
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'pauses onCreated immediately when Firefox has not filled totalBytes yet',
+  shouldPauseDownloadItem(
+    {
+      url: gofileCdn.url,
+      filename: 'REPO-SteamRIP.com.rar',
+      mime: 'application/octet-stream',
+      totalBytes: -1,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'does not pause a known 3 KB wait-page stub',
+  shouldPauseDownloadItem(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 3280,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'cancels Gofile CDN .rar on onBeforeRequest (before any body)',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+      type: 'xmlhttprequest',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'cancels Pixeldrain object URL on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://pixeldrain.com/api/file/abc123/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'cancels Buzzheavier object CDN .rar on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'does not cancel Buzzheavier /dl wait-page named as .rar on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(steamripStub, defaultSettings) === null,
+);
+
+assert(
+  'does not cancel Gofile listing pages that are not a file URL',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://gofile.io/d/eFKBSa',
+      method: 'GET',
+      type: 'main_frame',
+    },
+    defaultSettings,
+  ) === null,
+);
+
+assert(
+  'does not cancel non-CDN .rar URLs on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://cdn.example.com/files/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  ) === null,
+);
+
+assert(
+  'respects ignoredFileExtensions on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    { ...defaultSettings, ignoredFileExtensions: ['rar'] },
+  ) === null,
+);
+
+let closed = 0;
+assert(
+  'closes the Firefox response filter so the body cannot continue',
+  abortFirefoxResponseBody(
+    {
+      filterResponseData: () => ({
+        onstart: null,
+        ondata: null,
+        onstop: null,
+        onerror: null,
+        close() {
+          closed += 1;
+        },
+      }),
+    },
+    'req-1',
+  ) === true && closed >= 1,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

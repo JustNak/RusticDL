@@ -6,10 +6,23 @@ import {
   type HostToExtensionResponse,
 } from '@rusticdl/protocol';
 import browser from './browser';
-import { downloadCreatedAction, knownDownloadBytes, shouldCaptureDownloadItem } from './captureFilter';
 import {
+  downloadCreatedAction,
+  knownDownloadBytes,
+  matchesInterceptedDownload,
+  normalizeCaptureUrl,
+  shouldCaptureDownloadItem,
+  shouldPauseDownloadItem,
+  urlIsClaimed,
+  type InterceptedDownload,
+} from './captureFilter';
+
+import {
+  abortFirefoxResponseBody,
+  firefoxBeforeRequestDownloadCandidate,
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
+  type FirefoxBeforeRequestDetails,
   type FirefoxCaptureCandidate,
   type FirefoxHeadersReceivedDetails,
 } from './firefoxCapture';
@@ -40,14 +53,24 @@ const CAPTURE_DEDUPE_TTL_MS = 15_000;
 /** Wait for Firefox to fill in totalBytes before capturing unknown-size items. */
 const SIZE_WAIT_MS = 1_500;
 const captureClaims = new Map<string, number>();
+/** URLs/filenames canceled via blocking webRequest — erase leftover download items. */
+const interceptedDownloads = new Map<string, InterceptedDownload>();
 
 type PendingSizeWait = {
   item: CapturedDownloadItem;
   timer: ReturnType<typeof setTimeout>;
 };
 const pendingSizeWaits = new Map<number, PendingSizeWait>();
+const pausedForCapture = new Set<number>();
+/** URLs we put back in Firefox after a dismissed/failed handoff — do not recapture. */
+const restoreSkipUrls = new Map<string, number>();
 
 let cachedSettings: ExtensionIntegrationSettings | null = null;
+
+/** Blocking listeners stay sync. Null until storage loads so we do not override Off/ignore. */
+function settingsForSyncCapture(): ExtensionIntegrationSettings | null {
+  return cachedSettings;
+}
 
 async function getCachedSettings(): Promise<ExtensionIntegrationSettings> {
   if (!cachedSettings) {
@@ -117,18 +140,151 @@ async function updateBrowserBadge(state: PopupStateResponse) {
   await action.setBadgeBackgroundColor?.({ color: '#2563eb' });
 }
 
-function claimCapture(url: string): boolean {
-  const now = Date.now();
+function pruneStaleClaims(now = Date.now()): void {
   for (const [key, ts] of captureClaims) {
     if (now - ts > CAPTURE_DEDUPE_TTL_MS) captureClaims.delete(key);
   }
-  if (captureClaims.has(url)) return false;
-  captureClaims.set(url, now);
+  for (const [key, entry] of interceptedDownloads) {
+    if (now - entry.ts > CAPTURE_DEDUPE_TTL_MS) interceptedDownloads.delete(key);
+  }
+  for (const [key, ts] of restoreSkipUrls) {
+    if (now - ts > CAPTURE_DEDUPE_TTL_MS) restoreSkipUrls.delete(key);
+  }
+}
+
+function rememberRestoreSkip(url: string): void {
+  pruneStaleClaims();
+  restoreSkipUrls.set(normalizeCaptureUrl(url), Date.now());
+}
+
+function shouldSkipRestoredUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  pruneStaleClaims();
+  return restoreSkipUrls.has(normalizeCaptureUrl(url));
+}
+
+function claimCapture(url: string): boolean {
+  const key = normalizeCaptureUrl(url);
+  const now = Date.now();
+  pruneStaleClaims(now);
+  if (captureClaims.has(key)) return false;
+  captureClaims.set(key, now);
   return true;
 }
 
 function releaseCapture(url: string): void {
-  captureClaims.delete(url);
+  captureClaims.delete(normalizeCaptureUrl(url));
+}
+
+function rememberInterceptedDownload(url: string, filename?: string): void {
+  const key = normalizeCaptureUrl(url);
+  const now = Date.now();
+  pruneStaleClaims(now);
+  interceptedDownloads.set(key, { url: key, filename, ts: now });
+}
+
+function isClaimedItem(item: CapturedDownloadItem): boolean {
+  return (
+    urlIsClaimed(item.finalUrl || item.url, captureClaims.keys())
+    || urlIsClaimed(item.url, captureClaims.keys())
+  );
+}
+
+function shouldEraseBrowserGhost(item: CapturedDownloadItem): boolean {
+  pruneStaleClaims();
+  if (isClaimedItem(item)) return true;
+  if (!matchesInterceptedDownload(item, interceptedDownloads.values(), Date.now(), CAPTURE_DEDUPE_TTL_MS)) {
+    return false;
+  }
+  // webRequest ghosts are interrupted/complete. An in_progress item with no
+  // active claim is a later retry after a failed handoff — let it fall through.
+  return item.state !== 'in_progress';
+}
+
+function requestPause(id: number): void {
+  pausedForCapture.add(id);
+  void pauseBrowserDownload(id);
+}
+
+async function pauseBrowserDownload(id: number): Promise<void> {
+  try {
+    await browser.downloads.pause(id);
+  } catch {
+    // already finished, interrupted, or pause is unavailable
+  }
+}
+
+async function resumeBrowserDownload(id: number): Promise<void> {
+  pausedForCapture.delete(id);
+  try {
+    await browser.downloads.resume(id);
+  } catch {
+    // user canceled, already complete, or resume is unavailable
+  }
+}
+
+/** Cancel and drop the Firefox/Chrome shelf item so a handed-off file does not linger as failed. */
+async function eraseBrowserDownload(id: number): Promise<void> {
+  pausedForCapture.delete(id);
+  try {
+    await browser.downloads.cancel(id);
+  } catch {
+    // may already be canceled / interrupted by webRequest
+  }
+  try {
+    await browser.downloads.removeFile(id);
+  } catch {
+    // no dest file, or already gone — the usual "File moved or missing" case
+  }
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const erased = await browser.downloads.erase({ id });
+      if (erased.length > 0) return;
+    } catch {
+      // Firefox sometimes rejects erase until state settles after cancel
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+  }
+}
+
+/**
+ * Stop the shelf item before any await. Known captures are canceled immediately
+ * so Ask-mode does not sit on "Paused — 30 MB of 2.5 GB". Unknown-size items
+ * are only paused until we can tell a stub from a real file.
+ */
+function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
+  if (item.byExtensionId) return;
+  if (shouldEraseBrowserGhost(item)) {
+    void eraseBrowserDownload(item.id);
+    return;
+  }
+  const settings = settingsForSyncCapture();
+  if (!settings) return;
+  const action = downloadCreatedAction(item, settings);
+  if (action === 'capture') {
+    void eraseBrowserDownload(item.id);
+    return;
+  }
+  if (action === 'wait' || shouldPauseDownloadItem(item, settings)) {
+    requestPause(item.id);
+  }
+}
+
+async function restoreBrowserDownload(snapshot: {
+  url: string;
+  filename?: string;
+}): Promise<void> {
+  rememberRestoreSkip(snapshot.url);
+  try {
+    const options: { url: string; filename?: string } = { url: snapshot.url };
+    const name = snapshot.filename?.split(/[\\/]/).pop();
+    if (name && !/[\\/:]/.test(name)) {
+      options.filename = name;
+    }
+    await browser.downloads.download(options);
+  } catch {
+    restoreSkipUrls.delete(normalizeCaptureUrl(snapshot.url));
+  }
 }
 
 /** True when desktop accepted the handoff (queued or already tracked). */
@@ -149,6 +305,8 @@ type CapturedDownloadItem = browser.downloads.DownloadItem & {
   bytesReceived?: number;
 };
 
+type HandoffAttempt = 'accepted' | 'already_claimed' | 'rejected';
+
 async function handOffUrl(
   url: string,
   settings: ExtensionIntegrationSettings,
@@ -159,8 +317,8 @@ async function handOffUrl(
     incognito?: boolean;
     cookieStoreId?: string;
   } = {},
-): Promise<boolean> {
-  if (!claimCapture(url)) return false;
+): Promise<HandoffAttempt> {
+  if (!claimCapture(url)) return 'already_claimed';
 
   const source = {
     entryPoint: 'browser_download' as const,
@@ -194,12 +352,12 @@ async function handOffUrl(
       );
       await updateBrowserBadge(state);
     }
-    return false;
+    return 'rejected';
   }
 
   const state = await setLastResult('connected', response);
   await updateBrowserBadge(state);
-  return true;
+  return 'accepted';
 }
 
 async function handoffBrowserDownload(
@@ -209,10 +367,15 @@ async function handoffBrowserDownload(
   const url = item.finalUrl || item.url;
   if (!url) return;
 
-  // Hand off first. Only cancel/erase the browser download after RusticDL accepts it
-  // so a down desktop / dismissed ask prompt does not lose the file.
-  const ok = await handOffUrl(url, settings, {
-    suggestedFilename: item.filename?.split(/[\\/]/).pop(),
+  const suggestedFilename = item.filename?.split(/[\\/]/).pop();
+
+  // Drop the Firefox item before the desktop ask prompt. Pause still lets the
+  // shelf show "30 MB of 2.5 GB" while the user confirms. Restore only if the
+  // desktop rejects or the user dismisses.
+  await eraseBrowserDownload(item.id);
+
+  const attempt = await handOffUrl(url, settings, {
+    suggestedFilename,
     totalBytes: knownDownloadBytes(item),
   }, {
     pageUrl: item.referrer,
@@ -220,17 +383,9 @@ async function handoffBrowserDownload(
     incognito: item.incognito,
     cookieStoreId: item.cookieStoreId,
   });
-  if (!ok) return;
 
-  try {
-    await browser.downloads.cancel(item.id);
-  } catch {
-    // may already be canceled
-  }
-  try {
-    await browser.downloads.erase({ id: item.id });
-  } catch {
-    // optional cleanup
+  if (attempt === 'rejected') {
+    await restoreBrowserDownload({ url, filename: suggestedFilename });
   }
 }
 
@@ -305,19 +460,48 @@ async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<Captu
 }
 
 async function finalizePendingCapture(item: CapturedDownloadItem) {
+  if (shouldEraseBrowserGhost(item)) {
+    await eraseBrowserDownload(item.id);
+    return;
+  }
   const settings = await getCachedSettings();
-  if (!shouldCaptureDownloadItem(item, settings)) return;
+  if (!shouldCaptureDownloadItem(item, settings)) {
+    if (pausedForCapture.has(item.id)) {
+      await resumeBrowserDownload(item.id);
+    }
+    return;
+  }
   await handoffBrowserDownload(item, settings);
 }
 
 async function onDownloadCreated(item: CapturedDownloadItem) {
+  // webRequest already canceled this transfer; the downloads API still emits a
+  // failed shelf item. Drop it before any size-wait / second handoff.
+  if (shouldEraseBrowserGhost(item)) {
+    await eraseBrowserDownload(item.id);
+    return;
+  }
+
   const settings = await getCachedSettings();
+  if (shouldEraseBrowserGhost(item)) {
+    await eraseBrowserDownload(item.id);
+    return;
+  }
+
   const action = downloadCreatedAction(item, settings);
+  if (action === 'ignore') {
+    if (pausedForCapture.has(item.id)) {
+      await resumeBrowserDownload(item.id);
+    }
+    return;
+  }
+
+  requestPause(item.id);
+
   if (action === 'capture') {
     await handoffBrowserDownload(item, settings);
     return;
   }
-  if (action !== 'wait') return;
 
   const timer = setTimeout(() => {
     const pending = pendingSizeWaits.get(item.id);
@@ -335,6 +519,12 @@ function onDownloadChanged(delta: DownloadChangeDelta) {
   const merged = mergeDownloadDelta(pending.item, delta);
   pending.item = merged;
 
+  if (shouldEraseBrowserGhost(merged)) {
+    clearPendingSizeWait(delta.id);
+    void eraseBrowserDownload(delta.id);
+    return;
+  }
+
   const known = knownDownloadBytes(merged);
   const state = deltaCurrent(delta.state);
   if (known == null && state !== 'complete') return;
@@ -351,7 +541,7 @@ async function handoffFirefoxCandidate(
   candidate: FirefoxCaptureCandidate,
   settings: ExtensionIntegrationSettings,
 ) {
-  await handOffUrl(candidate.url, settings, {
+  const attempt = await handOffUrl(candidate.url, settings, {
     suggestedFilename: candidate.filename,
     totalBytes: candidate.totalBytes,
   }, {
@@ -360,50 +550,102 @@ async function handoffFirefoxCandidate(
     incognito: candidate.incognito,
     cookieStoreId: candidate.cookieStoreId,
   });
+  if (attempt === 'rejected') {
+    await restoreBrowserDownload({
+      url: candidate.url,
+      filename: candidate.filename,
+    });
+  }
 }
 
 function registerFirefoxWebRequestInterception() {
   const webRequest = getFirefoxBlockingWebRequest();
   if (!webRequest) return;
 
+  const filter = {
+    urls: ['http://*/*', 'https://*/*'],
+    // xmlhttprequest is included so file-host CDNs (Gofile/Pixeldrain fetch)
+    // can be handed off before they become an uncatchable blob: download.
+    types: ['main_frame', 'object', 'other', 'xmlhttprequest'],
+  };
+
+  webRequest.onBeforeRequest?.addListener(
+    (details: FirefoxBeforeRequestDetails) => handleFirefoxBeforeRequestSync(details),
+    filter,
+    ['blocking'],
+  );
+
   webRequest.onHeadersReceived.addListener(
-    (details: FirefoxHeadersReceivedDetails) => {
-      // Listener must return cancel synchronously when possible; we use a promise-safe path.
-      return handleFirefoxHeadersReceived(details);
-    },
-    {
-      urls: ['http://*/*', 'https://*/*'],
-      // xmlhttprequest is included so file-host CDNs (Gofile/Pixeldrain fetch)
-      // can be handed off before they become an uncatchable blob: download.
-      // Heuristics still reject tiny/XHR-API noise (see firefoxCapture).
-      types: ['main_frame', 'object', 'other', 'xmlhttprequest'],
-    },
+    (details: FirefoxHeadersReceivedDetails) =>
+      handleFirefoxHeadersReceivedSync(details, webRequest),
+    filter,
     ['blocking', 'responseHeaders'],
   );
 }
 
-async function handleFirefoxHeadersReceived(
-  details: FirefoxHeadersReceivedDetails,
-): Promise<{ cancel?: boolean }> {
+function acceptFirefoxCandidate(
+  candidate: FirefoxCaptureCandidate,
+  settings: ExtensionIntegrationSettings,
+  detailsType?: string,
+): { cancel: true } {
+  if (settings.downloadCaptureDebugLogging) {
+    console.info('[RusticDL] capture candidate', {
+      reason: candidate.reason,
+      url: candidate.url,
+      filename: candidate.filename,
+      totalBytes: candidate.totalBytes,
+      type: detailsType,
+    });
+  }
+  rememberInterceptedDownload(candidate.url, candidate.filename);
+  void handoffFirefoxCandidate(candidate, settings);
+  return { cancel: true };
+}
+
+/** Cancel Gofile/Pixeldrain/Buzzheavier object URLs before any body is read. */
+function handleFirefoxBeforeRequestSync(
+  details: FirefoxBeforeRequestDetails,
+): { cancel?: boolean } {
   try {
-    const settings = await getCachedSettings();
+    if (shouldSkipRestoredUrl(details.url)) {
+      return {};
+    }
+    const settings = settingsForSyncCapture();
+    if (!settings) {
+      return {};
+    }
+    const candidate = firefoxBeforeRequestDownloadCandidate(details, settings);
+    if (!candidate) {
+      return {};
+    }
+    return acceptFirefoxCandidate(candidate, settings, details.type);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Must stay synchronous. `{ cancel: true }` is ignored after Firefox attaches a
+ * download, so also close the response stream to stop the body.
+ */
+function handleFirefoxHeadersReceivedSync(
+  details: FirefoxHeadersReceivedDetails,
+  webRequest: NonNullable<ReturnType<typeof getFirefoxBlockingWebRequest>>,
+): { cancel?: boolean } {
+  try {
+    if (shouldSkipRestoredUrl(details.url)) {
+      return {};
+    }
+    const settings = settingsForSyncCapture();
+    if (!settings) {
+      return {};
+    }
     const candidate = firefoxWebRequestDownloadCandidate(details, settings);
     if (!candidate) {
       return {};
     }
-    if (settings.downloadCaptureDebugLogging) {
-      console.info('[RusticDL] capture candidate', {
-        reason: candidate.reason,
-        url: candidate.url,
-        filename: candidate.filename,
-        totalBytes: candidate.totalBytes,
-        type: details.type,
-      });
-    }
-    // Blocking listeners must decide cancel synchronously-ish; we still only cancel
-    // after claiming, and handOffUrl releases the claim if the desktop rejects.
-    void handoffFirefoxCandidate(candidate, settings);
-    return { cancel: true };
+    abortFirefoxResponseBody(webRequest, details.requestId);
+    return acceptFirefoxCandidate(candidate, settings, details.type);
   } catch {
     return {};
   }
@@ -465,6 +707,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 registerFirefoxWebRequestInterception();
 if (browser.downloads?.onCreated) {
   browser.downloads.onCreated.addListener((item) => {
+    pauseIfLikelyCapture(item);
     void onDownloadCreated(item);
   });
 }

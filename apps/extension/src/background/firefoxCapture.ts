@@ -50,10 +50,15 @@ export type FirefoxCaptureCandidate = {
 
 export {
   MIN_CAPTURE_BYTES,
+  canonicalDownloadFilename,
   downloadCreatedAction,
   knownDownloadBytes,
+  matchesInterceptedDownload,
+  normalizeCaptureUrl,
   shouldCaptureDownloadItem,
+  shouldPauseDownloadItem,
   shouldWaitForDownloadSize,
+  urlIsClaimed,
 } from './captureFilter';
 
 const DOWNLOAD_MIME = new Set([
@@ -360,17 +365,154 @@ export function firefoxWebRequestDownloadCandidate(
   };
 }
 
+/**
+ * Object CDNs only. Apex /dl/ hosts (buzzheavier.com, gofile.io) serve HTML
+ * wait-pages that can still be named Game.rar — those stay on headersReceived.
+ */
+export function isFileHostObjectCdnHost(host: string): boolean {
+  const name = host.toLowerCase();
+  if (name === 'gofile.io' || name === 'www.gofile.io') return false;
+  if (name === 'buzzheavier.com' || name === 'www.buzzheavier.com') return false;
+  if (name.endsWith('.gofile.io')) return true;
+  if (name === 'pixeldrain.com' || name.endsWith('.pixeldrain.com')) return true;
+  if (name === 'cdn.buzzheavier.com' || name.endsWith('.cdn.buzzheavier.com')) return true;
+  return false;
+}
+
+export type FirefoxBeforeRequestDetails = {
+  requestId?: string;
+  url: string;
+  originUrl?: string;
+  documentUrl?: string;
+  method?: string;
+  type?: string;
+  incognito?: boolean;
+  cookieStoreId?: string;
+};
+
+/**
+ * Cancel known file-host CDN object URLs before Firefox classifies them as a
+ * download. `{ cancel: true }` on onHeadersReceived is ignored once Firefox
+ * has already attached a download (Gofile then shows "Paused — 30 MB of 2.5 GB").
+ */
+export function firefoxBeforeRequestDownloadCandidate(
+  details: FirefoxBeforeRequestDetails,
+  settings: ExtensionIntegrationSettings,
+): FirefoxCaptureCandidate | null {
+  if (!settings.enabled || settings.downloadHandoffMode === 'off') {
+    return null;
+  }
+  const method = (details.method ?? 'GET').toUpperCase();
+  if (method !== 'GET') {
+    return null;
+  }
+  const url = details.url;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    return null;
+  }
+  if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) {
+    return null;
+  }
+
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return null;
+  }
+  if (!isFileHostObjectCdnHost(host)) {
+    return null;
+  }
+
+  const filename = basenameFromUrl(url);
+  const ext = extensionOf(filename);
+  if (!ext || isWeakCaptureExtension(ext)) {
+    return null;
+  }
+  const ignored = new Set(
+    (settings.ignoredFileExtensions ?? []).map((value) => value.toLowerCase()),
+  );
+  if (ignored.has(ext)) {
+    return null;
+  }
+  const captured = new Set(settings.capturedFileExtensions.map((value) => value.toLowerCase()));
+  if (!captured.has(ext)) {
+    return null;
+  }
+
+  return {
+    url,
+    filename,
+    pageUrl: details.documentUrl || details.originUrl,
+    referrer: details.originUrl || details.documentUrl,
+    incognito: details.incognito,
+    cookieStoreId: details.cookieStoreId,
+    reason: 'file_host_cdn_url',
+  };
+}
+
+export type FirefoxStreamFilter = {
+  onstart: ((event: unknown) => void) | null;
+  ondata: ((event: unknown) => void) | null;
+  onstop: ((event: unknown) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  close(): void;
+};
+
+type BlockingListener = (
+  details: FirefoxHeadersReceivedDetails,
+) => { cancel?: boolean } | Promise<{ cancel?: boolean }>;
+
 type BlockingWebRequest = {
   onHeadersReceived: {
     addListener(
-      listener: (
-        details: FirefoxHeadersReceivedDetails,
-      ) => { cancel?: boolean } | Promise<{ cancel?: boolean }>,
+      listener: BlockingListener,
       filter: { urls: string[]; types?: string[] },
       extraInfoSpec: string[],
     ): void;
   };
+  onBeforeRequest?: {
+    addListener(
+      listener: (
+        details: FirefoxBeforeRequestDetails,
+      ) => { cancel?: boolean },
+      filter: { urls: string[]; types?: string[] },
+      extraInfoSpec: string[],
+    ): void;
+  };
+  filterResponseData?: (requestId: string) => FirefoxStreamFilter;
 };
+
+/**
+ * Close the response stream so Firefox cannot keep reading the file after it
+ * has already turned the request into a download (cancel is ignored then).
+ */
+export function abortFirefoxResponseBody(
+  webRequest: Pick<BlockingWebRequest, 'filterResponseData'>,
+  requestId: string | undefined,
+): boolean {
+  if (!requestId || !webRequest.filterResponseData) {
+    return false;
+  }
+  try {
+    const filter = webRequest.filterResponseData(requestId);
+    const close = () => {
+      try {
+        filter.close();
+      } catch {
+        // already closed
+      }
+    };
+    filter.onstart = close;
+    filter.ondata = close;
+    filter.onstop = close;
+    filter.onerror = close;
+    close();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function getFirefoxBlockingWebRequest(): BlockingWebRequest | null {
   const wr = (browser as unknown as { webRequest?: BlockingWebRequest }).webRequest;
