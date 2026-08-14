@@ -73,7 +73,9 @@ pub(crate) fn render_detail(
     let terminal = job.state.is_terminal();
     let size = format_size(job);
     let date = format_date(job.display_date());
-    let kind_label = FileTypeKind::from_filename(&job.filename).label().to_string();
+    let kind_label = FileTypeKind::from_filename(&job.filename)
+        .label()
+        .to_string();
     let file_ext = file_extension_label(&job.filename);
     let speed = if matches!(job.state, JobState::Downloading | JobState::Starting) {
         format_speed(job.speed)
@@ -201,8 +203,7 @@ pub(crate) fn render_detail(
                                                                 .iter()
                                                                 .find(|j| j.id == id)
                                                             {
-                                                                if job.state
-                                                                    != JobState::Completed
+                                                                if job.state != JobState::Completed
                                                                 {
                                                                     return;
                                                                 }
