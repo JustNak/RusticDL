@@ -39,19 +39,30 @@ impl BrowserPromptWindow {
         )
     }
 
-    pub(super) fn resolve_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let filename = match self.current_collision(cx) {
-            Some(collision) => Some(collision.suggested_unique_name),
-            None => {
-                let name = self.current_conflict_name(cx);
-                if name.is_empty() {
-                    None
-                } else {
-                    Some(name)
-                }
-            }
+    /// Put a free `file (n).ext` into the filename field. Does not start the job.
+    pub(super) fn apply_suggested_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(suggested) = self.current_collision(cx).map(|c| c.suggested_unique_name) else {
+            return;
         };
-        self.resolve_accept(filename, false, window, cx);
+        let Some(input) = self.name_input.clone() else {
+            return;
+        };
+        input.update(cx, |state, cx| {
+            state.set_value(suggested, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn resolve_start_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_collision(cx).is_some() {
+            return;
+        }
+        let name = self.current_conflict_name(cx);
+        if name.is_empty() {
+            return;
+        }
+        self.resolve_accept(Some(name), false, window, cx);
     }
 
     pub(super) fn resolve_overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -105,17 +116,12 @@ impl BrowserPromptWindow {
         } else {
             format!("“{display_name}” is available.")
         };
-        let hint = if name_taken && blocks_overwrite {
-            format!("Rename will save as {unique_preview}. Overwrite is unavailable.")
-        } else if name_taken {
-            format!("Rename will save as {unique_preview}.")
+        let hint = if name_taken {
+            format!(
+                "Change the filename below, then click Start download. Suggested: {unique_preview}."
+            )
         } else {
-            "Start download will keep this name.".into()
-        };
-        let primary_label = if name_taken {
-            "Rename"
-        } else {
-            "Start download"
+            "This name is available. Click Start download to keep it.".into()
         };
 
         v_flex()
@@ -195,13 +201,22 @@ impl BrowserPromptWindow {
                                     this.resolve_overwrite(window, cx);
                                 })),
                         )
+                        .child(
+                            Button::new("conflict-rename")
+                                .label("Rename")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_suggested_rename(window, cx);
+                                })),
+                        )
                     })
                     .child(
-                        Button::new("conflict-rename")
-                            .label(primary_label)
+                        Button::new("conflict-start")
+                            .label("Start download")
                             .primary()
+                            .disabled(name_taken)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.resolve_rename(window, cx);
+                                this.resolve_start_download(window, cx);
                             })),
                     ),
             )

@@ -55,6 +55,12 @@ impl BrowserPromptWindow {
                 .default_value(prompt.default_directory.to_string_lossy().to_string())
         });
 
+        if opens_conflict {
+            name_input.update(cx, |state, cx| {
+                state.focus(window, cx);
+            });
+        }
+
         window.activate_window();
         start_sync_timer(cx);
 

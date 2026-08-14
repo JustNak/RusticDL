@@ -28,7 +28,7 @@ Supported types:
 
 - `ping` / `get_status`
 - `enqueue_download`
-- `prompt_download` — desktop shows an in-app confirm dialog (filename + save folder). If that name already exists in the save folder, a file-exists popup is shown instead (rename / overwrite / cancel). User can start or dismiss; 5-minute timeout dismisses. The extension protocol is unchanged.
+- `prompt_download` — desktop shows an in-app confirm dialog (filename + save folder). If that name already exists in the save folder, a file-exists popup is shown instead (edit/suggest a new name then start, overwrite, or cancel). User can start or dismiss; 5-minute timeout dismisses. The extension protocol is unchanged.
 - `open_app`
 - `save_extension_settings`
 
