@@ -2,11 +2,15 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
+use gpui::{
+    div, prelude::FluentBuilder, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
+};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
+    tooltip::Tooltip,
     v_flex, ActiveTheme, Disableable, IconName, StyledExt,
 };
 
@@ -117,12 +121,18 @@ impl BrowserPromptWindow {
             format!("“{display_name}” is available.")
         };
         let hint = if name_taken {
-            format!(
-                "Change the filename below, then click Start download. Suggested: {unique_preview}."
-            )
+            format!("Pick a different name, or click Rename for {unique_preview}.")
         } else {
             "This name is available. Click Start download to keep it.".into()
         };
+        let hint_color = if name_taken { theme.danger } else { muted };
+        let start_button = Button::new("conflict-start")
+            .label("Start download")
+            .disabled(name_taken)
+            .when(!name_taken, |btn| btn.primary())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.resolve_start_download(window, cx);
+            }));
 
         v_flex()
             .gap_3()
@@ -145,6 +155,15 @@ impl BrowserPromptWindow {
                     .child(div().text_xs().font_medium().child("Filename"))
                     .when_some(self.name_input.as_ref(), |el, input| {
                         el.child(Input::new(input).w_full())
+                    })
+                    .when(name_taken, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(theme.danger)
+                                .child("Duplicate Name"),
+                        )
                     }),
             )
             .child(
@@ -175,7 +194,7 @@ impl BrowserPromptWindow {
                             .text_color(muted)
                             .child(format!("Preview: {save_preview}")),
                     )
-                    .child(div().text_xs().text_color(muted).child(hint)),
+                    .child(div().text_xs().text_color(hint_color).child(hint)),
             )
             .child(
                 h_flex()
@@ -211,13 +230,19 @@ impl BrowserPromptWindow {
                         )
                     })
                     .child(
-                        Button::new("conflict-start")
-                            .label("Start download")
-                            .primary()
-                            .disabled(name_taken)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.resolve_start_download(window, cx);
-                            })),
+                        div()
+                            .id("conflict-start-wrap")
+                            .when(name_taken, |el| {
+                                let danger = theme.danger;
+                                el.tooltip(move |window, cx| {
+                                    Tooltip::new("Duplicate Name")
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(danger)
+                                        .build(window, cx)
+                                })
+                            })
+                            .child(start_button),
                     ),
             )
             .into_any_element()
