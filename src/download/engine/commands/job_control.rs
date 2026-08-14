@@ -19,6 +19,7 @@ pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
     job.state = JobState::Failed;
     job.error = Some(RESUME_RESTART_MESSAGE.into());
     job.failure_category = Some(FailureCategory::Resume);
+    job.mark_finished();
     if let Some(reason) = policy.fallback_reason() {
         job.fallback_reason = Some(reason.to_string());
     }
@@ -59,6 +60,7 @@ pub(super) async fn resume(inner: &Arc<Mutex<EngineInner>>, id: String) {
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;
+            job.clear_finished();
             job.speed = 0;
             if let Some(ctrl) = guard.controls.get(&id) {
                 store_control(ctrl, WorkerControl::Continue);
@@ -102,6 +104,7 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             // worker finalizer sets Canceled after control flag is observed.
             if !matches!(job.state, JobState::Downloading | JobState::Starting) {
                 job.state = JobState::Canceled;
+                job.mark_finished();
                 job.speed = 0;
                 job.eta_secs = 0;
             }
@@ -151,6 +154,7 @@ pub(super) async fn retry(inner: &Arc<Mutex<EngineInner>>, id: String) {
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;
+            job.clear_finished();
             job.retry_attempts = 0;
             job.speed = 0;
             job.eta_secs = 0;
@@ -189,6 +193,7 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
         job.eta_secs = 0;
         job.error = None;
         job.failure_category = None;
+        job.clear_finished();
         job.retry_attempts = 0;
         job.clear_transfer_identity();
         job.resume_supported = false;

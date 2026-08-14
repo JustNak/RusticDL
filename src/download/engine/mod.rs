@@ -463,6 +463,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                     Ok(DownloadOutcome::Canceled) => {
                         if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
                             job.state = JobState::Canceled;
+                            job.mark_finished();
                             clear_live_metrics(job);
                             if partial_to_delete.is_some() {
                                 job.clear_partial_and_identity();
@@ -484,6 +485,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                                 }
                                 2 => {
                                     job.state = JobState::Canceled;
+                                    job.mark_finished();
                                     clear_live_metrics(job);
                                     if partial_to_delete.is_some() {
                                         job.clear_partial_and_identity();
@@ -716,6 +718,7 @@ fn apply_failed_lifecycle(job: &mut Job, error: super::job::DownloadError) {
     job.state = JobState::Failed;
     job.error = Some(error.message);
     job.failure_category = Some(error.category);
+    job.mark_finished();
     clear_live_metrics(job);
 }
 

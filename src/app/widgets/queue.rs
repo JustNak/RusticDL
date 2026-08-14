@@ -190,6 +190,17 @@ impl FileTypeKind {
     }
 }
 
+/// Lowercase file extension for the detail File field (`mp3`, `mp4`).
+/// Compound names like `video.mkv.zip` report the last segment (`zip`).
+pub(crate) fn file_extension_label(filename: &str) -> String {
+    std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "—".into())
+}
+
 /// File-type tile with a status badge overlaid at the bottom-right.
 pub(crate) fn file_type_status_tile(
     job_id: &str,
@@ -259,6 +270,14 @@ pub(crate) fn name_char_budget(main_w: f32, cols: QueueColumns) -> usize {
     ((name_px / 8.0) as usize).clamp(16, 200)
 }
 
+/// How many characters fit the detail-panel filename (header minus badge + close).
+pub(crate) fn detail_name_char_budget(main_w: f32) -> usize {
+    // Horizontal chrome: panel padding, status icon, Completed tag, close, gaps.
+    let used = 40.0 + 16.0 + 96.0 + 28.0 + 24.0;
+    let name_px = (main_w - used).max(200.0);
+    ((name_px / 8.0) as usize).clamp(40, 280)
+}
+
 /// Force a visible "..." when the label is longer than the name column can show.
 /// (GPUI's text-overflow ellipsis is unreliable for this flex layout.)
 pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
@@ -273,7 +292,10 @@ pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize_name, name_char_budget, QueueColumns};
+    use super::{
+        detail_name_char_budget, ellipsize_name, file_extension_label, name_char_budget,
+        FileTypeKind, QueueColumns,
+    };
 
     #[test]
     fn ellipsize_keeps_short_names() {
@@ -298,5 +320,28 @@ mod tests {
         };
         assert!(name_char_budget(900.0, cols) >= 16);
         assert!(name_char_budget(0.0, cols) >= 16);
+    }
+
+    #[test]
+    fn detail_name_budget_fits_long_release_names() {
+        let name = "HELL.MODE.S02E02.A.NEW.FRIEND.1080p.HIDI.WEB-DL.AAC2.0.H.264-VARYG.mkv.zip";
+        assert!(detail_name_char_budget(1100.0) >= name.chars().count());
+        assert!(detail_name_char_budget(0.0) >= 40);
+    }
+
+    #[test]
+    fn file_extension_label_uses_last_segment() {
+        assert_eq!(file_extension_label("movie.mkv.zip"), "zip");
+        assert_eq!(file_extension_label("track.FLAC"), "flac");
+        assert_eq!(file_extension_label("song.mp3"), "mp3");
+        assert_eq!(file_extension_label("README"), "—");
+    }
+
+    #[test]
+    fn file_type_kind_from_common_extensions() {
+        assert_eq!(FileTypeKind::from_filename("clip.mp4").label(), "Video");
+        assert_eq!(FileTypeKind::from_filename("song.mp3").label(), "Audio");
+        assert_eq!(FileTypeKind::from_filename("pack.zip").label(), "Archive");
+        assert_eq!(FileTypeKind::from_filename("notes").label(), "File");
     }
 }
