@@ -45,6 +45,7 @@ const {
   matchesInterceptedDownload,
   canonicalDownloadFilename,
   normalizeCaptureUrl,
+  shouldPauseDownloadItem,
   urlIsClaimed,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
@@ -728,6 +729,70 @@ assert(
     'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar#x',
     ['https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar'],
   ) === true,
+);
+
+const gofileCdn = {
+  url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/REPO-SteamRIP.com.rar',
+  method: 'GET',
+  statusCode: 200,
+  originUrl: 'https://gofile.io/d/eFKBSa',
+  documentUrl: 'https://gofile.io/d/eFKBSa',
+  responseHeaders: [
+    { name: 'content-type', value: 'application/octet-stream' },
+    { name: 'access-control-allow-origin', value: '*' },
+    { name: 'content-length', value: String(596 * 1024 * 1024) },
+    {
+      name: 'content-disposition',
+      value: 'attachment; filename="REPO-SteamRIP.com.rar"',
+    },
+  ],
+};
+
+assert(
+  'captures Gofile CDN xhr .rar (SteamRIP-style fetch)',
+  candidate({ ...gofileCdn, type: 'xmlhttprequest' })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures Gofile CDN .rar as type=other without waiting for onCreated',
+  candidate({ ...gofileCdn, type: 'other' })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'captures Gofile CDN .rar even when Content-Disposition is omitted',
+  candidate({
+    ...gofileCdn,
+    type: 'xmlhttprequest',
+    responseHeaders: gofileCdn.responseHeaders.filter(
+      (header) => header.name !== 'content-disposition',
+    ),
+  })?.reason === 'download_mime_navigation',
+);
+
+assert(
+  'pauses onCreated immediately when Firefox has not filled totalBytes yet',
+  shouldPauseDownloadItem(
+    {
+      url: gofileCdn.url,
+      filename: 'REPO-SteamRIP.com.rar',
+      mime: 'application/octet-stream',
+      totalBytes: -1,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'does not pause a known 3 KB wait-page stub',
+  shouldPauseDownloadItem(
+    {
+      url: steamripStub.url,
+      filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+      mime: 'application/x-rar-compressed',
+      totalBytes: 3280,
+    },
+    defaultSettings,
+  ) === false,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -228,6 +228,15 @@ export function downloadCreatedAction(
   return 'ignore';
 }
 
+/** Pause immediately — do not let Firefox keep reading the body while we wait or hand off. */
+export function shouldPauseDownloadItem(
+  item: DownloadItemLike,
+  settings: ExtensionIntegrationSettings,
+): boolean {
+  const action = downloadCreatedAction(item, settings);
+  return action === 'capture' || action === 'wait';
+}
+
 /** Strip hash so the same file is recognized after a fragment-only change. */
 export function normalizeCaptureUrl(url: string): string {
   try {

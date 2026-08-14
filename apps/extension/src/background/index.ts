@@ -12,9 +12,11 @@ import {
   matchesInterceptedDownload,
   normalizeCaptureUrl,
   shouldCaptureDownloadItem,
+  shouldPauseDownloadItem,
   urlIsClaimed,
   type InterceptedDownload,
 } from './captureFilter';
+import { createDefaultExtensionSettings } from '../shared/defaultExtensionSettings';
 import {
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
@@ -56,8 +58,14 @@ type PendingSizeWait = {
   timer: ReturnType<typeof setTimeout>;
 };
 const pendingSizeWaits = new Map<number, PendingSizeWait>();
+const pausedForCapture = new Set<number>();
 
 let cachedSettings: ExtensionIntegrationSettings | null = null;
+
+/** Blocking webRequest must not await; use cache or defaults so cancel is synchronous. */
+function settingsForSyncCapture(): ExtensionIntegrationSettings {
+  return cachedSettings ?? createDefaultExtensionSettings();
+}
 
 async function getCachedSettings(): Promise<ExtensionIntegrationSettings> {
   if (!cachedSettings) {
@@ -174,6 +182,11 @@ function shouldEraseBrowserGhost(item: CapturedDownloadItem): boolean {
   return item.state !== 'in_progress';
 }
 
+function requestPause(id: number): void {
+  pausedForCapture.add(id);
+  void pauseBrowserDownload(id);
+}
+
 async function pauseBrowserDownload(id: number): Promise<void> {
   try {
     await browser.downloads.pause(id);
@@ -183,6 +196,7 @@ async function pauseBrowserDownload(id: number): Promise<void> {
 }
 
 async function resumeBrowserDownload(id: number): Promise<void> {
+  pausedForCapture.delete(id);
   try {
     await browser.downloads.resume(id);
   } catch {
@@ -192,6 +206,7 @@ async function resumeBrowserDownload(id: number): Promise<void> {
 
 /** Cancel and drop the Firefox/Chrome shelf item so a handed-off file does not linger as failed. */
 async function eraseBrowserDownload(id: number): Promise<void> {
+  pausedForCapture.delete(id);
   try {
     await browser.downloads.cancel(id);
   } catch {
@@ -210,6 +225,21 @@ async function eraseBrowserDownload(id: number): Promise<void> {
       // Firefox sometimes rejects erase until state settles after cancel
     }
     await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+  }
+}
+
+/**
+ * Kick off pause before any await. Firefox onCreated often has totalBytes: -1
+ * (`wait`); leaving that unpaused is how 40+ MB lands in the shelf first.
+ */
+function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
+  if (item.byExtensionId) return;
+  if (shouldEraseBrowserGhost(item)) {
+    void eraseBrowserDownload(item.id);
+    return;
+  }
+  if (shouldPauseDownloadItem(item, settingsForSyncCapture())) {
+    requestPause(item.id);
   }
 }
 
@@ -398,7 +428,12 @@ async function finalizePendingCapture(item: CapturedDownloadItem) {
     return;
   }
   const settings = await getCachedSettings();
-  if (!shouldCaptureDownloadItem(item, settings)) return;
+  if (!shouldCaptureDownloadItem(item, settings)) {
+    if (pausedForCapture.has(item.id)) {
+      await resumeBrowserDownload(item.id);
+    }
+    return;
+  }
   await handoffBrowserDownload(item, settings);
 }
 
@@ -417,11 +452,19 @@ async function onDownloadCreated(item: CapturedDownloadItem) {
   }
 
   const action = downloadCreatedAction(item, settings);
+  if (action === 'ignore') {
+    if (pausedForCapture.has(item.id)) {
+      await resumeBrowserDownload(item.id);
+    }
+    return;
+  }
+
+  requestPause(item.id);
+
   if (action === 'capture') {
     await handoffBrowserDownload(item, settings);
     return;
   }
-  if (action !== 'wait') return;
 
   const timer = setTimeout(() => {
     const pending = pendingSizeWaits.get(item.id);
@@ -477,10 +520,7 @@ function registerFirefoxWebRequestInterception() {
   if (!webRequest) return;
 
   webRequest.onHeadersReceived.addListener(
-    (details: FirefoxHeadersReceivedDetails) => {
-      // Listener must return cancel synchronously when possible; we use a promise-safe path.
-      return handleFirefoxHeadersReceived(details);
-    },
+    (details: FirefoxHeadersReceivedDetails) => handleFirefoxHeadersReceivedSync(details),
     {
       urls: ['http://*/*', 'https://*/*'],
       // xmlhttprequest is included so file-host CDNs (Gofile/Pixeldrain fetch)
@@ -492,11 +532,15 @@ function registerFirefoxWebRequestInterception() {
   );
 }
 
-async function handleFirefoxHeadersReceived(
+/**
+ * Must stay synchronous. Returning a Promise lets Firefox start the body
+ * (tens of MB) before `{ cancel: true }` lands.
+ */
+function handleFirefoxHeadersReceivedSync(
   details: FirefoxHeadersReceivedDetails,
-): Promise<{ cancel?: boolean }> {
+): { cancel?: boolean } {
   try {
-    const settings = await getCachedSettings();
+    const settings = settingsForSyncCapture();
     const candidate = firefoxWebRequestDownloadCandidate(details, settings);
     if (!candidate) {
       return {};
@@ -510,8 +554,6 @@ async function handleFirefoxHeadersReceived(
         type: details.type,
       });
     }
-    // Cancel before Firefox commits a shelf item. Remember the URL so the
-    // downloads.onCreated ghost ("File moved or missing") can be erased.
     rememberInterceptedDownload(candidate.url, candidate.filename);
     void handoffFirefoxCandidate(candidate, settings);
     return { cancel: true };
@@ -576,6 +618,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 registerFirefoxWebRequestInterception();
 if (browser.downloads?.onCreated) {
   browser.downloads.onCreated.addListener((item) => {
+    pauseIfLikelyCapture(item);
     void onDownloadCreated(item);
   });
 }

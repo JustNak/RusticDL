@@ -56,6 +56,7 @@ export {
   matchesInterceptedDownload,
   normalizeCaptureUrl,
   shouldCaptureDownloadItem,
+  shouldPauseDownloadItem,
   shouldWaitForDownloadSize,
   urlIsClaimed,
 } from './captureFilter';
