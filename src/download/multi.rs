@@ -1006,10 +1006,9 @@ async fn stream_segment_body(
             .await;
 
         let writer = task.writer.clone();
-        let data = chunk.to_vec();
-        let data_len = data.len();
+        let data_len = chunk.len();
         let write_offset = offset;
-        let n = tokio::task::spawn_blocking(move || writer.write_at(write_offset, &data, end))
+        let n = tokio::task::spawn_blocking(move || writer.write_at(write_offset, &chunk[..], end))
             .await
             .map_err(|error| {
                 download_error(

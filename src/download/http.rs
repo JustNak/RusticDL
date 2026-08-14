@@ -645,7 +645,8 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                 )
             })?;
 
-        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        const WRITE_BUF: usize = 256 * 1024;
+        let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
         if existing_bytes > 0 {
             writer
                 .seek(std::io::SeekFrom::Start(existing_bytes))
