@@ -82,7 +82,9 @@ const targets = [
       ],
       background: {
         scripts: ['background.js'],
-        persistent: false,
+        // Persistent so blocking webRequest + ghost erase still run if Firefox
+        // would otherwise suspend the event page mid-handoff.
+        persistent: true,
       },
       browser_action: {
         default_title: 'RusticDL',

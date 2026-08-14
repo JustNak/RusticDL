@@ -50,10 +50,14 @@ export type FirefoxCaptureCandidate = {
 
 export {
   MIN_CAPTURE_BYTES,
+  canonicalDownloadFilename,
   downloadCreatedAction,
   knownDownloadBytes,
+  matchesInterceptedDownload,
+  normalizeCaptureUrl,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
+  urlIsClaimed,
 } from './captureFilter';
 
 const DOWNLOAD_MIME = new Set([

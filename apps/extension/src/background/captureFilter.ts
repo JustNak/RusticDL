@@ -227,3 +227,67 @@ export function downloadCreatedAction(
   if (shouldCaptureDownloadItem(item, settings)) return 'capture';
   return 'ignore';
 }
+
+/** Strip hash so the same file is recognized after a fragment-only change. */
+export function normalizeCaptureUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Firefox collision names: `file (1).rar` / `file(1).rar`.
+ * Only strip 1–2 digit suffixes so `Game (2024).rar` stays intact.
+ */
+export function canonicalDownloadFilename(filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const base = filename.split(/[\\/]/).pop() ?? filename;
+  const stripped = base.replace(/\s*\(\d{1,2}\)(?=\.[^.]+$)/, '');
+  return stripped || undefined;
+}
+
+export type InterceptedDownload = {
+  url: string;
+  filename?: string;
+  ts: number;
+};
+
+/**
+ * True when this downloads.onCreated item is the browser ghost of a capture
+ * we already canceled (blocking webRequest) or claimed for handoff.
+ */
+export function matchesInterceptedDownload(
+  item: Pick<DownloadItemLike, 'url' | 'finalUrl' | 'filename'>,
+  intercepted: Iterable<InterceptedDownload>,
+  now = Date.now(),
+  ttlMs = 15_000,
+): boolean {
+  const itemUrls = [item.url, item.finalUrl]
+    .filter((value): value is string => Boolean(value))
+    .map(normalizeCaptureUrl);
+  const itemName = canonicalDownloadFilename(item.filename);
+
+  for (const entry of intercepted) {
+    if (now - entry.ts > ttlMs) continue;
+    if (itemUrls.includes(normalizeCaptureUrl(entry.url))) return true;
+    const entryName = canonicalDownloadFilename(entry.filename);
+    if (itemName && entryName && itemName === entryName) return true;
+  }
+  return false;
+}
+
+export function urlIsClaimed(
+  url: string | undefined,
+  claimedUrls: Iterable<string>,
+): boolean {
+  if (!url) return false;
+  const normalized = normalizeCaptureUrl(url);
+  for (const claimed of claimedUrls) {
+    if (normalizeCaptureUrl(claimed) === normalized) return true;
+  }
+  return false;
+}

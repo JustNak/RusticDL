@@ -42,6 +42,10 @@ const {
   shouldWaitForDownloadSize,
   downloadCreatedAction,
   knownDownloadBytes,
+  matchesInterceptedDownload,
+  canonicalDownloadFilename,
+  normalizeCaptureUrl,
+  urlIsClaimed,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
@@ -639,6 +643,91 @@ assert(
     },
     defaultSettings,
   ) === false,
+);
+
+console.log('\nFirefox ghost download suppression\n');
+
+assert(
+  'strips Firefox (1) collision suffix without a space',
+  canonicalDownloadFilename('Shift-At-Midnight-SteamRIP.com(1).rar')
+    === 'Shift-At-Midnight-SteamRIP.com.rar',
+);
+
+assert(
+  'strips Firefox (1) collision suffix with a space',
+  canonicalDownloadFilename('C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\Shift-At-Midnight-SteamRIP.com (1).rar')
+    === 'Shift-At-Midnight-SteamRIP.com.rar',
+);
+
+assert(
+  'does not strip a 4-digit year in the filename',
+  canonicalDownloadFilename('Game (2024).rar') === 'Game (2024).rar',
+);
+
+assert(
+  'normalizes capture URLs by dropping the hash',
+  normalizeCaptureUrl('https://cdn.example.com/file.rar#frag')
+    === 'https://cdn.example.com/file.rar',
+);
+
+const intercepted = [
+  {
+    url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+    filename: 'Shift-At-Midnight-SteamRIP.com.rar',
+    ts: Date.now(),
+  },
+];
+
+assert(
+  'matches a ghost download item by URL after webRequest cancel',
+  matchesInterceptedDownload(
+    {
+      url: 'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar',
+      filename: 'Shift-At-Midnight-SteamRIP.com(1).rar',
+    },
+    intercepted,
+  ) === true,
+);
+
+assert(
+  'matches a ghost download item by filename when Firefox used a redirected URL',
+  matchesInterceptedDownload(
+    {
+      url: 'https://download.pixeldrain.com/u/eFKBSa/Skedule-I-SteamRIP.com.rar',
+      filename: 'C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\Shift-At-Midnight-SteamRIP.com(1).rar',
+    },
+    intercepted,
+  ) === true,
+);
+
+assert(
+  'does not match an unrelated download',
+  matchesInterceptedDownload(
+    {
+      url: 'https://cdn.example.com/other.zip',
+      filename: 'other.zip',
+    },
+    intercepted,
+  ) === false,
+);
+
+assert(
+  'does not match an expired intercept record',
+  matchesInterceptedDownload(
+    {
+      url: intercepted[0].url,
+      filename: intercepted[0].filename,
+    },
+    [{ ...intercepted[0], ts: Date.now() - 30_000 }],
+  ) === false,
+);
+
+assert(
+  'treats a claimed URL as already handed off',
+  urlIsClaimed(
+    'https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar#x',
+    ['https://cdn.buzzheavier.com/file/Shift-At-Midnight-SteamRIP.com.rar'],
+  ) === true,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
