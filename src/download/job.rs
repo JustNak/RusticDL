@@ -183,6 +183,9 @@ pub struct Job {
     pub filename: String,
     pub state: JobState,
     pub created_at: u64,
+    /// Unix seconds when the job last became Completed, Failed, or Canceled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
     pub progress: f64,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
@@ -228,6 +231,7 @@ impl Job {
             filename,
             state: JobState::Queued,
             created_at: now_unix_secs(),
+            completed_at: None,
             progress: 0.0,
             total_bytes: 0,
             downloaded_bytes: 0,
@@ -284,6 +288,26 @@ impl Job {
         self.transfer_format_version = 0;
         self.active_connections = 0;
         self.transfer_mode = None;
+        self.mark_finished();
+    }
+
+    /// Stamp the last terminal transition (Completed / Failed / Canceled).
+    pub fn mark_finished(&mut self) {
+        self.completed_at = Some(now_unix_secs());
+    }
+
+    /// Drop finished time when the job re-enters the queue (retry / restart / resume).
+    pub fn clear_finished(&mut self) {
+        self.completed_at = None;
+    }
+
+    /// Date for the detail panel: last finish when terminal, otherwise added time.
+    pub fn display_date(&self) -> u64 {
+        if self.state.is_terminal() {
+            self.completed_at.unwrap_or(self.created_at)
+        } else {
+            self.created_at
+        }
     }
 }
 
@@ -322,6 +346,7 @@ mod tests {
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
         assert!(job.expected_sha256.is_none());
+        assert!(job.completed_at.is_none());
     }
 
     #[test]
@@ -340,6 +365,28 @@ mod tests {
         assert!(job.transfer_mode.is_none());
         assert!(job.fallback_reason.is_none());
         assert!(job.expected_sha256.is_none());
+        assert!(job.completed_at.is_none());
+    }
+
+    #[test]
+    fn display_date_uses_finished_time_when_terminal() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.created_at = 100;
+        assert_eq!(job.display_date(), 100);
+
+        job.state = JobState::Completed;
+        job.completed_at = Some(250);
+        assert_eq!(job.display_date(), 250);
+
+        job.clear_finished();
+        job.state = JobState::Queued;
+        assert!(job.completed_at.is_none());
+        assert_eq!(job.display_date(), 100);
     }
 
     #[test]
@@ -394,6 +441,7 @@ mod tests {
 
         job.on_completed();
 
+        assert!(job.completed_at.is_some());
         assert!(job.segment_map.is_none());
         assert_eq!(job.transfer_format_version, 0);
         assert_eq!(job.active_connections, 0);

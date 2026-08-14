@@ -226,7 +226,7 @@ impl DownloadApp {
             )
             .when(multi_selected, |el| el.child(self.render_batch_bar(cx)))
             .when_some(detail, |el, job| {
-                el.child(render_detail(&job, detail_max_h, cx))
+                el.child(render_detail(&job, detail_max_h, main_w, cx))
             })
             .into_any_element()
     }

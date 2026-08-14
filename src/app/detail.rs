@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled,
+    div, prelude::FluentBuilder, px, ClickEvent, Context, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -9,12 +9,13 @@ use gpui_component::{
 };
 
 use super::job_row::restart_icon;
-use super::widgets::{ellipsize_name, soft_tooltip, status_color, status_tag};
-use super::DownloadApp;
-use crate::download::{
-    fallback_reason_label, open_path, reveal_in_folder, EngineCommand, Job, JobState,
+use super::widgets::{
+    detail_name_char_budget, ellipsize_name, file_extension_label, soft_tooltip, status_color,
+    status_tag, FileTypeKind,
 };
-use crate::format::{format_eta, format_size, format_speed};
+use super::DownloadApp;
+use crate::download::{fallback_reason_label, open_path, EngineCommand, Job, JobState};
+use crate::format::{format_date, format_eta, format_size, format_speed};
 
 /// Inline “Label value” pair used in the detail meta row (no card chrome).
 pub(crate) fn detail_pair(
@@ -62,12 +63,20 @@ pub(crate) fn detail_meta_sep(theme: &Theme) -> impl IntoElement {
 pub(crate) fn render_detail(
     job: &Job,
     max_h: f32,
+    main_w: f32,
     cx: &mut Context<DownloadApp>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
     let tone = job.state.tone();
     let accent = status_color(tone, &theme);
+    let completed = job.state == JobState::Completed;
+    let terminal = job.state.is_terminal();
     let size = format_size(job);
+    let date = format_date(job.display_date());
+    let kind_label = FileTypeKind::from_filename(&job.filename)
+        .label()
+        .to_string();
+    let file_ext = file_extension_label(&job.filename);
     let speed = if matches!(job.state, JobState::Downloading | JobState::Starting) {
         format_speed(job.speed)
     } else {
@@ -91,15 +100,23 @@ pub(crate) fn render_detail(
         .unwrap_or_else(|| "—".into());
     let connections = job.active_connections.to_string();
     let reconnects = job.reconnect_count.to_string();
-    let fallback = job.fallback_reason.clone();
+    let fallback = if terminal {
+        None
+    } else {
+        job.fallback_reason.clone()
+    };
     let path = job.target_path.to_string_lossy().to_string();
     let path_tip: SharedString = path.clone().into();
     let tip_color = theme.muted_foreground;
     let url = job.url.clone();
     let error = job.error.clone();
     let id = job.id.clone();
-    let filename = job.filename.clone();
-    let filename_tip: SharedString = job.filename.clone().into();
+    let filename_tip: SharedString = if completed {
+        format!("{}\nDouble-click to open", job.filename).into()
+    } else {
+        job.filename.clone().into()
+    };
+    let filename_label = ellipsize_name(&job.filename, detail_name_char_budget(main_w));
 
     let can_pause = matches!(
         job.state,
@@ -110,10 +127,9 @@ pub(crate) fn render_detail(
     // Restart wipes partial progress and starts from zero — only useful after a
     // failed or canceled transfer, not on completed jobs.
     let can_restart = matches!(job.state, JobState::Failed | JobState::Canceled);
-    let can_open = job.state == JobState::Completed && job.target_path.exists();
-    let can_remove = job.is_removable();
-    let can_delete = job.has_deletable_file();
     let can_cancel = !job.state.is_terminal() && job.state != JobState::Paused;
+    // Open / folder / remove / delete live on the row overflow menu.
+    let show_actions = can_pause || can_resume || can_retry || can_restart || can_cancel;
 
     // Height-capped inspector: scrolls internally so the job list keeps space.
     // Flat surfaces only — hierarchy comes from type and a single top border, not nested cards.
@@ -175,7 +191,32 @@ pub(crate) fn render_detail(
                                                 .text_sm()
                                                 .font_semibold()
                                                 .text_color(theme.foreground)
-                                                .child(ellipsize_name(&job.filename, 72))
+                                                .when(completed, |el| {
+                                                    let id = id.clone();
+                                                    el.cursor_pointer().on_click(cx.listener(
+                                                        move |this, event: &ClickEvent, _, cx| {
+                                                            if event.click_count() < 2 {
+                                                                return;
+                                                            }
+                                                            if let Some(job) = this
+                                                                .jobs
+                                                                .iter()
+                                                                .find(|j| j.id == id)
+                                                            {
+                                                                if job.state != JobState::Completed
+                                                                {
+                                                                    return;
+                                                                }
+                                                                if let Err(msg) =
+                                                                    open_path(&job.target_path)
+                                                                {
+                                                                    this.show_toast(msg, cx);
+                                                                }
+                                                            }
+                                                        },
+                                                    ))
+                                                })
+                                                .child(filename_label)
                                                 .tooltip(move |window, cx| {
                                                     soft_tooltip(
                                                         filename_tip.clone(),
@@ -223,8 +264,29 @@ pub(crate) fn render_detail(
                                         })),
                                 ),
                         )
-                        // ── Meta row: inline label/value pairs ──
-                        .child(
+                        // ── Meta row: terminal jobs keep Size / Date / Type / File ──
+                        .child(if terminal {
+                            let row = h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_3()
+                                .items_center()
+                                .flex_wrap()
+                                .child(detail_pair("Size", size, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("Date", date, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("Type", kind_label, &theme))
+                                .child(detail_meta_sep(&theme))
+                                .child(detail_pair("File", file_ext, &theme));
+                            if matches!(job.state, JobState::Failed | JobState::Canceled) {
+                                row.child(detail_meta_sep(&theme))
+                                    .child(detail_pair("Retries", retries, &theme))
+                                    .into_any_element()
+                            } else {
+                                row.into_any_element()
+                            }
+                        } else {
                             h_flex()
                                 .w_full()
                                 .min_w_0()
@@ -247,8 +309,9 @@ pub(crate) fn render_detail(
                                 .child(detail_meta_sep(&theme))
                                 .child(detail_pair("Connections", connections, &theme))
                                 .child(detail_meta_sep(&theme))
-                                .child(detail_pair("Reconnects", reconnects, &theme)),
-                        )
+                                .child(detail_pair("Reconnects", reconnects, &theme))
+                                .into_any_element()
+                        })
                         .when_some(fallback, |el, reason| {
                             el.child(
                                 h_flex()
@@ -331,166 +394,91 @@ pub(crate) fn render_detail(
                                     ),
                             )
                         })
-                        // ── Actions ──
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .flex_wrap()
-                                .pt_1()
-                                .when(can_pause, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-pause")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Minus)
-                                            .label("Pause")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Pause(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_resume, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-resume")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Redo2)
-                                            .label("Resume")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Resume(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_retry, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-retry")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Redo)
-                                            .label("Retry")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Retry(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_restart, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-restart")
-                                            .outline()
-                                            .small()
-                                            .icon(restart_icon())
-                                            .label("Restart")
-                                            .tooltip("Discard progress and download from the start")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine
-                                                    .send(EngineCommand::Restart(id.clone()));
-                                            })),
-                                    )
-                                })
-                                .when(can_cancel, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-cancel")
-                                            .outline()
-                                            .small()
-                                            .danger()
-                                            .icon(IconName::Close)
-                                            .label("Cancel")
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                this.engine.send(EngineCommand::Cancel {
-                                                    id: id.clone(),
-                                                    delete_partial: false,
-                                                });
-                                            })),
-                                    )
-                                })
-                                .when(can_open, |el| {
-                                    let id = id.clone();
-                                    el.child(
-                                        Button::new("detail-open")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::ExternalLink)
-                                            .label("Open")
-                                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                                if let Some(job) =
-                                                    this.jobs.iter().find(|j| j.id == id)
-                                                {
-                                                    if let Err(msg) = open_path(&job.target_path) {
-                                                        this.show_toast(msg, cx);
-                                                    }
-                                                }
-                                            })),
-                                    )
-                                })
-                                .child({
-                                    let id = id.clone();
-                                    Button::new("detail-reveal")
-                                        .outline()
-                                        .small()
-                                        .icon(IconName::FolderOpen)
-                                        .label("Open")
-                                        .tooltip("Open containing folder")
-                                        .on_click(cx.listener(move |this, _, _window, cx| {
-                                            if let Some(job) = this.jobs.iter().find(|j| j.id == id)
-                                            {
-                                                let path = if job.target_path.exists() {
-                                                    job.target_path.clone()
-                                                } else {
-                                                    job.temp_path.clone()
-                                                };
-                                                if let Err(msg) = reveal_in_folder(&path) {
-                                                    this.show_toast(msg, cx);
-                                                }
-                                            }
-                                        }))
-                                })
-                                .when(can_remove, |el| {
-                                    let id = id.clone();
-                                    let filename = filename.clone();
-                                    el.child(
-                                        Button::new("detail-remove")
-                                            .outline()
-                                            .small()
-                                            .icon(IconName::Close)
-                                            .label("Remove")
-                                            .tooltip("Remove from queue, keep the file")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.confirm_remove(
-                                                    id.clone(),
-                                                    filename.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                })
-                                .when(can_delete, |el| {
-                                    let id = id.clone();
-                                    let filename = filename.clone();
-                                    el.child(
-                                        Button::new("detail-delete")
-                                            .danger()
-                                            .small()
-                                            .icon(IconName::Delete)
-                                            .label("Delete")
-                                            .tooltip("Delete the file from disk")
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.confirm_delete(
-                                                    id.clone(),
-                                                    filename.clone(),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                }),
-                        ),
+                        .when(show_actions, |el| {
+                            el.child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .pt_1()
+                                    .when(can_pause, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-pause")
+                                                .outline()
+                                                .small()
+                                                .icon(IconName::Minus)
+                                                .label("Pause")
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.engine
+                                                        .send(EngineCommand::Pause(id.clone()));
+                                                })),
+                                        )
+                                    })
+                                    .when(can_resume, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-resume")
+                                                .outline()
+                                                .small()
+                                                .icon(IconName::Redo2)
+                                                .label("Resume")
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.engine
+                                                        .send(EngineCommand::Resume(id.clone()));
+                                                })),
+                                        )
+                                    })
+                                    .when(can_retry, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-retry")
+                                                .outline()
+                                                .small()
+                                                .icon(IconName::Redo)
+                                                .label("Retry")
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.engine
+                                                        .send(EngineCommand::Retry(id.clone()));
+                                                })),
+                                        )
+                                    })
+                                    .when(can_restart, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-restart")
+                                                .outline()
+                                                .small()
+                                                .icon(restart_icon())
+                                                .label("Restart")
+                                                .tooltip(
+                                                    "Discard progress and download from the start",
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.engine
+                                                        .send(EngineCommand::Restart(id.clone()));
+                                                })),
+                                        )
+                                    })
+                                    .when(can_cancel, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-cancel")
+                                                .outline()
+                                                .small()
+                                                .danger()
+                                                .icon(IconName::Close)
+                                                .label("Cancel")
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.engine.send(EngineCommand::Cancel {
+                                                        id: id.clone(),
+                                                        delete_partial: false,
+                                                    });
+                                                })),
+                                        )
+                                    }),
+                            )
+                        }),
                 ),
         )
 }

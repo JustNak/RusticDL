@@ -46,6 +46,7 @@ pub(super) async fn resume_all(inner: &Arc<Mutex<EngineInner>>) {
             }
             job.state = JobState::Queued;
             job.error = None;
+            job.clear_finished();
             job.speed = 0;
         }
     }
@@ -65,6 +66,7 @@ pub(super) async fn retry_all(inner: &Arc<Mutex<EngineInner>>) {
             job.state = JobState::Queued;
             job.error = None;
             job.failure_category = None;
+            job.clear_finished();
             job.retry_attempts = 0;
             job.speed = 0;
             job.eta_secs = 0;
