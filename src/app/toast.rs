@@ -24,10 +24,8 @@ pub(crate) enum ToastKind {
 /// Optional primary action on a toast (e.g. update flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToastActionKind {
-    /// Advance from “Update available” → “Restart to update”.
-    ConfirmUpdate,
     /// Hand off to the external updater and quit.
-    RestartToUpdate,
+    ApplyUpdate,
 }
 
 #[derive(Debug, Clone)]

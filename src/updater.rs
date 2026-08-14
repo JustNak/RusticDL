@@ -9,8 +9,8 @@
 //! 1. Query the GitHub Releases API for the latest tag + assets on the chosen channel.
 //! 2. Offer that channel’s current build when this install is not already it
 //!    (channel switch is not a semver “newer” check). Toast stages:
-//!    Checking → You're up to date | Update available [Update] → Restart [Restart].
-//! 3. On Restart, flush app state, spawn **RusticDL Updater** with the setup
+//!    Checking → You're up to date | Update available [Update].
+//! 3. On Update, flush app state, spawn **RusticDL Updater** with the setup
 //!    download URL, then quit. The updater shows progress, runs NSIS `/S`, and
 //!    relaunches this app.
 
