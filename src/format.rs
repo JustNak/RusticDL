@@ -233,14 +233,20 @@ fn size_sort_key(job: &Job) -> u64 {
     }
 }
 
+/// ASCII case-insensitive order (no allocation). Matches `to_lowercase` for
+/// typical filenames; non-ASCII letters are compared as-is.
+fn cmp_filename_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
 /// Stable sort of the visible queue by the user's preferred column/direction.
-pub fn sort_jobs(jobs: &mut [Job], column: SortColumn, direction: SortDirection) {
+pub fn sort_jobs(jobs: &mut [&Job], column: SortColumn, direction: SortDirection) {
     jobs.sort_by(|a, b| {
         let ord = match column {
             SortColumn::Name => {
-                let an = a.filename.to_lowercase();
-                let bn = b.filename.to_lowercase();
-                an.cmp(&bn).then_with(|| a.id.cmp(&b.id))
+                cmp_filename_ci(&a.filename, &b.filename).then_with(|| a.id.cmp(&b.id))
             }
             SortColumn::Date => a
                 .created_at
@@ -303,19 +309,18 @@ pub fn total_completed_bytes(jobs: &[Job]) -> u64 {
         .sum()
 }
 
+/// `query` is already trimmed and lowercased by the caller (empty matches all).
 pub fn job_matches_search(job: &Job, query: &str) -> bool {
-    let q = query.trim();
-    if q.is_empty() {
+    if query.is_empty() {
         return true;
     }
-    let q = q.to_lowercase();
-    job.filename.to_lowercase().contains(&q)
-        || job.url.to_lowercase().contains(&q)
+    job.filename.to_lowercase().contains(query)
+        || job.url.to_lowercase().contains(query)
         || job
             .target_path
             .to_string_lossy()
             .to_lowercase()
-            .contains(&q)
+            .contains(query)
 }
 
 #[cfg(test)]
@@ -398,5 +403,37 @@ mod tests {
         assert_eq!(format_duration(72), "1m 12s");
         assert_eq!(format_duration(120), "2m");
         assert_eq!(format_duration(3723), "1h 02m");
+    }
+
+    fn sample_job(id: &str, filename: &str, url: &str) -> Job {
+        let mut job = Job::new(
+            url.into(),
+            filename.into(),
+            std::path::PathBuf::from(format!("C:\\dl\\{filename}")),
+            std::path::PathBuf::from(format!("C:\\dl\\{filename}.part")),
+        );
+        job.id = id.into();
+        job
+    }
+
+    #[test]
+    fn name_sort_is_case_insensitive_for_ascii() {
+        let a = sample_job("2", "Zebra.bin", "https://example.com/z");
+        let b = sample_job("1", "apple.bin", "https://example.com/a");
+        let c = sample_job("3", "Banana.bin", "https://example.com/b");
+        let mut jobs = vec![&a, &b, &c];
+        sort_jobs(&mut jobs, SortColumn::Name, SortDirection::Asc);
+        let names: Vec<&str> = jobs.iter().map(|j| j.filename.as_str()).collect();
+        assert_eq!(names, ["apple.bin", "Banana.bin", "Zebra.bin"]);
+    }
+
+    #[test]
+    fn search_matches_filename_url_and_path() {
+        let job = sample_job("1", "Report.PDF", "https://cdn.example.com/files/x");
+        assert!(job_matches_search(&job, "report"));
+        assert!(job_matches_search(&job, "cdn.example"));
+        assert!(job_matches_search(&job, "c:\\dl"));
+        assert!(!job_matches_search(&job, "missing"));
+        assert!(job_matches_search(&job, ""));
     }
 }

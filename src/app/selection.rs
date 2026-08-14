@@ -42,7 +42,7 @@ impl DownloadApp {
     /// `to_id` in **current visible sorted list order**. Keeps the original
     /// anchor. Primary = `to_id` (placed last). Falls back to `select_only`
     /// when anchor/target are missing from `visible`.
-    pub(crate) fn select_range_visible(&mut self, to_id: &str, visible: &[Job]) {
+    pub(crate) fn select_range_visible(&mut self, to_id: &str, visible: &[&Job]) {
         let anchor = match self.selection_anchor_id.as_deref() {
             Some(a) => a,
             None => {
