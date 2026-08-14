@@ -2,11 +2,15 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
+use gpui::{
+    div, prelude::FluentBuilder, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
+};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
+    tooltip::Tooltip,
     v_flex, ActiveTheme, Disableable, IconName, StyledExt,
 };
 
@@ -16,12 +20,20 @@ use crate::download::{find_filename_collision, FilenameCollision};
 use crate::format::format_bytes;
 
 impl BrowserPromptWindow {
-    fn current_conflict_name(&self, cx: &Context<Self>) -> String {
+    fn typed_conflict_name(&self, cx: &Context<Self>) -> String {
         self.name_input
             .as_ref()
             .map(|input| input.read(cx).value().trim().to_string())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "download.bin".into())
+            .unwrap_or_default()
+    }
+
+    fn current_conflict_name(&self, cx: &Context<Self>) -> String {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() {
+            "download.bin".into()
+        } else {
+            name
+        }
     }
 
     fn current_conflict_dir(&self, cx: &Context<Self>) -> PathBuf {
@@ -32,26 +44,38 @@ impl BrowserPromptWindow {
     }
 
     pub(super) fn current_collision(&self, cx: &Context<Self>) -> Option<FilenameCollision> {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() {
+            return None;
+        }
         find_filename_collision(
             &self.current_conflict_dir(cx),
-            &self.current_conflict_name(cx),
+            &name,
             &self.ipc.jobs_snapshot(),
         )
     }
 
-    pub(super) fn resolve_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let filename = match self.current_collision(cx) {
-            Some(collision) => Some(collision.suggested_unique_name),
-            None => {
-                let name = self.current_conflict_name(cx);
-                if name.is_empty() {
-                    None
-                } else {
-                    Some(name)
-                }
-            }
+    pub(super) fn apply_suggested_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(suggested) = self.current_collision(cx).map(|c| c.suggested_unique_name) else {
+            return;
         };
-        self.resolve_accept(filename, false, window, cx);
+        let Some(input) = self.name_input.as_ref() else {
+            return;
+        };
+        input.update(cx, |state, cx| {
+            state.set_value(suggested, window, cx);
+            state.focus(window, cx);
+        });
+        window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        cx.notify();
+    }
+
+    pub(super) fn resolve_start_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.typed_conflict_name(cx);
+        if name.is_empty() || self.current_collision(cx).is_some() {
+            return;
+        }
+        self.resolve_accept(Some(name), false, window, cx);
     }
 
     pub(super) fn resolve_overwrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -71,6 +95,8 @@ impl BrowserPromptWindow {
         let prompt = self.prompt.as_ref();
         let collision = self.current_collision(cx);
         let name_taken = collision.is_some();
+        let name_empty = self.typed_conflict_name(cx).is_empty();
+        let start_blocked = name_taken || name_empty;
         let blocks_overwrite = collision.as_ref().is_some_and(|c| c.blocks_overwrite);
         let unique_preview = collision
             .as_ref()
@@ -106,17 +132,22 @@ impl BrowserPromptWindow {
             format!("“{display_name}” is available.")
         };
         let hint = if name_taken && blocks_overwrite {
-            format!("Rename will save as {unique_preview}. Overwrite is unavailable.")
+            format!("Another download is using this name. Click Rename for {unique_preview}.")
         } else if name_taken {
-            format!("Rename will save as {unique_preview}.")
+            format!("Pick a different name, or click Rename for {unique_preview}.")
+        } else if name_empty {
+            "Enter a filename to start the download.".into()
         } else {
-            "Start download will keep this name.".into()
+            "This name is available. Click Start download to keep it.".into()
         };
-        let primary_label = if name_taken {
-            "Rename"
-        } else {
-            "Start download"
-        };
+        let hint_color = if start_blocked { theme.danger } else { muted };
+        let start_button = Button::new("conflict-start")
+            .label("Start download")
+            .disabled(start_blocked)
+            .when(!start_blocked, |btn| btn.primary())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.resolve_start_download(window, cx);
+            }));
 
         v_flex()
             .gap_3()
@@ -139,6 +170,15 @@ impl BrowserPromptWindow {
                     .child(div().text_xs().font_medium().child("Filename"))
                     .when_some(self.name_input.as_ref(), |el, input| {
                         el.child(Input::new(input).w_full())
+                    })
+                    .when(name_taken, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(theme.danger)
+                                .child("Duplicate Name"),
+                        )
                     }),
             )
             .child(
@@ -169,7 +209,7 @@ impl BrowserPromptWindow {
                             .text_color(muted)
                             .child(format!("Preview: {save_preview}")),
                     )
-                    .child(div().text_xs().text_color(muted).child(hint)),
+                    .child(div().text_xs().text_color(hint_color).child(hint)),
             )
             .child(
                 h_flex()
@@ -195,14 +235,39 @@ impl BrowserPromptWindow {
                                     this.resolve_overwrite(window, cx);
                                 })),
                         )
+                        .child(
+                            Button::new("conflict-rename")
+                                .label("Rename")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_suggested_rename(window, cx);
+                                })),
+                        )
                     })
                     .child(
-                        Button::new("conflict-rename")
-                            .label(primary_label)
-                            .primary()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.resolve_rename(window, cx);
-                            })),
+                        div()
+                            .id("conflict-start-wrap")
+                            .when(name_taken, |el| {
+                                let danger = theme.danger;
+                                el.tooltip(move |window, cx| {
+                                    Tooltip::new("Duplicate Name")
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(danger)
+                                        .build(window, cx)
+                                })
+                            })
+                            .when(name_empty && !name_taken, |el| {
+                                let danger = theme.danger;
+                                el.tooltip(move |window, cx| {
+                                    Tooltip::new("Enter a filename")
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(danger)
+                                        .build(window, cx)
+                                })
+                            })
+                            .child(start_button),
                     ),
             )
             .into_any_element()
