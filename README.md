@@ -144,7 +144,7 @@ Large files can split across parallel HTTP Range connections. Smaller files, ser
 | **Fsync on pause** | Flush `.part` to disk when pausing (safer on power loss) |
 | **Reconnect** | Transient network/TLS drops retry the same pinned URL with short backoff (per segment for multi; up to 5 times, 200 ms–2 s) |
 
-**Settings → General → Limits**
+**Settings → Download Engine**
 
 | Setting | Default | Clamp |
 | --- | --- | --- |

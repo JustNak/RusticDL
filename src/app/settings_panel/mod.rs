@@ -4,6 +4,7 @@
 
 mod appearance;
 mod browser;
+mod engine;
 mod general;
 mod system;
 
@@ -73,6 +74,9 @@ impl DownloadApp {
                             .child(match category {
                                 SettingsCategory::General => {
                                     self.render_settings_general(cx).into_any_element()
+                                }
+                                SettingsCategory::DownloadEngine => {
+                                    self.render_settings_engine(cx).into_any_element()
                                 }
                                 SettingsCategory::System => {
                                     self.render_settings_system(cx).into_any_element()

@@ -7,18 +7,25 @@ use gpui_component::IconName;
 pub(crate) enum SettingsCategory {
     #[default]
     General,
+    DownloadEngine,
     System,
     Browser,
     Appearance,
 }
 
 impl SettingsCategory {
-    pub(crate) const ALL: [Self; 4] =
-        [Self::General, Self::System, Self::Browser, Self::Appearance];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::General,
+        Self::DownloadEngine,
+        Self::System,
+        Self::Browser,
+        Self::Appearance,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::DownloadEngine => "Download Engine",
             Self::System => "System",
             Self::Browser => "Browser",
             Self::Appearance => "Appearance",
@@ -28,6 +35,7 @@ impl SettingsCategory {
     pub(crate) fn icon(self) -> IconName {
         match self {
             Self::General => IconName::Folder,
+            Self::DownloadEngine => IconName::ArrowDown,
             Self::System => IconName::Settings,
             Self::Browser => IconName::ExternalLink,
             Self::Appearance => IconName::Palette,
