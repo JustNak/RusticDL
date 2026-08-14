@@ -9,7 +9,8 @@
 //! 5. **What’s new** — post-relaunch dialog with the release changelog.
 //!
 //! Channel (`UpdateChannel`) selects Stable (`/releases/latest`) vs Nightly
-//! (`vX.Y.Z-nightly.*` pre-releases).
+//! (`vX.Y.Z-nightly.*` pre-releases). Switching channels offers that stream’s
+//! current build even when its version number is lower.
 //! In-flight checks are invalidated when the channel changes.
 
 use std::time::Duration;
