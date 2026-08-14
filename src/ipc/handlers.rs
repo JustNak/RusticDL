@@ -13,8 +13,8 @@ use super::protocol::{
     HostRequest, HostResponse, RawHandoffAuth, MAX_METADATA_LENGTH,
 };
 use crate::download::{
-    find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus, HandoffAuth,
-    HandoffAuthHeader,
+    find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus, FilenameConflictPolicy,
+    HandoffAuth, HandoffAuthHeader,
 };
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::persistence::save_settings;
@@ -153,6 +153,7 @@ async fn enqueue_download(
         payload.suggested_filename,
         directory,
         handoff_auth,
+        FilenameConflictPolicy::Uniquify,
     )
     .await
 }
@@ -224,9 +225,15 @@ async fn prompt_download(
         PromptDecision::Accept {
             filename,
             directory: dir_override,
+            overwrite,
         } => {
             let directory = dir_override.unwrap_or(directory);
             let filename = filename.or(payload.suggested_filename);
+            let conflict = if overwrite {
+                FilenameConflictPolicy::Overwrite
+            } else {
+                FilenameConflictPolicy::Uniquify
+            };
             engine_enqueue(
                 bridge,
                 request_id,
@@ -234,6 +241,7 @@ async fn prompt_download(
                 filename,
                 directory,
                 handoff_auth,
+                conflict,
             )
             .await
         }
@@ -247,6 +255,7 @@ async fn engine_enqueue(
     filename: Option<String>,
     directory: PathBuf,
     handoff_auth: Option<HandoffAuth>,
+    conflict: FilenameConflictPolicy,
 ) -> HostResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
     bridge.engine.send(EngineCommand::Add {
@@ -254,6 +263,7 @@ async fn engine_enqueue(
         filename,
         directory,
         handoff_auth,
+        conflict,
         reply: Some(reply_tx),
     });
 

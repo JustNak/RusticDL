@@ -569,37 +569,40 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         };
 
         // Filename / path discovery (first response or when still generic).
-        if let Some(header_name) = response
-            .headers()
-            .get(CONTENT_DISPOSITION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_content_disposition_filename)
-        {
-            if filename == "download.bin"
-                || filename_from_url_fallback(&job_url).as_deref() == Some(filename.as_str())
+        // Overwrite confirmed a specific path — never let CD / redirect rename it.
+        if !ctx.job.replace_existing {
+            if let Some(header_name) = response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_disposition_filename)
             {
-                filename = header_name;
-                if let Some(parent) = target_path.parent() {
-                    let new_target = parent.join(&filename);
-                    let new_temp = super::filesystem::temp_path_for(&new_target);
-                    if temp_path != new_temp && temp_path.exists() {
-                        let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                if filename == "download.bin"
+                    || filename_from_url_fallback(&job_url).as_deref() == Some(filename.as_str())
+                {
+                    filename = header_name;
+                    if let Some(parent) = target_path.parent() {
+                        let new_target = parent.join(&filename);
+                        let new_temp = super::filesystem::temp_path_for(&new_target);
+                        if temp_path != new_temp && temp_path.exists() {
+                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                        }
+                        target_path = new_target;
+                        temp_path = new_temp;
                     }
-                    target_path = new_target;
-                    temp_path = new_temp;
                 }
-            }
-        } else if let Some(from_final) = filename_from_response_url(&current_url) {
-            if filename == "download.bin" {
-                filename = from_final;
-                if let Some(parent) = target_path.parent() {
-                    let new_target = parent.join(&filename);
-                    let new_temp = super::filesystem::temp_path_for(&new_target);
-                    if temp_path != new_temp && temp_path.exists() {
-                        let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+            } else if let Some(from_final) = filename_from_response_url(&current_url) {
+                if filename == "download.bin" {
+                    filename = from_final;
+                    if let Some(parent) = target_path.parent() {
+                        let new_target = parent.join(&filename);
+                        let new_temp = super::filesystem::temp_path_for(&new_target);
+                        if temp_path != new_temp && temp_path.exists() {
+                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                        }
+                        target_path = new_target;
+                        temp_path = new_temp;
                     }
-                    target_path = new_target;
-                    temp_path = new_temp;
                 }
             }
         }
@@ -782,7 +785,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
             verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
 
-            let final_path = move_to_final_path(&temp_path, &target_path)
+            let final_path = move_to_final_path(&temp_path, &target_path, ctx.job.replace_existing)
                 .await
                 .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 

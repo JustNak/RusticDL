@@ -394,6 +394,7 @@ impl DownloadApp {
                             filename: None,
                             directory: directory.clone(),
                             handoff_auth: None,
+                            conflict: crate::download::FilenameConflictPolicy::Uniquify,
                             reply: None,
                         });
                     }

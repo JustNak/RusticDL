@@ -1194,9 +1194,13 @@ async fn finalize_completed(
         return Err(error);
     }
 
-    let final_path = move_to_final_path(&ctx.job.temp_path, &ctx.job.target_path)
-        .await
-        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+    let final_path = move_to_final_path(
+        &ctx.job.temp_path,
+        &ctx.job.target_path,
+        ctx.job.replace_existing,
+    )
+    .await
+    .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
     let downloaded = map.written_sum().max(map.total_bytes);
     ctx.job.downloaded_bytes = downloaded;

@@ -5,6 +5,7 @@
 
 mod complete;
 mod confirm;
+mod conflict;
 mod helpers;
 mod open;
 mod progress;
@@ -39,6 +40,8 @@ const SPEED_SAMPLE_CAP: usize = 90;
 enum CapturePhase {
     /// Ask-mode confirmation form.
     Confirm,
+    /// Same-name file already exists — rename, overwrite, or cancel.
+    Conflict,
     /// Waiting for engine job id after Accept (or bound and downloading).
     Progress {
         /// Bound job id once known.
@@ -117,7 +120,7 @@ impl BrowserPromptWindow {
 
     fn close_hud(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.phase {
-            CapturePhase::Confirm => {
+            CapturePhase::Confirm | CapturePhase::Conflict => {
                 self.dismiss_confirm(window, cx);
             }
             CapturePhase::Progress { .. } | CapturePhase::Complete { .. } => {
@@ -131,7 +134,9 @@ impl BrowserPromptWindow {
 
     fn close_hud_on_native_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.phase {
-            CapturePhase::Confirm => self.dismiss_confirm_on_close(window, cx),
+            CapturePhase::Confirm | CapturePhase::Conflict => {
+                self.dismiss_confirm_on_close(window, cx)
+            }
             CapturePhase::Progress { .. } | CapturePhase::Complete { .. } => {
                 self.release_ownership();
                 cx.notify();
@@ -160,6 +165,7 @@ impl BrowserPromptWindow {
     fn title_for_phase(&self) -> &'static str {
         match &self.phase {
             CapturePhase::Confirm => "Confirm browser download",
+            CapturePhase::Conflict => "File already exists",
             CapturePhase::Progress { .. } => {
                 if let Some(job) = &self.job {
                     match job.state {
@@ -184,7 +190,7 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
             .await;
         if this
             .update(cx, |this, cx| {
-                if !matches!(this.phase, CapturePhase::Confirm) {
+                if !matches!(this.phase, CapturePhase::Confirm | CapturePhase::Conflict) {
                     this.sync_from_bridge(cx);
                 }
             })
@@ -198,6 +204,13 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
 
 impl Render for BrowserPromptWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Live name/folder edits can collide after Confirm opened on a free name.
+        if matches!(self.phase, CapturePhase::Confirm)
+            && !self.resolved
+            && self.current_collision(cx).is_some()
+        {
+            self.phase = CapturePhase::Conflict;
+        }
         self.fit_window_to_phase(window);
         let theme = cx.theme().clone();
         let title = self.title_for_phase().to_string();
@@ -205,6 +218,7 @@ impl Render for BrowserPromptWindow {
 
         let body = match &self.phase {
             CapturePhase::Confirm => self.render_confirm(cx),
+            CapturePhase::Conflict => self.render_conflict(cx),
             CapturePhase::Progress { .. } => self.render_progress(cx),
             CapturePhase::Complete { .. } => self.render_complete(cx),
         };

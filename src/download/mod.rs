@@ -23,6 +23,7 @@ pub use engine::{
     open_path, reveal_in_folder, spawn_engine, EngineCommand, EngineEvent, EngineHandle,
     EngineRuntimeConfig,
 };
+pub use filesystem::{find_filename_collision, FilenameCollision, FilenameConflictPolicy};
 pub use handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader};
 pub use job::{fallback_reason_label, Job, JobState};
 pub use urls::extract_http_urls;

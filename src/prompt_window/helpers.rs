@@ -354,6 +354,17 @@ fn paint_speed_graph(
     );
 }
 
+pub(super) fn default_prompt_filename(prompt: &crate::ipc::BrowserPromptView) -> String {
+    prompt
+        .suggested_filename
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            crate::download::filesystem::derive_filename_from_url(&prompt.url)
+                .unwrap_or_else(|| "download.bin".into())
+        })
+}
+
 pub(super) fn truncate_middle(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {

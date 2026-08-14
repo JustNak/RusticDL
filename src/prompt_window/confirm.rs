@@ -14,7 +14,7 @@ use gpui_component::{
     v_flex, ActiveTheme, IconName, StyledExt,
 };
 
-use super::helpers::{shorten_path, truncate_middle};
+use super::helpers::{default_prompt_filename, shorten_path, truncate_middle};
 use super::start_sync_timer;
 use super::{BrowserPromptWindow, CapturePhase, CAPTURE_WINDOW_H};
 use crate::appearance::apply_appearance;
@@ -36,14 +36,13 @@ impl BrowserPromptWindow {
         apply_appearance(settings, Some(window), cx);
         apply_app_icon(window);
 
-        let default_name = prompt
-            .suggested_filename
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| {
-                crate::download::filesystem::derive_filename_from_url(&prompt.url)
-                    .unwrap_or_else(|| "download.bin".into())
-            });
+        let default_name = default_prompt_filename(&prompt);
+        let opens_conflict = crate::download::find_filename_collision(
+            &prompt.default_directory,
+            &default_name,
+            &ipc.jobs_snapshot(),
+        )
+        .is_some();
 
         let name_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -60,7 +59,11 @@ impl BrowserPromptWindow {
         start_sync_timer(cx);
 
         Self {
-            phase: CapturePhase::Confirm,
+            phase: if opens_conflict {
+                CapturePhase::Conflict
+            } else {
+                CapturePhase::Confirm
+            },
             prompt: Some(prompt),
             ipc,
             engine,
@@ -97,7 +100,7 @@ impl BrowserPromptWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.phase, CapturePhase::Confirm) && !self.resolved {
+        if matches!(self.phase, CapturePhase::Confirm | CapturePhase::Conflict) && !self.resolved {
             self.resolved = true;
             if let Some(prompt) = &self.prompt {
                 let _ = self.ipc.resolve_prompt(&prompt.id, PromptDecision::Dismiss);
@@ -108,6 +111,16 @@ impl BrowserPromptWindow {
     }
 
     pub(super) fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_accept(None, false, window, cx);
+    }
+
+    pub(super) fn resolve_accept(
+        &mut self,
+        filename_override: Option<String>,
+        overwrite: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.resolved {
             return;
         }
@@ -121,14 +134,16 @@ impl BrowserPromptWindow {
             }
         };
 
-        let filename = self.name_input.as_ref().and_then(|input| {
-            let raw = input.read(cx).value().to_string();
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+        let filename = filename_override.or_else(|| {
+            self.name_input.as_ref().and_then(|input| {
+                let raw = input.read(cx).value().to_string();
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
         });
         let directory = self
             .dir_input
@@ -140,6 +155,7 @@ impl BrowserPromptWindow {
             PromptDecision::Accept {
                 filename,
                 directory,
+                overwrite,
             },
         );
 

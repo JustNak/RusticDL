@@ -18,9 +18,19 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             filename,
             directory,
             handoff_auth,
+            conflict,
             reply,
         } => {
-            add::handle(inner, url, filename, directory, handoff_auth, reply).await;
+            add::handle(
+                inner,
+                url,
+                filename,
+                directory,
+                handoff_auth,
+                conflict,
+                reply,
+            )
+            .await;
         }
         EngineCommand::Pause(id) => {
             job_control::pause(inner, id).await;
@@ -170,6 +180,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -205,6 +216,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -234,6 +246,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -273,6 +286,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
         let outcome = reply_rx.await.expect("reply");
@@ -296,6 +310,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -342,6 +357,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -381,6 +397,7 @@ mod tests {
             filename: Some("from-caller.bin".into()),
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -413,6 +430,7 @@ mod tests {
             filename: None,
             directory: dir.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: Some(reply_tx),
         });
 
@@ -767,6 +785,138 @@ mod tests {
 
         let jobs = next_jobs(&mut events).await;
         assert!(jobs.is_empty(), "missing target still drops the job");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn overwrite_add_keeps_original_name_and_leaves_existing_file() {
+        let dir = temp_dir();
+        let target = dir.join("same.bin");
+        std::fs::write(&target, b"keep-until-finalize").expect("write existing");
+
+        let (engine, mut events) = spawn_engine(vec![], test_config());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/same.bin".into(),
+            filename: Some("same.bin".into()),
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "same.bin");
+
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs.iter().find(|j| j.filename == "same.bin").expect("job");
+        assert!(added.replace_existing);
+        assert_eq!(added.target_path, target);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"keep-until-finalize",
+            "existing file stays until finalize"
+        );
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn overwrite_add_deletes_unowned_leftover_part() {
+        let dir = temp_dir();
+        let part = dir.join("same.bin.part");
+        std::fs::write(&part, b"stale-partial").expect("write part");
+
+        let (engine, mut events) = spawn_engine(vec![], test_config());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/same.bin".into(),
+            filename: Some("same.bin".into()),
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.filename, "same.bin");
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs.iter().find(|j| j.filename == "same.bin").expect("job");
+        assert!(added.replace_existing);
+        assert!(
+            !part.exists(),
+            "leftover .part must be dropped on overwrite"
+        );
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn overwrite_add_falls_back_when_active_job_owns_name() {
+        let dir = temp_dir();
+        let existing = sample_job("https://example.com/owner.bin", JobState::Paused, &dir);
+        // sample_job always uses file.bin — keep that name for the collision.
+        let existing_name = existing.filename.clone();
+
+        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/other.bin".into(),
+            filename: Some(existing_name.clone()),
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "file (1).bin");
+
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs
+            .iter()
+            .find(|j| j.url == "https://example.com/other.bin")
+            .expect("new job");
+        assert!(!added.replace_existing);
+        assert_eq!(added.filename, "file (1).bin");
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn overwrite_add_falls_back_when_failed_job_owns_name() {
+        let dir = temp_dir();
+        let existing = sample_job("https://example.com/failed.bin", JobState::Failed, &dir);
+        let existing_name = existing.filename.clone();
+
+        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/other.bin".into(),
+            filename: Some(existing_name),
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            reply: Some(reply_tx),
+        });
+
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        assert_eq!(outcome.filename, "file (1).bin");
+
+        let jobs = next_jobs(&mut events).await;
+        let added = jobs
+            .iter()
+            .find(|j| j.url == "https://example.com/other.bin")
+            .expect("new job");
+        assert!(!added.replace_existing);
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

@@ -21,6 +21,7 @@ pub enum PromptDecision {
     Accept {
         filename: Option<String>,
         directory: Option<PathBuf>,
+        overwrite: bool,
     },
     Dismiss,
 }
