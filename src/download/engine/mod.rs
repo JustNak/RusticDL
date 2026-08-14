@@ -11,7 +11,7 @@ use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
 use super::filesystem::{
     apply_partial_progress_from_disk, apply_progress_from_sum, is_untracked_preallocate_hole,
-    metadata_len, remove_partial,
+    metadata_len, remove_partial, FilenameConflictPolicy,
 };
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
@@ -108,6 +108,8 @@ pub enum EngineCommand {
         directory: PathBuf,
         /// Browser session headers (memory-only; never persisted).
         handoff_auth: Option<HandoffAuth>,
+        /// Same-name file policy (Ask-mode overwrite vs default uniquify).
+        conflict: FilenameConflictPolicy,
         reply: Option<oneshot::Sender<EnqueueOutcome>>,
     },
     Pause(String),

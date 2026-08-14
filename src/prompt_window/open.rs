@@ -21,8 +21,20 @@ pub fn open_browser_prompt_window(
     settings: &Settings,
     cx: &mut App,
 ) -> Option<WindowHandle<Root>> {
+    let default_name = super::helpers::default_prompt_filename(&prompt);
+    let title = if crate::download::find_filename_collision(
+        &prompt.default_directory,
+        &default_name,
+        &ipc.jobs_snapshot(),
+    )
+    .is_some()
+    {
+        format!("{APP_NAME} — File already exists")
+    } else {
+        format!("{APP_NAME} — Confirm download")
+    };
     open_capture_window(
-        format!("{APP_NAME} — Confirm download"),
+        title,
         CAPTURE_WINDOW_H,
         {
             let prompt = prompt.clone();

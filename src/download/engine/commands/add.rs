@@ -7,7 +7,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use super::super::super::duplicates::find_active_duplicate;
 use super::super::super::filesystem::{
-    allocate_unique_download_paths, derive_filename_from_url, sanitize_filename,
+    allocate_download_paths, derive_filename_from_url, sanitize_filename, FilenameConflictPolicy,
 };
 use super::super::super::handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth};
 use super::super::super::job::Job;
@@ -20,6 +20,7 @@ pub(super) async fn handle(
     filename: Option<String>,
     directory: PathBuf,
     handoff_auth: Option<HandoffAuth>,
+    conflict: FilenameConflictPolicy,
     reply: Option<oneshot::Sender<EnqueueOutcome>>,
 ) {
     // Split newlines/spaces and glued pastes (…tokenhttps://other…).
@@ -88,16 +89,29 @@ pub(super) async fn handle(
                 derive_filename_from_url(&url).unwrap_or_else(|| "download.bin".into())
             };
 
-            let (name, target, temp) = allocate_unique_download_paths(
+            // Overwrite applies to the first successfully enqueued job only.
+            let policy = if first_outcome.is_none() {
+                conflict
+            } else {
+                FilenameConflictPolicy::Uniquify
+            };
+            let (name, target, temp, replace_existing) = allocate_download_paths(
                 &directory,
                 &preferred,
                 &occupied_targets,
                 &occupied_temps,
+                &guard.jobs,
+                &new_jobs,
+                policy,
             );
+            if replace_existing && temp.exists() {
+                let _ = std::fs::remove_file(&temp);
+            }
             occupied_targets.push(target.clone());
             occupied_temps.push(temp.clone());
 
-            let job = Job::new(url, name, target, temp);
+            let mut job = Job::new(url, name, target, temp);
+            job.replace_existing = replace_existing;
             if first_outcome.is_none() {
                 first_outcome = Some(EnqueueOutcome {
                     job_id: job.id.clone(),

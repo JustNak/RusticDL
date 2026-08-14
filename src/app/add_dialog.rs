@@ -58,6 +58,7 @@ pub(crate) fn enqueue_urls(
             },
             directory: directory.clone(),
             handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
             reply: None,
         });
         count += 1;

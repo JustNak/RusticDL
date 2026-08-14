@@ -221,6 +221,9 @@ pub struct Job {
     /// Optional SHA-256 hex; verified after transfer, before finalize rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
+    /// Replace the on-disk file with this name at finalize (Ask-mode overwrite).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_existing: bool,
 }
 
 impl Job {
@@ -251,6 +254,7 @@ impl Job {
             transfer_mode: None,
             fallback_reason: None,
             expected_sha256: None,
+            replace_existing: false,
         }
     }
 

@@ -210,7 +210,7 @@ impl BrowserPromptWindow {
                     self.job = Some(j);
                 }
             }
-            CapturePhase::Confirm => {}
+            CapturePhase::Confirm | CapturePhase::Conflict => {}
         }
     }
 

@@ -278,8 +278,21 @@ pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
     apply_partial_progress_from_disk(job, on_disk)
 }
 
-pub async fn move_to_final_path(temp_path: &Path, target_path: &Path) -> Result<PathBuf, String> {
-    let final_path = allocate_final_path(target_path).await?;
+pub async fn move_to_final_path(
+    temp_path: &Path,
+    target_path: &Path,
+    replace: bool,
+) -> Result<PathBuf, String> {
+    let final_path = if replace {
+        if target_path.exists() {
+            fs::remove_file(target_path)
+                .await
+                .map_err(|error| format!("Could not replace existing download file: {error}"))?;
+        }
+        target_path.to_path_buf()
+    } else {
+        allocate_final_path(target_path).await?
+    };
 
     fs::rename(temp_path, &final_path)
         .await
@@ -420,6 +433,126 @@ pub fn temp_path_for(target: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// How to resolve a filename that already exists on disk or in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilenameConflictPolicy {
+    /// `file (n).ext` — current default for Add / Auto handoff.
+    #[default]
+    Uniquify,
+    /// Keep the exact name. Active jobs still force uniquify.
+    Overwrite,
+}
+
+/// A preferred name that is already taken in the save folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilenameCollision {
+    pub filename: String,
+    pub target_path: PathBuf,
+    pub temp_path: PathBuf,
+    /// True when an active job already owns this target or leftover `.part`.
+    pub owned_by_active_job: bool,
+    /// Next free `stem (n).ext` (or uuid fallback).
+    pub suggested_unique_name: String,
+}
+
+/// Sanitize and join `preferred_name` under `directory`.
+pub fn preferred_download_paths(
+    directory: &Path,
+    preferred_name: &str,
+) -> (String, PathBuf, PathBuf) {
+    let preferred = sanitize_filename(preferred_name);
+    let preferred = if preferred.is_empty() {
+        "download.bin".into()
+    } else {
+        preferred
+    };
+    let target = directory.join(&preferred);
+    let temp = temp_path_for(&target);
+    (preferred, target, temp)
+}
+
+fn paths_are_taken(
+    target: &Path,
+    temp: &Path,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+) -> bool {
+    occupied_targets.iter().any(|path| path == target)
+        || occupied_temps.iter().any(|path| path == temp)
+        || target.exists()
+        || temp.exists()
+}
+
+fn active_job_owns_paths(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
+    jobs.iter()
+        .any(|job| job.state.is_active() && (job.target_path == target || job.temp_path == temp))
+}
+
+/// First collision for `preferred_name` against disk, leftover `.part`, and jobs.
+pub fn find_filename_collision(
+    directory: &Path,
+    preferred_name: &str,
+    jobs: &[Job],
+) -> Option<FilenameCollision> {
+    let occupied_targets: Vec<PathBuf> = jobs.iter().map(|job| job.target_path.clone()).collect();
+    let occupied_temps: Vec<PathBuf> = jobs.iter().map(|job| job.temp_path.clone()).collect();
+    find_filename_collision_occupied(
+        directory,
+        preferred_name,
+        &occupied_targets,
+        &occupied_temps,
+        jobs,
+    )
+}
+
+fn find_filename_collision_occupied(
+    directory: &Path,
+    preferred_name: &str,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+    jobs: &[Job],
+) -> Option<FilenameCollision> {
+    let (filename, target, temp) = preferred_download_paths(directory, preferred_name);
+    if !paths_are_taken(&target, &temp, occupied_targets, occupied_temps) {
+        return None;
+    }
+    let (suggested_unique_name, _, _) =
+        allocate_unique_download_paths(directory, &filename, occupied_targets, occupied_temps);
+    Some(FilenameCollision {
+        owned_by_active_job: active_job_owns_paths(&target, &temp, jobs),
+        filename,
+        target_path: target,
+        temp_path: temp,
+        suggested_unique_name,
+    })
+}
+
+/// Pick target paths, uniquifying or keeping the exact name per `policy`.
+///
+/// Overwrite still uniquifies when an active job owns the preferred target or
+/// `.part`. The returned bool is `replace_existing` for the new job.
+pub fn allocate_download_paths(
+    directory: &Path,
+    preferred_name: &str,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+    jobs: &[Job],
+    extra_jobs: &[Job],
+    policy: FilenameConflictPolicy,
+) -> (String, PathBuf, PathBuf, bool) {
+    if policy == FilenameConflictPolicy::Overwrite {
+        let (name, target, temp) = preferred_download_paths(directory, preferred_name);
+        let blocked = active_job_owns_paths(&target, &temp, jobs)
+            || active_job_owns_paths(&target, &temp, extra_jobs);
+        if !blocked {
+            return (name, target, temp, true);
+        }
+    }
+    let (name, target, temp) =
+        allocate_unique_download_paths(directory, preferred_name, occupied_targets, occupied_temps);
+    (name, target, temp, false)
+}
+
 /// Pick a unique target filename within `directory`, avoiding collisions with
 /// existing jobs and on-disk final/partial files.
 pub fn allocate_unique_download_paths(
@@ -428,12 +561,7 @@ pub fn allocate_unique_download_paths(
     occupied_targets: &[PathBuf],
     occupied_temps: &[PathBuf],
 ) -> (String, PathBuf, PathBuf) {
-    let preferred = sanitize_filename(preferred_name);
-    let preferred = if preferred.is_empty() {
-        "download.bin".into()
-    } else {
-        preferred
-    };
+    let (preferred, _, _) = preferred_download_paths(directory, preferred_name);
 
     let stem = Path::new(&preferred)
         .file_stem()
@@ -454,11 +582,7 @@ pub fn allocate_unique_download_paths(
         };
         let target = directory.join(&name);
         let temp = temp_path_for(&target);
-        let taken = occupied_targets.iter().any(|path| path == &target)
-            || occupied_temps.iter().any(|path| path == &temp)
-            || target.exists()
-            || temp.exists();
-        if !taken {
+        if !paths_are_taken(&target, &temp, occupied_targets, occupied_temps) {
             return (name, target, temp);
         }
     }
@@ -853,6 +977,129 @@ mod tests {
         assert_eq!(n2, "file (1).zip");
         assert_ne!(t1, t2);
         assert_ne!(p1, p2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn collision_job(dir: &std::path::Path, name: &str, state: super::super::job::JobState) -> Job {
+        let target = dir.join(name);
+        let temp = temp_path_for(&target);
+        let mut job = Job::new("https://example.com/file".into(), name.into(), target, temp);
+        job.state = state;
+        job
+    }
+
+    #[test]
+    fn finds_collision_for_on_disk_file() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-col-disk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.pdf"), b"old").unwrap();
+        let found = find_filename_collision(&dir, "report.pdf", &[]).expect("collision");
+        assert_eq!(found.filename, "report.pdf");
+        assert!(!found.owned_by_active_job);
+        assert_eq!(found.suggested_unique_name, "report (1).pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_collision_for_leftover_part() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-col-part-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("clip.bin.part"), b"partial").unwrap();
+        let found = find_filename_collision(&dir, "clip.bin", &[]).expect("collision");
+        assert_eq!(found.filename, "clip.bin");
+        assert_eq!(found.suggested_unique_name, "clip (1).bin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_collision_for_occupied_job_target() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-col-job-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "taken.zip", super::super::job::JobState::Completed);
+        let found = find_filename_collision(&dir, "taken.zip", &[job]).expect("collision");
+        assert!(!found.owned_by_active_job);
+        assert_eq!(found.suggested_unique_name, "taken (1).zip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collision_marks_active_job_owner() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-col-act-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "busy.iso", super::super::job::JobState::Downloading);
+        let found = find_filename_collision(&dir, "busy.iso", &[job]).expect("collision");
+        assert!(found.owned_by_active_job);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_allocate_keeps_original_name() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-ow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.zip"), b"old").unwrap();
+        let (name, target, _, replace) = allocate_download_paths(
+            &dir,
+            "file.zip",
+            &[],
+            &[],
+            &[],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert_eq!(name, "file.zip");
+        assert_eq!(target, dir.join("file.zip"));
+        assert!(replace);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overwrite_allocate_falls_back_when_active_job_owns_path() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-ow-act-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = collision_job(&dir, "file.zip", super::super::job::JobState::Paused);
+        let occupied = vec![job.target_path.clone()];
+        let occupied_temps = vec![job.temp_path.clone()];
+        let (name, _, _, replace) = allocate_download_paths(
+            &dir,
+            "file.zip",
+            &occupied,
+            &occupied_temps,
+            &[job],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert_eq!(name, "file (1).zip");
+        assert!(!replace);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn move_to_final_path_replaces_when_requested() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-final-rep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keep-name.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&target, b"old-bytes").unwrap();
+        std::fs::write(&temp, b"new-bytes").unwrap();
+        let final_path = move_to_final_path(&temp, &target, true).await.unwrap();
+        assert_eq!(final_path, target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-bytes");
+        assert!(!temp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn move_to_final_path_uniquifies_when_not_replacing() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-final-uni-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keep-name.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&target, b"old-bytes").unwrap();
+        std::fs::write(&temp, b"new-bytes").unwrap();
+        let final_path = move_to_final_path(&temp, &target, false).await.unwrap();
+        assert_eq!(final_path, dir.join("keep-name (1).bin"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-bytes");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"new-bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

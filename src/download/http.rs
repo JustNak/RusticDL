@@ -782,7 +782,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
 
             verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
 
-            let final_path = move_to_final_path(&temp_path, &target_path)
+            let final_path = move_to_final_path(&temp_path, &target_path, ctx.job.replace_existing)
                 .await
                 .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
