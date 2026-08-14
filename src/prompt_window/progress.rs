@@ -59,9 +59,11 @@ impl BrowserPromptWindow {
         };
 
         let mut speed_samples = VecDeque::with_capacity(SPEED_SAMPLE_CAP);
+        let mut peak_speed = 0u64;
         if let Some(j) = job.as_ref() {
             if matches!(j.state, JobState::Downloading | JobState::Starting) && j.speed > 0 {
                 speed_samples.push_back(j.speed);
+                peak_speed = j.speed;
             }
         }
 
@@ -88,6 +90,7 @@ impl BrowserPromptWindow {
             waiting_url_noted: false,
             canceling: false,
             speed_samples,
+            peak_speed,
             reduce_motion: settings.reduce_motion,
             fitted_height,
         }
@@ -284,6 +287,17 @@ impl BrowserPromptWindow {
         };
 
         let samples: Vec<u64> = self.speed_samples.iter().copied().collect();
+        let spark_status = if self
+            .job
+            .as_ref()
+            .is_some_and(|j| j.state == JobState::Paused)
+        {
+            "paused"
+        } else if samples.iter().any(|&s| s > 0) {
+            "live"
+        } else {
+            "waiting…"
+        };
 
         v_flex()
             .gap_2()
@@ -332,7 +346,15 @@ impl BrowserPromptWindow {
                 )
             })
             // Live speed sparkline fills the empty band under the progress row.
-            .child(speed_sparkline(&samples, progress_color, muted, &theme))
+            .child(speed_sparkline(
+                &samples,
+                self.peak_speed,
+                progress_color,
+                muted,
+                &theme,
+                self.reduce_motion,
+                spark_status,
+            ))
             .child(
                 h_flex()
                     .w_full()

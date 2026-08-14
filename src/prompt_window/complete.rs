@@ -1,19 +1,25 @@
 //! Complete phase: construct, open/reveal actions, and render.
 
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{div, prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled, Window};
+use gpui::{
+    div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window,
+};
 use gpui_component::{
     button::{Button, ButtonVariants},
-    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
+    h_flex,
+    tooltip::Tooltip,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt,
 };
 
-use super::helpers::shorten_path;
+use super::helpers::{shorten_folder, truncate_middle};
 use super::start_sync_timer;
 use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H};
 use crate::appearance::apply_appearance;
 use crate::download::{open_path, reveal_in_folder, EngineHandle, Job};
-use crate::format::{format_bytes, format_size};
+use crate::format::{format_bytes, format_duration, format_size, format_speed};
 use crate::ipc::IpcBridge;
 use crate::settings::Settings;
 use crate::window_icon::apply_app_icon;
@@ -51,6 +57,7 @@ impl BrowserPromptWindow {
             waiting_url_noted: false,
             canceling: false,
             speed_samples: VecDeque::new(),
+            peak_speed: 0,
             reduce_motion: settings.reduce_motion,
             fitted_height: Some(CAPTURE_COMPLETE_H),
         }
@@ -101,9 +108,45 @@ impl BrowserPromptWindow {
                 .map(format_size)
                 .unwrap_or_else(|| "—".into())
         };
-        let path_preview = shorten_path(&target_path.to_string_lossy());
+
+        let elapsed_secs = self
+            .job
+            .as_ref()
+            .map(|j| now_unix_secs().saturating_sub(j.created_at));
+        let downloaded = self
+            .job
+            .as_ref()
+            .map(|j| {
+                if j.downloaded_bytes > 0 {
+                    j.downloaded_bytes
+                } else {
+                    j.total_bytes
+                }
+            })
+            .unwrap_or(total_bytes);
+        let avg_speed = elapsed_secs
+            .filter(|&s| s > 0)
+            .map(|s| downloaded / s)
+            .filter(|&s| s > 0);
+
+        let mut meta = vec![size_label];
+        if let Some(secs) = elapsed_secs.filter(|&s| s > 0) {
+            meta.push(format_duration(secs));
+        }
+        if self.peak_speed > 0 {
+            meta.push(format!("peak {}", format_speed(self.peak_speed)));
+        }
+        if let Some(avg) = avg_speed {
+            meta.push(format!("avg {}", format_speed(avg)));
+        }
+
+        let folder_label = shorten_folder(&target_path);
+        let filename_display = truncate_middle(&filename, 52);
+        let filename_tip: SharedString = filename.clone().into();
+        let path_tip: SharedString = target_path.to_string_lossy().into_owned().into();
         let file_exists = target_path.exists();
         let action_error = self.action_error.clone();
+        let tip_color = muted;
 
         v_flex()
             .size_full()
@@ -131,17 +174,20 @@ impl BrowserPromptWindow {
                             .gap_0p5()
                             .child(
                                 div()
+                                    .id("capture-complete-name")
                                     .text_sm()
                                     .font_medium()
                                     .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(filename),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!("{size_label} · finished")),
+                                    .child(filename_display)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(filename_tip.clone())
+                                            .text_xs()
+                                            .font_normal()
+                                            .text_color(tip_color)
+                                            .py_0()
+                                            .px_1p5()
+                                            .build(window, cx)
+                                    }),
                             )
                             .child(
                                 div()
@@ -149,10 +195,36 @@ impl BrowserPromptWindow {
                                     .text_color(muted)
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(path_preview),
+                                    .child(meta.join(" · ")),
+                            )
+                            .child(
+                                div()
+                                    .id("capture-complete-folder")
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(folder_label)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(path_tip.clone())
+                                            .text_xs()
+                                            .font_normal()
+                                            .text_color(tip_color)
+                                            .py_0()
+                                            .px_1p5()
+                                            .build(window, cx)
+                                    }),
                             ),
                     ),
             )
+            .when(!file_exists, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("File is missing from disk"),
+                )
+            })
             .when_some(action_error, |el, msg| {
                 el.child(div().text_xs().text_color(theme.danger).child(msg))
             })
@@ -185,4 +257,11 @@ impl BrowserPromptWindow {
             )
             .into_any_element()
     }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

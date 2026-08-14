@@ -77,6 +77,8 @@ pub struct BrowserPromptWindow {
     canceling: bool,
     /// Rolling bytes/sec samples for the Progress speed sparkline.
     speed_samples: VecDeque<u64>,
+    /// Highest speed seen this HUD session (sticky Y-scale / peak label).
+    peak_speed: u64,
     /// When true, skip animating sample growth (settings reduce_motion).
     reduce_motion: bool,
     /// Last height we applied via `resize` so Complete/Progress don't fight.
@@ -85,6 +87,9 @@ pub struct BrowserPromptWindow {
 
 impl BrowserPromptWindow {
     fn push_speed_sample(&mut self, speed: u64) {
+        if speed > self.peak_speed {
+            self.peak_speed = speed;
+        }
         if self.reduce_motion {
             // Keep a short flat trail so the chart still has shape without churn.
             if self.speed_samples.len() >= 12 {

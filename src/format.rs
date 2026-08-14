@@ -49,6 +49,27 @@ pub fn format_eta(secs: u64) -> String {
     }
 }
 
+/// Exact elapsed time for a finished transfer (not quantized like ETA).
+pub fn format_duration(secs: u64) -> String {
+    if secs == 0 {
+        return "—".into();
+    }
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {seconds:02}s")
+        }
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Snap remaining-time to coarse buckets so a 1–2s engine wiggle does not
 /// rewrite the label every tick.
 fn quantize_eta(secs: u64) -> u64 {
@@ -363,5 +384,19 @@ mod tests {
     fn eta_one_minute_keeps_quantized_seconds() {
         assert_eq!(format_eta(70), "1m 00s");
         assert_eq!(format_eta(80), "1m 15s");
+    }
+
+    #[test]
+    fn duration_unknown_is_em_dash() {
+        assert_eq!(format_duration(0), "—");
+    }
+
+    #[test]
+    fn duration_keeps_exact_seconds() {
+        assert_eq!(format_duration(7), "7s");
+        assert_eq!(format_duration(54), "54s");
+        assert_eq!(format_duration(72), "1m 12s");
+        assert_eq!(format_duration(120), "2m");
+        assert_eq!(format_duration(3723), "1h 02m");
     }
 }
