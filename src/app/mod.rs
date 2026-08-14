@@ -24,6 +24,7 @@ mod widgets;
 pub use filter::FilterKind;
 pub(crate) use settings_category::SettingsCategory;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -59,7 +60,7 @@ use toast::Toast;
 use widgets::render_vignette_overlay;
 
 pub struct DownloadApp {
-    jobs: Vec<Job>,
+    jobs: Arc<Vec<Job>>,
     settings: Settings,
     paths: AppPaths,
     engine: EngineHandle,
@@ -70,7 +71,7 @@ pub struct DownloadApp {
     /// Anchor for future Shift+range multi-select (PR-07).
     selection_anchor_id: Option<String>,
     last_ui_update: Instant,
-    pending_jobs: Option<Vec<Job>>,
+    pending_jobs: Option<Arc<Vec<Job>>>,
     pending_toast: Option<String>,
     toasts: Vec<Toast>,
     next_toast_id: u64,
@@ -429,7 +430,8 @@ impl DownloadApp {
         .detach();
 
         ipc.update_settings(&settings);
-        ipc.update_jobs(&jobs);
+        let jobs = Arc::new(jobs);
+        ipc.update_jobs(Arc::clone(&jobs));
 
         let started_minimized = launched_minimized();
         // Tray is needed for close-to-tray, startup-minimized, and OS balloons.

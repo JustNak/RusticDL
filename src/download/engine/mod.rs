@@ -95,7 +95,7 @@ const PROGRESS_COALESCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    JobsChanged(Vec<Job>),
+    JobsChanged(Arc<Vec<Job>>),
     Toast(String),
 }
 
@@ -729,7 +729,7 @@ pub(super) fn find_job_mut<'a>(jobs: &'a mut [Job], id: &str) -> Option<&'a mut 
 pub(super) fn emit_jobs_locked(guard: &EngineInner) {
     let _ = guard
         .event_tx
-        .send(EngineEvent::JobsChanged(guard.jobs.clone()));
+        .send(EngineEvent::JobsChanged(Arc::new(guard.jobs.clone())));
 }
 
 pub(super) async fn emit_toast(inner: &Arc<Mutex<EngineInner>>, message: String) {
