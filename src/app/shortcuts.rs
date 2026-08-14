@@ -117,7 +117,8 @@ impl DownloadApp {
         if visible.is_empty() {
             return;
         }
-        self.selected_ids = visible.iter().map(|j| j.id.clone()).collect();
+        let ids: Vec<String> = visible.iter().map(|j| j.id.clone()).collect();
+        self.selected_ids = ids;
         // Keep a stable Shift-range anchor at the first visible row; primary = last.
         self.selection_anchor_id = self.selected_ids.first().cloned();
         cx.notify();

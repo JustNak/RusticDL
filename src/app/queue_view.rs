@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{
     div, prelude::FluentBuilder, px, Context, ExternalPaths, InteractiveElement, IntoElement,
@@ -84,12 +85,13 @@ impl DownloadApp {
         cx: &mut Context<DownloadApp>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        let filtered = self.visible_jobs(cx);
+        let jobs = Arc::clone(&self.jobs);
+        let filtered = self.visible_jobs_in(&jobs, cx);
         let query = self.search_query(cx);
         let has_query = !query.trim().is_empty();
         if filtered.is_empty()
             && !has_query
-            && filter_jobs(&self.jobs, self.filter.as_index()).is_empty()
+            && filter_jobs(&jobs, self.filter.as_index()).is_empty()
         {
             return self.render_empty(cx).into_any_element();
         }

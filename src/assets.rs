@@ -5,17 +5,19 @@ use std::path::PathBuf;
 use gpui::{AssetSource, Result, SharedString};
 use include_dir::{include_dir, Dir};
 
-/// Assets baked into the binary at compile time. Used when the loose
-/// `assets/` directory is missing (e.g. a mis-packaged install) so SVG icons
-/// still resolve for light and dark themes.
-static EMBEDDED_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
+/// SVG icons baked into the binary (icon fallback when loose `assets/` is missing).
+static EMBEDDED_ICONS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets/icons");
+
+/// Title-bar logos. Paths stay `brand/logo.png` / `brand/logo-light.png`.
+static EMBEDDED_LOGO_DARK: &[u8] = include_bytes!("../assets/brand/logo.png");
+static EMBEDDED_LOGO_LIGHT: &[u8] = include_bytes!("../assets/brand/logo-light.png");
 
 /// Loads SVG/icons and other static files from the project `assets/` directory.
 ///
 /// Resolution order:
 /// 1. `<exe-dir>/assets/` — release installs (cargo-packager copies `assets`)
 /// 2. `CARGO_MANIFEST_DIR/assets` — local `cargo run` / `cargo build` from the repo
-/// 3. Compile-time embedded copy of `assets/` — always available as a fallback
+/// 3. Compile-time embedded icons + title-bar logos — always available as a fallback
 pub struct Assets {
     base: PathBuf,
 }
@@ -39,16 +41,36 @@ impl Assets {
     }
 
     fn load_embedded(path: &str) -> Option<Cow<'static, [u8]>> {
-        EMBEDDED_ASSETS
-            .get_file(path)
-            .map(|file| Cow::Borrowed(file.contents()))
+        if let Some(rest) = path.strip_prefix("icons/") {
+            return EMBEDDED_ICONS
+                .get_file(rest)
+                .map(|file| Cow::Borrowed(file.contents()));
+        }
+        match path {
+            "brand/logo.png" => Some(Cow::Borrowed(EMBEDDED_LOGO_DARK)),
+            "brand/logo-light.png" => Some(Cow::Borrowed(EMBEDDED_LOGO_LIGHT)),
+            _ => None,
+        }
     }
 
     fn list_embedded(path: &str) -> Vec<SharedString> {
-        let dir = if path.is_empty() || path == "." {
-            Some(&EMBEDDED_ASSETS)
+        if path.is_empty() || path == "." {
+            return ["icons", "brand"]
+                .into_iter()
+                .map(SharedString::from)
+                .collect();
+        }
+        if path == "brand" {
+            return ["logo.png", "logo-light.png"]
+                .into_iter()
+                .map(SharedString::from)
+                .collect();
+        }
+        let dir = if path == "icons" {
+            Some(&EMBEDDED_ICONS)
         } else {
-            EMBEDDED_ASSETS.get_dir(path)
+            path.strip_prefix("icons/")
+                .and_then(|rest| EMBEDDED_ICONS.get_dir(rest))
         };
         let Some(dir) = dir else {
             return Vec::new();
@@ -133,6 +155,13 @@ mod tests {
             // PNG magic
             assert_eq!(&bytes[..4], b"\x89PNG", "{path} should be a PNG");
         }
+    }
+
+    #[test]
+    fn unused_assets_are_not_embedded() {
+        assert!(Assets::load_embedded("noise.png").is_none());
+        assert!(Assets::load_embedded("brand/masters/icon-master-1024.png").is_none());
+        assert!(Assets::load_embedded("brand/masters/icon-master-light-1024.png").is_none());
     }
 
     #[test]

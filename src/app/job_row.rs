@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use gpui::{
     div, prelude::FluentBuilder, px, ClickEvent, Context, Corner, Hsla, InteractiveElement,
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
@@ -20,7 +22,7 @@ use crate::format::{format_date, format_eta, format_size, format_speed};
 use crate::settings::{ProgressStyle, UiDensity};
 
 pub(crate) fn render_job_row(
-    job: Job,
+    job: &Job,
     selected: bool,
     cols: QueueColumns,
     main_w: f32,
@@ -51,7 +53,7 @@ pub(crate) fn render_job_row(
     } else {
         "—".into()
     };
-    let size = format_size(&job);
+    let size = format_size(job);
     let date = format_date(job.created_at);
     let status = job.state.label();
     let progress = job.progress as f32;
@@ -104,7 +106,8 @@ pub(crate) fn render_job_row(
             if m.secondary() {
                 this.toggle_select(id_for_select.clone());
             } else if m.shift {
-                let visible = this.visible_jobs(cx);
+                let jobs = Arc::clone(&this.jobs);
+                let visible = this.visible_jobs_in(&jobs, cx);
                 this.select_range_visible(&id_for_select, &visible);
             } else {
                 this.select_only(id_for_select.clone());

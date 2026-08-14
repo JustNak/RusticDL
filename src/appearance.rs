@@ -328,18 +328,23 @@ fn noise_strength(intensity: u8) -> f32 {
 }
 
 /// Cached grain texture for a given slider intensity (0 → empty / unused).
+/// Holds only the current intensity key.
 pub fn film_grain_image(intensity: u8) -> Arc<RenderImage> {
     use std::sync::Mutex;
-    type Cache = std::collections::HashMap<u8, Arc<RenderImage>>;
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    type GrainCache = Option<(u8, Arc<RenderImage>)>;
+    static CACHE: OnceLock<Mutex<GrainCache>> = OnceLock::new();
 
     let key = noise_cache_key(intensity);
-    let cache = CACHE.get_or_init(|| Mutex::new(Cache::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(build_film_grain_texture(512, noise_strength(key))))
-        .clone()
+    match guard.as_ref() {
+        Some((cached_key, image)) if *cached_key == key => Arc::clone(image),
+        _ => {
+            let image = Arc::new(build_film_grain_texture(512, noise_strength(key)));
+            *guard = Some((key, Arc::clone(&image)));
+            image
+        }
+    }
 }
 
 /// Dense dual-polarity film grain (BGRA for [`RenderImage`]).

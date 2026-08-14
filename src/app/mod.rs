@@ -583,12 +583,12 @@ impl DownloadApp {
         self.search_input.read(cx).value().to_string()
     }
 
-    fn visible_jobs(&self, cx: &App) -> Vec<Job> {
+    fn visible_jobs_in<'a>(&self, jobs: &'a [Job], cx: &App) -> Vec<&'a Job> {
         let query = self.search_query(cx);
-        let mut jobs: Vec<Job> = filter_jobs(&self.jobs, self.filter.as_index())
+        let query = query.trim().to_lowercase();
+        let mut jobs: Vec<&Job> = filter_jobs(jobs, self.filter.as_index())
             .into_iter()
             .filter(|job| job_matches_search(job, &query))
-            .cloned()
             .collect();
         sort_jobs(
             &mut jobs,
@@ -596,6 +596,10 @@ impl DownloadApp {
             self.settings.sort_direction,
         );
         jobs
+    }
+
+    fn visible_jobs(&self, cx: &App) -> Vec<&Job> {
+        self.visible_jobs_in(&self.jobs, cx)
     }
 
     /// Toggle or switch queue sort; persists the preference immediately.
