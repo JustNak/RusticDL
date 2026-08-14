@@ -78,6 +78,7 @@ const targets = [
         'storage',
         'webRequest',
         'webRequestBlocking',
+        'webRequestFilterResponse',
         '<all_urls>',
       ],
       background: {

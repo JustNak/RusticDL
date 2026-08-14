@@ -38,6 +38,8 @@ await esbuild.build({
 const require = createRequire(import.meta.url);
 const {
   firefoxWebRequestDownloadCandidate,
+  firefoxBeforeRequestDownloadCandidate,
+  abortFirefoxResponseBody,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
   downloadCreatedAction,
@@ -793,6 +795,71 @@ assert(
     },
     defaultSettings,
   ) === false,
+);
+
+assert(
+  'cancels Gofile CDN .rar on onBeforeRequest (before any body)',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://file-ap-hkg-1.gofile.io/download/web/4526a00b8d/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+      type: 'xmlhttprequest',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'cancels Pixeldrain object URL on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://pixeldrain.com/api/file/abc123/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  )?.reason === 'file_host_cdn_url',
+);
+
+assert(
+  'does not cancel Gofile listing pages that are not a file URL',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://gofile.io/d/eFKBSa',
+      method: 'GET',
+      type: 'main_frame',
+    },
+    defaultSettings,
+  ) === null,
+);
+
+assert(
+  'does not cancel non-CDN .rar URLs on onBeforeRequest',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://cdn.example.com/files/RAFT-SteamRIP.com.rar',
+      method: 'GET',
+    },
+    defaultSettings,
+  ) === null,
+);
+
+let closed = 0;
+assert(
+  'closes the Firefox response filter so the body cannot continue',
+  abortFirefoxResponseBody(
+    {
+      filterResponseData: () => ({
+        onstart: null,
+        ondata: null,
+        onstop: null,
+        onerror: null,
+        close() {
+          closed += 1;
+        },
+      }),
+    },
+    'req-1',
+  ) === true && closed >= 1,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
