@@ -72,6 +72,7 @@ mod tests {
     use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -139,7 +140,9 @@ mod tests {
         .expect("timed out waiting for toast")
     }
 
-    async fn next_jobs(events: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>) -> Vec<Job> {
+    async fn next_jobs(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    ) -> Arc<Vec<Job>> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match events.recv().await {
@@ -501,7 +504,7 @@ mod tests {
         // Should not panic; job stays Canceled.
         let jobs = tokio::time::timeout(Duration::from_millis(200), next_jobs(&mut events))
             .await
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_default();
         if let Some(j) = jobs.iter().find(|j| j.id == id) {
             assert_eq!(j.state, JobState::Canceled);
         }

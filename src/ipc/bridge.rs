@@ -79,7 +79,7 @@ pub(crate) struct IpcState {
     pub(crate) download_directory: PathBuf,
     pub(crate) extension_settings: ExtensionIntegrationSettings,
     pub(crate) settings: Settings,
-    pub(crate) jobs: Vec<Job>,
+    pub(crate) jobs: Arc<Vec<Job>>,
     /// FIFO of browser prompts waiting for UI (or currently shown).
     pub(crate) prompt_queue: VecDeque<BrowserPrompt>,
     /// Prompt id currently shown in the ask dialog (if any).
@@ -105,7 +105,7 @@ impl IpcBridge {
                 download_directory: settings.download_directory.clone(),
                 extension_settings: settings.extension.clone(),
                 settings: settings.clone(),
-                jobs: Vec::new(),
+                jobs: Arc::new(Vec::new()),
                 prompt_queue: VecDeque::new(),
                 active_prompt_id: None,
                 show_window_requested: false,
@@ -148,9 +148,9 @@ impl IpcBridge {
         }
     }
 
-    pub fn update_jobs(&self, jobs: &[Job]) {
+    pub fn update_jobs(&self, jobs: Arc<Vec<Job>>) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard.jobs = jobs.to_vec();
+            guard.jobs = jobs;
         }
     }
 
@@ -225,13 +225,18 @@ impl IpcBridge {
 
     pub(crate) fn snapshot(
         &self,
-    ) -> Option<(PathBuf, ExtensionIntegrationSettings, Settings, Vec<Job>)> {
+    ) -> Option<(
+        PathBuf,
+        ExtensionIntegrationSettings,
+        Settings,
+        Arc<Vec<Job>>,
+    )> {
         let guard = self.inner.lock().ok()?;
         Some((
             guard.download_directory.clone(),
             guard.extension_settings.clone(),
             guard.settings.clone(),
-            guard.jobs.clone(),
+            Arc::clone(&guard.jobs),
         ))
     }
 
@@ -281,7 +286,6 @@ impl IpcBridge {
         let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
-        let jobs = guard.jobs.clone();
         let mut open = Vec::new();
         let mut keep = VecDeque::new();
         while let Some(id) = guard.pending_progress_job_ids.pop_front() {
@@ -290,7 +294,7 @@ impl IpcBridge {
             }
             // Job not in snapshot yet (JobsChanged lag): retry next poll so we do not
             // open a Progress HUD while Confirm morph still waits with job_id: None.
-            let Some(job) = jobs.iter().find(|j| j.id == id) else {
+            let Some(job) = guard.jobs.iter().find(|j| j.id == id) else {
                 keep.push_back(id);
                 continue;
             };
@@ -305,12 +309,20 @@ impl IpcBridge {
         open
     }
 
-    /// Snapshot of current jobs for floating capture windows (progress/complete).
-    pub fn jobs_snapshot(&self) -> Vec<Job> {
+    /// Look up one job without cloning the whole snapshot.
+    pub fn job_by_id(&self, id: &str) -> Option<Job> {
         self.inner
             .lock()
             .ok()
-            .map(|guard| guard.jobs.clone())
+            .and_then(|guard| guard.jobs.iter().find(|j| j.id == id).cloned())
+    }
+
+    /// Shared snapshot of current jobs (cheap Arc clone).
+    pub fn jobs_snapshot(&self) -> Arc<Vec<Job>> {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| Arc::clone(&guard.jobs))
             .unwrap_or_default()
     }
 

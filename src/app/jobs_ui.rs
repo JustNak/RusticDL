@@ -1,5 +1,6 @@
 //! Jobs list apply path, debounced persist, and OS notify flush wiring for `DownloadApp`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::Context;
@@ -18,7 +19,7 @@ use crate::settings::OsNotifyMode;
 const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl DownloadApp {
-    pub(crate) fn on_jobs_changed(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
+    pub(crate) fn on_jobs_changed(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
         if self.last_ui_update.elapsed() < Duration::from_millis(80) {
             self.pending_jobs = Some(jobs);
             return;
@@ -26,7 +27,7 @@ impl DownloadApp {
         self.apply_jobs(jobs, cx);
     }
 
-    pub(crate) fn apply_jobs(&mut self, jobs: Vec<Job>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_jobs(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
         // Edge-detect BEFORE overwrite (Completed / Failed only — never Canceled).
         let edges = terminal_edges(&self.jobs, &jobs);
         let notify_edges = filter_notify_edges(
@@ -69,7 +70,7 @@ impl DownloadApp {
         } else {
             self.flush_jobs_save_if_due();
         }
-        self.ipc.update_jobs(&self.jobs);
+        self.ipc.update_jobs(Arc::clone(&self.jobs));
         // Adopt bridge extension settings only when the user has no local preview
         // (unsaved toggles). Never clobber while extension_settings_dirty.
         self.sync_extension_settings_from_bridge(false);

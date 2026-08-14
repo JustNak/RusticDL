@@ -34,6 +34,7 @@ use persistence::{app_paths, ensure_app_dirs, load_jobs, load_settings};
 use settings::{WindowLayout, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
 use single_instance::{claim_instance, InstanceRole};
 use startup::{apply_launch_at_startup, launched_minimized};
+use std::sync::Arc;
 use window_icon::apply_app_icon;
 use window_placement::center_window;
 
@@ -60,7 +61,7 @@ fn main() {
         spawn_engine(jobs.clone(), EngineRuntimeConfig::from_settings(&settings));
 
     let ipc_bridge = IpcBridge::new(engine.clone(), &settings, paths.clone());
-    ipc_bridge.update_jobs(&jobs);
+    ipc_bridge.update_jobs(Arc::new(jobs.clone()));
     start_ipc_server(ipc_bridge.clone());
 
     let (ui_tx, ui_rx) = async_channel::unbounded();

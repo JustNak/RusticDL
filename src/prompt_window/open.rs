@@ -51,9 +51,8 @@ pub fn open_browser_progress_window(
         return None;
     }
     let already_complete = ipc
-        .jobs_snapshot()
-        .iter()
-        .any(|j| j.id == job_id && j.state == JobState::Completed);
+        .job_by_id(&job_id)
+        .is_some_and(|j| j.state == JobState::Completed);
     let opened = open_capture_window(
         format!("{APP_NAME} — Downloading"),
         if already_complete {

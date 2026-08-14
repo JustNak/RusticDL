@@ -127,6 +127,12 @@ struct PersistedState {
     jobs: Vec<Job>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedStateRef<'a> {
+    jobs: &'a [Job],
+}
+
 pub fn load_jobs(paths: &AppPaths) -> Vec<Job> {
     let Ok(bytes) = fs::read(&paths.state) else {
         return Vec::new();
@@ -141,11 +147,8 @@ pub fn save_jobs(paths: &AppPaths, jobs: &[Job]) -> Result<(), String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_app_dirs(paths)?;
-    let state = PersistedState {
-        jobs: jobs.to_vec(),
-    };
-    let json =
-        serde_json::to_vec_pretty(&state).map_err(|e| format!("Could not serialize state: {e}"))?;
+    let json = serde_json::to_vec(&PersistedStateRef { jobs })
+        .map_err(|e| format!("Could not serialize state: {e}"))?;
     atomic_write(&paths.state, &json)
 }
 
@@ -227,6 +230,41 @@ mod tests {
         fs::write(&paths.pending_whats_new, b"{not valid json").unwrap();
         assert!(load_pending_whats_new(&paths).is_none());
         assert!(!paths.pending_whats_new.is_file());
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn save_jobs_writes_compact_camel_case_json() {
+        let paths = temp_paths("jobs");
+        let job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        let job_id = job.id.clone();
+        save_jobs(&paths, std::slice::from_ref(&job)).unwrap();
+
+        let bytes = fs::read(&paths.state).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !text.contains('\n'),
+            "state.json must be compact, not pretty"
+        );
+        assert!(
+            text.contains("\"jobs\""),
+            "camelCase jobs key must be present"
+        );
+        assert!(
+            !text.contains("\"Jobs\""),
+            "PascalCase jobs key must not be written"
+        );
+
+        let loaded = load_jobs(&paths);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, job_id);
+        assert_eq!(loaded[0].filename, "f.bin");
+        assert_eq!(loaded[0].url, "https://example.com/f.bin");
         let _ = fs::remove_dir_all(&paths.root);
     }
 }

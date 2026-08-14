@@ -32,7 +32,7 @@ impl BrowserPromptWindow {
         apply_appearance(settings, Some(window), cx);
         apply_app_icon(window);
 
-        let job = ipc.jobs_snapshot().into_iter().find(|j| j.id == job_id);
+        let job = ipc.job_by_id(&job_id);
         let url = job.as_ref().map(|j| j.url.clone()).unwrap_or_default();
 
         // Promote to Complete immediately if already finished.
@@ -146,15 +146,14 @@ impl BrowserPromptWindow {
 
     /// Refresh job snapshot; bind id; morph to Complete when done.
     pub(super) fn sync_from_bridge(&mut self, cx: &mut Context<Self>) {
-        let jobs = self.ipc.jobs_snapshot();
-
         match &self.phase {
             CapturePhase::Progress { job_id, url } => {
                 let mut bound_id = job_id.clone();
                 if bound_id.is_none() {
                     // Bind only active jobs; prefer newest so same-URL re-downloads
                     // do not attach to an older Completed/Failed row.
-                    if let Some(j) = jobs
+                    let snapshot = self.ipc.jobs_snapshot();
+                    if let Some(j) = snapshot
                         .iter()
                         .filter(|j| j.url == *url && j.state.is_active())
                         .max_by_key(|j| j.created_at)
@@ -170,13 +169,12 @@ impl BrowserPromptWindow {
                 }
 
                 if let Some(id) = bound_id.clone() {
-                    if let Some(j) = jobs.iter().find(|j| j.id == id) {
+                    if let Some(j) = self.ipc.job_by_id(&id) {
                         if matches!(j.state, JobState::Downloading | JobState::Starting) {
                             self.push_speed_sample(j.speed);
                         } else if j.state == JobState::Paused {
                             // Freeze chart — do not push new samples while paused.
                         }
-                        self.job = Some(j.clone());
                         if j.state == JobState::Completed {
                             let _ = self.ipc.try_claim_complete_hud(&id);
                             self.phase = CapturePhase::Complete {
@@ -185,9 +183,11 @@ impl BrowserPromptWindow {
                                 target_path: j.target_path.clone(),
                                 total_bytes: j.total_bytes,
                             };
+                            self.job = Some(j);
                             cx.notify();
                             return;
                         }
+                        self.job = Some(j);
                         // Canceled/Failed: keep HUD open so Retry stays available.
                     }
                 }
@@ -201,12 +201,10 @@ impl BrowserPromptWindow {
                 }
                 cx.notify();
             }
-            CapturePhase::Complete { .. } => {
+            CapturePhase::Complete { job_id, .. } => {
                 // Keep snapshot fresh for path existence checks.
-                if let CapturePhase::Complete { job_id, .. } = &self.phase {
-                    if let Some(j) = jobs.into_iter().find(|j| j.id == *job_id) {
-                        self.job = Some(j);
-                    }
+                if let Some(j) = self.ipc.job_by_id(job_id) {
+                    self.job = Some(j);
                 }
             }
             CapturePhase::Confirm => {}
