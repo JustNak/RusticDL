@@ -8,6 +8,8 @@ $hostName = 'com.rusticdl.native_host'
 
 $keys = @(
   "Software\Google\Chrome\NativeMessagingHosts\$hostName",
+  "Software\Chromium\NativeMessagingHosts\$hostName",
+  "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\$hostName",
   "Software\Microsoft\Edge\NativeMessagingHosts\$hostName",
   "Software\Mozilla\NativeMessagingHosts\$hostName"
 )

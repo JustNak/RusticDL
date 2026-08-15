@@ -4,9 +4,9 @@ param(
 
   [string]$DesktopBinaryPath = "",
 
-  [string]$ChromiumExtensionId = 'rusticdl-chromium',
+  [string]$ChromiumExtensionId = '',
 
-  [string]$EdgeExtensionId = 'rusticdl-chromium',
+  [string]$EdgeExtensionId = '',
 
   [string]$FirefoxExtensionId = 'rusticdl@local',
 
@@ -19,6 +19,26 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
+
+# Must match apps/extension/chromium-identity.json (unpacked Chromium/Edge id).
+$pinnedChromiumId = 'looccikmfpkiagfaeiocohmcneoacmom'
+$identityCandidates = @(
+  (Join-Path $workspaceRoot 'apps\extension\chromium-identity.json'),
+  (Join-Path $PSScriptRoot 'chromium-identity.json')
+)
+foreach ($candidate in $identityCandidates) {
+  if (-not (Test-Path $candidate)) { continue }
+  try {
+    $identity = Get-Content -Raw -Path $candidate | ConvertFrom-Json
+    if ($identity.id) { $pinnedChromiumId = [string]$identity.id }
+  } catch {
+    # keep baked-in id
+  }
+  break
+}
+
+if (-not $ChromiumExtensionId) { $ChromiumExtensionId = $pinnedChromiumId }
+if (-not $EdgeExtensionId) { $EdgeExtensionId = $pinnedChromiumId }
 
 if (-not $HostBinaryPath) {
   $candidates = @(
@@ -134,6 +154,8 @@ function Set-RegistryDefaultValue {
 }
 
 Set-RegistryDefaultValue -SubKey "Software\Google\Chrome\NativeMessagingHosts\$hostName" -Value $chromiumManifestPath
+Set-RegistryDefaultValue -SubKey "Software\Chromium\NativeMessagingHosts\$hostName" -Value $chromiumManifestPath
+Set-RegistryDefaultValue -SubKey "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\$hostName" -Value $chromiumManifestPath
 Set-RegistryDefaultValue -SubKey "Software\Microsoft\Edge\NativeMessagingHosts\$hostName" -Value $edgeManifestPath
 Set-RegistryDefaultValue -SubKey "Software\Mozilla\NativeMessagingHosts\$hostName" -Value $firefoxManifestPath
 
@@ -161,13 +183,15 @@ if ($DesktopBinaryPath) {
 Write-Host "  Chrome JSON : $chromiumManifestPath"
 Write-Host "  Edge JSON   : $edgeManifestPath"
 Write-Host "  Firefox JSON: $firefoxManifestPath"
+Write-Host "  Chromium id : $ChromiumExtensionId"
+Write-Host "  Edge id     : $EdgeExtensionId"
 Write-Host "  Firefox id  : $FirefoxExtensionId"
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Start RusticDL (rusticdl.exe)"
 Write-Host "  2. Load the browser extension (see README)"
-Write-Host "  3. Open the extension popup and confirm status is Connected"
-Write-Host "  4. For Chromium, re-run this script with -ChromiumExtensionId after loading unpacked"
+Write-Host "  3. Reload an already-loaded unpacked Chromium extension so it picks up the pinned id"
+Write-Host "  4. Open the extension popup and confirm status is Connected"
 Write-Host ""
 Write-Host "Firefox manifest preview:"
 Get-Content -Raw $firefoxManifestPath

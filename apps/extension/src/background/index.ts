@@ -84,16 +84,92 @@ function rememberSettings(settings: ExtensionIntegrationSettings): ExtensionInte
   return settings;
 }
 
-async function ensureContextMenu() {
-  const settings = await getCachedSettings();
-  await browser.contextMenus.removeAll();
-  if (!settings.contextMenuEnabled) return;
+const CONTEXT_MENU_PROPS = {
+  id: CONTEXT_MENU_ID,
+  title: 'Download with RusticDL',
+  contexts: ['link'] as ['link'],
+};
 
-  await browser.contextMenus.create({
-    id: CONTEXT_MENU_ID,
-    title: 'Download with RusticDL',
-    contexts: ['link'],
-  });
+type ChromeRuntime = {
+  lastError?: { message?: string };
+};
+
+type ChromeContextMenus = {
+  create: (
+    createProperties: typeof CONTEXT_MENU_PROPS,
+    callback?: () => void,
+  ) => string | number;
+};
+
+function chromeContextMenus(): ChromeContextMenus | undefined {
+  return (globalThis as { chrome?: { contextMenus?: ChromeContextMenus } }).chrome?.contextMenus;
+}
+
+function chromeLastErrorMessage(): string | undefined {
+  return (globalThis as { chrome?: { runtime?: ChromeRuntime } }).chrome?.runtime?.lastError?.message;
+}
+
+function isDuplicateMenuError(message: string | undefined): boolean {
+  return Boolean(message && /duplicate id/i.test(message));
+}
+
+/** One rebuild at a time — overlapping create() calls trip Chromium's lastError. */
+let contextMenuTask = Promise.resolve();
+
+function ensureContextMenu(): Promise<void> {
+  contextMenuTask = contextMenuTask.then(rebuildContextMenu, rebuildContextMenu);
+  return contextMenuTask;
+}
+
+async function rebuildContextMenu(): Promise<void> {
+  const settings = await getCachedSettings();
+  if (!settings.contextMenuEnabled) {
+    await browser.contextMenus.removeAll();
+    return;
+  }
+
+  try {
+    await browser.contextMenus.update(CONTEXT_MENU_ID, {
+      title: CONTEXT_MENU_PROPS.title,
+      contexts: CONTEXT_MENU_PROPS.contexts,
+    });
+    return;
+  } catch {
+    // Missing item: first install, or Chromium dropped persisted menus.
+  }
+
+  try {
+    await createContextMenuItem();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isDuplicateMenuError(message)) {
+      console.warn('[RusticDL] context menu create failed', error);
+    }
+  }
+}
+
+/**
+ * webextension-polyfill does not wrap contextMenus.create. Chromium's API is
+ * callback-only and logs "Unchecked runtime.lastError" unless lastError is read.
+ */
+function createContextMenuItem(): Promise<void> {
+  const chromeMenus = chromeContextMenus();
+  if (chromeMenus) {
+    return new Promise((resolve, reject) => {
+      chromeMenus.create(CONTEXT_MENU_PROPS, () => {
+        const message = chromeLastErrorMessage();
+        if (message && !isDuplicateMenuError(message)) {
+          reject(new Error(message));
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
+  return Promise.resolve(
+    browser.contextMenus.create(CONTEXT_MENU_PROPS) as Promise<string | number> | string | number,
+  ).then(() => undefined);
 }
 
 async function refreshConnectionState(): Promise<HostToExtensionResponse> {
@@ -110,11 +186,14 @@ async function refreshConnectionState(): Promise<HostToExtensionResponse> {
     return response;
   }
 
+  const previousMenuEnabled = cachedSettings?.contextMenuEnabled;
   const state = await setLastResult('connected', response);
   if (state.extensionSettings) {
     rememberSettings(state.extensionSettings);
   }
-  await ensureContextMenu();
+  if (state.extensionSettings?.contextMenuEnabled !== previousMenuEnabled) {
+    await ensureContextMenu();
+  }
   await updateBrowserBadge(state);
   return response;
 }

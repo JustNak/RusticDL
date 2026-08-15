@@ -21,6 +21,12 @@ const extensionIcons = {
 /** Locked Firefox id — must match native-host registration `allowed_extensions`. */
 export const FIREFOX_EXTENSION_ID = 'rusticdl@local';
 
+/** Pinned Chromium/Edge unpacked id — must match native-host `allowed_origins`. */
+const chromiumIdentity = JSON.parse(
+  readFileSync(path.join(appRoot, 'chromium-identity.json'), 'utf8'),
+);
+export const CHROMIUM_EXTENSION_ID = chromiumIdentity.id;
+
 const targets = [
   {
     name: 'chromium',
@@ -55,6 +61,8 @@ const targets = [
         page: 'options.html',
         open_in_tab: true,
       },
+      // Public key pins the unpacked id so native-host allowed_origins can match.
+      key: chromiumIdentity.key,
     },
   },
   {
