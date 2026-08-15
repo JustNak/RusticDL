@@ -1,7 +1,6 @@
 //! Complete phase: construct, open/reveal actions, and render.
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
@@ -15,7 +14,6 @@ use gpui_component::{
 };
 
 use super::helpers::{shorten_folder, truncate_middle};
-use super::start_sync_timer;
 use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H};
 use crate::appearance::apply_appearance;
 use crate::download::{open_path, reveal_in_folder, EngineHandle, Job};
@@ -36,7 +34,6 @@ impl BrowserPromptWindow {
         apply_appearance(settings, Some(window), cx);
         apply_app_icon(window);
         window.activate_window();
-        start_sync_timer(cx);
 
         Self {
             phase: CapturePhase::Complete {
@@ -109,10 +106,7 @@ impl BrowserPromptWindow {
                 .unwrap_or_else(|| "—".into())
         };
 
-        let elapsed_secs = self
-            .job
-            .as_ref()
-            .map(|j| now_unix_secs().saturating_sub(j.created_at));
+        let elapsed_secs = self.job.as_ref().map(|j| j.elapsed_secs());
         let downloaded = self
             .job
             .as_ref()
@@ -257,11 +251,4 @@ impl BrowserPromptWindow {
             )
             .into_any_element()
     }
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

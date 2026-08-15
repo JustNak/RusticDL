@@ -68,7 +68,9 @@ impl BrowserPromptWindow {
         }
 
         window.activate_window();
-        start_sync_timer(cx);
+        if matches!(phase, CapturePhase::Progress { .. }) {
+            start_sync_timer(cx);
+        }
 
         let fitted_height = Some(if matches!(phase, CapturePhase::Complete { .. }) {
             CAPTURE_COMPLETE_H

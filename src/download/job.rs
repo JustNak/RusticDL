@@ -319,6 +319,16 @@ impl Job {
             self.created_at
         }
     }
+
+    /// Seconds from add to finish. Terminal jobs stay frozen at `completed_at`.
+    pub fn elapsed_secs(&self) -> u64 {
+        let end = if self.state.is_terminal() {
+            self.completed_at.unwrap_or_else(now_unix_secs)
+        } else {
+            now_unix_secs()
+        };
+        end.saturating_sub(self.created_at)
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +407,26 @@ mod tests {
         job.state = JobState::Queued;
         assert!(job.completed_at.is_none());
         assert_eq!(job.display_date(), 100);
+    }
+
+    #[test]
+    fn elapsed_secs_freezes_at_completed_at() {
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            PathBuf::from("C:\\dl\\f.bin"),
+            PathBuf::from("C:\\dl\\f.bin.part"),
+        );
+        job.created_at = 100;
+        job.completed_at = Some(130);
+        job.state = JobState::Completed;
+        assert_eq!(job.elapsed_secs(), 30);
+
+        job.completed_at = Some(100);
+        assert_eq!(job.elapsed_secs(), 0);
+
+        job.completed_at = Some(90);
+        assert_eq!(job.elapsed_secs(), 0);
     }
 
     #[test]
