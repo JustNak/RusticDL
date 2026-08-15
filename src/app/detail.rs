@@ -8,7 +8,7 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme,
 };
 
-use super::job_row::restart_icon;
+use super::job_row::{progress_popup_icon, restart_icon};
 use super::widgets::{
     detail_name_char_budget, ellipsize_name, file_extension_label, soft_tooltip, status_color,
     status_tag, FileTypeKind,
@@ -118,6 +118,7 @@ pub(crate) fn render_detail(
     };
     let filename_label = ellipsize_name(&job.filename, detail_name_char_budget(main_w));
 
+    let can_show_progress = job.state.can_show_progress_popup();
     let can_pause = matches!(
         job.state,
         JobState::Queued | JobState::Starting | JobState::Downloading
@@ -129,7 +130,8 @@ pub(crate) fn render_detail(
     let can_restart = matches!(job.state, JobState::Failed | JobState::Canceled);
     let can_cancel = !job.state.is_terminal() && job.state != JobState::Paused;
     // Open / folder / remove / delete live on the row overflow menu.
-    let show_actions = can_pause || can_resume || can_retry || can_restart || can_cancel;
+    let show_actions =
+        can_show_progress || can_pause || can_resume || can_retry || can_restart || can_cancel;
 
     // Height-capped inspector: scrolls internally so the job list keeps space.
     // Flat surfaces only — hierarchy comes from type and a single top border, not nested cards.
@@ -401,6 +403,19 @@ pub(crate) fn render_detail(
                                     .items_center()
                                     .flex_wrap()
                                     .pt_1()
+                                    .when(can_show_progress, |el| {
+                                        let id = id.clone();
+                                        el.child(
+                                            Button::new("detail-show-progress")
+                                                .outline()
+                                                .small()
+                                                .icon(progress_popup_icon())
+                                                .label("Show progress")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_job_progress_popup(&id, cx);
+                                                })),
+                                        )
+                                    })
                                     .when(can_pause, |el| {
                                         let id = id.clone();
                                         el.child(

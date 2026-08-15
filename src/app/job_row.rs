@@ -226,6 +226,8 @@ pub(crate) fn render_job_row(
                                 let can_retry = job.is_some_and(|j| {
                                     matches!(j.state, JobState::Failed | JobState::Canceled)
                                 });
+                                let can_show_progress =
+                                    job.is_some_and(|j| j.state.can_show_progress_popup());
                                 let can_open = job.is_some_and(|j| {
                                     j.state == JobState::Completed && j.target_path.exists()
                                 });
@@ -233,6 +235,22 @@ pub(crate) fn render_job_row(
                                 let can_delete = job.is_some_and(|j| j.has_deletable_file());
 
                                 let mut menu = menu.min_w(px(180.));
+
+                                if can_show_progress {
+                                    menu = menu.item(
+                                        PopupMenuItem::new("Show progress")
+                                            .icon(progress_popup_icon())
+                                            .on_click({
+                                                let view = view.clone();
+                                                let id = id.clone();
+                                                move |_, _window, cx| {
+                                                    view.update(cx, |app, cx| {
+                                                        app.open_job_progress_popup(&id, cx);
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                }
 
                                 if can_pause {
                                     menu = menu.item(
@@ -273,7 +291,7 @@ pub(crate) fn render_job_row(
                                         ),
                                     );
                                 }
-                                if can_pause || can_resume || can_retry {
+                                if can_show_progress || can_pause || can_resume || can_retry {
                                     menu = menu.separator();
                                 }
 
@@ -389,6 +407,11 @@ pub(crate) fn render_job_row(
 /// Circular arrow — reads as “start over”, unlike redo’s curved arrow.
 pub(crate) fn restart_icon() -> Icon {
     Icon::empty().path("icons/rotate-cw.svg")
+}
+
+/// Spinner — marks the in-flight progress HUD action.
+pub(crate) fn progress_popup_icon() -> Icon {
+    Icon::empty().path("icons/loader-circle.svg")
 }
 
 /// Destructive queue action (Remove / Delete) — red label and icon.
