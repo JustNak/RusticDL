@@ -95,6 +95,66 @@ export function filenameExtension(filename: string | undefined): string | undefi
   return ext;
 }
 
+/** Last path segment, ignoring folders Chrome/Firefox put on DownloadItem.filename. */
+export function downloadBasename(filename: string | undefined): string | undefined {
+  const base = filename?.split(/[\\/]/).pop()?.trim();
+  return base || undefined;
+}
+
+/**
+ * Parse Content-Disposition `filename` / `filename*`.
+ * Chromium onCreated often only has the URL token; Firefox webRequest already
+ * uses this so the desktop confirm dialog gets the real name.
+ */
+export function filenameFromContentDisposition(value: string): string | undefined {
+  const star = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)/i);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, '')) || undefined;
+    } catch {
+      // fall through to the plain filename= parameter
+    }
+  }
+  const plain = value.match(/filename\s*=\s*("?)([^";]+)\1/i);
+  return plain?.[2]?.trim() || undefined;
+}
+
+/**
+ * True when the name is a CDN token / Chrome temp name, not a user-facing file.
+ * `9daaa83c-7e52-4f70-a1b9-17dee6eb5cb2` and `Unconfirmed 12345.crdownload`
+ * must not be handed off as suggestedFilename.
+ */
+export function isWeakSuggestedFilename(filename: string | undefined): boolean {
+  const base = downloadBasename(filename);
+  if (!base) return true;
+  if (/\.crdownload$/i.test(base)) return true;
+  if (/^unconfirmed\s+\d+/i.test(base)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(base)) {
+    return true;
+  }
+  if (/^[0-9a-f]{20,}$/i.test(base)) return true;
+  return filenameExtension(base) == null;
+}
+
+/** Prefer a Content-Disposition / Chrome-determined name over a URL token. */
+export function preferredSuggestedFilename(
+  ...candidates: Array<string | undefined>
+): string | undefined {
+  const names = candidates
+    .map(downloadBasename)
+    .filter((value): value is string => Boolean(value));
+  return names.find((name) => !isWeakSuggestedFilename(name)) ?? names[0];
+}
+
+export function shouldWaitForSuggestedFilename(
+  item: DownloadItemLike,
+  extraNames: Array<string | undefined> = [],
+): boolean {
+  return isWeakSuggestedFilename(
+    preferredSuggestedFilename(...extraNames, item.filename),
+  );
+}
+
 export function isWeakCaptureExtension(ext: string | undefined): boolean {
   return Boolean(ext && WEAK_CAPTURE_EXTENSIONS.has(ext));
 }
@@ -222,18 +282,22 @@ export function shouldWaitForDownloadSize(
 export function downloadCreatedAction(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
+  extraNames: Array<string | undefined> = [],
 ): 'wait' | 'capture' | 'ignore' {
   if (shouldWaitForDownloadSize(item, settings)) return 'wait';
-  if (shouldCaptureDownloadItem(item, settings)) return 'capture';
-  return 'ignore';
+  if (!shouldCaptureDownloadItem(item, settings)) return 'ignore';
+  // Chromium onCreated uses the URL token (UUID) before Content-Disposition.
+  if (shouldWaitForSuggestedFilename(item, extraNames)) return 'wait';
+  return 'capture';
 }
 
 /** Pause immediately — do not let Firefox keep reading the body while we wait or hand off. */
 export function shouldPauseDownloadItem(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
+  extraNames: Array<string | undefined> = [],
 ): boolean {
-  const action = downloadCreatedAction(item, settings);
+  const action = downloadCreatedAction(item, settings, extraNames);
   return action === 'capture' || action === 'wait';
 }
 

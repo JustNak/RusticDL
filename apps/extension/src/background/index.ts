@@ -8,15 +8,28 @@ import {
 import browser from './browser';
 import {
   downloadCreatedAction,
+  isWeakSuggestedFilename,
   knownDownloadBytes,
   matchesInterceptedDownload,
   normalizeCaptureUrl,
   shouldCaptureDownloadItem,
   shouldPauseDownloadItem,
+  shouldWaitForDownloadSize,
+  shouldWaitForSuggestedFilename,
   urlIsClaimed,
   type InterceptedDownload,
 } from './captureFilter';
-
+import {
+  applyDeterminedFilename,
+  getChromiumDeterminingFilenameApi,
+  getChromiumWebRequest,
+  hintNamesForDownload,
+  lookupFilenameHint,
+  rememberResponseFilenameHint,
+  resolveSuggestedFilename,
+  type ChromiumDeterminingFilenameItem,
+  type ChromiumHeadersReceivedDetails,
+} from './chromiumCapture';
 import {
   abortFirefoxResponseBody,
   firefoxBeforeRequestDownloadCandidate,
@@ -249,8 +262,8 @@ async function eraseBrowserDownload(id: number): Promise<void> {
 
 /**
  * Stop the shelf item before any await. Known captures are canceled immediately
- * so Ask-mode does not sit on "Paused — 30 MB of 2.5 GB". Unknown-size items
- * are only paused until we can tell a stub from a real file.
+ * so Ask-mode does not sit on "Paused — 30 MB of 2.5 GB". Unknown-size or
+ * token-named items are only paused until size / Content-Disposition settle.
  */
 function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
   if (item.byExtensionId) return;
@@ -260,12 +273,12 @@ function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
   }
   const settings = settingsForSyncCapture();
   if (!settings) return;
-  const action = downloadCreatedAction(item, settings);
+  const action = captureAction(item, settings);
   if (action === 'capture') {
     void eraseBrowserDownload(item.id);
     return;
   }
-  if (action === 'wait' || shouldPauseDownloadItem(item, settings)) {
+  if (action === 'wait' || shouldPauseDownloadItem(itemForCaptureDecision(item), settings, hintNamesForDownload(item))) {
     requestPause(item.id);
   }
 }
@@ -303,7 +316,37 @@ type CapturedDownloadItem = browser.downloads.DownloadItem & {
   cookieStoreId?: string;
   fileSize?: number;
   bytesReceived?: number;
+  /** Name present when we decided to wait/capture — do not replace with a later .mkv. */
+  captureDecisionFilename?: string;
 };
+
+function withDecisionFilename(item: CapturedDownloadItem): CapturedDownloadItem {
+  return {
+    ...item,
+    captureDecisionFilename: item.captureDecisionFilename ?? item.filename,
+  };
+}
+
+function itemForCaptureDecision(item: CapturedDownloadItem): CapturedDownloadItem {
+  return {
+    ...item,
+    filename: item.captureDecisionFilename ?? item.filename,
+  };
+}
+
+function withHeaderSize(item: CapturedDownloadItem): CapturedDownloadItem {
+  if (knownDownloadBytes(item) != null) return item;
+  const hint = lookupFilenameHint(item.finalUrl || item.url) ?? lookupFilenameHint(item.url);
+  if (hint?.totalBytes == null) return item;
+  return { ...item, totalBytes: hint.totalBytes };
+}
+
+function captureAction(
+  item: CapturedDownloadItem,
+  settings: NonNullable<ReturnType<typeof settingsForSyncCapture>>,
+) {
+  return downloadCreatedAction(itemForCaptureDecision(item), settings, hintNamesForDownload(item));
+}
 
 type HandoffAttempt = 'accepted' | 'already_claimed' | 'rejected';
 
@@ -367,7 +410,7 @@ async function handoffBrowserDownload(
   const url = item.finalUrl || item.url;
   if (!url) return;
 
-  const suggestedFilename = item.filename?.split(/[\\/]/).pop();
+  const suggestedFilename = resolveSuggestedFilename(item);
 
   // Drop the Firefox item before the desktop ask prompt. Pause still lets the
   // shelf show "30 MB of 2.5 GB" while the user confirms. Restore only if the
@@ -376,7 +419,7 @@ async function handoffBrowserDownload(
 
   const attempt = await handOffUrl(url, settings, {
     suggestedFilename,
-    totalBytes: knownDownloadBytes(item),
+    totalBytes: knownDownloadBytes(item) ?? lookupFilenameHint(url)?.totalBytes,
   }, {
     pageUrl: item.referrer,
     referrer: item.referrer,
@@ -423,6 +466,7 @@ function mergeDownloadDelta(
     ...(mime ? { mime } : {}),
     ...(typeof fileSize === 'number' && fileSize > 0 ? { fileSize } : {}),
     ...(typeof totalBytes === 'number' && totalBytes > 0 ? { totalBytes } : {}),
+    captureDecisionFilename: item.captureDecisionFilename,
   };
   const known = knownDownloadBytes(next);
   if (known != null) next.totalBytes = known;
@@ -447,6 +491,7 @@ async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<Captu
       ...latest,
       cookieStoreId: latest.cookieStoreId ?? item.cookieStoreId,
       fileSize: latest.fileSize && latest.fileSize > 0 ? latest.fileSize : item.fileSize,
+      captureDecisionFilename: item.captureDecisionFilename,
     };
     const known = knownDownloadBytes(merged)
       ?? (latest.state === 'complete' && latest.bytesReceived && latest.bytesReceived > 0
@@ -465,7 +510,13 @@ async function finalizePendingCapture(item: CapturedDownloadItem) {
     return;
   }
   const settings = await getCachedSettings();
-  if (!shouldCaptureDownloadItem(item, settings)) {
+  // Decide with the original token name so a later .mkv from Content-Disposition
+  // does not drop a capture that Chrome started as a UUID + octet-stream.
+  const decision = itemForCaptureDecision(item);
+  if (
+    !shouldCaptureDownloadItem(decision, settings)
+    && !shouldCaptureDownloadItem(item, settings)
+  ) {
     if (pausedForCapture.has(item.id)) {
       await resumeBrowserDownload(item.id);
     }
@@ -488,28 +539,37 @@ async function onDownloadCreated(item: CapturedDownloadItem) {
     return;
   }
 
-  const action = downloadCreatedAction(item, settings);
+  const tracked = withDecisionFilename(withHeaderSize(item));
+  const action = captureAction(tracked, settings);
   if (action === 'ignore') {
-    if (pausedForCapture.has(item.id)) {
-      await resumeBrowserDownload(item.id);
+    if (pausedForCapture.has(tracked.id)) {
+      await resumeBrowserDownload(tracked.id);
     }
     return;
   }
 
-  requestPause(item.id);
+  requestPause(tracked.id);
 
   if (action === 'capture') {
-    await handoffBrowserDownload(item, settings);
+    await handoffBrowserDownload(tracked, settings);
     return;
   }
 
   const timer = setTimeout(() => {
-    const pending = pendingSizeWaits.get(item.id);
+    const pending = pendingSizeWaits.get(tracked.id);
     if (!pending) return;
-    pendingSizeWaits.delete(item.id);
+    pendingSizeWaits.delete(tracked.id);
     void latestDownloadSnapshot(pending.item).then((latest) => finalizePendingCapture(latest));
   }, SIZE_WAIT_MS);
-  pendingSizeWaits.set(item.id, { item, timer });
+  pendingSizeWaits.set(tracked.id, { item: tracked, timer });
+}
+
+function stillWaitingForCaptureSignals(item: CapturedDownloadItem): boolean {
+  const settings = settingsForSyncCapture();
+  if (settings && shouldWaitForDownloadSize(itemForCaptureDecision(item), settings)) {
+    return true;
+  }
+  return shouldWaitForSuggestedFilename(item, hintNamesForDownload(item));
 }
 
 function onDownloadChanged(delta: DownloadChangeDelta) {
@@ -528,6 +588,11 @@ function onDownloadChanged(delta: DownloadChangeDelta) {
   const known = knownDownloadBytes(merged);
   const state = deltaCurrent(delta.state);
   if (known == null && state !== 'complete') return;
+  // Size is known but Chrome still only has the URL token — keep waiting for
+  // Content-Disposition / onDeterminingFilename until the timer fires.
+  if (state !== 'complete' && stillWaitingForCaptureSignals(merged)) {
+    return;
+  }
 
   clearPendingSizeWait(delta.id);
   if (known == null && state === 'complete') {
@@ -535,6 +600,54 @@ function onDownloadChanged(delta: DownloadChangeDelta) {
     return;
   }
   void finalizePendingCapture(merged);
+}
+
+function flushPendingFilenameHint(url: string): void {
+  const key = normalizeCaptureUrl(url);
+  for (const [id, pending] of pendingSizeWaits) {
+    const itemUrls = [pending.item.finalUrl, pending.item.url]
+      .filter((value): value is string => Boolean(value))
+      .map(normalizeCaptureUrl);
+    if (!itemUrls.includes(key)) continue;
+    pending.item = withHeaderSize(pending.item);
+    if (stillWaitingForCaptureSignals(pending.item)) continue;
+    clearPendingSizeWait(id);
+    void finalizePendingCapture(pending.item);
+  }
+}
+
+function onChromiumHeadersReceived(details: ChromiumHeadersReceivedDetails): void {
+  const hint = rememberResponseFilenameHint(details);
+  if (!hint?.filename || isWeakSuggestedFilename(hint.filename)) return;
+  flushPendingFilenameHint(details.url);
+}
+
+function onChromiumDeterminingFilename(
+  item: ChromiumDeterminingFilenameItem,
+  suggest: (suggestion?: { filename?: string }) => void,
+): void {
+  const name = applyDeterminedFilename(item, suggest);
+  const pending = pendingSizeWaits.get(item.id);
+  if (!pending) return;
+  pending.item = {
+    ...pending.item,
+    ...(name ? { filename: name } : {}),
+  };
+  if (stillWaitingForCaptureSignals(pending.item)) return;
+  clearPendingSizeWait(item.id);
+  void finalizePendingCapture(pending.item);
+}
+
+function registerChromiumFilenameHints(): void {
+  const webRequest = getChromiumWebRequest();
+  webRequest?.onHeadersReceived.addListener(
+    onChromiumHeadersReceived,
+    { urls: ['http://*/*', 'https://*/*'] },
+    ['responseHeaders'],
+  );
+
+  const determining = getChromiumDeterminingFilenameApi();
+  determining?.addListener(onChromiumDeterminingFilename);
 }
 
 async function handoffFirefoxCandidate(
@@ -705,6 +818,8 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 
 // Firefox primary: blocking webRequest. downloads.onCreated is fallback.
 registerFirefoxWebRequestInterception();
+// Chromium: observe Content-Disposition so handoff is not a URL token.
+registerChromiumFilenameHints();
 if (browser.downloads?.onCreated) {
   browser.downloads.onCreated.addListener((item) => {
     pauseIfLikelyCapture(item);
