@@ -81,7 +81,7 @@ If you want downloads captured from Firefox / Chromium:
 ```
 
 4. Load the matching extension package (see [Browser extension](#browser-extension)).
-5. For Chromium, re-run the register script with the extension id from `chrome://extensions`.
+5. Reload an already-loaded unpacked Chromium extension so it picks up the pinned id.
 
 ---
 
@@ -308,21 +308,14 @@ npm run build
      `apps/extension/dist/firefox/manifest.json`  
      (do **not** load the Chromium folder in Firefox — that is Manifest V3 and will fail)
 
-5. Register extension ids. Firefox uses a fixed id from the manifest (`rusticdl@local`). Chromium needs the generated id after first load:
+5. Register the native host (Firefox id `rusticdl@local` and the pinned Chromium id are the defaults):
 
 ```powershell
-# Firefox (default id already matches the Firefox package)
 .\scripts\register-native-host.ps1 `
-  -HostBinaryPath "$PWD\target\debug\rusticdl-native-host.exe" `
-  -FirefoxExtensionId "rusticdl@local"
-
-# Chromium: re-run with the id from chrome://extensions
-.\scripts\register-native-host.ps1 `
-  -HostBinaryPath "$PWD\target\debug\rusticdl-native-host.exe" `
-  -ChromiumExtensionId "<id-from-chrome-extensions-page>"
+  -HostBinaryPath "$PWD\target\debug\rusticdl-native-host.exe"
 ```
 
-6. Start the desktop app (`cargo run`), open the extension popup, and confirm **Connected**.
+6. Start the desktop app (`cargo run`), reload the unpacked Chromium extension, open the popup, and confirm **Connected**.
 
 ### Environment overrides (native host)
 

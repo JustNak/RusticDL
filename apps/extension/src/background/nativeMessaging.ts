@@ -17,6 +17,17 @@ import {
 import browser from './browser';
 import type { PopupStateResponse } from '../shared/messages';
 
+function browserLabel(): string {
+  switch (detectBrowser()) {
+    case 'firefox':
+      return 'Firefox';
+    case 'edge':
+      return 'Edge';
+    default:
+      return 'Chrome';
+  }
+}
+
 function mapNativeMessagingError(error: unknown): {
   code: ErrorCode;
   message: string;
@@ -25,16 +36,28 @@ function mapNativeMessagingError(error: unknown): {
   const message = error instanceof Error ? error.message : 'Native messaging failed.';
   const lowered = message.toLowerCase();
 
+  if (lowered.includes('forbidden')) {
+    return {
+      code: 'HOST_REGISTRATION_MISSING',
+      message:
+        `This ${browserLabel()} extension is not allowed to use RusticDL Backend. `
+        + 'The host is registered, but this extension id is missing from allowed_origins. '
+        + 'Reload the unpacked extension after rebuilding, or from the repo root run:\n'
+        + '.\\scripts\\register-native-host.ps1',
+      connection: 'host_missing',
+    };
+  }
+
   if (
     (lowered.includes('host') && lowered.includes('not found'))
     || lowered.includes('specified native messaging host not found')
     || lowered.includes('no such native application')
-    || lowered.includes('native application') && lowered.includes('not found')
+    || (lowered.includes('native application') && lowered.includes('not found'))
   ) {
     return {
       code: 'HOST_REGISTRATION_MISSING',
       message:
-        'RusticDL Backend is not registered for Firefox. From the repo root run:\n'
+        `RusticDL Backend is not registered for ${browserLabel()}. From the repo root run:\n`
         + '.\\scripts\\register-native-host.ps1 -HostBinaryPath "$PWD\\target\\debug\\rusticdl-native-host.exe"',
       connection: 'host_missing',
     };
