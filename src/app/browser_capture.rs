@@ -12,6 +12,34 @@ use crate::prompt_window::{
 };
 
 impl DownloadApp {
+    /// Open the floating progress HUD for a queue job that is still downloading.
+    ///
+    /// No-ops when the job is missing or not in-flight. If a HUD already owns
+    /// this job (browser handoff or a previous open), tell the user instead of
+    /// stacking a second window.
+    pub(crate) fn open_job_progress_popup(&mut self, job_id: &str, cx: &mut Context<Self>) {
+        let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
+            return;
+        };
+        if !job.state.can_show_progress_popup() {
+            return;
+        }
+        if self.ipc.is_progress_hud_owned(job_id) {
+            self.show_toast("Progress window is already open.", cx);
+            return;
+        }
+        let opened = open_browser_progress_window(
+            job_id.to_string(),
+            self.ipc.clone(),
+            self.engine.clone(),
+            &self.settings,
+            cx,
+        );
+        if opened.is_none() {
+            self.show_toast("Could not open the progress window.", cx);
+        }
+    }
+
     /// Poll for browser ask-mode handoffs and open a dedicated prompt window.
     ///
     /// Safe to call from the main window render loop or a background timer so

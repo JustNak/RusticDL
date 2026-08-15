@@ -56,6 +56,12 @@ impl JobState {
     pub fn is_removable(self) -> bool {
         self.is_terminal() || self == Self::Paused
     }
+
+    /// Queue/detail can open the floating progress HUD only while bytes are
+    /// still moving (not queued, paused, or terminal).
+    pub fn can_show_progress_popup(self) -> bool {
+        matches!(self, Self::Starting | Self::Downloading)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +576,17 @@ mod tests {
         assert!(!JobState::Queued.is_removable());
         assert!(!JobState::Starting.is_removable());
         assert!(!JobState::Downloading.is_removable());
+    }
+
+    #[test]
+    fn progress_popup_only_while_transfer_is_in_flight() {
+        assert!(JobState::Starting.can_show_progress_popup());
+        assert!(JobState::Downloading.can_show_progress_popup());
+        assert!(!JobState::Queued.can_show_progress_popup());
+        assert!(!JobState::Paused.can_show_progress_popup());
+        assert!(!JobState::Completed.can_show_progress_popup());
+        assert!(!JobState::Failed.can_show_progress_popup());
+        assert!(!JobState::Canceled.can_show_progress_popup());
     }
 
     #[test]

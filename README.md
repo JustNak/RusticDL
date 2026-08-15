@@ -107,6 +107,7 @@ RusticDL is a **simple, local-first download manager** focused on everyday HTTP/
 - Queue filters: All / Active / Completed / Failed
 - Search by filename, URL, or path
 - Live progress: percent, size, speed, ETA
+- Open a floating progress window from the queue overflow menu or detail panel while a job is still downloading
 - Status bar with totals, aggregate speed, and speed limit
 - Pause / resume, pause-all / resume-all
 - Retry, restart, cancel, remove from the queue, or delete the file from disk (with confirmation)
