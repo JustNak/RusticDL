@@ -36,16 +36,42 @@ await esbuild.build({
 });
 
 const require = createRequire(import.meta.url);
+const chromiumOutfile = join(tmp, 'chromiumCapture.cjs');
+await esbuild.build({
+  entryPoints: [join(root, 'src/background/chromiumCapture.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: chromiumOutfile,
+  plugins: [
+    {
+      name: 'stub-browser',
+      setup(build) {
+        build.onResolve({ filter: /^\.\/browser$/ }, () => ({ path: browserStub }));
+      },
+    },
+  ],
+});
+const {
+  rememberResponseFilenameHint,
+  lookupFilenameHint,
+  rememberDeterminedFilename,
+  resolveSuggestedFilename,
+} = require(chromiumOutfile);
 const {
   firefoxWebRequestDownloadCandidate,
   firefoxBeforeRequestDownloadCandidate,
   abortFirefoxResponseBody,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
+  shouldWaitForSuggestedFilename,
   downloadCreatedAction,
   knownDownloadBytes,
   matchesInterceptedDownload,
   canonicalDownloadFilename,
+  filenameFromContentDisposition,
+  isWeakSuggestedFilename,
+  preferredSuggestedFilename,
   normalizeCaptureUrl,
   shouldPauseDownloadItem,
   urlIsClaimed,
@@ -887,6 +913,143 @@ assert(
     },
     'req-1',
   ) === true && closed >= 1,
+);
+
+console.log('\nChromium suggested filename (CDN token vs Content-Disposition)\n');
+
+const tokenName = '9daaa83c-7e52-4f70-a1b9-17dee6eb5cb2';
+const realVideoName =
+  'HELL.MODE.The.Hardcore.Gamer.Dominates.in.Another.World.with.Garbage.Balancing.S02E02.1080p.HIDI.WEB-DL.DUAL.AAC2.0.H.264-VARYG.mkv';
+
+assert(
+  'parses a quoted Content-Disposition filename',
+  filenameFromContentDisposition(`attachment; filename="${realVideoName}"`) === realVideoName,
+);
+
+assert(
+  'prefers filename* over the plain filename parameter',
+  filenameFromContentDisposition(
+    'attachment; filename="fallback.bin"; filename*=UTF-8\'\'show%20title.mkv',
+  ) === 'show title.mkv',
+);
+
+assert(
+  'treats a UUID path token as a weak suggested filename',
+  isWeakSuggestedFilename(tokenName) === true,
+);
+
+assert(
+  'treats Chrome Unconfirmed .crdownload names as weak',
+  isWeakSuggestedFilename('C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\Unconfirmed 12345.crdownload')
+    === true,
+);
+
+assert(
+  'does not treat a real release name as weak',
+  isWeakSuggestedFilename(realVideoName) === false,
+);
+
+assert(
+  'prefers the Content-Disposition name over a URL token',
+  preferredSuggestedFilename(realVideoName, tokenName) === realVideoName,
+);
+
+assert(
+  'captures a Chromium CDN token + octet-stream download',
+  shouldCaptureDownloadItem(
+    {
+      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
+      filename: tokenName,
+      mime: 'application/octet-stream',
+      totalBytes: 950 * 1024 * 1024,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'waits for a real filename when Chromium only has the URL token',
+  downloadCreatedAction(
+    {
+      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
+      filename: tokenName,
+      mime: 'application/octet-stream',
+      totalBytes: 950 * 1024 * 1024,
+    },
+    defaultSettings,
+  ) === 'wait',
+);
+
+assert(
+  'captures immediately once Content-Disposition supplied the real name',
+  downloadCreatedAction(
+    {
+      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
+      filename: tokenName,
+      mime: 'application/octet-stream',
+      totalBytes: 950 * 1024 * 1024,
+    },
+    defaultSettings,
+    [realVideoName],
+  ) === 'capture',
+);
+
+assert(
+  'still captures a strong zip name immediately',
+  downloadCreatedAction(
+    {
+      url: 'https://cdn.example.com/files/app.zip',
+      filename: 'app.zip',
+      mime: 'application/zip',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === 'capture',
+);
+
+assert(
+  'shouldWaitForSuggestedFilename is false once a real name is known',
+  shouldWaitForSuggestedFilename(
+    {
+      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
+      filename: tokenName,
+    },
+    [realVideoName],
+  ) === false,
+);
+
+const tokenUrl = `https://store-073.wnam.tb-cdn.example/${tokenName}`;
+rememberResponseFilenameHint({
+  url: tokenUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'application/octet-stream' },
+    { name: 'content-length', value: String(950 * 1024 * 1024) },
+    { name: 'content-disposition', value: `attachment; filename="${realVideoName}"` },
+  ],
+});
+
+assert(
+  'caches Content-Disposition from Chromium webRequest headers',
+  lookupFilenameHint(tokenUrl)?.filename === realVideoName,
+);
+
+assert(
+  'resolves a Chromium download item to the cached Content-Disposition name',
+  resolveSuggestedFilename({
+    id: 42,
+    url: tokenUrl,
+    filename: `C:\\\\Users\\\\ZeusVeilmon\\\\Downloads\\\\${tokenName}`,
+  }) === realVideoName,
+);
+
+rememberDeterminedFilename(7, realVideoName);
+assert(
+  'uses onDeterminingFilename when headers were missed',
+  resolveSuggestedFilename({
+    id: 7,
+    url: 'https://cdn.example.com/download/abc',
+    filename: 'abc',
+  }) === realVideoName,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

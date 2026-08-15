@@ -14,6 +14,7 @@ import {
 } from '@rusticdl/protocol';
 import {
   MIN_CAPTURE_BYTES,
+  filenameFromContentDisposition,
   isPageOrApiMime,
   isWeakCaptureExtension,
 } from './captureFilter';
@@ -51,13 +52,18 @@ export type FirefoxCaptureCandidate = {
 export {
   MIN_CAPTURE_BYTES,
   canonicalDownloadFilename,
+  downloadBasename,
   downloadCreatedAction,
+  filenameFromContentDisposition,
+  isWeakSuggestedFilename,
   knownDownloadBytes,
   matchesInterceptedDownload,
   normalizeCaptureUrl,
+  preferredSuggestedFilename,
   shouldCaptureDownloadItem,
   shouldPauseDownloadItem,
   shouldWaitForDownloadSize,
+  shouldWaitForSuggestedFilename,
   urlIsClaimed,
 } from './captureFilter';
 
@@ -149,19 +155,6 @@ function contentLength(headers: FirefoxWebRequestHeader[] | undefined): number |
   if (!raw) return undefined;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
-}
-
-export function filenameFromContentDisposition(value: string): string | undefined {
-  const star = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;]+)/i);
-  if (star?.[1]) {
-    try {
-      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
-    } catch {
-      // fall through
-    }
-  }
-  const plain = value.match(/filename\s*=\s*("?)([^";]+)\1/i);
-  return plain?.[2]?.trim() || undefined;
 }
 
 export function basenameFromUrl(url: string): string | undefined {
