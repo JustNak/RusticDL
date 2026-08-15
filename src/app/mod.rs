@@ -109,8 +109,6 @@ pub struct DownloadApp {
     window_layout_dirty: bool,
     /// Throttle how often we rewrite settings.json while the user drags a resize edge.
     last_window_layout_save: Instant,
-    /// Browser ask-mode prompt currently shown in its dedicated window.
-    browser_prompt_open_id: Option<String>,
     /// Browser-handoff job ids that should re-open Complete if Progress was closed early.
     browser_watch_complete_ids: Vec<String>,
     /// Queue snapshot differs from last successful disk write.
@@ -429,9 +427,8 @@ impl DownloadApp {
                         app.flush_window_layout_if_due();
                         app.flush_jobs_save_if_due();
                         // Dedicated prompt / progress / complete windows even if main UI is idle.
-                        app.poll_browser_prompt(cx);
-                        app.poll_browser_progress(cx);
-                        app.poll_browser_complete(cx);
+                        // Never open these from Render — GPUI crashes if open_window re-enters draw.
+                        app.poll_browser_capture(cx);
                         // Second-instance / extension show_window while hidden to tray.
                         app.poll_hidden_window_actions(cx);
                     })
@@ -516,7 +513,6 @@ impl DownloadApp {
             last_window_layout_save: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
-            browser_prompt_open_id: None,
             browser_watch_complete_ids: Vec::new(),
             jobs_dirty: false,
             last_jobs_save: Instant::now()
@@ -843,9 +839,6 @@ fn window_layout_from_window(window: &Window) -> WindowLayout {
 impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
-        self.poll_browser_prompt(cx);
-        self.poll_browser_progress(cx);
-        self.poll_browser_complete(cx);
         self.apply_pending_tray_actions(window, cx);
         // Post-update changelog after relaunch (once a Window is free).
         self.apply_pending_whats_new(window, cx);

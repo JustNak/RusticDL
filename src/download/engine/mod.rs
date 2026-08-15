@@ -146,6 +146,13 @@ impl EngineHandle {
     pub fn send(&self, cmd: EngineCommand) {
         let _ = self.tx.send(cmd);
     }
+
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::mem::forget(rx);
+        Self { tx }
+    }
 }
 
 pub(super) struct EngineInner {

@@ -88,6 +88,8 @@ pub struct BrowserPromptWindow {
     reduce_motion: bool,
     /// Last height we applied via `resize` so Complete/Progress don't fight.
     fitted_height: Option<f32>,
+    /// Stagger index so this HUD does not land on top of another open capture window.
+    cascade_index: usize,
 }
 
 impl BrowserPromptWindow {
@@ -162,7 +164,7 @@ impl BrowserPromptWindow {
         // Record first so a synchronous resize→re-render does not loop.
         self.fitted_height = Some(target);
         window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
-        crate::window_placement::center_window(window);
+        crate::window_placement::cascade_window(window, self.cascade_index);
     }
 
     fn title_for_phase(&self) -> &'static str {

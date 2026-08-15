@@ -15,7 +15,7 @@ use gpui_component::{
 
 use super::helpers::{shorten_folder, truncate_middle};
 use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H};
-use crate::appearance::apply_appearance;
+use crate::appearance::apply_window_opacity;
 use crate::download::{open_path, reveal_in_folder, EngineHandle, Job};
 use crate::format::{format_bytes, format_duration, format_size, format_speed};
 use crate::ipc::IpcBridge;
@@ -31,9 +31,10 @@ impl BrowserPromptWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        apply_appearance(settings, Some(window), cx);
+        apply_window_opacity(window, settings.window_transparency, settings.backdrop_blur);
         apply_app_icon(window);
         window.activate_window();
+        let cascade_index = ipc.capture_window_count().saturating_sub(1);
 
         Self {
             phase: CapturePhase::Complete {
@@ -57,6 +58,7 @@ impl BrowserPromptWindow {
             peak_speed: 0,
             reduce_motion: settings.reduce_motion,
             fitted_height: Some(CAPTURE_COMPLETE_H),
+            cascade_index,
         }
     }
 
