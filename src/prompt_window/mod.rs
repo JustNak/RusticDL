@@ -191,15 +191,17 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
         cx.background_executor()
             .timer(Duration::from_millis(100))
             .await;
-        if this
-            .update(cx, |this, cx| {
-                if !matches!(this.phase, CapturePhase::Confirm | CapturePhase::Conflict) {
-                    this.sync_from_bridge(cx);
-                }
-            })
-            .is_err()
-        {
-            break;
+        let keep_going = this.update(cx, |this, cx| {
+            if matches!(this.phase, CapturePhase::Progress { .. }) {
+                this.sync_from_bridge(cx);
+                true
+            } else {
+                false
+            }
+        });
+        match keep_going {
+            Ok(true) => {}
+            _ => break,
         }
     })
     .detach();
