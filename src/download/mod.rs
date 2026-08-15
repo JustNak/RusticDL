@@ -5,6 +5,7 @@ pub mod drop_files;
 pub mod duplicates;
 pub mod engine;
 pub mod eta;
+pub mod file_type;
 pub mod filesystem;
 pub mod handoff;
 pub mod http;
@@ -23,7 +24,11 @@ pub use engine::{
     open_path, reveal_in_folder, spawn_engine, EngineCommand, EngineEvent, EngineHandle,
     EngineRuntimeConfig,
 };
-pub use filesystem::{find_filename_collision, FilenameCollision, FilenameConflictPolicy};
+pub use file_type::FileTypeKind;
+pub use filesystem::{
+    derive_filename_from_url, find_filename_collision, sanitize_filename, FilenameCollision,
+    FilenameConflictPolicy,
+};
 pub use handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader};
 pub use job::{fallback_reason_label, Job, JobState};
 pub use urls::extract_http_urls;

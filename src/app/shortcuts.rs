@@ -105,6 +105,10 @@ impl DownloadApp {
         ]
         .into_iter()
         .any(|input| input.focus_handle(cx).is_focused(window))
+            || self
+                .category_folder_inputs
+                .iter()
+                .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
     /// Ctrl/Cmd+A — select every job currently visible (filter + search + sort).

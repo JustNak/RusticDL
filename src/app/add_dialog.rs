@@ -19,7 +19,10 @@ use gpui_component::{
 
 use super::widgets::{browse_directory, field_hint, field_label, shorten_path_display};
 use super::DownloadApp;
-use crate::download::EngineCommand;
+use crate::download::{
+    derive_filename_from_url, sanitize_filename, EngineCommand, FilenameConflictPolicy,
+};
+use crate::settings::{same_dir, Settings};
 
 /// Estimated dialog content height so the footer stays on-screen.
 fn estimated_dialog_height(is_advanced: bool, is_multi: bool) -> f32 {
@@ -37,18 +40,38 @@ fn dialog_margin_top(view_h: f32, est_h: f32) -> f32 {
     ((view_h - est_h) * 0.5).clamp(24.0, max_top)
 }
 
+/// Preferred filename used to pick a type folder (matches engine Add).
+fn preferred_filename(url: &str, override_name: Option<&str>) -> String {
+    override_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(sanitize_filename)
+        .filter(|s| !s.is_empty())
+        .or_else(|| derive_filename_from_url(url))
+        .unwrap_or_else(|| "download.bin".into())
+}
+
 /// Enqueue HTTP(S) URLs via the same `EngineCommand::Add` path used by IPC / drop.
 ///
 /// Duplicate policy is applied inside the engine. Returns how many URLs were sent.
 /// `filename_for_first` only applies when a single URL is enqueued (add-dialog Advanced).
+/// `explicit_directory` skips type-folder routing when it is not the configured download dir.
 pub(crate) fn enqueue_urls(
     urls: impl IntoIterator<Item = String>,
-    directory: PathBuf,
+    settings: &Settings,
+    explicit_directory: Option<&std::path::Path>,
     filename_for_first: Option<String>,
     engine: &crate::download::EngineHandle,
 ) -> usize {
     let mut count = 0;
     for (i, url) in urls.into_iter().enumerate() {
+        let override_name = if i == 0 {
+            filename_for_first.as_deref()
+        } else {
+            None
+        };
+        let name = preferred_filename(&url, override_name);
+        let directory = settings.resolve_save_directory(&name, explicit_directory);
         engine.send(EngineCommand::Add {
             url,
             filename: if i == 0 {
@@ -56,9 +79,9 @@ pub(crate) fn enqueue_urls(
             } else {
                 None
             },
-            directory: directory.clone(),
+            directory,
             handoff_auth: None,
-            conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            conflict: FilenameConflictPolicy::Uniquify,
             reply: None,
         });
         count += 1;
@@ -69,20 +92,28 @@ pub(crate) fn enqueue_urls(
 /// Parse free-form text and enqueue; shared by add dialog (and drop path for text bodies).
 pub(crate) fn enqueue_urls_from_text(
     raw: &str,
-    directory: PathBuf,
+    settings: &Settings,
+    explicit_directory: Option<&std::path::Path>,
     filename_for_first: Option<String>,
     engine: &crate::download::EngineHandle,
 ) -> usize {
     // Engine also splits glued schemes; do it here so filename applies to first only.
     let urls = crate::download::extract_http_urls(raw);
-    enqueue_urls(urls, directory, filename_for_first, engine)
+    enqueue_urls(
+        urls,
+        settings,
+        explicit_directory,
+        filename_for_first,
+        engine,
+    )
 }
 
 /// Enqueue one or more URLs from the add dialog; returns whether the dialog should close.
 fn submit_add_download(
     raw: &str,
     filename: String,
-    directory: PathBuf,
+    typed_directory: PathBuf,
+    settings: &Settings,
     engine: &crate::download::EngineHandle,
     app_view: &Entity<DownloadApp>,
     cx: &mut App,
@@ -101,15 +132,21 @@ fn submit_add_download(
     } else {
         None
     };
+    let explicit = if same_dir(&typed_directory, &settings.download_directory) {
+        None
+    } else {
+        Some(typed_directory.as_path())
+    };
 
     // Shared path with file-drop enqueue (filename only for single-URL Advanced).
-    let _ = enqueue_urls_from_text(raw, directory, single_name, engine);
+    let _ = enqueue_urls_from_text(raw, settings, explicit, single_name, engine);
     true
 }
 
 impl DownloadApp {
     pub(super) fn open_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let default_dir = self.settings.download_directory.clone();
+        let settings = self.settings.clone();
         let engine = self.engine.clone();
         let app_view = cx.entity().clone();
 
@@ -146,6 +183,7 @@ impl DownloadApp {
             let dir_input = dir_input.clone();
             let engine = engine.clone();
             let app_view = app_view.clone();
+            let settings = settings.clone();
             let advanced_open = advanced_open.clone();
             let multi_urls = multi_urls.clone();
             move |dialog, window, cx| {
@@ -158,11 +196,40 @@ impl DownloadApp {
                 let app_view_ok = app_view.clone();
                 let app_view_browse = app_view.clone();
                 let dir_browse = dir_for_browse.clone();
+                let settings_ok = settings.clone();
+                let settings_preview = settings.clone();
                 let theme = cx.theme().clone();
                 let muted = theme.muted_foreground;
                 let is_advanced = advanced_open.get();
                 let is_multi = multi_urls.get();
-                let save_preview = shorten_path_display(&dir_input.read(cx).value());
+                let typed_dir = PathBuf::from(dir_input.read(cx).value().to_string());
+                let typed_name = name_input.read(cx).value().to_string();
+                let preview_url = if is_multi {
+                    url_multi.read(cx).value().to_string()
+                } else {
+                    url_single.read(cx).value().to_string()
+                };
+                let first_url = crate::download::extract_http_urls(&preview_url)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let preview_name = preferred_filename(
+                    &first_url,
+                    if typed_name.trim().is_empty() {
+                        None
+                    } else {
+                        Some(typed_name.as_str())
+                    },
+                );
+                let preview_explicit =
+                    if same_dir(&typed_dir, &settings_preview.download_directory) {
+                        None
+                    } else {
+                        Some(typed_dir.as_path())
+                    };
+                let save_dest =
+                    settings_preview.resolve_save_directory(&preview_name, preview_explicit);
+                let save_preview = shorten_path_display(&save_dest.to_string_lossy());
 
                 // Center when compact; when Advanced / multi-URL is open, bias upward
                 // so the footer (Cancel / Start download) never clips the window bottom.
@@ -437,6 +504,7 @@ impl DownloadApp {
                             &raw,
                             filename,
                             directory,
+                            &settings_ok,
                             &engine_ok,
                             &app_view_ok,
                             cx,

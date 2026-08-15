@@ -1,8 +1,8 @@
 //! Sidebar navigation extracted from `DownloadApp`.
 
 use gpui::{
-    div, px, Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled,
+    div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled,
 };
 use gpui_component::{
     divider::Divider, h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
@@ -10,16 +10,20 @@ use gpui_component::{
 
 use super::filter::FilterKind;
 use super::settings_category::SettingsCategory;
-use super::widgets::{nav_item, settings_nav_item};
+use super::widgets::{library_parent_nav, nav_item, settings_nav_item, type_nav_item};
 use super::DownloadApp;
-use crate::format::count_jobs;
+use crate::download::FileTypeKind;
+use crate::format::{count_jobs, count_jobs_by_type};
 
 impl DownloadApp {
     pub(crate) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (all, active, completed, failed) = count_jobs(&self.jobs);
+        let type_counts = count_jobs_by_type(&self.jobs);
         let theme = cx.theme().clone();
         let filter = self.filter;
         let sidebar_w = self.settings.ui_density.sidebar_w();
+        let library_expanded = self.settings.sidebar_library_expanded;
+        let all_active = filter == FilterKind::All;
 
         v_flex()
             .w(px(sidebar_w))
@@ -30,13 +34,17 @@ impl DownloadApp {
             .border_color(theme.sidebar_border)
             .p_3()
             .gap_0p5()
-            .child(nav_item(
-                "All downloads",
-                FilterKind::All,
-                all,
-                filter == FilterKind::All,
-                cx,
-            ))
+            .child(library_parent_nav(all, all_active, library_expanded, cx))
+            .when(library_expanded, |el| {
+                el.children(FileTypeKind::ALL.into_iter().map(|kind| {
+                    type_nav_item(
+                        kind,
+                        type_counts[kind.index()],
+                        filter == FilterKind::FileType(kind),
+                        cx,
+                    )
+                }))
+            })
             .child(nav_item(
                 "Active",
                 FilterKind::Active,

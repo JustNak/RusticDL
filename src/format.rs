@@ -1,7 +1,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::download::{Job, JobState};
+use crate::download::{FileTypeKind, Job, JobState};
 use crate::settings::{SortColumn, SortDirection};
+
+/// Queue list filter (status or file type). Settings is not a queue filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueFilter {
+    All,
+    Active,
+    Completed,
+    Failed,
+    FileType(FileTypeKind),
+}
 
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -211,18 +221,25 @@ fn format_absolute_date_windows(unix_secs: u64) -> Option<String> {
     }
 }
 
-pub fn filter_jobs<'a>(jobs: &'a [Job], filter_index: i32) -> Vec<&'a Job> {
+pub fn filter_jobs<'a>(jobs: &'a [Job], filter: QueueFilter) -> Vec<&'a Job> {
     jobs.iter()
-        .filter(|job| match filter_index {
-            1 => matches!(
-                job.state,
-                JobState::Queued | JobState::Starting | JobState::Downloading | JobState::Paused
-            ),
-            2 => job.state == JobState::Completed,
-            3 => matches!(job.state, JobState::Failed | JobState::Canceled),
-            _ => true,
+        .filter(|job| match filter {
+            QueueFilter::All => true,
+            QueueFilter::Active => job.state.is_active(),
+            QueueFilter::Completed => job.state == JobState::Completed,
+            QueueFilter::Failed => matches!(job.state, JobState::Failed | JobState::Canceled),
+            QueueFilter::FileType(kind) => FileTypeKind::from_filename(&job.filename) == kind,
         })
         .collect()
+}
+
+/// Counts per [`FileTypeKind::ALL`] index.
+pub fn count_jobs_by_type(jobs: &[Job]) -> [i32; FileTypeKind::COUNT] {
+    let mut counts = [0i32; FileTypeKind::COUNT];
+    for job in jobs {
+        counts[FileTypeKind::from_filename(&job.filename).index()] += 1;
+    }
+    counts
 }
 
 fn size_sort_key(job: &Job) -> u64 {
@@ -435,5 +452,20 @@ mod tests {
         assert!(job_matches_search(&job, "c:\\dl"));
         assert!(!job_matches_search(&job, "missing"));
         assert!(job_matches_search(&job, ""));
+    }
+
+    #[test]
+    fn type_filter_matches_extension_regardless_of_state() {
+        let mut video = sample_job("1", "clip.mp4", "https://example.com/v");
+        video.state = JobState::Completed;
+        let audio = sample_job("2", "song.mp3", "https://example.com/a");
+        let jobs = vec![video.clone(), audio.clone()];
+        let filtered = filter_jobs(&jobs, QueueFilter::FileType(FileTypeKind::Video));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].filename, "clip.mp4");
+        let counts = count_jobs_by_type(&jobs);
+        assert_eq!(counts[FileTypeKind::Video.index()], 1);
+        assert_eq!(counts[FileTypeKind::Audio.index()], 1);
+        assert_eq!(counts[FileTypeKind::Other.index()], 0);
     }
 }

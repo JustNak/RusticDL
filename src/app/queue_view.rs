@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::FluentBuilder, px, Context, ExternalPaths, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -45,8 +45,7 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         let summary = extract_urls_from_dropped_paths(paths.paths());
-        let directory = self.settings.download_directory.clone();
-        let n = enqueue_urls(summary.urls, directory, None, &self.engine);
+        let n = enqueue_urls(summary.urls, &self.settings, None, None, &self.engine);
 
         if n > 0 {
             let mut msg = format!("Added {n} from drop");
@@ -89,11 +88,12 @@ impl DownloadApp {
         let filtered = self.visible_jobs_in(&jobs, cx);
         let query = self.search_query(cx);
         let has_query = !query.trim().is_empty();
-        if filtered.is_empty()
-            && !has_query
-            && filter_jobs(&jobs, self.filter.as_index()).is_empty()
-        {
-            return self.render_empty(cx).into_any_element();
+        if filtered.is_empty() && !has_query {
+            let type_empty =
+                matches!(self.filter, super::FilterKind::FileType(_)) && !jobs.is_empty();
+            if !type_empty && filter_jobs(&jobs, self.filter.queue_filter()).is_empty() {
+                return self.render_empty(cx).into_any_element();
+            }
         }
 
         let viewport = window.viewport_size();
@@ -219,7 +219,7 @@ impl DownloadApp {
                         }
                     }))
                     .when(filtered.is_empty(), |el| {
-                        el.child(self.render_search_empty(cx))
+                        el.child(self.render_filter_empty(has_query, cx))
                     })
                     .children(filtered.into_iter().map(|job| {
                         let is_selected = self.is_selected(job.id.as_str());
@@ -440,9 +440,38 @@ impl DownloadApp {
         }
     }
 
-    pub(crate) fn render_search_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_filter_empty(
+        &mut self,
+        has_query: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let reduce_motion = self.settings.reduce_motion;
+        let (title, hint): (SharedString, SharedString) = match self.filter {
+            super::FilterKind::FileType(kind) if !has_query => {
+                let title =
+                    format!("No {} downloads yet", kind.label().to_ascii_lowercase()).into();
+                let hint = if self.settings.organize_by_file_type {
+                    let folder = self.settings.category_folders.name(kind);
+                    format!(
+                        "New {} files save to {}.",
+                        kind.label().to_ascii_lowercase(),
+                        self.settings
+                            .download_directory
+                            .join(folder)
+                            .to_string_lossy()
+                    )
+                    .into()
+                } else {
+                    "Downloads of this type will show up here.".into()
+                };
+                (title, hint)
+            }
+            _ => (
+                "No matching downloads".into(),
+                "Try a different search or clear the filter.".into(),
+            ),
+        };
         div()
             .size_full()
             .flex()
@@ -465,26 +494,28 @@ impl DownloadApp {
                             .text_sm()
                             .font_semibold()
                             .text_color(theme.foreground)
-                            .child("No matching downloads"),
+                            .child(title),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("Try a different search or clear the filter."),
+                            .child(hint),
                     )
-                    .child(
-                        Button::new("clear-search")
-                            .outline()
-                            .small()
-                            .label("Clear search")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.search_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
+                    .when(has_query, |el| {
+                        el.child(
+                            Button::new("clear-search")
+                                .outline()
+                                .small()
+                                .label("Clear search")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.search_input.update(cx, |input, cx| {
+                                        input.set_value("", window, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
     }
 

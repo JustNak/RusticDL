@@ -12,6 +12,7 @@ use super::super::layout::{
 };
 use super::super::DownloadApp;
 use super::chrome::soft_tooltip;
+use crate::download::FileTypeKind;
 use crate::settings::{SortColumn, SortDirection};
 
 pub(crate) fn status_chip(text: String, color: Hsla) -> impl IntoElement {
@@ -130,66 +131,6 @@ pub(crate) fn status_tag(status: &'static str, tone: i32) -> Tag {
     }
 }
 
-/// File-type group used for queue row icons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileTypeKind {
-    Archive,
-    Video,
-    Audio,
-    Image,
-    Program,
-    Document,
-    Generic,
-}
-
-impl FileTypeKind {
-    pub(crate) fn from_filename(filename: &str) -> Self {
-        let ext = std::path::Path::new(filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match ext.as_str() {
-            "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "lz4" | "zst" | "cab"
-            | "iso" => Self::Archive,
-            "mkv" | "mp4" | "avi" | "webm" | "mov" | "m4v" | "wmv" | "flv" | "mpeg" | "mpg"
-            | "ts" | "m2ts" => Self::Video,
-            "mp3" | "flac" | "wav" | "aac" | "m4a" | "ogg" | "opus" | "wma" | "aiff" => Self::Audio,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tif" | "tiff"
-            | "heic" | "avif" => Self::Image,
-            "exe" | "msi" | "bat" | "cmd" | "com" | "appx" | "msix" | "dll" | "sys" | "scr"
-            | "ps1" | "sh" | "bin" | "run" | "app" | "dmg" | "pkg" | "deb" | "rpm" => Self::Program,
-            "pdf" | "doc" | "docx" | "txt" | "md" | "rtf" | "odt" | "xls" | "xlsx" | "ppt"
-            | "pptx" | "csv" | "json" | "xml" | "html" | "htm" | "epub" | "mobi" => Self::Document,
-            _ => Self::Generic,
-        }
-    }
-
-    pub(crate) fn icon_path(self) -> &'static str {
-        match self {
-            Self::Archive => "icons/file-archive.svg",
-            Self::Video => "icons/file-video.svg",
-            Self::Audio => "icons/file-audio.svg",
-            Self::Image => "icons/file-image.svg",
-            Self::Program => "icons/file-code.svg",
-            Self::Document => "icons/file-text.svg",
-            Self::Generic => "icons/file.svg",
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Archive => "Archive",
-            Self::Video => "Video",
-            Self::Audio => "Audio",
-            Self::Image => "Image",
-            Self::Program => "Program",
-            Self::Document => "Document",
-            Self::Generic => "File",
-        }
-    }
-}
-
 /// Lowercase file extension for the detail File field (`mp3`, `mp4`).
 /// Compound names like `video.mkv.zip` report the last segment (`zip`).
 pub(crate) fn file_extension_label(filename: &str) -> String {
@@ -294,8 +235,9 @@ pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
 mod tests {
     use super::{
         detail_name_char_budget, ellipsize_name, file_extension_label, name_char_budget,
-        FileTypeKind, QueueColumns,
+        QueueColumns,
     };
+    use crate::download::FileTypeKind;
 
     #[test]
     fn ellipsize_keeps_short_names() {
@@ -341,7 +283,10 @@ mod tests {
     fn file_type_kind_from_common_extensions() {
         assert_eq!(FileTypeKind::from_filename("clip.mp4").label(), "Video");
         assert_eq!(FileTypeKind::from_filename("song.mp3").label(), "Audio");
-        assert_eq!(FileTypeKind::from_filename("pack.zip").label(), "Archive");
-        assert_eq!(FileTypeKind::from_filename("notes").label(), "File");
+        assert_eq!(
+            FileTypeKind::from_filename("pack.zip").label(),
+            "Compressed"
+        );
+        assert_eq!(FileTypeKind::from_filename("notes").label(), "Other");
     }
 }

@@ -180,7 +180,18 @@ impl IpcBridge {
                 break;
             }
         }
-        let dir = guard.download_directory.clone();
+        let name = {
+            let front = guard.prompt_queue.front()?;
+            front
+                .suggested_filename
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| crate::download::derive_filename_from_url(&front.url))
+                .unwrap_or_else(|| "download.bin".into())
+        };
+        let dir = guard.settings.resolve_save_directory(&name, None);
         let view = guard.prompt_queue.front()?.to_view(dir);
         guard.active_prompt_id = Some(view.id.clone());
         Some(view)

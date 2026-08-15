@@ -8,6 +8,7 @@ use gpui_component::{
     button::ButtonVariant, dialog::DialogButtonProps, v_flex, ActiveTheme, WindowExt,
 };
 
+use super::add_dialog::enqueue_urls;
 use super::DownloadApp;
 use crate::download::EngineCommand;
 
@@ -352,13 +353,13 @@ impl DownloadApp {
         }
 
         let engine = self.engine.clone();
-        let directory = self.settings.download_directory.clone();
+        let settings = self.settings.clone();
         let app_view = cx.entity().clone();
 
         window.open_dialog(cx, move |dialog, _, cx| {
             let engine = engine.clone();
             let urls = urls.clone();
-            let directory = directory.clone();
+            let settings = settings.clone();
             let app_view = app_view.clone();
             let title = title.clone();
             let body = body.clone();
@@ -388,17 +389,7 @@ impl DownloadApp {
                         ),
                 )
                 .on_ok(move |_, _, cx| {
-                    for url in &urls {
-                        engine.send(EngineCommand::Add {
-                            url: url.clone(),
-                            filename: None,
-                            directory: directory.clone(),
-                            handoff_auth: None,
-                            conflict: crate::download::FilenameConflictPolicy::Uniquify,
-                            reply: None,
-                        });
-                    }
-                    let n = urls.len();
+                    let n = enqueue_urls(urls.clone(), &settings, None, None, &engine);
                     app_view.update(cx, |app, cx| {
                         app.show_toast(
                             if n == 1 {

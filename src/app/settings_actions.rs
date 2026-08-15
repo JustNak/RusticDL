@@ -8,7 +8,7 @@ use gpui_component::WindowExt;
 use super::confirm_dialogs;
 use super::DownloadApp;
 use crate::appearance::{apply_appearance, apply_window_opacity};
-use crate::download::{EngineCommand, EngineRuntimeConfig};
+use crate::download::{EngineCommand, EngineRuntimeConfig, FileTypeKind};
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
 use crate::persistence::save_settings;
 use crate::settings::{
@@ -147,6 +147,11 @@ impl DownloadApp {
         self.settings.extension.excluded_hosts = excluded_hosts;
         self.settings.extension.captured_file_extensions = captured_extensions;
 
+        for (i, kind) in FileTypeKind::ALL.iter().enumerate() {
+            let raw = self.category_folder_inputs[i].read(cx).value().to_string();
+            self.settings.category_folders.get_mut(*kind).name = raw;
+        }
+
         self.settings.sanitize_appearance();
         // Reflect clamped multi limits back into text drafts.
         let multi_segs = self.settings.multi_max_segments.to_string();
@@ -174,6 +179,7 @@ impl DownloadApp {
         self.extension_committed = self.settings.extension.clone();
         // Show sanitized hosts/extensions in the drafts after Save.
         self.refresh_extension_text_inputs(window, cx);
+        self.refresh_category_folder_inputs(window, cx);
         let _ = save_settings(&self.paths, &self.settings);
         self.ipc.update_settings(&self.settings);
 
@@ -195,6 +201,46 @@ impl DownloadApp {
         ));
 
         self.show_toast("Settings saved.", cx);
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_category_folder_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (i, kind) in FileTypeKind::ALL.iter().enumerate() {
+            let name = self.settings.category_folders.name(*kind).to_string();
+            self.category_folder_inputs[i].update(cx, |input, cx| {
+                input.set_value(name.clone(), window, cx);
+            });
+        }
+    }
+
+    pub(crate) fn toggle_sidebar_library(&mut self, cx: &mut Context<Self>) {
+        self.settings.sidebar_library_expanded = !self.settings.sidebar_library_expanded;
+        let _ = save_settings(&self.paths, &self.settings_for_disk());
+        cx.notify();
+    }
+
+    pub(crate) fn set_organize_by_file_type(
+        &mut self,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.organize_by_file_type = on;
+        cx.notify();
+    }
+
+    pub(crate) fn set_category_enabled(
+        &mut self,
+        kind: FileTypeKind,
+        on: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.category_folders.get_mut(kind).enabled = on;
         cx.notify();
     }
 
