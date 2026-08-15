@@ -83,8 +83,8 @@ pub(crate) struct IpcState {
     pub(crate) jobs: Arc<Vec<Job>>,
     /// FIFO of browser prompts waiting for UI (or currently shown).
     pub(crate) prompt_queue: VecDeque<BrowserPrompt>,
-    /// Prompt id currently shown in the ask dialog (if any).
-    pub(crate) active_prompt_id: Option<String>,
+    /// Prompt ids currently shown in an ask dialog (more than one HUD can be open).
+    pub(crate) active_prompt_ids: HashSet<String>,
     /// Set by `show_window` IPC; UI polls and activates the main window.
     pub(crate) show_window_requested: bool,
     /// Job ids from browser handoff that should open the progress HUD.
@@ -108,7 +108,7 @@ impl IpcBridge {
                 settings: settings.clone(),
                 jobs: Arc::new(Vec::new()),
                 prompt_queue: VecDeque::new(),
-                active_prompt_id: None,
+                active_prompt_ids: HashSet::new(),
                 show_window_requested: false,
                 pending_progress_job_ids: VecDeque::new(),
                 pending_progress_watch_ids: VecDeque::new(),
@@ -163,41 +163,46 @@ impl IpcBridge {
             .map(|guard| guard.extension_settings.clone())
     }
 
-    /// If no dialog is open and a prompt is waiting, mark it active and return a UI view.
+    /// Claim the next unshown prompt and return a UI view.
+    ///
+    /// Multiple confirm HUDs can be open at once; already-claimed ids stay in
+    /// the queue until resolved and are skipped here.
     pub fn claim_next_prompt_for_ui(&self) -> Option<BrowserPromptView> {
         let mut guard = self.inner.lock().ok()?;
-        if guard.active_prompt_id.is_some() {
-            return None;
-        }
         // Drop timed-out prompts still sitting in the queue.
         let now = Instant::now();
         while let Some(front) = guard.prompt_queue.front() {
             if now.duration_since(front.created_at) > DOWNLOAD_PROMPT_TIMEOUT {
                 if let Some(stale) = guard.prompt_queue.pop_front() {
+                    guard.active_prompt_ids.remove(&stale.id);
                     let _ = stale.reply.send(PromptDecision::Dismiss);
                 }
             } else {
                 break;
             }
         }
+        let index = guard
+            .prompt_queue
+            .iter()
+            .position(|p| !guard.active_prompt_ids.contains(&p.id))?;
         let name = {
-            let front = guard.prompt_queue.front()?;
-            front
+            let prompt = &guard.prompt_queue[index];
+            prompt
                 .suggested_filename
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
-                .or_else(|| crate::download::derive_filename_from_url(&front.url))
+                .or_else(|| crate::download::derive_filename_from_url(&prompt.url))
                 .unwrap_or_else(|| "download.bin".into())
         };
         let dir = guard.settings.resolve_save_directory(&name, None);
-        let view = guard.prompt_queue.front()?.to_view(dir);
-        guard.active_prompt_id = Some(view.id.clone());
+        let view = guard.prompt_queue[index].to_view(dir);
+        guard.active_prompt_ids.insert(view.id.clone());
         Some(view)
     }
 
-    /// Resolve the active prompt (or any matching id) with the user's decision.
+    /// Resolve a claimed or queued prompt with the user's decision.
     pub fn resolve_prompt(&self, prompt_id: &str, decision: PromptDecision) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
             return false;
@@ -206,13 +211,12 @@ impl IpcBridge {
             return false;
         };
         let prompt = guard.prompt_queue.remove(index).expect("index checked");
-        if guard.active_prompt_id.as_deref() == Some(prompt_id) {
-            guard.active_prompt_id = None;
-        }
+        guard.active_prompt_ids.remove(prompt_id);
         prompt.reply.send(decision).is_ok()
     }
 
     /// Whether a prompt is still waiting (used to close stale dialogs after IPC timeout).
+    #[allow(dead_code)] // used by unit tests; HUD timeout close can consult this
     pub fn is_prompt_pending(&self, prompt_id: &str) -> bool {
         self.inner
             .lock()
@@ -294,10 +298,18 @@ impl IpcBridge {
     ///
     /// Skips jobs already owned by a HUD and jobs whose URL is being bound by
     /// a Confirm→Progress morph (those windows claim the job themselves).
+    /// `max` caps how many ready ids leave the queue (1 = one window per tick).
     pub fn take_pending_progress_jobs(&self) -> Vec<String> {
+        self.take_pending_progress_jobs_n(usize::MAX)
+    }
+
+    pub fn take_pending_progress_jobs_n(&self, max: usize) -> Vec<String> {
         let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
+        if max == 0 {
+            return Vec::new();
+        }
         let mut open = Vec::new();
         let mut keep = VecDeque::new();
         while let Some(id) = guard.pending_progress_job_ids.pop_front() {
@@ -315,7 +327,11 @@ impl IpcBridge {
                 keep.push_back(id);
                 continue;
             }
-            open.push(id);
+            if open.len() < max {
+                open.push(id);
+            } else {
+                keep.push_back(id);
+            }
         }
         guard.pending_progress_job_ids = keep;
         open
@@ -377,6 +393,15 @@ impl IpcBridge {
             .is_some_and(|g| g.progress_hud_owned_jobs.contains(job_id))
     }
 
+    /// Open capture HUDs (confirm + progress/complete) currently tracked.
+    ///
+    /// Used to cascade newly opened windows so they do not stack on one pixel.
+    pub fn capture_window_count(&self) -> usize {
+        self.inner.lock().ok().map_or(0, |g| {
+            g.active_prompt_ids.len() + g.progress_hud_owned_jobs.len()
+        })
+    }
+
     /// Returns true the first time Complete should be shown for this job.
     pub fn try_claim_complete_hud(&self, job_id: &str) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
@@ -405,5 +430,97 @@ impl IpcBridge {
             .lock()
             .ok()
             .is_some_and(|g| g.extension_settings.show_progress_after_handoff)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::download::{EngineHandle, Job};
+    use crate::persistence::AppPaths;
+    use crate::settings::Settings;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn test_bridge() -> IpcBridge {
+        let root = std::env::temp_dir().join(format!("rusticdl-ipc-test-{}", uuid::Uuid::new_v4()));
+        IpcBridge::new(
+            EngineHandle::stub(),
+            &Settings::default(),
+            AppPaths {
+                settings: root.join("settings.json"),
+                state: root.join("state.json"),
+                pending_whats_new: root.join("pending_whats_new.json"),
+                root,
+            },
+        )
+    }
+
+    fn test_prompt(id: &str, url: &str) -> (BrowserPrompt, oneshot::Receiver<PromptDecision>) {
+        let (reply, rx) = oneshot::channel();
+        (
+            BrowserPrompt {
+                id: id.to_string(),
+                url: url.to_string(),
+                suggested_filename: Some(format!("{id}.bin")),
+                total_bytes: Some(1),
+                browser: "chrome".into(),
+                entry_point: "popup".into(),
+                page_title: None,
+                created_at: Instant::now(),
+                reply,
+            },
+            rx,
+        )
+    }
+
+    fn test_job(id: &str, url: &str) -> Job {
+        let mut job = Job::new(
+            url.to_string(),
+            format!("{id}.bin"),
+            PathBuf::from(format!("C:\\tmp\\{id}.bin")),
+            PathBuf::from(format!("C:\\tmp\\{id}.bin.part")),
+        );
+        job.id = id.to_string();
+        job
+    }
+
+    #[test]
+    fn claim_next_prompt_allows_multiple_open_huds() {
+        let ipc = test_bridge();
+        let (prompt_a, _rx_a) = test_prompt("a", "https://example.com/a");
+        let (prompt_b, _rx_b) = test_prompt("b", "https://example.com/b");
+        ipc.enqueue_prompt(prompt_a).expect("enqueue a");
+        ipc.enqueue_prompt(prompt_b).expect("enqueue b");
+
+        let first = ipc.claim_next_prompt_for_ui().expect("first prompt");
+        let second = ipc.claim_next_prompt_for_ui().expect("second prompt");
+        assert_eq!(first.id, "a");
+        assert_eq!(second.id, "b");
+        assert!(ipc.claim_next_prompt_for_ui().is_none());
+        assert_eq!(ipc.capture_window_count(), 2);
+
+        assert!(ipc.resolve_prompt("a", PromptDecision::Dismiss));
+        assert_eq!(ipc.capture_window_count(), 1);
+        assert!(ipc.is_prompt_pending("b"));
+        assert!(!ipc.is_prompt_pending("a"));
+    }
+
+    #[test]
+    fn take_pending_progress_jobs_n_leaves_the_rest() {
+        let ipc = test_bridge();
+        ipc.update_jobs(Arc::new(vec![
+            test_job("j1", "https://example.com/1"),
+            test_job("j2", "https://example.com/2"),
+            test_job("j3", "https://example.com/3"),
+        ]));
+        ipc.enqueue_progress_job("j1".into());
+        ipc.enqueue_progress_job("j2".into());
+        ipc.enqueue_progress_job("j3".into());
+
+        assert_eq!(ipc.take_pending_progress_jobs_n(1), vec!["j1".to_string()]);
+        assert_eq!(ipc.take_pending_progress_jobs_n(1), vec!["j2".to_string()]);
+        assert_eq!(ipc.take_pending_progress_jobs(), vec!["j3".to_string()]);
+        assert!(ipc.take_pending_progress_jobs_n(1).is_empty());
     }
 }

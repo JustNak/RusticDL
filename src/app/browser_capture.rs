@@ -1,7 +1,9 @@
 //! Browser handoff capture pollers extracted from `DownloadApp`.
 //!
-//! Dual-invoked from the shell `new` 80ms timer and from `Render` so prompts
-//! and progress HUDs still appear when the main UI is idle or minimized.
+//! Invoked from the shell 80ms timer (not from `Render`). Opening a native
+//! window during paint re-enters GPUI's draw path and crashes on Windows.
+//! At most one new capture window is created per tick so two HUDs never
+//! `open_window` in the same update.
 
 use gpui::Context;
 
@@ -40,41 +42,36 @@ impl DownloadApp {
         }
     }
 
+    /// Open at most one pending confirm / progress / complete HUD this tick.
+    pub(crate) fn poll_browser_capture(&mut self, cx: &mut Context<Self>) {
+        if self.open_next_browser_prompt(cx) {
+            return;
+        }
+        if self.open_next_browser_progress(cx) {
+            return;
+        }
+        self.open_next_browser_complete(cx);
+    }
+
     /// Poll for browser ask-mode handoffs and open a dedicated prompt window.
     ///
-    /// Safe to call from the main window render loop or a background timer so
-    /// prompts still appear when the main UI is idle or minimized.
-    pub(crate) fn poll_browser_prompt(&mut self, cx: &mut Context<Self>) {
-        // Clear tracking when the prompt was resolved, timed out, or the window closed.
-        if let Some(id) = self.browser_prompt_open_id.clone() {
-            if !self.ipc.is_prompt_pending(&id) {
-                self.browser_prompt_open_id = None;
-            } else {
-                // One confirm at a time.
-                return;
-            }
-        }
-
+    /// Returns true when a new window was created (caller should stop this tick).
+    fn open_next_browser_prompt(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(prompt) = self.ipc.claim_next_prompt_for_ui() else {
-            return;
+            return false;
         };
-        let prompt_id = prompt.id.clone();
-        let opened = open_browser_prompt_window(
+        open_browser_prompt_window(
             prompt,
             self.ipc.clone(),
             self.engine.clone(),
             &self.settings,
             cx,
-        );
-        if opened.is_some() {
-            self.browser_prompt_open_id = Some(prompt_id);
-        } else {
-            self.browser_prompt_open_id = None;
-        }
+        )
+        .is_some()
     }
 
-    /// Open floating progress HUDs for browser handoffs (auto mode + confirm morph fallback).
-    pub(crate) fn poll_browser_progress(&mut self, cx: &mut Context<Self>) {
+    /// Open one floating progress HUD for a browser handoff (auto mode + morph fallback).
+    fn open_next_browser_progress(&mut self, cx: &mut Context<Self>) -> bool {
         // Always adopt watch ids so Complete re-open works for Confirm morph too.
         for job_id in self.ipc.take_progress_watch_jobs() {
             if !self
@@ -90,22 +87,24 @@ impl DownloadApp {
         if !self.ipc.show_progress_after_handoff() {
             // Drain open-queue so ids do not pile up while the setting is off.
             let _ = self.ipc.take_pending_progress_jobs();
-            return;
+            return false;
         }
 
-        for job_id in self.ipc.take_pending_progress_jobs() {
-            let _ = open_browser_progress_window(
-                job_id,
-                self.ipc.clone(),
-                self.engine.clone(),
-                &self.settings,
-                cx,
-            );
-        }
+        let Some(job_id) = self.ipc.take_pending_progress_jobs_n(1).into_iter().next() else {
+            return false;
+        };
+        open_browser_progress_window(
+            job_id,
+            self.ipc.clone(),
+            self.engine.clone(),
+            &self.settings,
+            cx,
+        )
+        .is_some()
     }
 
-    /// If Progress was closed early, re-open a Complete HUD when the job finishes.
-    pub(crate) fn poll_browser_complete(&mut self, cx: &mut Context<Self>) {
+    /// If Progress was closed early, re-open one Complete HUD when a watched job finishes.
+    fn open_next_browser_complete(&mut self, cx: &mut Context<Self>) {
         // Match enqueue / progress poll: committed bridge setting only.
         if !self.ipc.show_progress_after_handoff() {
             self.browser_watch_complete_ids.clear();
@@ -116,6 +115,7 @@ impl DownloadApp {
         }
 
         let mut still_watch = Vec::new();
+        let mut opened = false;
         for job_id in self.browser_watch_complete_ids.drain(..) {
             let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
                 // Job removed — stop watching.
@@ -124,10 +124,10 @@ impl DownloadApp {
             match job.state {
                 JobState::Completed => {
                     // Progress HUD still open will morph itself; avoid a second window.
-                    if self.ipc.is_progress_hud_owned(&job_id) {
+                    if self.ipc.is_progress_hud_owned(&job_id) || opened {
                         still_watch.push(job_id);
                     } else {
-                        let opened = open_browser_complete_window(
+                        let handle = open_browser_complete_window(
                             job.clone(),
                             self.ipc.clone(),
                             self.engine.clone(),
@@ -135,8 +135,10 @@ impl DownloadApp {
                             cx,
                         );
                         // Keep watching on open failure so Complete can retry.
-                        if opened.is_none() {
+                        if handle.is_none() {
                             still_watch.push(job_id);
+                        } else {
+                            opened = true;
                         }
                     }
                 }

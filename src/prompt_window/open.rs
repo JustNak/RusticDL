@@ -11,7 +11,7 @@ use crate::branding::APP_NAME;
 use crate::download::{EngineHandle, Job, JobState};
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
-use crate::window_placement::center_window;
+use crate::window_placement::cascade_window;
 
 /// Open the ask-mode browser confirm window (may morph into progress/complete).
 pub fn open_browser_prompt_window(
@@ -177,9 +177,11 @@ where
 
     match result {
         Ok(handle) => {
+            // Count includes this HUD (already claimed/owned). Index 0 stays centered.
+            let cascade_index = ipc_fallback.capture_window_count().saturating_sub(1);
             cx.activate(true);
             let _ = handle.update(cx, |_root, window, _cx| {
-                center_window(window);
+                cascade_window(window, cascade_index);
                 window.activate_window();
             });
             Some(handle)

@@ -17,7 +17,7 @@ use gpui_component::{
 use super::helpers::{default_prompt_filename, shorten_path, truncate_middle};
 use super::start_sync_timer;
 use super::{BrowserPromptWindow, CapturePhase, CAPTURE_CONFLICT_H, CAPTURE_WINDOW_H};
-use crate::appearance::apply_appearance;
+use crate::appearance::apply_window_opacity;
 use crate::download::EngineHandle;
 use crate::format::format_bytes;
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
@@ -33,7 +33,7 @@ impl BrowserPromptWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        apply_appearance(settings, Some(window), cx);
+        apply_window_opacity(window, settings.window_transparency, settings.backdrop_blur);
         apply_app_icon(window);
 
         let default_name = default_prompt_filename(&prompt);
@@ -64,6 +64,7 @@ impl BrowserPromptWindow {
 
         window.activate_window();
         start_sync_timer(cx);
+        let cascade_index = ipc.capture_window_count().saturating_sub(1);
 
         Self {
             phase: if opens_conflict {
@@ -90,6 +91,7 @@ impl BrowserPromptWindow {
             } else {
                 CAPTURE_WINDOW_H
             }),
+            cascade_index,
         }
     }
 

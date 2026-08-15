@@ -13,7 +13,7 @@ use super::start_sync_timer;
 use super::{
     BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, SPEED_SAMPLE_CAP,
 };
-use crate::appearance::apply_appearance;
+use crate::appearance::apply_window_opacity;
 use crate::download::{EngineCommand, EngineHandle, JobState};
 use crate::format::{format_eta, format_size, format_speed};
 use crate::ipc::IpcBridge;
@@ -29,7 +29,7 @@ impl BrowserPromptWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        apply_appearance(settings, Some(window), cx);
+        apply_window_opacity(window, settings.window_transparency, settings.backdrop_blur);
         apply_app_icon(window);
 
         let job = ipc.job_by_id(&job_id);
@@ -71,6 +71,7 @@ impl BrowserPromptWindow {
         if matches!(phase, CapturePhase::Progress { .. }) {
             start_sync_timer(cx);
         }
+        let cascade_index = ipc.capture_window_count().saturating_sub(1);
 
         let fitted_height = Some(if matches!(phase, CapturePhase::Complete { .. }) {
             CAPTURE_COMPLETE_H
@@ -95,6 +96,7 @@ impl BrowserPromptWindow {
             peak_speed,
             reduce_motion: settings.reduce_motion,
             fitted_height,
+            cascade_index,
         }
     }
 
