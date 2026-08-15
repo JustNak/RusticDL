@@ -1,5 +1,8 @@
 use gpui_component::IconName;
 
+use crate::download::FileTypeKind;
+use crate::format::QueueFilter;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
     All,
@@ -7,22 +10,23 @@ pub enum FilterKind {
     Completed,
     Failed,
     Settings,
+    FileType(FileTypeKind),
 }
 
 impl FilterKind {
-    pub(crate) fn as_index(self) -> i32 {
+    pub(crate) fn queue_filter(self) -> QueueFilter {
         match self {
-            Self::All => 0,
-            Self::Active => 1,
-            Self::Completed => 2,
-            Self::Failed => 3,
-            Self::Settings => 4,
+            Self::All | Self::Settings => QueueFilter::All,
+            Self::Active => QueueFilter::Active,
+            Self::Completed => QueueFilter::Completed,
+            Self::Failed => QueueFilter::Failed,
+            Self::FileType(kind) => QueueFilter::FileType(kind),
         }
     }
 
     pub(crate) fn nav_icon(self) -> IconName {
         match self {
-            Self::All => IconName::Inbox,
+            Self::All | Self::FileType(_) => IconName::Inbox,
             Self::Active => IconName::ArrowDown,
             Self::Completed => IconName::CircleCheck,
             Self::Failed => IconName::CircleX,

@@ -43,7 +43,7 @@ use gpui_component::{
 use crate::appearance::{
     apply_appearance, film_grain_image, noise_enabled, vignette_edge_alpha, vignette_enabled,
 };
-use crate::download::{EngineEvent, EngineHandle, Job};
+use crate::download::{EngineEvent, EngineHandle, FileTypeKind, Job};
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
@@ -89,6 +89,8 @@ pub struct DownloadApp {
     excluded_hosts_input: Entity<InputState>,
     /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
     captured_extensions_input: Entity<InputState>,
+    /// Draft folder names aligned with [`FileTypeKind::ALL`].
+    category_folder_inputs: [Entity<InputState>; FileTypeKind::COUNT],
     /// Unsaved Browser capture toggles/enums (preview) not yet flushed via Save settings.
     extension_settings_dirty: bool,
     /// Last extension snapshot written to disk / IPC (or accepted from the bridge).
@@ -213,6 +215,10 @@ impl DownloadApp {
                 .placeholder("zip, pdf, exe… (comma-separated)")
                 .default_value(settings.extension.captured_file_extensions.join(", "))
         });
+        let category_folder_inputs = FileTypeKind::ALL.map(|kind| {
+            let name = settings.category_folders.name(kind).to_string();
+            cx.new(|cx| InputState::new(window, cx).default_value(name))
+        });
 
         let noise_slider = cx.new(|_| {
             SliderState::new()
@@ -277,6 +283,14 @@ impl DownloadApp {
             &captured_extensions_input,
             &dir_input,
         ] {
+            cx.subscribe(input, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        for input in &category_folder_inputs {
             cx.subscribe(input, |_, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -486,6 +500,7 @@ impl DownloadApp {
             max_connections_per_host_input,
             excluded_hosts_input,
             captured_extensions_input,
+            category_folder_inputs,
             extension_settings_dirty: false,
             extension_committed,
             extension_text_inputs_stale: false,
@@ -586,7 +601,7 @@ impl DownloadApp {
     fn visible_jobs_in<'a>(&self, jobs: &'a [Job], cx: &App) -> Vec<&'a Job> {
         let query = self.search_query(cx);
         let query = query.trim().to_lowercase();
-        let mut jobs: Vec<&Job> = filter_jobs(jobs, self.filter.as_index())
+        let mut jobs: Vec<&Job> = filter_jobs(jobs, self.filter.queue_filter())
             .into_iter()
             .filter(|job| job_matches_search(job, &query))
             .collect();
@@ -665,6 +680,7 @@ impl DownloadApp {
         self.max_connections_per_host_input
             .update(cx, |i, cx| i.set_value(max_host, window, cx));
         self.refresh_extension_text_inputs(window, cx);
+        self.refresh_category_folder_inputs(window, cx);
 
         // Appearance sliders (same rebind as reset_appearance_draft).
         let noise = self.settings.noise_intensity as f32;
@@ -740,6 +756,10 @@ impl DownloadApp {
             self.max_connections_per_host_input
                 .update(cx, |i, cx| i.set_value(max_host, window, cx));
             self.refresh_extension_text_inputs(window, cx);
+            self.refresh_category_folder_inputs(window, cx);
+        }
+        if matches!(filter, FilterKind::FileType(_)) {
+            self.settings.sidebar_library_expanded = true;
         }
         cx.notify();
     }

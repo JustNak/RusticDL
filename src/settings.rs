@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::download::FileTypeKind;
 use crate::extension_settings::ExtensionIntegrationSettings;
 
 /// Default first-run window size (logical px). Matches the designed layout:
@@ -331,10 +332,185 @@ impl UpdateChannel {
     }
 }
 
+/// One type-folder under the main download directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryFolder {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl CategoryFolder {
+    fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            enabled: true,
+        }
+    }
+
+    fn sanitize(&mut self, default_name: &str) {
+        self.name = sanitize_category_folder_name(&self.name, default_name);
+    }
+}
+
+/// Per-type subfolder names (and optional disable) for organize-by-type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryFolders {
+    #[serde(default = "default_video_folder")]
+    pub video: CategoryFolder,
+    #[serde(default = "default_audio_folder")]
+    pub audio: CategoryFolder,
+    #[serde(default = "default_compressed_folder")]
+    pub compressed: CategoryFolder,
+    #[serde(default = "default_images_folder")]
+    pub images: CategoryFolder,
+    #[serde(default = "default_documents_folder")]
+    pub documents: CategoryFolder,
+    #[serde(default = "default_programs_folder")]
+    pub programs: CategoryFolder,
+    #[serde(default = "default_other_folder")]
+    pub other: CategoryFolder,
+}
+
+impl Default for CategoryFolders {
+    fn default() -> Self {
+        Self {
+            video: default_video_folder(),
+            audio: default_audio_folder(),
+            compressed: default_compressed_folder(),
+            images: default_images_folder(),
+            documents: default_documents_folder(),
+            programs: default_programs_folder(),
+            other: default_other_folder(),
+        }
+    }
+}
+
+impl CategoryFolders {
+    pub fn get(&self, kind: FileTypeKind) -> &CategoryFolder {
+        match kind {
+            FileTypeKind::Video => &self.video,
+            FileTypeKind::Audio => &self.audio,
+            FileTypeKind::Compressed => &self.compressed,
+            FileTypeKind::Images => &self.images,
+            FileTypeKind::Documents => &self.documents,
+            FileTypeKind::Programs => &self.programs,
+            FileTypeKind::Other => &self.other,
+        }
+    }
+
+    pub fn get_mut(&mut self, kind: FileTypeKind) -> &mut CategoryFolder {
+        match kind {
+            FileTypeKind::Video => &mut self.video,
+            FileTypeKind::Audio => &mut self.audio,
+            FileTypeKind::Compressed => &mut self.compressed,
+            FileTypeKind::Images => &mut self.images,
+            FileTypeKind::Documents => &mut self.documents,
+            FileTypeKind::Programs => &mut self.programs,
+            FileTypeKind::Other => &mut self.other,
+        }
+    }
+
+    pub fn name(&self, kind: FileTypeKind) -> &str {
+        let name = self.get(kind).name.as_str();
+        if name.is_empty() {
+            kind.default_folder_name()
+        } else {
+            name
+        }
+    }
+
+    pub fn folder_if_enabled(&self, kind: FileTypeKind) -> Option<&str> {
+        let entry = self.get(kind);
+        if entry.enabled {
+            Some(self.name(kind))
+        } else {
+            None
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        for kind in FileTypeKind::ALL {
+            self.get_mut(kind).sanitize(kind.default_folder_name());
+        }
+    }
+}
+
+fn default_video_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Video.default_folder_name())
+}
+fn default_audio_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Audio.default_folder_name())
+}
+fn default_compressed_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Compressed.default_folder_name())
+}
+fn default_images_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Images.default_folder_name())
+}
+fn default_documents_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Documents.default_folder_name())
+}
+fn default_programs_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Programs.default_folder_name())
+}
+fn default_other_folder() -> CategoryFolder {
+    CategoryFolder::named(FileTypeKind::Other.default_folder_name())
+}
+
+fn default_organize_by_file_type() -> bool {
+    true
+}
+
+fn default_sidebar_library_expanded() -> bool {
+    true
+}
+
+/// Compare download directories ignoring slash style, trailing separators, and ASCII case.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    fn key(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('/', "\\");
+        s.trim_end_matches('\\').to_ascii_lowercase()
+    }
+    !a.as_os_str().is_empty() && !b.as_os_str().is_empty() && key(a) == key(b)
+}
+
+/// Keep a single folder name (no `..`, no separators). Empty / invalid → `default_name`.
+pub fn sanitize_category_folder_name(raw: &str, default_name: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return default_name.to_string();
+    }
+    let component = Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed);
+    if component == "." || component == ".." {
+        return default_name.to_string();
+    }
+    let sanitized = crate::download::sanitize_filename(component);
+    if sanitized.is_empty() || sanitized == "download.bin" {
+        default_name.to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub download_directory: PathBuf,
+    /// Save new downloads under `{download_directory}/{Type}/filename`.
+    #[serde(default = "default_organize_by_file_type")]
+    pub organize_by_file_type: bool,
+    /// Sidebar type tree under All downloads is expanded.
+    #[serde(default = "default_sidebar_library_expanded")]
+    pub sidebar_library_expanded: bool,
+    #[serde(default)]
+    pub category_folders: CategoryFolders,
     pub max_concurrent_downloads: u32,
     pub auto_retry_attempts: u32,
     pub speed_limit_kib_per_second: u32,
@@ -447,6 +623,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             download_directory: default_download_directory(),
+            organize_by_file_type: true,
+            sidebar_library_expanded: true,
+            category_folders: CategoryFolders::default(),
             max_concurrent_downloads: 3,
             auto_retry_attempts: 6,
             speed_limit_kib_per_second: 0,
@@ -509,7 +688,29 @@ impl Settings {
         self.accent_lightness = self.accent_lightness.clamp(0.0, 100.0);
         self.window_layout.sanitize();
         self.extension.sanitize();
+        self.category_folders.sanitize();
         self.sanitize_download_limits();
+    }
+
+    /// Destination folder for a new download.
+    ///
+    /// An explicit directory that is not the configured download directory wins
+    /// (Add Advanced / Browse). Otherwise, when organize is on, append the
+    /// type folder for `filename` (or stay at the root if that type is disabled).
+    pub fn resolve_save_directory(&self, filename: &str, explicit_dir: Option<&Path>) -> PathBuf {
+        if let Some(explicit) = explicit_dir {
+            if !same_dir(explicit, &self.download_directory) {
+                return explicit.to_path_buf();
+            }
+        }
+        if !self.organize_by_file_type {
+            return self.download_directory.clone();
+        }
+        let kind = FileTypeKind::from_filename(filename);
+        match self.category_folders.folder_if_enabled(kind) {
+            Some(name) => self.download_directory.join(name),
+            None => self.download_directory.clone(),
+        }
     }
 
     /// Reset all appearance fields to defaults (keeps download prefs).
@@ -600,6 +801,9 @@ mod tests {
         assert!(s.notify_on_complete);
         assert!(s.notify_on_fail);
         assert!(!s.clipboard_watch_enabled);
+        assert!(s.organize_by_file_type);
+        assert!(s.sidebar_library_expanded);
+        assert_eq!(s.category_folders.audio.name, "Audio");
         // Multi limits default when legacy JSON omits those keys.
         assert_eq!(s.multi_max_segments, 8);
         assert_eq!(s.multi_min_bytes, 5 * 1024 * 1024);
@@ -707,6 +911,10 @@ mod tests {
         s.notify_on_complete = false;
         s.notify_on_fail = false;
         s.clipboard_watch_enabled = true;
+        s.organize_by_file_type = false;
+        s.sidebar_library_expanded = false;
+        s.category_folders.audio.name = "Music".into();
+        s.category_folders.programs.enabled = false;
         s.extension.enabled = false;
         s.extension.excluded_hosts = vec!["example.com".into()];
 
@@ -723,6 +931,8 @@ mod tests {
         assert_eq!(s.accent_saturation, defaults.accent_saturation);
         assert_eq!(s.accent_lightness, defaults.accent_lightness);
         assert_eq!(s.accent_preset, defaults.accent_preset);
+        assert!(s.organize_by_file_type);
+        assert_eq!(s.category_folders, CategoryFolders::default());
     }
 
     #[test]
@@ -744,5 +954,81 @@ mod tests {
         expected.download_directory = keep_dir;
         expected.window_layout = keep_layout;
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn same_dir_normalizes_slashes_and_case() {
+        assert!(same_dir(
+            Path::new(r"C:\Users\You\Downloads"),
+            Path::new(r"c:/Users/You/Downloads/")
+        ));
+        assert!(!same_dir(
+            Path::new(r"C:\Users\You\Downloads"),
+            Path::new(r"C:\Users\You\Downloads\Audio")
+        ));
+    }
+
+    #[test]
+    fn sanitize_category_folder_rejects_traversal() {
+        assert_eq!(sanitize_category_folder_name("..", "Audio"), "Audio");
+        assert_eq!(sanitize_category_folder_name("a/b", "Audio"), "b");
+        assert_eq!(sanitize_category_folder_name(r"x\y", "Audio"), "y");
+        assert_eq!(sanitize_category_folder_name("Music", "Audio"), "Music");
+        assert_eq!(sanitize_category_folder_name("   ", "Audio"), "Audio");
+    }
+
+    #[test]
+    fn resolve_save_directory_routes_when_organize_on() {
+        let mut s = Settings::default();
+        s.download_directory = PathBuf::from(r"C:\dl");
+        assert_eq!(
+            s.resolve_save_directory("song.mp3", None),
+            PathBuf::from(r"C:\dl\Audio")
+        );
+        assert_eq!(
+            s.resolve_save_directory("clip.mp4", None),
+            PathBuf::from(r"C:\dl\Video")
+        );
+        assert_eq!(
+            s.resolve_save_directory("notes", None),
+            PathBuf::from(r"C:\dl\Other")
+        );
+        assert_eq!(
+            s.resolve_save_directory("pack.zip", Some(Path::new(r"C:\dl"))),
+            PathBuf::from(r"C:\dl\Compressed")
+        );
+    }
+
+    #[test]
+    fn resolve_save_directory_explicit_other_dir_wins() {
+        let mut s = Settings::default();
+        s.download_directory = PathBuf::from(r"C:\dl");
+        assert_eq!(
+            s.resolve_save_directory("song.mp3", Some(Path::new(r"D:\other"))),
+            PathBuf::from(r"D:\other")
+        );
+    }
+
+    #[test]
+    fn resolve_save_directory_respects_organize_off_and_disabled_type() {
+        let mut s = Settings::default();
+        s.download_directory = PathBuf::from(r"C:\dl");
+        s.organize_by_file_type = false;
+        assert_eq!(
+            s.resolve_save_directory("song.mp3", None),
+            PathBuf::from(r"C:\dl")
+        );
+        s.organize_by_file_type = true;
+        s.category_folders.audio.enabled = false;
+        assert_eq!(
+            s.resolve_save_directory("song.mp3", None),
+            PathBuf::from(r"C:\dl")
+        );
+        s.category_folders.audio.name = "Music".into();
+        s.category_folders.audio.enabled = true;
+        assert_eq!(
+            s.resolve_save_directory("song.mp3", None),
+            PathBuf::from(r"C:\dl\Music")
+        );
     }
 }

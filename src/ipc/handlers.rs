@@ -13,8 +13,8 @@ use super::protocol::{
     HostRequest, HostResponse, RawHandoffAuth, MAX_METADATA_LENGTH,
 };
 use crate::download::{
-    find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus, FilenameConflictPolicy,
-    HandoffAuth, HandoffAuthHeader,
+    derive_filename_from_url, find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus,
+    FilenameConflictPolicy, HandoffAuth, HandoffAuthHeader,
 };
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::persistence::save_settings;
@@ -258,6 +258,18 @@ async fn engine_enqueue(
     conflict: FilenameConflictPolicy,
 ) -> HostResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
+    let name = filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| derive_filename_from_url(&url))
+        .unwrap_or_else(|| "download.bin".into());
+    let Some((_, _, settings, _)) = bridge.snapshot() else {
+        return HostResponse::error(request_id, "INTERNAL_ERROR", "Could not read app state.");
+    };
+    let directory = settings.resolve_save_directory(&name, Some(&directory));
+
     bridge.engine.send(EngineCommand::Add {
         url,
         filename,

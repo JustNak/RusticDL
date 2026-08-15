@@ -156,10 +156,14 @@ impl BrowserPromptWindow {
                 }
             })
         });
-        let directory = self
-            .dir_input
-            .as_ref()
-            .map(|input| PathBuf::from(input.read(cx).value().to_string()));
+        let directory = self.dir_input.as_ref().and_then(|input| {
+            let typed = PathBuf::from(input.read(cx).value().to_string());
+            if crate::settings::same_dir(&typed, &prompt.default_directory) {
+                None
+            } else {
+                Some(typed)
+            }
+        });
 
         let _ = self.ipc.resolve_prompt(
             &prompt.id,
