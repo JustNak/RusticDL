@@ -30,8 +30,10 @@ use crate::settings::ProgressStyle;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
-/// Conflict adds a rejection row + four actions; keep the button row on-screen.
-const CAPTURE_CONFLICT_H: f32 = 352.0;
+/// Four medium action buttons (Cancel / Overwrite / Rename / Start download)
+/// plus the Duplicate Name row and hint need more width and height than Confirm.
+const CAPTURE_CONFLICT_W: f32 = 540.0;
+const CAPTURE_CONFLICT_H: f32 = 408.0;
 /// Complete phase has no sparkline or form — hug the file row + actions.
 const CAPTURE_COMPLETE_H: f32 = 196.0;
 /// Rolling speed samples for the Progress sparkline (~9s at 100ms tick).
@@ -86,8 +88,8 @@ pub struct BrowserPromptWindow {
     peak_speed: u64,
     /// When true, skip animating sample growth (settings reduce_motion).
     reduce_motion: bool,
-    /// Last height we applied via `resize` so Complete/Progress don't fight.
-    fitted_height: Option<f32>,
+    /// Last size we applied via `resize` so phase transitions do not fight.
+    fitted_size: Option<(f32, f32)>,
     /// Stagger index so this HUD does not land on top of another open capture window.
     cascade_index: usize,
 }
@@ -148,22 +150,22 @@ impl BrowserPromptWindow {
         }
     }
 
-    fn target_window_height(&self) -> f32 {
+    fn target_window_size(&self) -> (f32, f32) {
         match self.phase {
-            CapturePhase::Complete { .. } => CAPTURE_COMPLETE_H,
-            CapturePhase::Conflict => CAPTURE_CONFLICT_H,
-            _ => CAPTURE_WINDOW_H,
+            CapturePhase::Complete { .. } => (CAPTURE_WINDOW_W, CAPTURE_COMPLETE_H),
+            CapturePhase::Conflict => (CAPTURE_CONFLICT_W, CAPTURE_CONFLICT_H),
+            _ => (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H),
         }
     }
 
     fn fit_window_to_phase(&mut self, window: &mut Window) {
-        let target = self.target_window_height();
-        if self.fitted_height.is_some_and(|h| (h - target).abs() < 0.5) {
+        let (width, height) = self.target_window_size();
+        if fitted_size_matches(self.fitted_size, width, height) {
             return;
         }
         // Record first so a synchronous resize→re-render does not loop.
-        self.fitted_height = Some(target);
-        window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
+        self.fitted_size = Some((width, height));
+        window.resize(gpui::size(gpui::px(width), gpui::px(height)));
         crate::window_placement::cascade_window(window, self.cascade_index);
     }
 
@@ -193,6 +195,10 @@ impl BrowserPromptWindow {
 /// stop once the HUD reaches Complete (or the window is gone).
 fn capture_sync_timer_should_continue(phase: &CapturePhase) -> bool {
     !matches!(phase, CapturePhase::Complete { .. })
+}
+
+fn fitted_size_matches(applied: Option<(f32, f32)>, width: f32, height: f32) -> bool {
+    applied.is_some_and(|(w, h)| (w - width).abs() < 0.5 && (h - height).abs() < 0.5)
 }
 
 fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
@@ -279,5 +285,21 @@ mod tests {
                 total_bytes: 1,
             }
         ));
+    }
+
+    #[test]
+    fn conflict_window_is_larger_than_confirm() {
+        // Four actions + rejection row must not share Confirm's 480×320 box.
+        assert!(CAPTURE_CONFLICT_W > CAPTURE_WINDOW_W);
+        assert!(CAPTURE_CONFLICT_H > CAPTURE_WINDOW_H);
+        assert!(CAPTURE_CONFLICT_H - CAPTURE_WINDOW_H >= 48.0);
+    }
+
+    #[test]
+    fn fit_skip_requires_matching_width_and_height() {
+        assert!(fitted_size_matches(Some((540.0, 408.0)), 540.0, 408.0));
+        assert!(!fitted_size_matches(Some((480.0, 408.0)), 540.0, 408.0));
+        assert!(!fitted_size_matches(Some((540.0, 320.0)), 540.0, 408.0));
+        assert!(!fitted_size_matches(None, 480.0, 320.0));
     }
 }

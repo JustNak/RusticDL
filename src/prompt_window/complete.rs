@@ -14,7 +14,7 @@ use gpui_component::{
 };
 
 use super::helpers::{shorten_folder, truncate_middle};
-use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H};
+use super::{BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_W};
 use crate::appearance::apply_window_opacity;
 use crate::download::{open_path, reveal_in_folder, EngineHandle, Job};
 use crate::format::{format_bytes, format_duration, format_size, format_speed};
@@ -57,12 +57,12 @@ impl BrowserPromptWindow {
             speed_samples: VecDeque::new(),
             peak_speed: 0,
             reduce_motion: settings.reduce_motion,
-            fitted_height: Some(CAPTURE_COMPLETE_H),
+            fitted_size: Some((CAPTURE_WINDOW_W, CAPTURE_COMPLETE_H)),
             cascade_index,
         }
     }
 
-    pub(super) fn open_file(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = match &self.phase {
             CapturePhase::Complete { target_path, .. } => target_path.clone(),
             _ => return,
@@ -70,10 +70,12 @@ impl BrowserPromptWindow {
         if let Err(msg) = open_path(&path) {
             self.action_error = Some(msg);
             cx.notify();
+            return;
         }
+        self.close_hud(window, cx);
     }
 
-    pub(super) fn show_in_folder(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn show_in_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = match &self.phase {
             CapturePhase::Complete { target_path, .. } => target_path.clone(),
             _ => return,
@@ -81,7 +83,9 @@ impl BrowserPromptWindow {
         if let Err(msg) = reveal_in_folder(&path) {
             self.action_error = Some(msg);
             cx.notify();
+            return;
         }
+        self.close_hud(window, cx);
     }
 
     pub(super) fn render_complete(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -237,8 +241,8 @@ impl BrowserPromptWindow {
                             .icon(IconName::FolderOpen)
                             .outline()
                             .disabled(!file_exists)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_in_folder(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_in_folder(window, cx);
                             })),
                     )
                     .child(
@@ -246,8 +250,8 @@ impl BrowserPromptWindow {
                             .label("Open file")
                             .primary()
                             .disabled(!file_exists)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_file(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_file(window, cx);
                             })),
                     ),
             )

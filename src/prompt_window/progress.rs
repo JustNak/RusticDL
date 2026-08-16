@@ -11,7 +11,8 @@ use gpui_component::{
 use super::helpers::{capture_progress_bar, speed_sparkline};
 use super::start_sync_timer;
 use super::{
-    BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, SPEED_SAMPLE_CAP,
+    BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
+    SPEED_SAMPLE_CAP,
 };
 use crate::appearance::apply_window_opacity;
 use crate::download::{EngineCommand, EngineHandle, Job, JobState};
@@ -80,10 +81,10 @@ impl BrowserPromptWindow {
         }
         let cascade_index = ipc.capture_window_count().saturating_sub(1);
 
-        let fitted_height = Some(if matches!(phase, CapturePhase::Complete { .. }) {
-            CAPTURE_COMPLETE_H
+        let fitted_size = Some(if matches!(phase, CapturePhase::Complete { .. }) {
+            (CAPTURE_WINDOW_W, CAPTURE_COMPLETE_H)
         } else {
-            CAPTURE_WINDOW_H
+            (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H)
         });
 
         Self {
@@ -102,7 +103,7 @@ impl BrowserPromptWindow {
             speed_samples,
             peak_speed,
             reduce_motion: settings.reduce_motion,
-            fitted_height,
+            fitted_size,
             cascade_index,
         }
     }
