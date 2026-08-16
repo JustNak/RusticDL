@@ -173,43 +173,52 @@ pub(super) async fn retry(inner: &Arc<Mutex<EngineInner>>, id: String) {
 }
 
 pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
-    let temp_path = {
-        let guard = inner.lock().await;
-        guard
+    let immediate_partial = {
+        let mut guard = inner.lock().await;
+        if let Some(ctrl) = guard.controls.get(&id) {
+            store_control(ctrl, WorkerControl::Canceled);
+        }
+        let worker_running = guard.active.contains_key(&id);
+        let temp_path = guard
             .jobs
             .iter()
             .find(|j| j.id == id)
-            .map(|j| j.temp_path.clone())
+            .map(|j| j.temp_path.clone());
+
+        if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
+            job.state = JobState::Queued;
+            job.progress = 0.0;
+            job.downloaded_bytes = 0;
+            job.total_bytes = 0;
+            job.speed = 0;
+            job.eta_secs = 0;
+            job.error = None;
+            job.failure_category = None;
+            job.clear_finished();
+            job.retry_attempts = 0;
+            job.clear_transfer_identity();
+            job.resume_supported = false;
+        }
+
+        let immediate = if worker_running {
+            // Finalizer keeps Queued and deletes .part after the worker drops its handle.
+            guard.requeue_on_cancel.insert(id.clone(), ());
+            if let Some(path) = temp_path {
+                guard.pending_partial_deletes.insert(id.clone(), path);
+            }
+            None
+        } else {
+            temp_path
+        };
+
+        emit_jobs_locked(&guard);
+        guard.wake.notify_one();
+        immediate
     };
-    if let Some(path) = temp_path {
+    let _ = persist_live_jobs(inner).await;
+    if let Some(path) = immediate_partial {
         remove_partial(&path).await;
     }
-    let mut guard = inner.lock().await;
-    if let Some(ctrl) = guard.controls.get(&id) {
-        store_control(ctrl, WorkerControl::Canceled);
-    }
-    // If a worker is still active, the finalizer must not stick the job in Canceled.
-    if guard.active.contains_key(&id) {
-        guard.requeue_on_cancel.insert(id.clone(), ());
-    }
-    if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
-        job.state = JobState::Queued;
-        job.progress = 0.0;
-        job.downloaded_bytes = 0;
-        job.total_bytes = 0;
-        job.speed = 0;
-        job.eta_secs = 0;
-        job.error = None;
-        job.failure_category = None;
-        job.clear_finished();
-        job.retry_attempts = 0;
-        job.clear_transfer_identity();
-        job.resume_supported = false;
-    }
-    emit_jobs_locked(&guard);
-    guard.wake.notify_one();
-    drop(guard);
-    let _ = persist_live_jobs(inner).await;
 }
 
 pub(super) async fn remove(

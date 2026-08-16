@@ -76,17 +76,24 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::bandwidth::GlobalBandwidthLimiter;
+    use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::{
         spawn_engine, EngineEvent, EngineHandle, EngineRuntimeConfig, MemoryJobStore,
     };
+    use crate::download::fetch::CONTROL_CANCELED;
     use crate::download::handoff::EnqueueStatus;
-    use crate::download::job::{ContentValidators, FailureCategory, Job, JobState, TransferMode};
+    use crate::download::job::{
+        ContentValidators, DownloadOutcome, FailureCategory, Job, JobState, TransferMode,
+    };
     use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
     fn test_config() -> EngineRuntimeConfig {
         let mut cfg = EngineRuntimeConfig::default();
@@ -621,6 +628,97 @@ mod tests {
         assert!(!part.exists(), "Restart deletes .part");
 
         engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restart_of_active_job_defers_part_delete_until_finalizer() {
+        let dir = temp_dir();
+        let mut job = sample_job(
+            "https://example.com/active-restart.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        job.downloaded_bytes = 500;
+        job.total_bytes = 1000;
+        job.progress = 50.0;
+        job.transfer_format_version = 1;
+        job.segment_map = Some(sample_map());
+        std::fs::write(&job.temp_path, b"partial-held").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+        let control = Arc::new(AtomicU8::new(0));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        // SegmentFileWriter would hold this open; DeleteFile must wait until it drops.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&part)
+            .expect("open part");
+
+        job_control::restart(&inner, id.clone()).await;
+
+        assert!(
+            part.exists(),
+            "Restart must not delete .part while the worker is active"
+        );
+        {
+            let guard = inner.lock().await;
+            assert!(
+                guard.pending_partial_deletes.contains_key(&id),
+                "active restart queues the .part for the finalizer"
+            );
+            assert!(guard.requeue_on_cancel.contains_key(&id));
+            let restarted = guard.jobs.iter().find(|j| j.id == id).expect("job remains");
+            assert_eq!(restarted.state, JobState::Queued);
+            assert_eq!(restarted.downloaded_bytes, 0);
+            assert!(restarted.segment_map.is_none());
+            assert_eq!(restarted.transfer_format_version, 0);
+        }
+        assert_eq!(control.load(Ordering::Relaxed), CONTROL_CANCELED);
+
+        drop(held);
+
+        super::super::worker::finalize_worker(&inner, &id, &control, Ok(DownloadOutcome::Canceled))
+            .await;
+
+        assert!(!part.exists(), ".part is deleted after the worker exits");
+        {
+            let guard = inner.lock().await;
+            assert!(!guard.pending_partial_deletes.contains_key(&id));
+            assert!(!guard.requeue_on_cancel.contains_key(&id));
+            assert!(!guard.active.contains_key(&id));
+            let restarted = guard.jobs.iter().find(|j| j.id == id).expect("job remains");
+            assert_eq!(restarted.state, JobState::Queued);
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,20 +9,15 @@ use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
-use super::context::TransferContext;
-use super::filesystem::{
-    metadata_len, reconcile_from_oracle, remove_partial, FilenameConflictPolicy,
-};
+use super::filesystem::FilenameConflictPolicy;
 use super::handoff::{EnqueueOutcome, HandoffAuth};
-use super::http::store_control;
-use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
-use super::progress::{apply_tick, ProgressTick, TransferEvent, TransferEventCallback};
-use super::resume::{resume_oracle, ResumeOracle};
-use super::transfer::run_transfer;
+use super::job::{Job, JobState};
+use super::progress::{apply_tick, ProgressTick, TransferEvent};
 use crate::settings::Settings;
 
 mod commands;
 mod persist;
+mod worker;
 
 pub(crate) use persist::EngineIdentity;
 pub use persist::{FileJobStore, JobStore, MemoryJobStore};
@@ -84,19 +79,6 @@ impl Default for EngineRuntimeConfig {
         Self::from_settings(&Settings::default())
     }
 }
-
-/// Backoff schedule for auto-retry (indexed by attempt number - 1).
-/// Longer delays help with flaky TLS / filter / CDN blips that browsers also hit.
-const RETRY_DELAYS: [Duration; 8] = [
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(45),
-];
 
 /// Progress patches are applied at most this often.
 const PROGRESS_COALESCE: Duration = Duration::from_millis(200);
@@ -172,7 +154,7 @@ pub(super) struct EngineInner {
     /// When a worker exits with Canceled, re-queue instead of marking Canceled.
     /// Used by Restart so an in-flight cancel does not stick the job in Canceled.
     requeue_on_cancel: HashMap<String, ()>,
-    /// Partial paths to delete after a still-running worker exits (Remove).
+    /// Partial paths to delete after a still-running worker exits (Cancel/Restart/Remove).
     pending_partial_deletes: HashMap<String, PathBuf>,
     pub(super) config: EngineRuntimeConfig,
     pub(super) limiter: Arc<GlobalBandwidthLimiter>,
@@ -277,7 +259,7 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
         };
 
         for id in to_start {
-            start_worker(inner.clone(), id);
+            worker::start_worker(inner.clone(), id);
         }
 
         let wake = {
@@ -289,244 +271,6 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
             _ = sleep(Duration::from_millis(500)) => {}
         }
     }
-}
-
-fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
-    tokio::spawn(async move {
-        let (job_snapshot, control, limiter, handoff_auth) = {
-            let mut guard = inner.lock().await;
-            let control = Arc::new(AtomicU8::new(0));
-            guard.controls.insert(job_id.clone(), control.clone());
-            guard.active.insert(job_id.clone(), ());
-            let job = match guard.jobs.iter().find(|j| j.id == job_id) {
-                Some(j) => j.clone(),
-                None => {
-                    guard.active.remove(&job_id);
-                    return;
-                }
-            };
-            let limiter = guard.limiter.clone();
-            let auth = guard.handoff_auth.get(&job_id).cloned();
-            (job, control, limiter, auth)
-        };
-
-        let mut attempt_job = job_snapshot;
-        let mut retry_attempts = attempt_job.retry_attempts;
-
-        // Per-attempt progress pump: drain (flush pending) after each attempt so
-        // restart/retry state writes cannot race a deferred coalesce window.
-        let final_result = loop {
-            // Disk is authoritative for FreshSingle / LegacySingle. Snapshot under
-            // the lock, then await metadata without holding it. Multi / Restart
-            // skip metadata_len so a sparse `.part` cannot lie.
-            let (temp_path, need_disk) = {
-                let guard = inner.lock().await;
-                match guard.jobs.iter().find(|j| j.id == job_id) {
-                    Some(job) => (
-                        Some(job.temp_path.clone()),
-                        matches!(
-                            resume_oracle(job),
-                            ResumeOracle::FreshSingle | ResumeOracle::LegacySingle
-                        ),
-                    ),
-                    None => (None, false),
-                }
-            };
-            let on_disk = if need_disk {
-                Some(match temp_path.as_ref() {
-                    Some(path) => metadata_len(path).await.unwrap_or(0),
-                    None => 0,
-                })
-            } else {
-                None
-            };
-            {
-                let mut guard = inner.lock().await;
-                let restarting = guard.requeue_on_cancel.contains_key(&job_id);
-                if !restarting {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        reconcile_from_oracle(job, on_disk);
-                        job.state = JobState::Downloading;
-                        job.error = None;
-                        attempt_job = job.clone();
-                        emit_jobs_locked(&guard);
-                    }
-                }
-            }
-
-            // Reset control to continue for each attempt unless user paused/canceled.
-            if control.load(Ordering::Relaxed) == 0 {
-                store_control(&control, WorkerControl::Continue);
-            }
-
-            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<TransferEvent>();
-            let progress_pump = spawn_progress_pump(inner.clone(), job_id.clone(), progress_rx);
-            let on_progress: TransferEventCallback = Arc::new(move |event: TransferEvent| {
-                let _ = progress_tx.send(event);
-            });
-            let committer = Arc::new(EngineIdentity {
-                inner: inner.clone(),
-            });
-
-            // Re-read live knobs so UpdateSettings applies to the next attempt.
-            // Mid-transfer reconnect (short backoff, max 5) is nested inside
-            // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
-            let (config, conn_budget) = {
-                let guard = inner.lock().await;
-                (guard.config.clone(), guard.conn_budget.clone())
-            };
-            let ctx = TransferContext::from_runtime(
-                attempt_job.clone(),
-                control.clone(),
-                on_progress.clone(),
-                handoff_auth.clone(),
-                limiter.clone(),
-                conn_budget,
-                committer,
-                &config,
-            );
-            let attempt_result = run_transfer(ctx).await;
-
-            // Flush remaining patches before any post-attempt state mutation.
-            drop(on_progress);
-            let _ = progress_pump.await;
-
-            match attempt_result {
-                Ok(outcome) => break Ok(outcome),
-                Err(error) => {
-                    // Restart requested mid-flight: stop retrying and exit as canceled.
-                    {
-                        let guard = inner.lock().await;
-                        if guard.requeue_on_cancel.contains_key(&job_id) {
-                            break Ok(DownloadOutcome::Canceled);
-                        }
-                    }
-                    // Re-read live auto_retry so UpdateSettings applies to the next failure.
-                    let max_retry = {
-                        let guard = inner.lock().await;
-                        guard.config.auto_retry
-                    };
-                    let can_retry = error.retryable && retry_attempts < max_retry;
-                    if can_retry {
-                        retry_attempts += 1;
-                        let delay_idx = (retry_attempts as usize - 1).min(RETRY_DELAYS.len() - 1);
-                        let delay = RETRY_DELAYS[delay_idx];
-                        {
-                            let mut guard = inner.lock().await;
-                            if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                                job.retry_attempts = retry_attempts;
-                                job.state = JobState::Starting;
-                                job.error = Some(format!(
-                                    "Retry {retry_attempts}/{max_retry} in {}s: {}",
-                                    delay.as_secs().max(1),
-                                    error.message
-                                ));
-                                emit_jobs_locked(&guard);
-                            }
-                        }
-                        sleep(delay).await;
-                        if control.load(Ordering::Relaxed) != 0 {
-                            break Err(error);
-                        }
-                        // Refresh paths/filename from latest job state.
-                        {
-                            let guard = inner.lock().await;
-                            if let Some(job) = guard.jobs.iter().find(|j| j.id == job_id) {
-                                attempt_job = job.clone();
-                            }
-                        }
-                        continue;
-                    }
-                    break Err(error);
-                }
-            }
-        };
-
-        let partial_to_delete = {
-            let mut guard = inner.lock().await;
-            guard.active.remove(&job_id);
-            let requeue = guard.requeue_on_cancel.remove(&job_id).is_some();
-            let partial_to_delete = guard.pending_partial_deletes.remove(&job_id);
-
-            if requeue {
-                // Restart already reset the job to Queued; do not overwrite with Canceled.
-                if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                    if !matches!(job.state, JobState::Queued) {
-                        job.state = JobState::Queued;
-                    }
-                    clear_live_metrics(job);
-                }
-            } else {
-                match final_result {
-                    Ok(DownloadOutcome::Completed) => {
-                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                            job.state = JobState::Completed;
-                            job.progress = 100.0;
-                            job.error = None;
-                            // Slim state.json: drop map, version 0; keep validators.
-                            job.on_completed();
-                            clear_live_metrics(job);
-                        }
-                        guard.handoff_auth.remove(&job_id);
-                    }
-                    Ok(DownloadOutcome::Paused) => {
-                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                            job.state = JobState::Paused;
-                            clear_live_metrics(job);
-                        }
-                    }
-                    Ok(DownloadOutcome::Canceled) => {
-                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                            job.state = JobState::Canceled;
-                            job.mark_finished();
-                            clear_live_metrics(job);
-                            if partial_to_delete.is_some() {
-                                job.clear_partial_and_identity();
-                            }
-                        }
-                        guard.handoff_auth.remove(&job_id);
-                    }
-                    Err(error) => {
-                        let clear_auth = match control.load(Ordering::Relaxed) {
-                            1 => false,
-                            _ => true,
-                        };
-                        if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                            // If user paused/canceled during retry wait, prefer that.
-                            match control.load(Ordering::Relaxed) {
-                                1 => {
-                                    job.state = JobState::Paused;
-                                    clear_live_metrics(job);
-                                }
-                                2 => {
-                                    job.state = JobState::Canceled;
-                                    job.mark_finished();
-                                    clear_live_metrics(job);
-                                    if partial_to_delete.is_some() {
-                                        job.clear_partial_and_identity();
-                                    }
-                                }
-                                _ => {
-                                    apply_failed_lifecycle(job, error);
-                                }
-                            }
-                        }
-                        if clear_auth {
-                            guard.handoff_auth.remove(&job_id);
-                        }
-                    }
-                }
-            }
-            guard.controls.remove(&job_id);
-            emit_jobs_locked(&guard);
-            guard.wake.notify_one();
-            partial_to_delete
-        };
-
-        if let Some(path) = partial_to_delete {
-            remove_partial(&path).await;
-        }
-    });
 }
 
 /// Coalesce ticks then apply at most every `PROGRESS_COALESCE`. Toasts flush now.
