@@ -62,7 +62,7 @@ impl BrowserPromptWindow {
         }
     }
 
-    pub(super) fn open_file(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = match &self.phase {
             CapturePhase::Complete { target_path, .. } => target_path.clone(),
             _ => return,
@@ -70,10 +70,12 @@ impl BrowserPromptWindow {
         if let Err(msg) = open_path(&path) {
             self.action_error = Some(msg);
             cx.notify();
+            return;
         }
+        self.close_hud(window, cx);
     }
 
-    pub(super) fn show_in_folder(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn show_in_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = match &self.phase {
             CapturePhase::Complete { target_path, .. } => target_path.clone(),
             _ => return,
@@ -81,7 +83,9 @@ impl BrowserPromptWindow {
         if let Err(msg) = reveal_in_folder(&path) {
             self.action_error = Some(msg);
             cx.notify();
+            return;
         }
+        self.close_hud(window, cx);
     }
 
     pub(super) fn render_complete(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -237,8 +241,8 @@ impl BrowserPromptWindow {
                             .icon(IconName::FolderOpen)
                             .outline()
                             .disabled(!file_exists)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_in_folder(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_in_folder(window, cx);
                             })),
                     )
                     .child(
@@ -246,8 +250,8 @@ impl BrowserPromptWindow {
                             .label("Open file")
                             .primary()
                             .disabled(!file_exists)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_file(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_file(window, cx);
                             })),
                     ),
             )

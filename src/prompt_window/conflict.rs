@@ -124,17 +124,19 @@ impl BrowserPromptWindow {
             .map(|d| shorten_path(&d.read(cx).value()))
             .unwrap_or_else(|| "default folder".into());
 
+        let short_name = truncate_middle(&display_name, 40);
+        let short_unique = truncate_middle(&unique_preview, 32);
         let banner = if name_taken && blocks_overwrite {
-            format!("“{display_name}” is used by another download.")
+            format!("“{short_name}” is used by another download.")
         } else if name_taken {
-            format!("“{display_name}” already exists in this folder.")
+            format!("“{short_name}” already exists in this folder.")
         } else {
-            format!("“{display_name}” is available.")
+            format!("“{short_name}” is available.")
         };
         let hint = if name_taken && blocks_overwrite {
-            format!("Another download is using this name. Click Rename for {unique_preview}.")
+            format!("Another download is using this name. Click Rename for {short_unique}.")
         } else if name_taken {
-            format!("Pick a different name, or click Rename for {unique_preview}.")
+            format!("Pick a different name, or click Rename for {short_unique}.")
         } else if name_empty {
             "Enter a filename to start the download.".into()
         } else {
@@ -155,6 +157,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(div().text_sm().font_medium().child(banner))
                     .child(div().text_xs().text_color(muted).child(source_label))
                     .child(
@@ -167,6 +170,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
+                    .flex_shrink_0()
                     .child(div().text_xs().font_medium().child("Filename"))
                     .when_some(self.name_input.as_ref(), |el, input| {
                         el.child(Input::new(input).w_full())
@@ -184,6 +188,8 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
+                    .flex_1()
+                    .min_h_0()
                     .child(div().text_xs().font_medium().child("Save to"))
                     .child(
                         h_flex()
@@ -215,8 +221,11 @@ impl BrowserPromptWindow {
                 h_flex()
                     .w_full()
                     .justify_end()
+                    .items_center()
                     .gap_2()
-                    .pt_1()
+                    .pt_2()
+                    .flex_shrink_0()
+                    .flex_wrap()
                     .child(
                         Button::new("conflict-cancel")
                             .label("Cancel")
@@ -247,6 +256,7 @@ impl BrowserPromptWindow {
                     .child(
                         div()
                             .id("conflict-start-wrap")
+                            .flex_shrink_0()
                             .when(name_taken, |el| {
                                 let danger = theme.danger;
                                 el.tooltip(move |window, cx| {

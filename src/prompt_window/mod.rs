@@ -30,8 +30,10 @@ use crate::settings::ProgressStyle;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
-/// Conflict adds a rejection row + four actions; keep the button row on-screen.
-const CAPTURE_CONFLICT_H: f32 = 352.0;
+/// Four medium action buttons (Cancel / Overwrite / Rename / Start download)
+/// plus the Duplicate Name row and hint need more width and height than Confirm.
+const CAPTURE_CONFLICT_W: f32 = 540.0;
+const CAPTURE_CONFLICT_H: f32 = 408.0;
 /// Complete phase has no sparkline or form — hug the file row + actions.
 const CAPTURE_COMPLETE_H: f32 = 196.0;
 /// Rolling speed samples for the Progress sparkline (~9s at 100ms tick).
@@ -148,22 +150,22 @@ impl BrowserPromptWindow {
         }
     }
 
-    fn target_window_height(&self) -> f32 {
+    fn target_window_size(&self) -> (f32, f32) {
         match self.phase {
-            CapturePhase::Complete { .. } => CAPTURE_COMPLETE_H,
-            CapturePhase::Conflict => CAPTURE_CONFLICT_H,
-            _ => CAPTURE_WINDOW_H,
+            CapturePhase::Complete { .. } => (CAPTURE_WINDOW_W, CAPTURE_COMPLETE_H),
+            CapturePhase::Conflict => (CAPTURE_CONFLICT_W, CAPTURE_CONFLICT_H),
+            _ => (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H),
         }
     }
 
     fn fit_window_to_phase(&mut self, window: &mut Window) {
-        let target = self.target_window_height();
-        if self.fitted_height.is_some_and(|h| (h - target).abs() < 0.5) {
+        let (width, height) = self.target_window_size();
+        if self.fitted_height.is_some_and(|h| (h - height).abs() < 0.5) {
             return;
         }
         // Record first so a synchronous resize→re-render does not loop.
-        self.fitted_height = Some(target);
-        window.resize(gpui::size(gpui::px(CAPTURE_WINDOW_W), gpui::px(target)));
+        self.fitted_height = Some(height);
+        window.resize(gpui::size(gpui::px(width), gpui::px(height)));
         crate::window_placement::cascade_window(window, self.cascade_index);
     }
 
@@ -279,5 +281,13 @@ mod tests {
                 total_bytes: 1,
             }
         ));
+    }
+
+    #[test]
+    fn conflict_window_is_larger_than_confirm() {
+        // Four actions + rejection row must not share Confirm's 480×320 box.
+        assert!(CAPTURE_CONFLICT_W > CAPTURE_WINDOW_W);
+        assert!(CAPTURE_CONFLICT_H > CAPTURE_WINDOW_H);
+        assert!(CAPTURE_CONFLICT_H - CAPTURE_WINDOW_H >= 48.0);
     }
 }
