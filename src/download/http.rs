@@ -1,30 +1,26 @@
-use futures_util::StreamExt;
-use reqwest::header::{
-    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, IF_RANGE,
-    LAST_MODIFIED, RANGE, REFERER,
-};
-use reqwest::{Client, StatusCode, Version};
-use std::error::Error as StdError;
-use std::sync::atomic::{AtomicU8, Ordering};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
+use reqwest::StatusCode;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::client::{download_client, referer_for_url};
+use super::body::{stream_body, AppendSink, BodySink, StreamEnd, CONTROL_POLL};
+use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
 use super::eta::EtaSmoother;
+use super::fetch::{
+    content_range_size_mismatch, fetch_range, FetchRequest, RangeSpec, RangeStatus,
+};
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
-    parse_content_range, sanitize_filename,
+    sanitize_filename,
 };
-use super::handoff::{handoff_auth_for_request_url, is_allowed_handoff_header, HandoffAuth};
+use super::handoff::HandoffAuth;
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
-    WorkerControl,
 };
 use super::progress::{
     CommitIdentity, MapUpdate, NoopIdentity, ProgressHint, ProgressTick, TransferEvent,
@@ -34,24 +30,18 @@ use super::resume::{resume_oracle, ResumeOracle};
 use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
-const CONTROL_POLL: Duration = Duration::from_millis(200);
-/// Timeout for HEAD / Range 0-0 preflight probes (shared with `preflight`).
-pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
-pub(crate) const MAX_REDIRECTS: u32 = 10;
 
 /// Nested mid-transfer reconnect before worker-level `RETRY_DELAYS`.
 pub(crate) const RECONNECT_MAX: u32 = 5;
 pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
 pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(2);
 
-const CONTROL_CONTINUE: u8 = 0;
-const CONTROL_PAUSED: u8 = 1;
-const CONTROL_CANCELED: u8 = 2;
-
 const FULL_REPLACE_NOTICE: &str =
     "Remote file changed or server ignored resume; restarting download from the beginning.";
 
 pub use super::context::TransferContext;
+pub(crate) use super::fetch::control_outcome;
+pub use super::fetch::store_control;
 
 pub async fn run_http_download(
     job: &Job,
@@ -156,25 +146,26 @@ pub async fn run_http_download_with_ctx(
             return Ok(outcome);
         }
 
-        let fetch_result = fetch_with_redirects(
-            &client,
-            &job_url,
-            &current_url,
-            existing_bytes,
-            &validators,
-            &control,
-            handoff_auth.as_ref(),
-        )
+        let fetch_result = fetch_range(FetchRequest {
+            client: &client,
+            job_url: &job_url,
+            url: &current_url,
+            range: RangeSpec::Open {
+                start: existing_bytes,
+            },
+            validators: &validators,
+            handoff: handoff_auth.as_ref(),
+            follow_redirects: true,
+            control: &control,
+        })
         .await;
 
-        let (response, final_url) = match fetch_result {
-            Ok(pair) => pair,
+        let (response, final_url, range_status) = match fetch_result {
+            Ok(outcome) => (outcome.response, outcome.final_url, outcome.status),
             Err(error) => {
-                // Pause/cancel during reconnect GET (fetch_with_redirects wraps as Internal).
                 if let Some(outcome) = control_outcome(&control) {
                     return Ok(outcome);
                 }
-                // Connect errors on reconnect GET only (not the first attempt).
                 match prepare_reconnect(
                     &error,
                     /*is_fetch_phase=*/ true,
@@ -206,93 +197,82 @@ pub async fn run_http_download_with_ctx(
             return Ok(outcome);
         }
 
-        let status = response.status();
-        // 416 Range Not Satisfiable — non-retryable without Restart.
-        if status == StatusCode::RANGE_NOT_SATISFIABLE && existing_bytes > 0 {
-            return Err(download_error(
-                FailureCategory::Resume,
-                format!(
-                    "Server rejected resume at {existing_bytes} bytes. Use Restart to download from zero."
-                ),
-                false,
-            ));
-        }
-
-        if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-            let retryable = should_retry_status(status);
-            let mut message = format!("Download failed with HTTP {status}.");
-            if status == StatusCode::BAD_GATEWAY || status == StatusCode::SERVICE_UNAVAILABLE {
-                message.push_str(
-                    " The CDN/origin rejected this request — often a bad or glued download token/URL, \
-or a temporary gateway issue. Confirm the full URL is a single link (not two pasted together).",
-                );
-            } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
-                message.push_str(
-                    " Access denied — the link may require a browser session, cookies, or a fresh token.",
-                );
-            } else if status == StatusCode::NOT_FOUND {
-                message.push_str(" File not found — the link may have expired.");
-            }
-            // Retryable HTTP on reconnect GET can use short budget; first attempt bubbles.
-            let error = download_error(FailureCategory::Http, message, retryable);
-            if let Some(outcome) = control_outcome(&control) {
-                return Ok(outcome);
-            }
-            if retryable {
-                match prepare_reconnect(
-                    &error,
-                    /*is_fetch_phase=*/ true,
-                    short_reconnects,
-                    existing_bytes,
-                    resume_supported,
-                    transfer_format_version,
-                    &temp_path,
-                    &control,
-                    &on_progress,
-                    &mut cumulative_reconnects,
-                )
-                .await
-                {
-                    ReconnectAction::Retry { offset } => {
-                        short_reconnects += 1;
-                        existing_bytes = offset;
-                        continue;
-                    }
-                    ReconnectAction::Control(outcome) => return Ok(outcome),
-                    ReconnectAction::GiveUp => return Err(error),
-                }
-            }
-            return Err(error);
-        }
-
-        resume_supported = status == StatusCode::PARTIAL_CONTENT
-            || response
-                .headers()
-                .get(ACCEPT_RANGES)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
-            || resume_supported;
-
-        // 200 with partial on disk: full replace (Range ignored or If-Range entity changed).
         let mut full_replace = false;
-        if existing_bytes > 0 && status != StatusCode::PARTIAL_CONTENT {
-            existing_bytes = 0;
-            full_replace = true;
-            let _ = tokio::fs::remove_file(&temp_path).await;
-        }
-
-        // Parse Content-Range once (206 resume + optional * total).
-        let parsed_range = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_content_range);
-
-        // 206 resume: require parseable Content-Range whose start matches expected offset
-        // (fail-closed — RFC requires Content-Range on 206; misaligned append is worse).
-        if status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
-            match parsed_range {
-                Some((start, _end, _total)) if start == existing_bytes => {
+        let range_total = match &range_status {
+            RangeStatus::RangeNotSatisfiable { at } => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    format!(
+                        "Server rejected resume at {at} bytes. Use Restart to download from zero."
+                    ),
+                    false,
+                ));
+            }
+            RangeStatus::AuthDenied { status } => {
+                return Err(http_status_error(*status, false));
+            }
+            RangeStatus::Other { status, retryable } => {
+                if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
+                    return Err(download_error(
+                        FailureCategory::Resume,
+                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
+                        false,
+                    ));
+                }
+                let error = http_status_error(*status, *retryable);
+                if let Some(outcome) = control_outcome(&control) {
+                    return Ok(outcome);
+                }
+                if *retryable {
+                    match prepare_reconnect(
+                        &error,
+                        /*is_fetch_phase=*/ true,
+                        short_reconnects,
+                        existing_bytes,
+                        resume_supported,
+                        transfer_format_version,
+                        &temp_path,
+                        &control,
+                        &on_progress,
+                        &mut cumulative_reconnects,
+                    )
+                    .await
+                    {
+                        ReconnectAction::Retry { offset } => {
+                            short_reconnects += 1;
+                            existing_bytes = offset;
+                            continue;
+                        }
+                        ReconnectAction::Control(outcome) => return Ok(outcome),
+                        ReconnectAction::GiveUp => return Err(error),
+                    }
+                }
+                return Err(error);
+            }
+            RangeStatus::RedirectWhenPinned => {
+                return Err(download_error(
+                    FailureCategory::Network,
+                    "Unexpected redirect on segment request.".into(),
+                    true,
+                ));
+            }
+            RangeStatus::FullEntityWhenRangeRequested => {
+                existing_bytes = 0;
+                full_replace = true;
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                None
+            }
+            RangeStatus::Partial { start, total, .. } => {
+                if *start != existing_bytes {
+                    return Err(download_error(
+                        FailureCategory::Resume,
+                        format!(
+                            "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
+                        ),
+                        false,
+                    ));
+                }
+                if existing_bytes > 0 {
                     let incoming = content_validators_from_headers(response.headers(), 0);
                     if resume_identity_mismatch(&validators, &incoming) {
                         return Err(download_error(
@@ -303,28 +283,20 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                         ));
                     }
                 }
-                Some((start, _end, _total)) => {
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        format!(
-                            "Unexpected resume range (got start {start}, expected {existing_bytes}). Use Restart."
-                        ),
-                        false,
-                    ));
-                }
-                None => {
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                        false,
-                    ));
-                }
+                *total
             }
-        }
+            RangeStatus::OkFromZero => None,
+        };
 
-        // Numeric Content-Range total vs stored expected_size (ignore * totals).
-        // Skip expected_size check after full replace — identity is being rebuilt.
-        let range_total = parsed_range.and_then(|(_s, _e, total)| total);
+        let http_status = response.status();
+        resume_supported = http_status == StatusCode::PARTIAL_CONTENT
+            || response
+                .headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
+            || resume_supported;
+
         if !full_replace {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)
@@ -342,7 +314,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         total_bytes = response
             .content_length()
             .map(|len| {
-                if status == StatusCode::PARTIAL_CONTENT {
+                if http_status == StatusCode::PARTIAL_CONTENT {
                     existing_bytes.saturating_add(len)
                 } else {
                     len
@@ -350,8 +322,7 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             })
             .unwrap_or(0);
 
-        // Prefer numeric Content-Range total when present; `*` leaves content-length math.
-        if let Some((_start, _end, Some(total))) = parsed_range {
+        if let Some(total) = range_total {
             total_bytes = total;
         }
 
@@ -458,37 +429,10 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             .await
             .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(existing_bytes == 0)
-            .open(&temp_path)
-            .await
-            .map_err(|error| {
-                download_error(
-                    FailureCategory::Disk,
-                    format!("Could not open partial download file: {error}"),
-                    false,
-                )
-            })?;
-
-        const WRITE_BUF: usize = 256 * 1024;
-        let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
-        if existing_bytes > 0 {
-            writer
-                .seek(std::io::SeekFrom::Start(existing_bytes))
-                .await
-                .map_err(|error| {
-                    download_error(
-                        FailureCategory::Disk,
-                        format!("Could not seek partial download file: {error}"),
-                        false,
-                    )
-                })?;
-        }
-
+        let mut sink = AppendSink::open(&temp_path, existing_bytes)
+            .await?
+            .with_target(total_bytes);
         let mut downloaded = existing_bytes;
-        let mut stream = response.bytes_stream();
         let mut last_progress = Instant::now();
         let mut window_start = Instant::now();
         let mut window_bytes: u64 = 0;
@@ -502,150 +446,72 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             progress_percent(downloaded, total_bytes),
         )));
 
-        // Body read loop — body/network errors trigger mid-transfer reconnect.
-        let body_result: Result<DownloadOutcome, DownloadError> = async {
-            loop {
-                if let Some(outcome) = control_outcome(&control) {
-                    flush_partial_writer(&mut writer, outcome).await?;
-                    emit_control_exit_progress(&on_progress, downloaded, total_bytes);
-                    return Ok(outcome);
-                }
-
-                let next = tokio::select! {
-                    item = stream.next() => item,
-                    _ = sleep(CONTROL_POLL) => {
-                        continue;
-                    }
-                };
-
-                let Some(chunk_result) = next else {
-                    break;
-                };
-
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(error) => {
-                        // Durable flush + close before reconnect: oracle must not run
-                        // ahead of disk, and metadata_len needs a closed handle.
-                        writer.flush().await.map_err(|e| disk_write_error(e))?;
-                        drop(writer);
-                        let retryable = error.is_timeout()
-                            || error.is_connect()
-                            || error.is_request()
-                            || error.is_body()
-                            || error.is_decode();
-                        return Err(download_error(
-                            FailureCategory::Network,
-                            format!("Download stream failed: {}", format_reqwest_error(&error)),
-                            retryable,
-                        ));
-                    }
-                };
-
-                if chunk.is_empty() {
-                    continue;
-                }
-
-                // Pre-write: charge the shared limiter (may burst up to bucket capacity).
-                // Interruptible for pause/cancel, but once the stream has delivered a chunk
-                // it must be written — dropping it leaves a Range-resume hole.
-                // On abort mid-throttle some quanta may already be charged; do not re-acquire
-                // the full length (would double-bill). Slight under-charge on the pause edge
-                // is acceptable.
-                let acquired = limiter.acquire(chunk.len(), Some(control.as_ref())).await;
-
-                writer.write_all(&chunk).await.map_err(disk_write_error)?;
-
-                let n = chunk.len() as u64;
-                downloaded = downloaded.saturating_add(n);
-                window_bytes = window_bytes.saturating_add(n);
-
-                if !acquired {
-                    let outcome = control_outcome(&control).unwrap_or(DownloadOutcome::Paused);
-                    flush_partial_writer(&mut writer, outcome).await?;
-                    emit_control_exit_progress(&on_progress, downloaded, total_bytes);
-                    return Ok(outcome);
-                }
-
-                if last_progress.elapsed() >= PROGRESS_INTERVAL {
-                    let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
-                    let speed = (window_bytes as f64 / elapsed) as u64;
-                    window_start = Instant::now();
-                    window_bytes = 0;
-
-                    let remaining = total_bytes.saturating_sub(downloaded);
-                    let (_, eta_secs) = eta_smoother.observe(speed, remaining);
-
-                    on_progress(TransferEvent::Tick(ProgressTick::downloading(
-                        downloaded,
-                        total_bytes,
-                        speed,
-                        eta_secs,
-                        progress_percent(downloaded, total_bytes),
-                    )));
-                    last_progress = Instant::now();
-                }
+        let body_result = stream_body(response, &mut sink, &control, limiter.as_ref(), |n| {
+            downloaded = downloaded.saturating_add(n);
+            window_bytes = window_bytes.saturating_add(n);
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                let elapsed = window_start.elapsed().as_secs_f64().max(0.001);
+                let speed = (window_bytes as f64 / elapsed) as u64;
+                window_start = Instant::now();
+                window_bytes = 0;
+                let remaining = total_bytes.saturating_sub(downloaded);
+                let (_, eta_secs) = eta_smoother.observe(speed, remaining);
+                on_progress(TransferEvent::Tick(ProgressTick::downloading(
+                    downloaded,
+                    total_bytes,
+                    speed,
+                    eta_secs,
+                    progress_percent(downloaded, total_bytes),
+                )));
+                last_progress = Instant::now();
             }
+        })
+        .await;
 
-            if let Some(outcome) = control_outcome(&control) {
-                flush_partial_writer(&mut writer, outcome).await?;
+        downloaded = sink.offset();
+        match body_result {
+            Ok(StreamEnd::Control(outcome)) => {
+                if matches!(outcome, DownloadOutcome::Paused) {
+                    let _ = sink.sync_data().await;
+                }
+                drop(sink);
                 emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                 return Ok(outcome);
             }
-
-            writer
-                .flush()
-                .await
-                .map_err(|error| disk_write_error(error))?;
-            drop(writer);
-
-            if total_bytes > 0 && downloaded < total_bytes {
-                return Err(download_error(
-                    FailureCategory::Network,
-                    format!("Download incomplete ({downloaded} of {total_bytes} bytes)."),
-                    true,
-                ));
+            Ok(StreamEnd::Exhausted { downloaded }) => {
+                drop(sink);
+                verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
+                let final_path =
+                    move_to_final_path(&temp_path, &target_path, ctx.job.replace_existing)
+                        .await
+                        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+                committer
+                    .commit(
+                        &mut ctx.job,
+                        CommitIdentity {
+                            downloaded_bytes: Some(downloaded),
+                            total_bytes: Some(if total_bytes == 0 {
+                                downloaded
+                            } else {
+                                total_bytes
+                            }),
+                            progress: Some(100.0),
+                            filename: final_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string()),
+                            target_path: Some(final_path),
+                            temp_path: Some(temp_path.clone()),
+                            resume_supported: Some(resume_supported),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+                return Ok(DownloadOutcome::Completed);
             }
-
-            verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
-
-            let final_path = move_to_final_path(&temp_path, &target_path, ctx.job.replace_existing)
-                .await
-                .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
-
-            committer
-                .commit(
-                    &mut ctx.job,
-                    CommitIdentity {
-                        downloaded_bytes: Some(downloaded),
-                        total_bytes: Some(if total_bytes == 0 {
-                            downloaded
-                        } else {
-                            total_bytes
-                        }),
-                        progress: Some(100.0),
-                        filename: final_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|s| s.to_string()),
-                        target_path: Some(final_path),
-                        temp_path: Some(temp_path.clone()),
-                        resume_supported: Some(resume_supported),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
-
-            Ok(DownloadOutcome::Completed)
-        }
-        .await;
-
-        match body_result {
-            Ok(outcome) => return Ok(outcome),
             Err(error) => {
-                // Pause/cancel after stream teardown. Do not swallow non-retryable
-                // verify / disk / internal failures as a user stop.
+                drop(sink);
                 if let Some(outcome) = control_outcome(&control) {
                     if error.retryable
                         || matches!(
@@ -657,8 +523,6 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                         return Ok(outcome);
                     }
                 }
-                // Keep local downloaded for oracle when version-gated (v1+).
-                // Disk errors from flush are non-retryable → prepare_reconnect GiveUps.
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
@@ -814,192 +678,21 @@ async fn refresh_reconnect_offset(
     }
 }
 
-async fn fetch_with_redirects(
-    client: &Client,
-    job_url: &str,
-    url: &str,
-    existing_bytes: u64,
-    validators: &ContentValidators,
-    control: &AtomicU8,
-    handoff_auth: Option<&HandoffAuth>,
-) -> Result<(reqwest::Response, String), DownloadError> {
-    let mut current = url.to_string();
-    let mut redirects = 0u32;
-
-    loop {
-        if let Some(outcome) = control_outcome(control) {
-            return Err(download_error(
-                FailureCategory::Internal,
-                match outcome {
-                    DownloadOutcome::Paused => "Download paused.".into(),
-                    DownloadOutcome::Canceled => "Download canceled.".into(),
-                    DownloadOutcome::Completed => "Interrupted.".into(),
-                },
-                false,
-            ));
-        }
-
-        let response = send_download_request(
-            client,
-            job_url,
-            &current,
-            existing_bytes,
-            validators,
-            handoff_auth,
-        )
-        .await?;
-
-        if response.status().is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    download_error(
-                        FailureCategory::Http,
-                        "Redirect missing Location header.".into(),
-                        false,
-                    )
-                })?;
-
-            let next = resolve_redirect_location(&current, location)?;
-
-            redirects += 1;
-            if redirects > MAX_REDIRECTS {
-                return Err(download_error(
-                    FailureCategory::Http,
-                    "Too many redirects.".into(),
-                    false,
-                ));
-            }
-            current = next;
-            continue;
-        }
-
-        return Ok((response, current));
+fn http_status_error(status: StatusCode, retryable: bool) -> DownloadError {
+    let mut message = format!("Download failed with HTTP {status}.");
+    if status == StatusCode::BAD_GATEWAY || status == StatusCode::SERVICE_UNAVAILABLE {
+        message.push_str(
+            " The CDN/origin rejected this request — often a bad or glued download token/URL, \
+or a temporary gateway issue. Confirm the full URL is a single link (not two pasted together).",
+        );
+    } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+        message.push_str(
+            " Access denied — the link may require a browser session, cookies, or a fresh token.",
+        );
+    } else if status == StatusCode::NOT_FOUND {
+        message.push_str(" File not found — the link may have expired.");
     }
-}
-
-/// Kind of transfer request sharing handoff / referer / identity headers.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum TransferRequestKind {
-    /// GET with optional open-ended Range resume (`bytes=N-`).
-    Get { existing_bytes: u64 },
-    /// GET closed Range (`bytes={start}-{end}`, inclusive) for multi-segment.
-    GetClosed { start: u64, end: u64 },
-    /// HEAD preflight probe.
-    Head,
-    /// GET `Range: bytes=0-0` Accept-Ranges / size probe.
-    RangeProbe,
-}
-
-/// Build a transfer request (preflight HEAD/Range probe or download GET).
-/// Applies same-origin handoff, identity encoding, and browser-like Referer.
-pub(crate) fn build_transfer_request(
-    client: &Client,
-    kind: TransferRequestKind,
-    job_url: &str,
-    url: &str,
-    handoff_auth: Option<&HandoffAuth>,
-) -> reqwest::RequestBuilder {
-    let mut request = match kind {
-        TransferRequestKind::Get { .. }
-        | TransferRequestKind::GetClosed { .. }
-        | TransferRequestKind::RangeProbe => client.get(url),
-        TransferRequestKind::Head => client.head(url),
-    };
-    request = request.header(ACCEPT_ENCODING, "identity");
-
-    let mut has_referer = false;
-    if let Some(auth) = handoff_auth_for_request_url(job_url, url, handoff_auth) {
-        for header in &auth.headers {
-            if !is_allowed_handoff_header(&header.name) {
-                continue;
-            }
-            if header.name.eq_ignore_ascii_case("referer") {
-                has_referer = true;
-            }
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
-                reqwest::header::HeaderValue::from_str(&header.value),
-            ) {
-                request = request.header(name, value);
-            }
-        }
-    }
-
-    if !has_referer {
-        if let Some(referer) = referer_for_url(url) {
-            request = request.header(REFERER, referer);
-        }
-    }
-
-    match kind {
-        TransferRequestKind::Get { existing_bytes } if existing_bytes > 0 => {
-            request = request.header(RANGE, format!("bytes={existing_bytes}-"));
-        }
-        TransferRequestKind::GetClosed { start, end } => {
-            request = request.header(RANGE, format!("bytes={start}-{end}"));
-        }
-        TransferRequestKind::RangeProbe => {
-            request = request.header(RANGE, "bytes=0-0");
-        }
-        _ => {}
-    }
-
-    request
-}
-
-/// Build a GET for the download transfer (identity encoding, optional Range/If-Range, Referer).
-fn build_download_request(
-    client: &Client,
-    job_url: &str,
-    url: &str,
-    existing_bytes: u64,
-    validators: &ContentValidators,
-    handoff_auth: Option<&HandoffAuth>,
-) -> reqwest::RequestBuilder {
-    let mut request = build_transfer_request(
-        client,
-        TransferRequestKind::Get { existing_bytes },
-        job_url,
-        url,
-        handoff_auth,
-    );
-    if existing_bytes > 0 {
-        if let Some(if_range) = if_range_header_value(validators) {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
-                request = request.header(IF_RANGE, value);
-            }
-        }
-    }
-    request
-}
-
-/// Resolve a redirect Location against the current URL (absolute or relative).
-pub(crate) fn resolve_redirect_location(
-    current: &str,
-    location: &str,
-) -> Result<String, DownloadError> {
-    match url::Url::parse(location) {
-        Ok(absolute) => Ok(absolute.to_string()),
-        Err(_) => {
-            let base = url::Url::parse(current).map_err(|error| {
-                download_error(
-                    FailureCategory::Http,
-                    format!("Invalid URL during redirect: {error}"),
-                    false,
-                )
-            })?;
-            base.join(location).map(|u| u.to_string()).map_err(|error| {
-                download_error(
-                    FailureCategory::Http,
-                    format!("Invalid redirect target: {error}"),
-                    false,
-                )
-            })
-        }
-    }
+    download_error(FailureCategory::Http, message, retryable)
 }
 
 /// Best-effort preflight: pin `resolved_url` and publish an early progress patch.
@@ -1083,279 +776,12 @@ pub(crate) fn preflight_commit_identity(
         ..Default::default()
     }
 }
-
-/// Prefer TCP HTTP/1.1–2, then fall back to HTTP/3 (QUIC) on connect/TLS failures.
-/// QUIC often bypasses SNI-based router filters that break plain HTTPS.
-async fn send_download_request(
-    client: &Client,
-    job_url: &str,
-    url: &str,
-    existing_bytes: u64,
-    validators: &ContentValidators,
-    handoff_auth: Option<&HandoffAuth>,
-) -> Result<reqwest::Response, DownloadError> {
-    let primary = build_download_request(
-        client,
-        job_url,
-        url,
-        existing_bytes,
-        validators,
-        handoff_auth,
-    )
-    .send()
-    .await;
-
-    match primary {
-        Ok(response) => Ok(response),
-        Err(error) if should_try_http3(&error) && url.starts_with("https://") => {
-            match build_download_request(
-                client,
-                job_url,
-                url,
-                existing_bytes,
-                validators,
-                handoff_auth,
-            )
-            .version(Version::HTTP_3)
-            .send()
-            .await
-            {
-                Ok(response) => Ok(response),
-                Err(http3_error) => {
-                    let tcp_detail = format_reqwest_error(&error);
-                    let h3_detail = format_reqwest_error(&http3_error);
-                    let retryable = error.is_timeout()
-                        || error.is_connect()
-                        || error.is_request()
-                        || http3_error.is_timeout()
-                        || http3_error.is_connect()
-                        || http3_error.is_request();
-                    let message = if tcp_detail == h3_detail {
-                        format!("Could not connect (TCP + HTTP/3): {tcp_detail}")
-                    } else {
-                        format!(
-                            "Could not connect. TCP/HTTPS: {tcp_detail} | HTTP/3 (QUIC): {h3_detail}"
-                        )
-                    };
-                    Err(download_error(FailureCategory::Network, message, retryable))
-                }
-            }
-        }
-        Err(error) => {
-            let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-            Err(download_error(
-                FailureCategory::Network,
-                format!("Could not connect: {}", format_reqwest_error(&error)),
-                retryable,
-            ))
-        }
-    }
-}
-
-/// GET a closed Range against a **pinned** URL. Does not follow redirects
-/// (unexpected hops reconnect to the pinned URL).
-pub(crate) async fn send_segment_get(
-    client: &Client,
-    job_url: &str,
-    pinned_url: &str,
-    range_start: u64,
-    range_end: u64,
-    validators: &ContentValidators,
-    handoff_auth: Option<&HandoffAuth>,
-) -> Result<reqwest::Response, DownloadError> {
-    let mut request = build_transfer_request(
-        client,
-        TransferRequestKind::GetClosed {
-            start: range_start,
-            end: range_end,
-        },
-        job_url,
-        pinned_url,
-        handoff_auth,
-    );
-    if range_start > 0 {
-        if let Some(if_range) = if_range_header_value(validators) {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
-                request = request.header(IF_RANGE, value);
-            }
-        }
-    }
-
-    let primary = request.send().await;
-    match primary {
-        Ok(response) => Ok(response),
-        Err(error) if should_try_http3(&error) && pinned_url.starts_with("https://") => {
-            let mut retry = build_transfer_request(
-                client,
-                TransferRequestKind::GetClosed {
-                    start: range_start,
-                    end: range_end,
-                },
-                job_url,
-                pinned_url,
-                handoff_auth,
-            );
-            if range_start > 0 {
-                if let Some(if_range) = if_range_header_value(validators) {
-                    if let Ok(value) = reqwest::header::HeaderValue::from_str(if_range) {
-                        retry = retry.header(IF_RANGE, value);
-                    }
-                }
-            }
-            match retry.version(Version::HTTP_3).send().await {
-                Ok(response) => Ok(response),
-                Err(http3_error) => {
-                    let tcp_detail = format_reqwest_error(&error);
-                    let h3_detail = format_reqwest_error(&http3_error);
-                    let retryable = error.is_timeout()
-                        || error.is_connect()
-                        || error.is_request()
-                        || http3_error.is_timeout()
-                        || http3_error.is_connect()
-                        || http3_error.is_request();
-                    let message = if tcp_detail == h3_detail {
-                        format!("Could not connect (TCP + HTTP/3): {tcp_detail}")
-                    } else {
-                        format!(
-                            "Could not connect. TCP/HTTPS: {tcp_detail} | HTTP/3 (QUIC): {h3_detail}"
-                        )
-                    };
-                    Err(download_error(FailureCategory::Network, message, retryable))
-                }
-            }
-        }
-        Err(error) => {
-            let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-            Err(download_error(
-                FailureCategory::Network,
-                format!("Could not connect: {}", format_reqwest_error(&error)),
-                retryable,
-            ))
-        }
-    }
-}
-
-fn should_try_http3(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || error.is_request() || looks_like_tls_failure(error)
-}
-
-fn looks_like_tls_failure(error: &reqwest::Error) -> bool {
-    let text = format_error_chain(error).to_ascii_lowercase();
-    text.contains("tls")
-        || text.contains("ssl")
-        || text.contains("certificate")
-        || text.contains("handshake")
-        || text.contains("corrupt message")
-        || text.contains("invalidcontenttype")
-        || text.contains("invalid content type")
-        || text.contains("sec_e_invalid_token")
-        || text.contains("frame size")
-        || text.contains("corrupted frame")
-}
-
-/// Full error chain for UI: top-level message + nested causes + optional filter hint.
-pub fn format_reqwest_error(error: &reqwest::Error) -> String {
-    let chain = format_error_chain(error);
-    if looks_like_tls_interference(&chain) {
-        format!(
-            "{chain}. Hint: TLS handshake failed — possible router web filter (e.g. ASUS AiProtection), \
-antivirus HTTPS scan, or blocked domain. Browsers may still work via HTTP/3/QUIC; try allowlisting \
-the host or copy the browser's final download URL."
-        )
-    } else {
-        chain
-    }
-}
-
-fn format_error_chain(error: &reqwest::Error) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let top = error.to_string();
-    parts.push(top);
-
-    let mut source = error.source();
-    while let Some(err) = source {
-        let text = err.to_string();
-        // Skip exact duplicates / pure wrappers that add no detail.
-        if parts.iter().all(|p| p != &text) {
-            parts.push(text);
-        }
-        source = err.source();
-    }
-
-    if parts.len() == 1 {
-        return parts.remove(0);
-    }
-
-    // "top (cause1 → cause2 → root)"
-    let root_path = parts[1..].join(" → ");
-    format!("{} ({})", parts[0], root_path)
-}
-
-fn looks_like_tls_interference(chain: &str) -> bool {
-    let lower = chain.to_ascii_lowercase();
-    lower.contains("corrupt message")
-        || lower.contains("invalidcontenttype")
-        || lower.contains("invalid content type")
-        || lower.contains("sec_e_invalid_token")
-        || lower.contains("token supplied to the function is invalid")
-        || lower.contains("frame size")
-        || lower.contains("corrupted frame")
-        || lower.contains("certificate")
-        || (lower.contains("tls")
-            && (lower.contains("fail") || lower.contains("error") || lower.contains("handshake")))
-        || (lower.contains("ssl")
-            && (lower.contains("fail") || lower.contains("error") || lower.contains("handshake")))
-}
-
-pub(crate) fn control_outcome(control: &AtomicU8) -> Option<DownloadOutcome> {
-    match control.load(Ordering::Relaxed) {
-        CONTROL_PAUSED => Some(DownloadOutcome::Paused),
-        CONTROL_CANCELED => Some(DownloadOutcome::Canceled),
-        _ => None,
-    }
-}
-
-pub fn store_control(control: &AtomicU8, value: WorkerControl) {
-    let raw = match value {
-        WorkerControl::Continue => CONTROL_CONTINUE,
-        WorkerControl::Paused => CONTROL_PAUSED,
-        WorkerControl::Canceled => CONTROL_CANCELED,
-    };
-    control.store(raw, Ordering::Relaxed);
-}
-
 pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     if total == 0 {
         return 0.0;
     }
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
-
-/// Strong ETags are usable for If-Range. Weak form is `W/"…"` (RFC 7232).
-fn is_strong_etag(etag: &str) -> bool {
-    let t = etag.trim();
-    !t.is_empty() && !t.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("W/"))
-}
-
-/// If-Range value selection (normative):
-/// - strong ETag → prefer it
-/// - weak ETag only → prefer Last-Modified if present, else bare Range (`None`)
-/// - Last-Modified (no strong ETag) → use it
-/// - none → bare Range
-pub(crate) fn if_range_header_value(validators: &ContentValidators) -> Option<&str> {
-    if let Some(etag) = validators.etag.as_deref() {
-        let etag = etag.trim();
-        if is_strong_etag(etag) {
-            return Some(etag);
-        }
-    }
-    validators
-        .last_modified
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
 /// Both sides present and differ. Missing 206 headers are not a mismatch
 /// (CDN 206 without identity still continues).
 fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
@@ -1373,17 +799,6 @@ fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValida
         }
     }
     false
-}
-
-/// Size mismatch when both stored expected_size and a numeric Content-Range total are known.
-pub(crate) fn content_range_size_mismatch(
-    content_range_total: Option<u64>,
-    expected_size: Option<u64>,
-) -> Option<(u64, u64)> {
-    match (content_range_total, expected_size) {
-        (Some(total), Some(expected)) if total != expected => Some((total, expected)),
-        _ => None,
-    }
 }
 
 /// Capture ETag / Last-Modified / expected size from a successful download response.
@@ -1421,27 +836,6 @@ fn content_validators_patch(
     }
 }
 
-fn disk_write_error(error: std::io::Error) -> DownloadError {
-    download_error(
-        FailureCategory::Disk,
-        format!("Could not write download data: {error}"),
-        false,
-    )
-}
-
-/// Flush buffered writes; `sync_data` on pause (prefer over `sync_all` on Windows).
-async fn flush_partial_writer(
-    writer: &mut BufWriter<tokio::fs::File>,
-    outcome: DownloadOutcome,
-) -> Result<(), DownloadError> {
-    writer.flush().await.map_err(disk_write_error)?;
-    if should_sync_data_on_exit(outcome) {
-        // Already flushed to the OS; a failed durability sync must not fail Pause.
-        let _ = writer.get_ref().sync_data().await;
-    }
-    Ok(())
-}
-
 /// `sync_data` only on pause — cancel/complete skip fsync.
 fn should_sync_data_on_exit(outcome: DownloadOutcome) -> bool {
     matches!(outcome, DownloadOutcome::Paused)
@@ -1461,17 +855,6 @@ fn emit_control_exit_progress(
     )));
 }
 
-pub(crate) fn should_retry_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT
-            | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-    ) || status.is_server_error()
-}
-
 fn filename_from_url_fallback(url: &str) -> Option<String> {
     super::filesystem::derive_filename_from_url(url)
 }
@@ -1482,25 +865,16 @@ fn filename_from_response_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fetch::{CONTROL_CANCELED, CONTROL_CONTINUE, CONTROL_PAUSED};
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn progress_clamps() {
         assert_eq!(progress_percent(50, 100), 50.0);
         assert_eq!(progress_percent(0, 0), 0.0);
         assert_eq!(progress_percent(150, 100), 100.0);
-    }
-
-    #[test]
-    fn tls_interference_hint_matches_known_patterns() {
-        assert!(looks_like_tls_interference(
-            "error sending request (received corrupt message of type InvalidContentType)"
-        ));
-        assert!(looks_like_tls_interference(
-            "The token supplied to the function is invalid (os error -2146893048)"
-        ));
-        assert!(!looks_like_tls_interference("connection refused"));
     }
 
     #[test]
@@ -1638,40 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn is_strong_etag_rejects_weak() {
-        assert!(is_strong_etag("\"abc123\""));
-        assert!(is_strong_etag("\"cdn-opaque-v2\""));
-        assert!(!is_strong_etag("W/\"abc123\""));
-        assert!(!is_strong_etag("w/\"weak\""));
-        assert!(!is_strong_etag(""));
-        assert!(!is_strong_etag("   "));
-    }
-
-    #[test]
-    fn if_range_prefers_strong_etag_over_last_modified() {
-        let v = ContentValidators {
-            etag: Some("\"strong-1\"".into()),
-            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
-            expected_size: Some(1_048_576),
-        };
-        assert_eq!(if_range_header_value(&v), Some("\"strong-1\""));
-    }
-
-    #[test]
-    fn if_range_weak_etag_falls_back_to_last_modified() {
-        // CDN-like: weak ETag + Last-Modified → If-Range uses LM only.
-        let v = ContentValidators {
-            etag: Some("W/\"5f4dcc3b\"".into()),
-            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
-            expected_size: Some(999),
-        };
-        assert_eq!(
-            if_range_header_value(&v),
-            Some("Mon, 01 Jan 2024 00:00:00 GMT")
-        );
-    }
-
-    #[test]
     fn preflight_patch_leaves_progress_none_on_known_total() {
         let job = Job::new(
             "https://example.com/f.bin".into(),
@@ -1696,46 +1036,6 @@ mod tests {
             patch.validators.as_ref().and_then(|v| v.etag.as_deref()),
             Some("\"e\"")
         );
-    }
-
-    #[test]
-    fn if_range_weak_etag_only_uses_bare_range() {
-        let v = ContentValidators {
-            etag: Some("W/\"only-weak\"".into()),
-            last_modified: None,
-            expected_size: Some(100),
-        };
-        assert_eq!(if_range_header_value(&v), None);
-    }
-
-    #[test]
-    fn if_range_last_modified_only() {
-        let v = ContentValidators {
-            etag: None,
-            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
-            expected_size: None,
-        };
-        assert_eq!(
-            if_range_header_value(&v),
-            Some("Tue, 15 Nov 1994 12:45:26 GMT")
-        );
-    }
-
-    #[test]
-    fn if_range_none_when_empty_validators() {
-        assert_eq!(if_range_header_value(&ContentValidators::default()), None);
-    }
-
-    #[test]
-    fn content_range_size_mismatch_numeric_only() {
-        assert_eq!(
-            content_range_size_mismatch(Some(1000), Some(2000)),
-            Some((1000, 2000))
-        );
-        assert_eq!(content_range_size_mismatch(Some(1000), Some(1000)), None);
-        // `*` total → None total → no mismatch.
-        assert_eq!(content_range_size_mismatch(None, Some(1000)), None);
-        assert_eq!(content_range_size_mismatch(Some(1000), None), None);
     }
 
     #[test]
@@ -1771,109 +1071,6 @@ mod tests {
             expected_size: None,
         };
         assert!(resume_identity_mismatch(&stored, &lm_changed));
-    }
-
-    #[test]
-    fn cdn_like_206_star_total_and_strong_etag_selection() {
-        // CloudFront-style probe: Content-Range bytes 0-0/* + strong ETag.
-        let (start, end, total) = parse_content_range("bytes 0-0/*").unwrap();
-        assert_eq!((start, end, total), (0, 0, None));
-        assert!(content_range_size_mismatch(total, Some(5_000_000)).is_none());
-
-        let v = ContentValidators {
-            etag: Some("\"cf-etag-abc\"".into()),
-            last_modified: Some("Wed, 12 Aug 2026 08:00:00 GMT".into()),
-            expected_size: Some(5_000_000),
-        };
-        assert_eq!(if_range_header_value(&v), Some("\"cf-etag-abc\""));
-
-        // Resume mid-file with numeric total matching expected_size.
-        let (start, end, total) = parse_content_range("bytes 1000-4999/5000").unwrap();
-        assert_eq!(start, 1000);
-        assert_eq!(end, 4999);
-        assert_eq!(total, Some(5000));
-        assert!(content_range_size_mismatch(total, Some(5000)).is_none());
-        assert_eq!(
-            content_range_size_mismatch(total, Some(4096)),
-            Some((5000, 4096))
-        );
-    }
-
-    #[test]
-    fn cdn_like_weak_etag_with_accept_ranges() {
-        // Fastly/Akamai often emit weak ETags; prefer bare Range over weak If-Range.
-        let v = ContentValidators {
-            etag: Some("W/\"1a2b3c\"".into()),
-            last_modified: None,
-            expected_size: Some(2_048_576),
-        };
-        assert!(!is_strong_etag(v.etag.as_deref().unwrap()));
-        assert_eq!(if_range_header_value(&v), None);
-
-        // Same object with LM present — use LM for If-Range.
-        let mut with_lm = v.clone();
-        with_lm.last_modified = Some("Sun, 06 Nov 1994 08:49:37 GMT".into());
-        assert_eq!(
-            if_range_header_value(&with_lm),
-            Some("Sun, 06 Nov 1994 08:49:37 GMT")
-        );
-    }
-
-    #[test]
-    fn build_download_request_attaches_range_and_strong_if_range() {
-        let client = download_client().expect("client");
-        let url = "https://cdn.example.com/file.bin";
-        let strong = ContentValidators {
-            etag: Some("\"strong-etag\"".into()),
-            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
-            expected_size: Some(4096),
-        };
-        let req = build_download_request(&client, url, url, 512, &strong, None)
-            .build()
-            .expect("build");
-        assert_eq!(
-            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
-            Some("bytes=512-")
-        );
-        assert_eq!(
-            req.headers().get(IF_RANGE).and_then(|v| v.to_str().ok()),
-            Some("\"strong-etag\"")
-        );
-    }
-
-    #[test]
-    fn build_download_request_weak_only_omits_if_range() {
-        let client = download_client().expect("client");
-        let url = "https://cdn.example.com/file.bin";
-        let weak_only = ContentValidators {
-            etag: Some("W/\"weak\"".into()),
-            last_modified: None,
-            expected_size: Some(100),
-        };
-        let req = build_download_request(&client, url, url, 100, &weak_only, None)
-            .build()
-            .expect("build");
-        assert_eq!(
-            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
-            Some("bytes=100-")
-        );
-        assert!(req.headers().get(IF_RANGE).is_none());
-    }
-
-    #[test]
-    fn build_download_request_no_range_when_offset_zero() {
-        let client = download_client().expect("client");
-        let url = "https://cdn.example.com/file.bin";
-        let strong = ContentValidators {
-            etag: Some("\"x\"".into()),
-            last_modified: None,
-            expected_size: None,
-        };
-        let req = build_download_request(&client, url, url, 0, &strong, None)
-            .build()
-            .expect("build");
-        assert!(req.headers().get(RANGE).is_none());
-        assert!(req.headers().get(IF_RANGE).is_none());
     }
 
     #[test]
@@ -2012,39 +1209,13 @@ mod tests {
         assert!(outcome.is_none());
     }
 
-    /// Reconnect re-GET must re-apply Range + strong If-Range on the pinned URL
-    /// (same builder path as mid-transfer continue).
-    #[test]
-    fn reconnect_reget_attaches_range_if_range_on_pinned_url() {
-        let client = download_client().expect("client");
-        let job_url = "https://origin.example.com/dl/token";
-        let pinned = "https://cdn.example.com/file.bin?sig=1";
-        let validators = ContentValidators {
-            etag: Some("\"resume-etag\"".into()),
-            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
-            expected_size: Some(10_000),
-        };
-        let offset = 4096u64;
-        let req = build_download_request(&client, job_url, pinned, offset, &validators, None)
-            .build()
-            .expect("build");
-        assert_eq!(req.url().as_str(), pinned);
-        assert_eq!(
-            req.headers().get(RANGE).and_then(|v| v.to_str().ok()),
-            Some("bytes=4096-")
-        );
-        assert_eq!(
-            req.headers().get(IF_RANGE).and_then(|v| v.to_str().ok()),
-            Some("\"resume-etag\"")
-        );
-    }
-
     #[test]
     fn disk_flush_failure_is_not_reconnectable() {
-        let disk = disk_write_error(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            "disk full",
-        ));
+        let disk = download_error(
+            FailureCategory::Disk,
+            "Could not write download data: disk full".into(),
+            false,
+        );
         assert!(!is_reconnectable_error(&disk));
         assert!(!can_mid_transfer_reconnect(&disk, false, 0, 100, true));
         assert_eq!(disk.category, FailureCategory::Disk);

@@ -13,12 +13,12 @@ use reqwest::header::{
 use reqwest::{Client, StatusCode};
 use std::sync::atomic::AtomicU8;
 
+use super::fetch::{
+    build_transfer_request, control_outcome, send_following_redirects, TransferRequestKind,
+    PREFLIGHT_TIMEOUT,
+};
 use super::filesystem::{parse_content_disposition_filename, parse_content_range};
 use super::handoff::HandoffAuth;
-use super::http::{
-    build_transfer_request, control_outcome, resolve_redirect_location, TransferRequestKind,
-    MAX_REDIRECTS, PREFLIGHT_TIMEOUT,
-};
 
 /// Planner / transfer input from a successful preflight probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,36 +319,21 @@ async fn send_with_redirects(
     handoff_auth: Option<&HandoffAuth>,
     control: &AtomicU8,
 ) -> Option<(reqwest::Response, String)> {
-    let mut current = url.to_string();
-    let mut redirects = 0u32;
-
-    loop {
-        if control_outcome(control).is_some() {
-            return None;
+    send_following_redirects(url, control, |current| {
+        let request = build_transfer_request(client, kind, job_url, current, handoff_auth)
+            .timeout(PREFLIGHT_TIMEOUT);
+        async move {
+            request.send().await.map_err(|error| {
+                super::job::download_error(
+                    super::job::FailureCategory::Network,
+                    error.to_string(),
+                    true,
+                )
+            })
         }
-
-        let response = build_transfer_request(client, kind, job_url, &current, handoff_auth)
-            .timeout(PREFLIGHT_TIMEOUT)
-            .send()
-            .await
-            .ok()?;
-
-        if response.status().is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())?;
-            let next = resolve_redirect_location(&current, location).ok()?;
-            redirects += 1;
-            if redirects > MAX_REDIRECTS {
-                return None;
-            }
-            current = next;
-            continue;
-        }
-
-        return Some((response, current));
-    }
+    })
+    .await
+    .ok()
 }
 
 #[cfg(test)]
