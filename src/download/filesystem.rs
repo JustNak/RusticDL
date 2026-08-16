@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::job::Job;
+use super::resume::{resume_oracle, ResumeOracle};
 
 /// Safety margin beyond remaining download bytes before preallocate is allowed.
 /// `max(64 MiB, 1% of total)`.
@@ -206,6 +207,59 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
     }
 }
 
+/// Sync mutate of `downloaded_bytes` from [`resume_oracle`]. The only mutator
+/// used by `start_worker` and [`reconcile_partial_progress`].
+///
+/// `FreshSingle` / `LegacySingle` require `Some(on_disk)` — callers `metadata_len`
+/// first. Never pass `None` into those arms.
+pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileResult {
+    let version_gated = job.transfer_format_version >= 1;
+    match resume_oracle(job) {
+        ResumeOracle::Multi { map } => {
+            let sum = map.written_sum();
+            let before = job.downloaded_bytes;
+            apply_progress_from_sum(job, sum);
+            ReconcileResult {
+                downloaded_bytes: sum,
+                on_disk: sum,
+                changed: before != sum,
+                used_metadata_len: false,
+                version_gated,
+                used_map_sum: true,
+                map_consistent: true,
+                resume_required: false,
+            }
+        }
+        ResumeOracle::RestartRequired => ReconcileResult {
+            downloaded_bytes: job.downloaded_bytes,
+            on_disk: job.downloaded_bytes,
+            changed: false,
+            used_metadata_len: false,
+            version_gated,
+            used_map_sum: false,
+            map_consistent: false,
+            resume_required: true,
+        },
+        ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
+            let disk = on_disk.expect("FreshSingle/LegacySingle require Some(on_disk)");
+            if is_untracked_preallocate_hole(job, disk) {
+                ReconcileResult {
+                    downloaded_bytes: job.downloaded_bytes,
+                    on_disk: disk,
+                    changed: false,
+                    used_metadata_len: false,
+                    version_gated: false,
+                    used_map_sum: false,
+                    map_consistent: false,
+                    resume_required: false,
+                }
+            } else {
+                apply_partial_progress_from_disk(job, disk)
+            }
+        }
+    }
+}
+
 /// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
 ///
 /// - Consistent `segment_map`: `downloaded_bytes = sum(written)`; **never** `metadata_len`.
@@ -213,69 +267,19 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
 ///   set `resume_required` (Fail Resume — do not invent Range, do not use file len).
 /// - version 0 and no map: single-stream — set `downloaded_bytes` from `.part` length.
 ///
-/// Engine uses `metadata_len` + `apply_partial_progress_from_disk` so the mutex
-/// is not held across filesystem I/O; this convenience wrapper remains for tests
-/// and call sites that already own the job exclusively.
-#[allow(dead_code)] // public API; engine prefers lock-split path
+/// Engine uses the same [`reconcile_from_oracle`] core after a lock-split
+/// `metadata_len`; this wrapper remains for tests and exclusive-job call sites.
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
-    let version_gated = job.transfer_format_version >= 1;
-    if job.segment_map.is_some() || version_gated {
-        if let Some(map) = job.segment_map.as_ref() {
-            if map.is_consistent() {
-                let sum = map.written_sum();
-                let before = job.downloaded_bytes;
-                apply_progress_from_sum(job, sum);
-                return ReconcileResult {
-                    downloaded_bytes: sum,
-                    on_disk: sum,
-                    changed: before != sum,
-                    used_metadata_len: false,
-                    version_gated,
-                    used_map_sum: true,
-                    map_consistent: true,
-                    resume_required: false,
-                };
-            }
-            // Inconsistent: do not invent progress or Range from the broken map.
-            return ReconcileResult {
-                downloaded_bytes: job.downloaded_bytes,
-                on_disk: job.downloaded_bytes,
-                changed: false,
-                used_metadata_len: false,
-                version_gated,
-                used_map_sum: false,
-                map_consistent: false,
-                resume_required: true,
-            };
-        }
-        // v1+ with no map — Restart required; never metadata_len.
-        return ReconcileResult {
-            downloaded_bytes: job.downloaded_bytes,
-            on_disk: job.downloaded_bytes,
-            changed: false,
-            used_metadata_len: false,
-            version_gated: true,
-            used_map_sum: false,
-            map_consistent: false,
-            resume_required: true,
-        };
-    }
-
-    let on_disk = metadata_len(&job.temp_path).await.unwrap_or(0);
-    // Wait for preflight size when total is unknown; never promote a hole to progress.
-    if is_untracked_preallocate_hole(job, on_disk) {
-        return ReconcileResult {
-            downloaded_bytes: job.downloaded_bytes,
-            on_disk,
-            changed: false,
-            used_metadata_len: false,
-            version_gated: false,
-            used_map_sum: false,
-            map_consistent: false,
-            resume_required: false,
-        };
-    }
-    apply_partial_progress_from_disk(job, on_disk)
+    let need_disk = matches!(
+        resume_oracle(job),
+        ResumeOracle::FreshSingle | ResumeOracle::LegacySingle
+    );
+    let on_disk = if need_disk {
+        Some(metadata_len(&job.temp_path).await.unwrap_or(0))
+    } else {
+        None
+    };
+    reconcile_from_oracle(job, on_disk)
 }
 
 pub async fn move_to_final_path(

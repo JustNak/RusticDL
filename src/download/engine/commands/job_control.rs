@@ -7,22 +7,26 @@ use tokio::sync::Mutex;
 use super::super::super::filesystem::remove_partial;
 use super::super::super::http::store_control;
 use super::super::super::job::{FailureCategory, Job, JobState, WorkerControl};
-use super::super::super::multi::{multi_resume_policy, RESUME_RESTART_MESSAGE};
+use super::super::super::multi::RESUME_RESTART_MESSAGE;
+use super::super::super::resume::{resume_oracle, FALLBACK_MAP_INCONSISTENT, FALLBACK_MAP_MISSING};
 use super::super::{emit_jobs_locked, find_job_mut, EngineInner};
 
 /// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
 pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
-    let policy = multi_resume_policy(job);
-    if !policy.is_resume_error() {
+    if !resume_oracle(job).is_resume_error() {
         return false;
     }
     job.state = JobState::Failed;
     job.error = Some(RESUME_RESTART_MESSAGE.into());
     job.failure_category = Some(FailureCategory::Resume);
     job.mark_finished();
-    if let Some(reason) = policy.fallback_reason() {
-        job.fallback_reason = Some(reason.to_string());
-    }
+    // Distinct visibility keys; not a second oracle.
+    let reason = if job.segment_map.is_none() {
+        FALLBACK_MAP_MISSING
+    } else {
+        FALLBACK_MAP_INCONSISTENT
+    };
+    job.fallback_reason = Some(reason.to_string());
     job.speed = 0;
     job.eta_secs = 0;
     job.active_connections = 0;
