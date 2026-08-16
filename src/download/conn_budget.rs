@@ -14,9 +14,14 @@
 //! are small; pruning is deferred polish.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::sleep;
+
+use super::job::DownloadOutcome;
 
 /// Process-wide connection budget: one global pool plus per-host caps.
 pub struct ConnectionBudget {
@@ -27,11 +32,28 @@ pub struct ConnectionBudget {
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
+/// While waiting with a control signal, re-check at least this often.
+const CONTROL_POLL: Duration = Duration::from_millis(50);
+
 /// RAII permits for both global and per-host slots. Drop to release.
 #[must_use = "the permit is released when dropped"]
 pub struct ConnectionPermit {
     _host: OwnedSemaphorePermit,
     _global: OwnedSemaphorePermit,
+}
+
+/// Host key for the per-host map: hostname (plus port when non-default).
+pub fn host_key_for_budget(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown");
+            match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            }
+        }
+        Err(_) => "unknown".into(),
+    }
 }
 
 impl ConnectionBudget {
@@ -99,10 +121,34 @@ impl ConnectionBudget {
         }
     }
 
+    /// Block until both slots are held, or return pause/cancel without keeping a
+    /// partial permit. Host first, then global (same order as [`Self::acquire`]).
+    #[must_use = "the permit is released when dropped"]
+    pub async fn acquire_interruptible(
+        self: &Arc<Self>,
+        host: &str,
+        control: &AtomicU8,
+    ) -> Result<ConnectionPermit, DownloadOutcome> {
+        if let Some(outcome) = control_outcome(control) {
+            return Err(outcome);
+        }
+
+        let key = Self::normalize_host(host);
+        let host_sem = self.host_semaphore(key).await;
+        let host = acquire_owned_interruptible(host_sem, control).await?;
+        let global = acquire_owned_interruptible(self.global.clone(), control).await?;
+
+        Ok(ConnectionPermit {
+            _host: host,
+            _global: global,
+        })
+    }
+
     /// Non-blocking attempt. Returns `None` if either pool is exhausted.
     ///
     /// Host first: if global is exhausted after host succeeds, the host permit
     /// is dropped and released immediately.
+    #[allow(dead_code)]
     #[must_use = "the permit is released when dropped"]
     pub async fn try_acquire(self: &Arc<Self>, host: &str) -> Option<ConnectionPermit> {
         let key = Self::normalize_host(host);
@@ -127,10 +173,35 @@ impl ConnectionBudget {
     }
 }
 
+async fn acquire_owned_interruptible(
+    sem: Arc<Semaphore>,
+    control: &AtomicU8,
+) -> Result<OwnedSemaphorePermit, DownloadOutcome> {
+    loop {
+        if let Some(outcome) = control_outcome(control) {
+            return Err(outcome);
+        }
+        tokio::select! {
+            result = sem.clone().acquire_owned() => {
+                return Ok(result.expect("connection budget semaphore closed"));
+            }
+            _ = sleep(CONTROL_POLL) => {}
+        }
+    }
+}
+
+fn control_outcome(control: &AtomicU8) -> Option<DownloadOutcome> {
+    match control.load(Ordering::Relaxed) {
+        1 => Some(DownloadOutcome::Paused),
+        2 => Some(DownloadOutcome::Canceled),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -254,6 +325,82 @@ mod tests {
             .expect("waiter should finish")
             .expect("task");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_interruptible_returns_paused_when_control_set() {
+        let budget = ConnectionBudget::new(1, 1);
+        let held = budget.acquire("host.example").await;
+        let control = Arc::new(AtomicU8::new(0));
+        let control2 = control.clone();
+        let budget2 = budget.clone();
+
+        let blocked = tokio::spawn(async move {
+            budget2
+                .acquire_interruptible("host.example", &control2)
+                .await
+        });
+
+        sleep(Duration::from_millis(80)).await;
+        control.store(1, Ordering::Relaxed);
+
+        let result = timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("should not hang on pause")
+            .expect("task");
+        assert!(
+            matches!(result, Err(DownloadOutcome::Paused)),
+            "acquire_interruptible must return Paused when control is set"
+        );
+        drop(held);
+        assert!(
+            budget.try_acquire("host.example").await.is_some(),
+            "paused waiter must not keep a host or global slot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_interruptible_drops_partial_host_permit_on_cancel() {
+        // Global=1, per-host=1: A holds a.com + the only global. B takes b.com's
+        // only host slot then waits on global — that is the partial-permit window.
+        let budget = ConnectionBudget::new(1, 1);
+        let held = budget.acquire("a.com").await;
+        let control = Arc::new(AtomicU8::new(0));
+        let control2 = control.clone();
+        let budget2 = budget.clone();
+
+        let blocked =
+            tokio::spawn(async move { budget2.acquire_interruptible("b.com", &control2).await });
+
+        sleep(Duration::from_millis(80)).await;
+        control.store(2, Ordering::Relaxed);
+
+        let result = timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("should not hang on cancel")
+            .expect("task");
+        assert!(
+            matches!(result, Err(DownloadOutcome::Canceled)),
+            "acquire_interruptible must return Canceled when control is set"
+        );
+        drop(held);
+        assert!(
+            budget.try_acquire("b.com").await.is_some(),
+            "canceled waiter must release the host slot taken before the global wait"
+        );
+    }
+
+    #[test]
+    fn host_key_for_budget_uses_host_and_port() {
+        assert_eq!(
+            host_key_for_budget("https://CDN.Example.COM/file.bin"),
+            "cdn.example.com"
+        );
+        assert_eq!(
+            host_key_for_budget("http://127.0.0.1:8080/x"),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(host_key_for_budget("not a url"), "unknown");
     }
 
     #[tokio::test]

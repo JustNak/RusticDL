@@ -17,7 +17,8 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::client::download_client;
-use super::conn_budget::ConnectionBudget;
+use super::conn_budget::{host_key_for_budget, ConnectionBudget};
+use super::context::TransferContext;
 use super::eta::EtaSmoother;
 use super::filesystem::{
     ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
@@ -25,7 +26,7 @@ use super::filesystem::{
 use super::http::{
     content_range_size_mismatch, control_outcome, progress_percent, reconnect_backoff,
     run_http_download_with_ctx, send_segment_get, should_retry_status, sleep_interruptible,
-    ProgressHint, ProgressUpdate, TransferContext, RECONNECT_MAX,
+    ProgressHint, ProgressUpdate, RECONNECT_MAX,
 };
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
@@ -577,14 +578,13 @@ async fn run_segment_workers(
 }
 
 async fn run_segment(client: reqwest::Client, task: SegmentTask) -> Result<(), DownloadError> {
-    let permit = loop {
-        if control_outcome(&task.control).is_some() {
-            return Ok(());
-        }
-        if let Some(permit) = task.budget.try_acquire(&task.host).await {
-            break permit;
-        }
-        sleep(CONTROL_POLL).await;
+    let permit = match task
+        .budget
+        .acquire_interruptible(&task.host, &task.control)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => return Ok(()),
     };
 
     task.active_add();
@@ -1103,23 +1103,11 @@ async fn finalize_completed(
     Ok(DownloadOutcome::Completed)
 }
 
-fn host_key_for_budget(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or("unknown");
-            match parsed.port() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_string(),
-            }
-        }
-        Err(_) => "unknown".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::download::bandwidth::GlobalBandwidthLimiter;
+    use crate::download::engine::EngineRuntimeConfig;
     use crate::download::filesystem::{looks_like_preallocate_hole, reconcile_partial_progress};
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use crate::download::http::ProgressCallback;
@@ -1138,6 +1126,27 @@ mod tests {
             "file.bin".into(),
             PathBuf::from("C:\\dl\\file.bin"),
             PathBuf::from("C:\\dl\\file.bin.part"),
+        )
+    }
+
+    fn test_ctx(
+        job: Job,
+        on_progress: ProgressCallback,
+        handoff: Option<HandoffAuth>,
+        max_segments: u32,
+    ) -> TransferContext {
+        TransferContext::from_runtime(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            handoff,
+            GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            &EngineRuntimeConfig {
+                multi_min_bytes: 1,
+                multi_max_segments: max_segments,
+                ..Default::default()
+            },
         )
     }
 
@@ -1372,16 +1381,19 @@ mod tests {
             patches_cb.lock().unwrap().push(u);
         });
 
-        let mut ctx = TransferContext::new(
+        let ctx = TransferContext::from_runtime(
             job,
             Arc::new(AtomicU8::new(0)),
             on_progress,
             None,
             GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(8, 4),
+            &EngineRuntimeConfig {
+                multi_min_bytes: 1,
+                multi_max_segments: 2,
+                ..Default::default()
+            },
         );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
-        ctx.conn_budget = ConnectionBudget::new(8, 4);
 
         let outcome = run_transfer(ctx).await.expect("multi transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -1451,15 +1463,7 @@ mod tests {
         job.downloaded_bytes = MIN_SEGMENT_SIZE;
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let outcome = run_transfer(ctx).await.expect("resume multi");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -1513,15 +1517,7 @@ mod tests {
             }],
         };
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            Some(auth),
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 1;
+        let ctx = test_ctx(job, on_progress, Some(auth), 1);
 
         let outcome = run_transfer(ctx).await.expect("handoff multi");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -1576,15 +1572,7 @@ mod tests {
         job.transfer_format_version = 0;
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 1;
+        let ctx = test_ctx(job, on_progress, None, 1);
 
         let outcome = run_transfer(ctx)
             .await
@@ -1614,15 +1602,7 @@ mod tests {
         job.expected_sha256 = Some(expected);
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let outcome = run_transfer(ctx).await.expect("hash match");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -1653,15 +1633,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let err = run_transfer(ctx)
             .await
@@ -1701,15 +1673,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let outcome = run_transfer(ctx)
             .await
@@ -1763,15 +1727,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let err = run_transfer(ctx)
             .await
@@ -1828,15 +1784,7 @@ mod tests {
         let job = Job::new(url, "out.bin".into(), target, temp.clone());
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let result = run_transfer(ctx).await;
         assert!(result.is_err(), "403 should fail after fallback");
@@ -1869,15 +1817,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let result = run_transfer(ctx).await;
         assert!(result.is_err(), "403 should fail after fallback");
@@ -1919,15 +1859,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let _ = run_transfer(ctx).await;
 
@@ -1965,15 +1897,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let result = run_transfer(ctx).await;
         assert!(result.is_err(), "start checklist should fail");
@@ -2021,15 +1945,7 @@ mod tests {
         let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
             patches_cb.lock().unwrap().push(u);
         });
-        let mut ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
+        let ctx = test_ctx(job, on_progress, None, 2);
 
         let err = run_transfer(ctx)
             .await

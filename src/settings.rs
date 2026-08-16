@@ -526,6 +526,9 @@ pub struct Settings {
     /// Per-host connection budget for multi-segment downloads.
     #[serde(default = "default_max_connections_per_host")]
     pub max_connections_per_host: u32,
+    /// When false, planner stays on single-stream unless a live map forces Multi.
+    #[serde(default = "default_true")]
+    pub multi_connection_enabled: bool,
     /// Stable vs Nightly (`vX.Y.Z-nightly.*` pre-release) update stream.
     #[serde(default)]
     pub update_channel: UpdateChannel,
@@ -633,6 +636,7 @@ impl Default for Settings {
             multi_min_bytes: default_multi_min_bytes(),
             max_total_connections: default_max_total_connections(),
             max_connections_per_host: default_max_connections_per_host(),
+            multi_connection_enabled: true,
             update_channel: UpdateChannel::Stable,
             theme: AppTheme::Light,
             accent_preset: AccentPreset::Default,
@@ -809,6 +813,7 @@ mod tests {
         assert_eq!(s.multi_min_bytes, 5 * 1024 * 1024);
         assert_eq!(s.max_total_connections, 32);
         assert_eq!(s.max_connections_per_host, 8);
+        assert!(s.multi_connection_enabled);
     }
 
     #[test]

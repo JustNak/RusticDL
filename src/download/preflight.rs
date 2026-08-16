@@ -762,7 +762,11 @@ Accept-Ranges: bytes\r\n\
     /// Soft-fail path: preflight None, then transfer GET still completes.
     #[tokio::test]
     async fn preflight_soft_fail_does_not_abort_transfer() {
-        use crate::download::http::{ProgressUpdate, TransferContext};
+        use crate::download::bandwidth::GlobalBandwidthLimiter;
+        use crate::download::conn_budget::ConnectionBudget;
+        use crate::download::context::TransferContext;
+        use crate::download::engine::EngineRuntimeConfig;
+        use crate::download::http::ProgressUpdate;
         use crate::download::job::Job;
         use crate::download::transfer::run_transfer;
         use std::path::PathBuf;
@@ -831,12 +835,14 @@ Accept-Ranges: bytes\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let ctx = TransferContext::new(
+        let ctx = TransferContext::from_runtime(
             job,
             control,
             on_progress,
             None,
-            crate::download::bandwidth::GlobalBandwidthLimiter::new(None),
+            GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            &EngineRuntimeConfig::default(),
         );
         let outcome = run_transfer(ctx)
             .await
@@ -861,7 +867,11 @@ Accept-Ranges: bytes\r\n\
 
     #[tokio::test]
     async fn transfer_context_pins_resolved_url_from_preflight_info() {
-        use crate::download::http::{ProgressUpdate, TransferContext};
+        use crate::download::bandwidth::GlobalBandwidthLimiter;
+        use crate::download::conn_budget::ConnectionBudget;
+        use crate::download::context::TransferContext;
+        use crate::download::engine::EngineRuntimeConfig;
+        use crate::download::http::ProgressUpdate;
         use crate::download::job::Job;
         use std::path::PathBuf;
 
@@ -884,12 +894,14 @@ Content-Length: 99\r\n\
             PathBuf::from("C:\\dl\\pin.bin"),
             PathBuf::from("C:\\dl\\pin.bin.part"),
         );
-        let mut ctx = TransferContext::new(
+        let mut ctx = TransferContext::from_runtime(
             job,
             control.clone(),
             on_progress,
             None,
-            crate::download::bandwidth::GlobalBandwidthLimiter::new(None),
+            GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            &EngineRuntimeConfig::default(),
         );
         assert_eq!(ctx.resolved_url, url);
 

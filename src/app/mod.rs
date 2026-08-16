@@ -85,6 +85,8 @@ pub struct DownloadApp {
     multi_min_mib_input: Entity<InputState>,
     max_total_connections_input: Entity<InputState>,
     max_connections_per_host_input: Entity<InputState>,
+    /// Save-gated draft for Engine → Connections "Multi-connection".
+    draft_multi_connection_enabled: bool,
     /// Draft textarea for `settings.extension.excluded_hosts` (one host per line).
     excluded_hosts_input: Entity<InputState>,
     /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
@@ -470,6 +472,7 @@ impl DownloadApp {
         }
 
         let extension_committed = settings.extension.clone();
+        let draft_multi_connection_enabled = settings.multi_connection_enabled;
         let mut app = Self {
             jobs,
             settings,
@@ -495,6 +498,7 @@ impl DownloadApp {
             multi_min_mib_input,
             max_total_connections_input,
             max_connections_per_host_input,
+            draft_multi_connection_enabled,
             excluded_hosts_input,
             captured_extensions_input,
             category_folder_inputs,
@@ -675,6 +679,7 @@ impl DownloadApp {
             .update(cx, |i, cx| i.set_value(max_total, window, cx));
         self.max_connections_per_host_input
             .update(cx, |i, cx| i.set_value(max_host, window, cx));
+        self.draft_multi_connection_enabled = self.settings.multi_connection_enabled;
         self.refresh_extension_text_inputs(window, cx);
         self.refresh_category_folder_inputs(window, cx);
 
@@ -751,6 +756,7 @@ impl DownloadApp {
                 .update(cx, |i, cx| i.set_value(max_total, window, cx));
             self.max_connections_per_host_input
                 .update(cx, |i, cx| i.set_value(max_host, window, cx));
+            self.draft_multi_connection_enabled = self.settings.multi_connection_enabled;
             self.refresh_extension_text_inputs(window, cx);
             self.refresh_category_folder_inputs(window, cx);
         }

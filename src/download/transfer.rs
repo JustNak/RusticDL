@@ -9,9 +9,8 @@
 //! - v1 map missing/inconsistent → Resume error (never invent Range offsets).
 //! - Surface `fallback_reason` whenever the planner stays on single-stream.
 
-use super::http::{
-    apply_preflight, control_outcome, run_http_download_with_ctx, ProgressUpdate, TransferContext,
-};
+use super::context::TransferContext;
+use super::http::{apply_preflight, control_outcome, run_http_download_with_ctx, ProgressUpdate};
 use super::job::{DownloadError, DownloadOutcome, Job, TransferMode};
 use super::multi::{resume_restart_required, run_multi_segment_download};
 use super::preflight::PreflightInfo;
@@ -32,6 +31,8 @@ pub enum TransferPlanReason {
     MapInconsistent,
     /// Multi qualifies — orchestrator should run.
     MultiQualified,
+    /// Settings kill switch; a live consistent map still forces Multi.
+    MultiDisabled,
 }
 
 /// One-shot toast when a large file cannot use multi (ranges unknown/unsupported).
@@ -49,6 +50,7 @@ impl TransferPlanReason {
             Self::MapMissing => "map_missing",
             Self::MapInconsistent => "map_inconsistent",
             Self::MultiQualified => "multi_qualified",
+            Self::MultiDisabled => "multi_disabled",
         }
     }
 
@@ -130,8 +132,9 @@ pub fn plan_transfer(
     job: &Job,
     preflight: Option<&PreflightInfo>,
     multi_min_bytes: u64,
+    multi_connection_enabled: bool,
 ) -> TransferPlan {
-    let reason = plan_reason(job, preflight, multi_min_bytes);
+    let reason = plan_reason(job, preflight, multi_min_bytes, multi_connection_enabled);
     TransferPlan {
         chosen: if reason.would_qualify_multi() {
             TransferMode::Multi
@@ -146,8 +149,10 @@ fn plan_reason(
     job: &Job,
     preflight: Option<&PreflightInfo>,
     multi_min_bytes: u64,
+    multi_connection_enabled: bool,
 ) -> TransferPlanReason {
-    match resume_oracle(job) {
+    let oracle = resume_oracle(job);
+    match oracle {
         ResumeOracle::RestartRequired => {
             return if job.segment_map.is_none() {
                 TransferPlanReason::MapMissing
@@ -155,9 +160,16 @@ fn plan_reason(
                 TransferPlanReason::MapInconsistent
             };
         }
-        ResumeOracle::LegacySingle => return TransferPlanReason::LegacyContiguousPartial,
         ResumeOracle::Multi { .. } => return TransferPlanReason::MultiQualified,
-        ResumeOracle::FreshSingle => {}
+        ResumeOracle::LegacySingle | ResumeOracle::FreshSingle => {}
+    }
+
+    if !multi_connection_enabled {
+        return TransferPlanReason::MultiDisabled;
+    }
+
+    if matches!(oracle, ResumeOracle::LegacySingle) {
+        return TransferPlanReason::LegacyContiguousPartial;
     }
 
     let Some(size) = known_size(job, preflight) else {
@@ -208,7 +220,12 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
         return Ok(outcome);
     }
 
-    let plan = plan_transfer(&ctx.job, preflight.as_ref(), ctx.multi_min_bytes);
+    let plan = plan_transfer(
+        &ctx.job,
+        preflight.as_ref(),
+        ctx.multi_min_bytes,
+        ctx.multi_connection_enabled,
+    );
     let existing_reason = ctx.job.fallback_reason.clone();
     if let Some(reason) = plan.fallback_reason() {
         ctx.job.fallback_reason = Some(reason.to_string());
@@ -236,8 +253,10 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
 mod tests {
     use super::*;
     use crate::download::bandwidth::GlobalBandwidthLimiter;
+    use crate::download::conn_budget::ConnectionBudget;
+    use crate::download::engine::EngineRuntimeConfig;
     use crate::download::http::ProgressCallback;
-    use crate::download::job::{FailureCategory, Job};
+    use crate::download::job::{fallback_reason_label, FailureCategory, Job};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::verify::{sha256_hex, SHA256_EMPTY};
     use std::path::PathBuf;
@@ -252,6 +271,26 @@ mod tests {
             "file.bin".into(),
             PathBuf::from("C:\\dl\\file.bin"),
             PathBuf::from("C:\\dl\\file.bin.part"),
+        )
+    }
+
+    fn test_ctx(job: Job, on_progress: ProgressCallback) -> TransferContext {
+        test_ctx_cfg(job, on_progress, EngineRuntimeConfig::default())
+    }
+
+    fn test_ctx_cfg(
+        job: Job,
+        on_progress: ProgressCallback,
+        config: EngineRuntimeConfig,
+    ) -> TransferContext {
+        TransferContext::from_runtime(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            on_progress,
+            None,
+            GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            &config,
         )
     }
 
@@ -270,7 +309,7 @@ mod tests {
     fn planner_unknown_size_stays_single() {
         let job = sample_job();
         let pf = preflight(None, Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::SizeUnknown);
         assert_eq!(plan.chosen, TransferMode::Single);
     }
@@ -280,7 +319,7 @@ mod tests {
         let mut job = sample_job();
         job.total_bytes = 8 * 1024 * 1024;
         job.resume_supported = true;
-        let plan = plan_transfer(&job, None, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, None, 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason.as_str(), "multi_qualified");
@@ -291,7 +330,7 @@ mod tests {
     fn planner_ranges_unknown_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), None);
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnknown);
         assert_eq!(
             plan.to_progress_update().fallback_reason.as_deref(),
@@ -303,7 +342,7 @@ mod tests {
     fn planner_ranges_unsupported_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
@@ -316,7 +355,7 @@ mod tests {
     fn planner_below_min_stays_single() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
@@ -329,7 +368,7 @@ mod tests {
     fn planner_multi_qualifies_chooses_multi() {
         let job = sample_job();
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert!(plan.reason.would_qualify_multi());
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
@@ -344,7 +383,7 @@ mod tests {
         let mut job = sample_job();
         job.total_bytes = 20 * 1024 * 1024;
         job.resume_supported = true;
-        let plan = plan_transfer(&job, None, 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, None, 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
     }
@@ -355,7 +394,7 @@ mod tests {
         job.total_bytes = 9 * 1024 * 1024;
         job.resume_supported = true;
         let pf = preflight(Some(9 * 1024 * 1024), None);
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
     }
@@ -368,7 +407,7 @@ mod tests {
         job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         // Flaky preflight: unknown size / ranges, and min-size raised above total.
         let pf = preflight(None, None);
-        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024, true);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
     }
@@ -392,7 +431,7 @@ mod tests {
             preallocated: true,
         });
         let pf = preflight(None, None);
-        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024, true);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
     }
@@ -405,7 +444,7 @@ mod tests {
         job.resume_supported = true;
         job.transfer_format_version = 0;
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(plan.reason, TransferPlanReason::LegacyContiguousPartial);
         assert_eq!(
@@ -421,7 +460,7 @@ mod tests {
         job.total_bytes = 10 * 1024 * 1024;
         job.resume_supported = true;
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert!(plan.reason.is_resume_required());
         assert_eq!(plan.reason, TransferPlanReason::MapMissing);
         assert_eq!(plan.chosen, TransferMode::Single);
@@ -442,13 +481,86 @@ mod tests {
             preallocated: false,
         });
         let pf = preflight(Some(1000), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 1);
+        let plan = plan_transfer(&job, Some(&pf), 1, true);
         assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
         assert!(plan.reason.is_resume_required());
         assert_eq!(
             plan.to_progress_update().fallback_reason.as_deref(),
             Some("map_inconsistent")
         );
+    }
+
+    #[test]
+    fn planner_v1_map_missing_still_resume_required_when_multi_disabled() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 10 * 1024 * 1024;
+        job.resume_supported = true;
+        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, false);
+        assert!(plan.reason.is_resume_required());
+        assert_eq!(plan.reason, TransferPlanReason::MapMissing);
+        assert_eq!(
+            plan.to_progress_update().fallback_reason.as_deref(),
+            Some("map_missing")
+        );
+    }
+
+    #[test]
+    fn planner_v1_map_inconsistent_still_resume_required_when_multi_disabled() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 1000;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![],
+            preallocated: false,
+        });
+        let pf = preflight(Some(1000), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), 1, false);
+        assert!(plan.reason.is_resume_required());
+        assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
+        assert_eq!(
+            plan.to_progress_update().fallback_reason.as_deref(),
+            Some("map_inconsistent")
+        );
+    }
+
+    #[test]
+    fn planner_multi_disabled_publishes_reason_and_label() {
+        let job = sample_job();
+        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, false);
+        assert_eq!(plan.reason, TransferPlanReason::MultiDisabled);
+        assert_eq!(plan.chosen, TransferMode::Single);
+        assert_eq!(plan.reason.as_str(), "multi_disabled");
+        assert_eq!(
+            plan.to_progress_update().fallback_reason.as_deref(),
+            Some("multi_disabled")
+        );
+        assert_eq!(
+            fallback_reason_label("multi_disabled"),
+            "Multi-connection disabled"
+        );
+        let patch = plan.to_visibility_update(Some(10 * 1024 * 1024), 5 * 1024 * 1024, None);
+        assert!(
+            patch.toast.is_none(),
+            "user-disabled multi must not fire the unavailable toast"
+        );
+        assert_eq!(patch.active_connections, Some(1));
+    }
+
+    #[test]
+    fn planner_disabled_still_forces_multi_when_map_present() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 2 * 1024 * 1024;
+        job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
+        let pf = preflight(None, None);
+        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024, false);
+        assert_eq!(plan.chosen, TransferMode::Multi);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
     }
 
     #[tokio::test]
@@ -485,13 +597,7 @@ Accept-Ranges: bytes\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
+        let ctx = test_ctx(job, on_progress);
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -516,7 +622,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_large_file_ranges_unsupported_toasts_once() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(patch.transfer_mode, Some(TransferMode::Single));
@@ -532,7 +638,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_small_file_ranges_unsupported_no_toast() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
@@ -543,7 +649,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_below_min_no_fallback_reason() {
         let job = sample_job();
         let pf = preflight(Some(1024), Some(true));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
         assert_eq!(
@@ -557,7 +663,7 @@ Accept-Ranges: bytes\r\n\
     fn visibility_same_reason_already_set_skips_toast() {
         let job = sample_job();
         let pf = preflight(Some(8 * 1024 * 1024), Some(false));
-        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024);
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let first = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024, None);
         assert_eq!(
             first.toast.as_deref(),
@@ -611,13 +717,7 @@ Content-Length: {}\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
+        let ctx = test_ctx(job, on_progress);
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -670,13 +770,7 @@ Content-Length: {}\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
+        let ctx = test_ctx(job, on_progress);
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -727,14 +821,14 @@ Accept-Ranges: none\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let mut ctx = TransferContext::new(
+        let ctx = test_ctx_cfg(
             job,
-            Arc::new(AtomicU8::new(0)),
             on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
+            EngineRuntimeConfig {
+                multi_min_bytes: 1,
+                ..Default::default()
+            },
         );
-        ctx.multi_min_bytes = 1;
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
         assert_eq!(std::fs::read(&target).expect("final file"), body);
@@ -797,14 +891,14 @@ Content-Length: {}\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let mut ctx = TransferContext::new(
+        let ctx = test_ctx_cfg(
             job,
-            Arc::new(AtomicU8::new(0)),
             on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
+            EngineRuntimeConfig {
+                multi_min_bytes: 1,
+                ..Default::default()
+            },
         );
-        ctx.multi_min_bytes = 1;
 
         let err = run_transfer(ctx)
             .await
@@ -876,15 +970,15 @@ Content-Length: 48\r\n\
             patches_cb.lock().unwrap().push(u);
         });
 
-        let mut ctx = TransferContext::new(
+        let ctx = test_ctx_cfg(
             job,
-            Arc::new(AtomicU8::new(0)),
             on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
+            EngineRuntimeConfig {
+                multi_min_bytes: 1,
+                multi_max_segments: 2,
+                ..Default::default()
+            },
         );
-        ctx.multi_min_bytes = 1;
-        ctx.multi_max_segments = 2;
 
         let outcome = run_transfer(ctx).await.expect("legacy single");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -955,6 +1049,114 @@ Content-Length: 48\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn single_stream_exhausts_last_budget_slot() {
+        use crate::download::conn_budget::host_key_for_budget;
+        use crate::download::job::DownloadOutcome;
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let body = vec![b'x'; 64];
+        let release_body = Arc::new(Notify::new());
+        let release_body_srv = release_body.clone();
+        let got_get = Arc::new(Notify::new());
+        let got_get_srv = got_get.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let body_srv = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                let lower = req.to_ascii_lowercase();
+                let is_body_get = req.starts_with("GET ")
+                    && !lower.contains("range: bytes=0-0")
+                    && !lower.contains("range: bytes=1-1");
+                if is_body_get {
+                    got_get_srv.notify_one();
+                    release_body_srv.notified().await;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\
+\r\n",
+                        body_srv.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&body_srv).await;
+                } else {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: none\r\n\
+Content-Length: {}\r\n\
+\r\n",
+                        body_srv.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-slot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let host = host_key_for_budget(&url);
+        let budget = ConnectionBudget::new(2, 2);
+        let dummy = budget.acquire(&host).await;
+
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        let ctx = TransferContext::from_runtime(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_: ProgressUpdate| {}),
+            None,
+            GlobalBandwidthLimiter::new(None),
+            budget.clone(),
+            &EngineRuntimeConfig::default(),
+        );
+
+        let download = tokio::spawn(async move { run_transfer(ctx).await });
+        tokio::time::timeout(Duration::from_secs(5), got_get.notified())
+            .await
+            .expect("body GET should start after taking the last slot");
+        assert!(
+            budget.try_acquire(&host).await.is_none(),
+            "single-stream must exhaust the last slot while a dummy holder exists"
+        );
+
+        release_body.notify_one();
+        drop(dummy);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), download)
+            .await
+            .expect("download finished")
+            .expect("task")
+            .expect("transfer");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn single_stream_ctx(
         body: &[u8],
         expected_sha256: Option<String>,
@@ -986,13 +1188,7 @@ Accept-Ranges: bytes\r\n\
         job.expected_sha256 = expected_sha256;
 
         let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
-        let ctx = TransferContext::new(
-            job,
-            Arc::new(AtomicU8::new(0)),
-            on_progress,
-            None,
-            GlobalBandwidthLimiter::new(None),
-        );
+        let ctx = test_ctx(job, on_progress);
         (dir, target, temp, ctx)
     }
 

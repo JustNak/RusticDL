@@ -592,6 +592,10 @@ mod tests {
             "Segment map inconsistent"
         );
         assert_eq!(
+            fallback_reason_label("multi_disabled"),
+            "Multi-connection disabled"
+        );
+        assert_eq!(
             fallback_reason_label("unknown_custom_reason"),
             "unknown_custom_reason"
         );
