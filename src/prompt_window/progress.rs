@@ -14,11 +14,18 @@ use super::{
     BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, SPEED_SAMPLE_CAP,
 };
 use crate::appearance::apply_window_opacity;
-use crate::download::{EngineCommand, EngineHandle, JobState};
+use crate::download::{EngineCommand, EngineHandle, Job, JobState};
 use crate::format::{format_eta, format_size, format_speed};
 use crate::ipc::IpcBridge;
 use crate::settings::Settings;
 use crate::window_icon::apply_app_icon;
+
+/// Newest active job for `url` — Confirm→Progress morph binds this after enqueue.
+fn newest_active_job_for_url<'a>(jobs: &'a [Job], url: &str) -> Option<&'a Job> {
+    jobs.iter()
+        .filter(|job| job.url == url && job.state.is_active())
+        .max_by_key(|job| job.created_at)
+}
 
 impl BrowserPromptWindow {
     pub(super) fn new_progress(
@@ -160,11 +167,7 @@ impl BrowserPromptWindow {
                     // Bind only active jobs; prefer newest so same-URL re-downloads
                     // do not attach to an older Completed/Failed row.
                     let snapshot = self.ipc.jobs_snapshot();
-                    if let Some(j) = snapshot
-                        .iter()
-                        .filter(|j| j.url == *url && j.state.is_active())
-                        .max_by_key(|j| j.created_at)
-                    {
+                    if let Some(j) = newest_active_job_for_url(&snapshot, url) {
                         if self.ipc.try_own_progress_job(&j.id) {
                             bound_id = Some(j.id.clone());
                             if self.waiting_url_noted {
@@ -413,5 +416,59 @@ impl BrowserPromptWindow {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newest_active_job_for_url;
+    use crate::download::{Job, JobState};
+    use std::path::PathBuf;
+
+    fn job(id: &str, url: &str, state: JobState, created_at: u64) -> Job {
+        let mut job = Job::new(
+            url.into(),
+            format!("{id}.bin"),
+            PathBuf::from(format!("C:\\dl\\{id}.bin")),
+            PathBuf::from(format!("C:\\dl\\{id}.bin.part")),
+        );
+        job.id = id.into();
+        job.state = state;
+        job.created_at = created_at;
+        job
+    }
+
+    #[test]
+    fn bind_picks_newest_active_job_for_url() {
+        let url = "https://cdn.example/show.mkv";
+        let jobs = vec![
+            job("old", url, JobState::Completed, 1),
+            job("paused", url, JobState::Paused, 2),
+            job("live", url, JobState::Downloading, 3),
+            job(
+                "other",
+                "https://cdn.example/other.mkv",
+                JobState::Downloading,
+                9,
+            ),
+        ];
+        let bound = newest_active_job_for_url(&jobs, url).expect("active job");
+        assert_eq!(bound.id, "live");
+    }
+
+    #[test]
+    fn bind_skips_terminal_jobs_and_other_urls() {
+        let url = "https://cdn.example/show.mkv";
+        let jobs = vec![
+            job("done", url, JobState::Completed, 5),
+            job("fail", url, JobState::Failed, 6),
+            job(
+                "other",
+                "https://cdn.example/other.mkv",
+                JobState::Queued,
+                7,
+            ),
+        ];
+        assert!(newest_active_job_for_url(&jobs, url).is_none());
     }
 }
