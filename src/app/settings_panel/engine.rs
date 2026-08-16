@@ -2,12 +2,14 @@
 
 use gpui::{prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{
+    button::{Button, ButtonVariants},
     group_box::{GroupBox, GroupBoxVariants},
     h_flex, v_flex,
 };
 
 use super::super::widgets::{
-    field_hint, settings_field_label, settings_input_with_reset, settings_subgroup,
+    field_hint, settings_choice_row, settings_field_label, settings_input_with_reset,
+    settings_subgroup,
 };
 use super::super::DownloadApp;
 use crate::settings::Settings;
@@ -197,6 +199,36 @@ impl DownloadApp {
                                     false,
                                 )),
                         )
+                })
+                .child({
+                    let enabled = self.draft_multi_connection_enabled;
+                    settings_choice_row(
+                        "Multi-connection",
+                        Some("Use parallel Range requests for large files."),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("multi-conn-off")
+                                    .label("Off")
+                                    .when(!enabled, |b| b.primary())
+                                    .when(enabled, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_draft_multi_connection_enabled(
+                                            false, window, cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("multi-conn-on")
+                                    .label("On")
+                                    .when(enabled, |b| b.primary())
+                                    .when(!enabled, |b| b.outline())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_draft_multi_connection_enabled(true, window, cx);
+                                    })),
+                            ),
+                        cx,
+                    )
                 })
                 .when_some(budget_hint, |el, text| el.child(field_hint(text, cx))),
         )

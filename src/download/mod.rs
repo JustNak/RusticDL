@@ -1,6 +1,7 @@
 pub mod bandwidth;
 pub mod client;
 pub mod conn_budget;
+pub mod context;
 pub mod drop_files;
 pub mod duplicates;
 pub mod engine;

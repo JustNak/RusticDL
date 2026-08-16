@@ -9,11 +9,12 @@ use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
+use super::context::TransferContext;
 use super::filesystem::{
     metadata_len, reconcile_from_oracle, remove_partial, FilenameConflictPolicy,
 };
 use super::handoff::{EnqueueOutcome, HandoffAuth};
-use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
+use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate};
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
 use super::resume::{resume_oracle, ResumeOracle};
 use super::transfer::run_transfer;
@@ -31,6 +32,7 @@ pub struct EngineRuntimeConfig {
     pub multi_min_bytes: u64,
     pub max_total_connections: u32,
     pub max_connections_per_host: u32,
+    pub multi_connection_enabled: bool,
 }
 
 impl EngineRuntimeConfig {
@@ -43,6 +45,7 @@ impl EngineRuntimeConfig {
             multi_min_bytes: s.multi_min_bytes,
             max_total_connections: s.max_total_connections,
             max_connections_per_host: s.max_connections_per_host,
+            multi_connection_enabled: s.multi_connection_enabled,
         };
         cfg.sanitize();
         cfg
@@ -350,27 +353,22 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 let _ = progress_tx.send(update);
             });
 
-            // Re-read live multi knobs so UpdateSettings applies to the next attempt.
+            // Re-read live knobs so UpdateSettings applies to the next attempt.
             // Mid-transfer reconnect (short backoff, max 5) is nested inside
             // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
-            let (multi_min, multi_max, conn_budget) = {
+            let (config, conn_budget) = {
                 let guard = inner.lock().await;
-                (
-                    guard.config.multi_min_bytes,
-                    guard.config.multi_max_segments,
-                    guard.conn_budget.clone(),
-                )
+                (guard.config.clone(), guard.conn_budget.clone())
             };
-            let mut ctx = TransferContext::new(
+            let ctx = TransferContext::from_runtime(
                 attempt_job.clone(),
                 control.clone(),
                 on_progress.clone(),
                 handoff_auth.clone(),
                 limiter.clone(),
+                conn_budget,
+                &config,
             );
-            ctx.multi_min_bytes = multi_min;
-            ctx.multi_max_segments = multi_max;
-            ctx.conn_budget = conn_budget;
             let attempt_result = run_transfer(ctx).await;
 
             // Flush remaining patches before any post-attempt state mutation.

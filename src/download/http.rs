@@ -15,7 +15,8 @@ use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::client::{download_client, referer_for_url};
-use super::conn_budget::ConnectionBudget;
+use super::conn_budget::{host_key_for_budget, ConnectionBudget};
+use super::engine::EngineRuntimeConfig;
 use super::eta::EtaSmoother;
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
@@ -223,55 +224,7 @@ pub enum ProgressHint {
 
 pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
-/// Default multi min-size used when a context is built without engine settings.
-pub const DEFAULT_MULTI_MIN_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Attempt-scoped transfer inputs shared by preflight, single-stream, reconnect, and
-/// (later) multi-segment workers. `resolved_url` is pinned after a successful redirect
-/// chain so subsequent requests do not re-walk independent redirect races.
-#[derive(Clone)]
-pub struct TransferContext {
-    pub job: Job,
-    pub control: Arc<AtomicU8>,
-    pub on_progress: ProgressCallback,
-    /// Memory-only browser session headers (snapshot from `EngineInner`).
-    pub handoff_auth: Option<HandoffAuth>,
-    pub limiter: Arc<GlobalBandwidthLimiter>,
-    /// Planner input: files smaller than this never qualify for multi.
-    pub multi_min_bytes: u64,
-    /// Fresh multi partition cap (clamped 1–16 by settings).
-    pub multi_max_segments: u32,
-    /// Process-wide HTTP body budget (global + per-host).
-    pub conn_budget: Arc<ConnectionBudget>,
-    /// Attempt-local; updated only when redirect follow succeeds. Init = `job.url`.
-    pub resolved_url: String,
-    /// Set after a preflight attempt this run so `run_transfer` + single do not double-probe.
-    pub preflight_done: bool,
-}
-
-impl TransferContext {
-    pub fn new(
-        job: Job,
-        control: Arc<AtomicU8>,
-        on_progress: ProgressCallback,
-        handoff_auth: Option<HandoffAuth>,
-        limiter: Arc<GlobalBandwidthLimiter>,
-    ) -> Self {
-        let resolved_url = job.url.clone();
-        Self {
-            job,
-            control,
-            on_progress,
-            handoff_auth,
-            limiter,
-            multi_min_bytes: DEFAULT_MULTI_MIN_BYTES,
-            multi_max_segments: super::segment::DEFAULT_SEGMENT_COUNT,
-            conn_budget: ConnectionBudget::new(32, 8),
-            resolved_url,
-            preflight_done: false,
-        }
-    }
-}
+pub use super::context::TransferContext;
 
 pub async fn run_http_download(
     job: &Job,
@@ -280,12 +233,18 @@ pub async fn run_http_download(
     on_progress: ProgressCallback,
     handoff_auth: Option<&HandoffAuth>,
 ) -> Result<DownloadOutcome, DownloadError> {
-    let mut ctx = TransferContext::new(
+    let config = EngineRuntimeConfig::default();
+    let mut ctx = TransferContext::from_runtime(
         job.clone(),
         control,
         on_progress,
         handoff_auth.cloned(),
         limiter,
+        ConnectionBudget::new(
+            config.max_total_connections,
+            config.max_connections_per_host,
+        ),
+        &config,
     );
     run_http_download_with_ctx(&mut ctx).await
 }
@@ -327,6 +286,16 @@ pub async fn run_http_download_with_ctx(
                 false,
             ));
         }
+    };
+
+    let host = host_key_for_budget(&ctx.resolved_url);
+    let _permit = match ctx
+        .conn_budget
+        .acquire_interruptible(&host, &ctx.control)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(outcome) => return Ok(outcome),
     };
 
     let job_url = ctx.job.url.clone();
@@ -1808,12 +1777,14 @@ mod tests {
             ResumeOracle::Multi { ref map } if map.segments.len() == 1
         ));
 
-        let mut ctx = TransferContext::new(
+        let mut ctx = TransferContext::from_runtime(
             job,
             Arc::new(AtomicU8::new(0)),
             Arc::new(|_: ProgressUpdate| {}),
             None,
             GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            &EngineRuntimeConfig::default(),
         );
         ctx.preflight_done = true;
 
