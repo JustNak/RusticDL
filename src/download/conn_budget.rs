@@ -361,9 +361,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acquire_interruptible_drops_partial_host_permit_on_cancel() {
-        // Global=1, per-host=2: A holds the only global slot. B can take its host
-        // slot then must wait on global — that is the partial-permit window.
-        let budget = ConnectionBudget::new(1, 2);
+        // Global=1, per-host=1: A holds a.com + the only global. B takes b.com's
+        // only host slot then waits on global — that is the partial-permit window.
+        let budget = ConnectionBudget::new(1, 1);
         let held = budget.acquire("a.com").await;
         let control = Arc::new(AtomicU8::new(0));
         let control2 = control.clone();
