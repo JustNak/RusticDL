@@ -25,7 +25,7 @@ pub use drop_files::extract_urls_from_dropped_paths;
 pub use duplicates::find_active_duplicate;
 pub use engine::{
     open_path, reveal_in_folder, spawn_engine, EngineCommand, EngineEvent, EngineHandle,
-    EngineRuntimeConfig,
+    EngineRuntimeConfig, FileJobStore,
 };
 pub use file_type::FileTypeKind;
 pub use filesystem::{

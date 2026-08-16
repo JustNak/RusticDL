@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
@@ -17,15 +16,16 @@ use super::filesystem::{
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::store_control;
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
-use super::progress::{
-    apply_commit_identity, apply_tick, CommitIdentity, IdentityCommit, MapUpdate, ProgressTick,
-    TransferEvent, TransferEventCallback,
-};
+use super::progress::{apply_tick, ProgressTick, TransferEvent, TransferEventCallback};
 use super::resume::{resume_oracle, ResumeOracle};
 use super::transfer::run_transfer;
 use crate::settings::Settings;
 
 mod commands;
+mod persist;
+
+pub(crate) use persist::EngineIdentity;
+pub use persist::{FileJobStore, JobStore, MemoryJobStore};
 
 /// Live engine knobs (from Settings).
 #[derive(Debug, Clone)]
@@ -179,14 +179,18 @@ pub(super) struct EngineInner {
     pub(super) conn_budget: Arc<ConnectionBudget>,
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     wake: Arc<Notify>,
+    store: Arc<dyn JobStore>,
+    persist_tx: mpsc::Sender<persist::PersistReq>,
 }
 
 pub fn spawn_engine(
     initial_jobs: Vec<Job>,
     config: EngineRuntimeConfig,
+    store: Arc<dyn JobStore>,
 ) -> (EngineHandle, mpsc::UnboundedReceiver<EngineEvent>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (persist_tx, persist_rx) = mpsc::channel(64);
     let wake = Arc::new(Notify::new());
 
     let mut config = config;
@@ -218,8 +222,11 @@ pub fn spawn_engine(
         conn_budget,
         event_tx,
         wake: wake.clone(),
+        store,
+        persist_tx,
     }));
 
+    tokio::spawn(persist::persist_actor(inner.clone(), persist_rx));
     tokio::spawn(command_loop(inner.clone(), cmd_rx));
     tokio::spawn(scheduler_loop(inner));
 
@@ -522,33 +529,6 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     });
 }
 
-/// In-memory identity committer.
-pub(crate) struct EngineIdentity {
-    inner: Arc<Mutex<EngineInner>>,
-}
-
-#[async_trait]
-impl IdentityCommit for EngineIdentity {
-    async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String> {
-        apply_commit_identity(job, &c);
-        let mut guard = self.inner.lock().await;
-        let requeued = guard.requeue_on_cancel.contains_key(&job.id);
-        if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
-            // Restart already wiped identity and requeued; do not restore the canceled worker's map.
-            if requeued
-                && canonical.segment_map.is_none()
-                && canonical.transfer_format_version == 0
-                && matches!(c.map, MapUpdate::Set(_) | MapUpdate::Clear)
-            {
-                return Ok(());
-            }
-            apply_commit_identity(canonical, &c);
-            emit_jobs_locked(&guard);
-        }
-        Ok(())
-    }
-}
-
 /// Coalesce ticks then apply at most every `PROGRESS_COALESCE`. Toasts flush now.
 fn spawn_progress_pump(
     inner: Arc<Mutex<EngineInner>>,
@@ -692,7 +672,7 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::super::job::{download_error, ContentValidators, FailureCategory};
-    use super::super::progress::ProgressHint;
+    use super::super::progress::{CommitIdentity, IdentityCommit, MapUpdate, ProgressHint};
     use super::super::segment::{Segment, SegmentMap, SegmentState};
     use super::*;
     use std::path::PathBuf;
@@ -719,7 +699,8 @@ mod tests {
         job: Job,
         event_tx: mpsc::UnboundedSender<EngineEvent>,
     ) -> Arc<Mutex<EngineInner>> {
-        Arc::new(Mutex::new(EngineInner {
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let inner = Arc::new(Mutex::new(EngineInner {
             jobs: vec![job],
             controls: HashMap::new(),
             active: HashMap::new(),
@@ -731,7 +712,11 @@ mod tests {
             conn_budget: ConnectionBudget::new(32, 8),
             event_tx,
             wake: Arc::new(Notify::new()),
-        }))
+            store: Arc::new(MemoryJobStore::default()),
+            persist_tx,
+        }));
+        tokio::spawn(persist::persist_actor(inner.clone(), persist_rx));
+        inner
     }
 
     #[test]
