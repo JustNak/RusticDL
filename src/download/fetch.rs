@@ -484,8 +484,21 @@ fn should_try_http3(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout() || error.is_request() || looks_like_tls_failure(error)
 }
 
+fn should_try_http3_flags(
+    is_connect: bool,
+    is_timeout: bool,
+    is_request: bool,
+    chain: &str,
+) -> bool {
+    is_connect || is_timeout || is_request || looks_like_tls_failure_text(chain)
+}
+
 fn looks_like_tls_failure(error: &reqwest::Error) -> bool {
-    let text = format_error_chain(error).to_ascii_lowercase();
+    looks_like_tls_failure_text(&format_error_chain(error))
+}
+
+fn looks_like_tls_failure_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
     text.contains("tls")
         || text.contains("ssl")
         || text.contains("certificate")
@@ -735,27 +748,47 @@ mod tests {
 
     #[test]
     fn http3_fallback_triggers_on_connect_timeout_request_and_tls() {
-        // Classification is string-based for TLS; connect/timeout/request flags
-        // are reqwest-internal. Keep the TLS-chain matcher locked here.
+        assert!(should_try_http3_flags(
+            true,
+            false,
+            false,
+            "connection refused"
+        ));
+        assert!(should_try_http3_flags(
+            false,
+            true,
+            false,
+            "connection refused"
+        ));
+        assert!(should_try_http3_flags(
+            false,
+            false,
+            true,
+            "connection refused"
+        ));
+        assert!(should_try_http3_flags(
+            false,
+            false,
+            false,
+            "error sending request (received corrupt message of type InvalidContentType)"
+        ));
+        assert!(should_try_http3_flags(
+            false,
+            false,
+            false,
+            "TLS handshake failure"
+        ));
+        assert!(!should_try_http3_flags(
+            false,
+            false,
+            false,
+            "connection refused"
+        ));
         assert!(looks_like_tls_failure_text(
             "error sending request (received corrupt message of type InvalidContentType)"
         ));
         assert!(looks_like_tls_failure_text("TLS handshake failure"));
         assert!(!looks_like_tls_failure_text("connection refused"));
-    }
-
-    fn looks_like_tls_failure_text(text: &str) -> bool {
-        let text = text.to_ascii_lowercase();
-        text.contains("tls")
-            || text.contains("ssl")
-            || text.contains("certificate")
-            || text.contains("handshake")
-            || text.contains("corrupt message")
-            || text.contains("invalidcontenttype")
-            || text.contains("invalid content type")
-            || text.contains("sec_e_invalid_token")
-            || text.contains("frame size")
-            || text.contains("corrupted frame")
     }
 
     #[test]

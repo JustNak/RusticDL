@@ -79,6 +79,10 @@ impl AppendSink {
         self
     }
 
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
     pub async fn sync_data(&self) -> Result<(), DownloadError> {
         self.writer
             .get_ref()
@@ -434,6 +438,106 @@ mod tests {
         assert_eq!(err.category, FailureCategory::Network);
         assert!(err.retryable);
         assert!(err.message.contains("Download incomplete"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn stream_body_writes_delivered_chunk_when_acquire_aborts() {
+        use crate::download::fetch::CONTROL_PAUSED;
+        use std::sync::atomic::Ordering;
+        use tokio::sync::oneshot;
+
+        let payload = b"must-write-even-when-throttle-aborts";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = payload.to_vec();
+        let (body_sent_tx, body_sent_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut collected = Vec::new();
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                sent.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.write_all(&sent).await;
+            let _ = socket.shutdown().await;
+            let _ = body_sent_tx.send(());
+        });
+        let url = format!("http://{addr}/file.bin");
+        let response = get_response(&url).await;
+
+        // Empty the burst bucket so the next acquire must wait (1 B/s refill).
+        let limiter = GlobalBandwidthLimiter::new(Some(1));
+        assert!(
+            limiter
+                .acquire(GlobalBandwidthLimiter::MAX_ACQUIRE_QUANTUM, None)
+                .await
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-limiter-abort-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap();
+        let control = std::sync::Arc::new(AtomicU8::new(0));
+        let control_flip = control.clone();
+        let mut credited = 0u64;
+
+        let stream = stream_body(
+            response,
+            &mut sink,
+            control.as_ref(),
+            limiter.as_ref(),
+            |n| {
+                credited += n;
+            },
+        );
+        let flipper = async {
+            body_sent_rx.await.expect("body sent");
+            // Yield so stream_body can take the chunk and block in acquire
+            // (empty bucket at 1 B/s). CONTROL_POLL is 200 ms.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            control_flip.store(CONTROL_PAUSED, Ordering::Relaxed);
+        };
+        let (end, _) = tokio::join!(stream, flipper);
+        let end = end.expect("stream");
+        match end {
+            StreamEnd::Control(outcome) => {
+                assert_eq!(outcome, DownloadOutcome::Paused);
+            }
+            StreamEnd::Exhausted { downloaded } => {
+                panic!("expected Control after acquire abort, got Exhausted {downloaded}")
+            }
+        }
+        assert_eq!(
+            credited,
+            payload.len() as u64,
+            "delivered chunk must be credited after acquire abort"
+        );
+        assert_eq!(sink.offset(), payload.len() as u64);
+        drop(sink);
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            payload,
+            "delivered chunk must be written after acquire abort"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

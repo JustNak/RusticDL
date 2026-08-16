@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{stream_body, AppendSink, BodySink, StreamEnd, CONTROL_POLL};
+use super::body::{stream_body, AppendSink, StreamEnd, CONTROL_POLL};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;

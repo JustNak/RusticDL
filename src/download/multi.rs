@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_ignored_on_resume_salvages_prefix() {
+    async fn range_ignored_on_resume_is_restart_not_salvage() {
         let total = 2 * MIN_SEGMENT_SIZE as usize;
         let body: Vec<u8> = (0..total).map(|i| (i % 193) as u8).collect();
         let (base, _seen, _handle) =
