@@ -63,7 +63,6 @@ export {
   shouldCaptureDownloadItem,
   shouldPauseDownloadItem,
   shouldWaitForDownloadSize,
-  shouldWaitForSuggestedFilename,
   urlIsClaimed,
 } from './captureFilter';
 
