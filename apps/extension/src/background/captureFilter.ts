@@ -243,27 +243,9 @@ export function shouldWaitForDownloadSize(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
 ): boolean {
-  if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
-  const url = item.finalUrl || item.url;
-  if (!url || !(url.startsWith('http://') || url.startsWith('https://'))) return false;
-  if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
-  if (item.byExtensionId) return false;
-  if (url.startsWith('blob:') || url.startsWith('data:')) return false;
-
-  const mime = (item.mime || '').toLowerCase().split(';')[0].trim();
-  if (isPageOrApiMime(mime)) return false;
-
-  const ext = filenameExtension(item.filename);
-  const ignored = new Set(
-    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
-  );
-  if (ext && ignored.has(ext)) return false;
-
-  const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
-  const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
-  if (!strongName && !mimeLooksLikeDownload(mime)) return false;
-
-  return knownDownloadBytes(item) == null;
+  if (knownDownloadBytes(item) != null) return false;
+  // Assume a non-stub size so wait matches the eventual capture decision.
+  return shouldCaptureDownloadItem({ ...item, totalBytes: MIN_CAPTURE_BYTES }, settings);
 }
 
 /** Wait for size before capturing unknown-size strong names (3 KB wait-page stubs). */

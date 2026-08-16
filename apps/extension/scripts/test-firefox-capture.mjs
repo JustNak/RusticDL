@@ -973,6 +973,19 @@ assert(
 );
 
 assert(
+  'unknown-size non-captured .mkv + octet-stream is ignore, not a size wait',
+  downloadCreatedAction(
+    {
+      url: 'https://cdn.example.com/files/movie.mkv',
+      filename: 'movie.mkv',
+      mime: 'application/octet-stream',
+      totalBytes: -1,
+    },
+    defaultSettings,
+  ) === 'ignore',
+);
+
+assert(
   'token + octet-stream is still a capture decision (name wait is separate)',
   downloadCreatedAction(
     {

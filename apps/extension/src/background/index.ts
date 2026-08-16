@@ -404,7 +404,8 @@ function withHeaderSize(item: CapturedDownloadItem): CapturedDownloadItem {
 }
 
 function needsFilenameHint(item: CapturedDownloadItem): boolean {
-  return isWeakSuggestedFilename(resolveSuggestedFilename(item));
+  const resolved = resolveSuggestedFilename(item);
+  return isWeakSuggestedFilename(resolved) || filenameExtension(resolved) == null;
 }
 
 function isCaptureSizeStub(item: CapturedDownloadItem): boolean {
@@ -582,8 +583,6 @@ async function finalizePendingCapture(item: CapturedDownloadItem) {
   }
   const settings = await getCachedSettings();
   const sized = withHeaderSize(item);
-  // onCreated already decided this is a capture. Only drop stubs, disabled
-  // capture, or a resolved name the user explicitly ignores.
   if (
     !settings.enabled
     || settings.downloadHandoffMode === 'off'
