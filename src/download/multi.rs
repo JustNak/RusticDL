@@ -4,8 +4,8 @@
 //! Progress is **map-authoritative** (`sum(written)`); never `metadata_len`
 //! after a map exists (preallocate would report the full file size).
 //!
-//! If the server cannot honor Range after multi has started, salvage the
-//! contiguous prefix and continue as single-stream instead of asking Restart.
+//! Convert multi→single only when every segment `written == 0`. After any
+//! `written > 0`, an unusable Range is a Resume error and the map is kept.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,42 +103,8 @@ pub(crate) fn may_convert_multi_to_single(map: &SegmentMap) -> bool {
     all_written_zero(map)
 }
 
-/// Bytes from 0 that form a hole-free prefix. Stops at the first incomplete
-/// segment so later islands are not treated as resumeable single-stream data.
-pub(crate) fn contiguous_prefix_bytes(map: &SegmentMap) -> u64 {
-    let mut prefix = 0u64;
-    for segment in &map.segments {
-        if segment.start != prefix {
-            break;
-        }
-        prefix = prefix.saturating_add(segment.written);
-        if segment.written < segment.length() {
-            break;
-        }
-    }
-    prefix
-}
-
-/// Server cannot honor the Range we need for this multi map.
-fn is_range_capability_error(error: &DownloadError) -> bool {
-    if error.category != FailureCategory::Resume {
-        return false;
-    }
-    let message = error.message.as_str();
-    message == RANGE_IGNORED_MESSAGE
-        || message.contains("Unexpected resume range")
-        || message.contains("Missing or invalid Content-Range")
-}
-
-/// Fall back when nothing is written yet, or when Range is unusable so a
-/// contiguous prefix can be kept and the rest fetched on one connection.
-fn should_fallback_to_single(map: &SegmentMap, error: &DownloadError) -> bool {
-    may_convert_multi_to_single(map) || is_range_capability_error(error)
-}
-
-/// Run multi-segment transfer. Falls back to single-stream when every
-/// segment still has `written == 0`, or when the server ignores Range and a
-/// contiguous prefix can be salvaged.
+/// Run multi-segment transfer. Converts to single-stream only when every
+/// segment still has `written == 0`.
 pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
@@ -276,12 +242,10 @@ pub async fn run_multi_segment_download(
         }
         Err((error, map)) => {
             persist_map_exit(ctx, &map, 0);
-            if should_fallback_to_single(&map, &error) {
-                // Windows: DeleteFile / set_len fail while SegmentFileWriter holds the handle.
+            if may_convert_multi_to_single(&map) {
+                // Writer handle blocks DeleteFile on Windows.
                 drop(writer);
-                if let Err(io_err) = prepare_single_stream_partial(ctx, &map).await {
-                    return Err(io_err);
-                }
+                remove_unwritten_partial(ctx).await?;
                 fallback_to_single(ctx, fallback_reason_for(&error)).await
             } else {
                 drop(writer);
@@ -420,53 +384,21 @@ async fn fallback_to_single(
     run_http_download_with_ctx(ctx).await
 }
 
-/// Make `.part` a contiguous v0 file: keep the prefix, drop holes / islands.
-async fn prepare_single_stream_partial(
-    ctx: &mut TransferContext,
-    map: &SegmentMap,
-) -> Result<(), DownloadError> {
-    let prefix = contiguous_prefix_bytes(map);
-    if prefix == 0 {
-        if ctx.job.temp_path.exists() {
-            tokio::fs::remove_file(&ctx.job.temp_path)
-                .await
-                .map_err(|io_err| {
-                    download_error(
-                        FailureCategory::Disk,
-                        format!(
-                            "Could not remove preallocated file before single-stream fallback: {io_err}"
-                        ),
-                        false,
-                    )
-                })?;
-        }
-    } else {
-        let path = ctx.job.temp_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
-            file.set_len(prefix)?;
-            let _ = file.sync_data();
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .map_err(|join| {
-            download_error(
-                FailureCategory::Disk,
-                format!("Could not resize partial file before single-stream fallback: {join}"),
-                false,
-            )
-        })?
-        .map_err(|io_err| {
-            download_error(
-                FailureCategory::Disk,
-                format!("Could not resize partial file before single-stream fallback: {io_err}"),
-                false,
-            )
-        })?;
+/// Drop a zero-written preallocate hole so single-stream does not resume from `metadata_len`.
+async fn remove_unwritten_partial(ctx: &TransferContext) -> Result<(), DownloadError> {
+    if ctx.job.temp_path.exists() {
+        tokio::fs::remove_file(&ctx.job.temp_path)
+            .await
+            .map_err(|io_err| {
+                download_error(
+                    FailureCategory::Disk,
+                    format!(
+                        "Could not remove preallocated file before single-stream fallback: {io_err}"
+                    ),
+                    false,
+                )
+            })?;
     }
-    ctx.job.downloaded_bytes = prefix;
-    ctx.job.total_bytes = map.total_bytes;
-    ctx.job.progress = progress_percent(prefix, map.total_bytes);
     Ok(())
 }
 
@@ -1328,25 +1260,6 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_prefix_stops_at_first_hole() {
-        assert_eq!(contiguous_prefix_bytes(&two_seg_map(0, 0)), 0);
-        assert_eq!(contiguous_prefix_bytes(&two_seg_map(80, 50)), 80);
-        assert_eq!(
-            contiguous_prefix_bytes(&two_seg_map(MIN_SEGMENT_SIZE, 0)),
-            MIN_SEGMENT_SIZE
-        );
-        assert_eq!(
-            contiguous_prefix_bytes(&two_seg_map(MIN_SEGMENT_SIZE, 40)),
-            MIN_SEGMENT_SIZE + 40
-        );
-        let mut gapped = two_seg_map(0, 50);
-        assert_eq!(contiguous_prefix_bytes(&gapped), 0);
-        gapped.segments[0].written = MIN_SEGMENT_SIZE;
-        gapped.segments[1].written = 0;
-        assert_eq!(contiguous_prefix_bytes(&gapped), MIN_SEGMENT_SIZE);
-    }
-
-    #[test]
     fn resume_oracle_legacy_and_map_errors() {
         let mut job = sample_job();
         job.downloaded_bytes = 10;
@@ -1860,15 +1773,43 @@ mod tests {
         ctx.multi_min_bytes = 1;
         ctx.multi_max_segments = 2;
 
-        let outcome = run_transfer(ctx)
+        let err = run_transfer(ctx)
             .await
-            .expect("resume Range-ignore must salvage prefix and finish");
-        assert!(matches!(outcome, DownloadOutcome::Completed));
-        assert_eq!(std::fs::read(&target).expect("final file"), body);
-        assert!(patches.lock().unwrap().iter().any(|p| {
-            p.fallback_reason.as_deref() == Some("multi_resume_fallback")
-                && p.clear_segment_map == Some(true)
-        }));
+            .expect_err("Range ignored after written > 0 must be Resume, not convert");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert_eq!(err.message, RANGE_IGNORED_MESSAGE);
+        assert!(!target.exists(), "must not complete as single-stream");
+        assert_eq!(
+            std::fs::metadata(&temp).map(|m| m.len()).unwrap_or(0),
+            total as u64,
+            ".part must stay preallocated length; no set_len(prefix)"
+        );
+
+        let published = patches.lock().unwrap();
+        assert!(
+            !published.iter().any(|p| p.clear_segment_map == Some(true)),
+            "map must be retained, not cleared"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|p| p.transfer_format_version == Some(0)),
+            "must not roll back version after written > 0"
+        );
+        assert!(
+            !published.iter().any(|p| {
+                p.fallback_reason.as_deref() == Some("multi_resume_fallback")
+                    || p.transfer_mode == Some(TransferMode::Single)
+            }),
+            "must not enter single-stream fallback"
+        );
+        let last_map = published
+            .iter()
+            .rev()
+            .find_map(|p| p.segment_map.clone())
+            .expect("map must stay published");
+        assert_eq!(last_map.segments[0].written, MIN_SEGMENT_SIZE);
+        assert_eq!(last_map.segments[1].written, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
