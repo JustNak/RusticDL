@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::client::download_client;
@@ -26,11 +25,14 @@ use super::filesystem::{
 use super::http::{
     content_range_size_mismatch, control_outcome, progress_percent, reconnect_backoff,
     run_http_download_with_ctx, send_segment_get, should_retry_status, sleep_interruptible,
-    ProgressHint, ProgressUpdate, RECONNECT_MAX,
+    RECONNECT_MAX,
 };
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
     TransferMode,
+};
+use super::progress::{
+    CommitIdentity, MapUpdate, ProgressHint, ProgressTick, TransferEvent, TransferEventCallback,
 };
 use super::resume::{
     resume_oracle, ResumeOracle, FALLBACK_LEGACY_PARTIAL, FALLBACK_MAP_INCONSISTENT,
@@ -133,10 +135,19 @@ pub async fn run_multi_segment_download(
                 Some(_) => FALLBACK_MAP_INCONSISTENT,
             };
             ctx.job.fallback_reason = Some(reason.to_string());
-            (ctx.on_progress)(ProgressUpdate {
-                fallback_reason: Some(reason.to_string()),
-                ..Default::default()
-            });
+            if let Err(message) = ctx
+                .committer
+                .commit(
+                    &mut ctx.job,
+                    CommitIdentity {
+                        fallback_reason: Some(reason.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                return Err(download_error(FailureCategory::Internal, message, false));
+            }
             return Err(error);
         }
     };
@@ -147,7 +158,7 @@ pub async fn run_multi_segment_download(
 
     // version=1 on the in-memory job *before* any set_len so same-process resume is safe.
     apply_multi_identity(ctx, &map, total);
-    emit_force_persist_and_wait(ctx, &map, 0).await;
+    commit_multi_identity(ctx, &map).await?;
 
     if let Err(message) = ensure_parent_directory(&ctx.job.target_path).await {
         return fail_before_workers(
@@ -176,7 +187,7 @@ pub async fn run_multi_segment_download(
             Ok(true) => {
                 map.preallocated = true;
                 ctx.job.segment_map = Some(map.clone());
-                emit_force_persist_and_wait(ctx, &map, 0).await;
+                commit_multi_identity(ctx, &map).await?;
                 true
             }
             Ok(false) => false,
@@ -233,7 +244,7 @@ pub async fn run_multi_segment_download(
     match result {
         Ok((DownloadOutcome::Completed, map)) => finalize_completed(ctx, writer, &map).await,
         Ok((outcome, map)) => {
-            persist_map_exit(ctx, &map, 0);
+            persist_map_exit(ctx, &map, 0).await?;
             if matches!(outcome, DownloadOutcome::Paused) {
                 let flush = writer.clone();
                 let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
@@ -242,7 +253,7 @@ pub async fn run_multi_segment_download(
             Ok(outcome)
         }
         Err((error, map)) => {
-            persist_map_exit(ctx, &map, 0);
+            persist_map_exit(ctx, &map, 0).await?;
             if may_convert_multi_to_single(&map) {
                 // Writer handle blocks DeleteFile on Windows.
                 drop(writer);
@@ -287,53 +298,47 @@ fn apply_multi_identity(ctx: &mut TransferContext, map: &SegmentMap, total: u64)
     ctx.job.progress = progress_percent(ctx.job.downloaded_bytes, total);
 }
 
-fn emit_force_persist(
-    ctx: &TransferContext,
-    map: &SegmentMap,
-    active: u32,
-    hint: Option<ProgressHint>,
-    persist_ack: Option<Arc<Notify>>,
-) {
+fn multi_identity_commit(map: &SegmentMap) -> CommitIdentity {
     let downloaded = map.written_sum();
-    (ctx.on_progress)(ProgressUpdate {
+    CommitIdentity {
         downloaded_bytes: Some(downloaded),
         total_bytes: Some(map.total_bytes),
         progress: Some(progress_percent(downloaded, map.total_bytes)),
         resume_supported: Some(true),
-        state_hint: hint,
         transfer_format_version: Some(1),
-        segment_map: Some(map.clone()),
         transfer_mode: Some(TransferMode::Multi),
-        active_connections: Some(active),
-        persist_ack,
+        map: MapUpdate::Set(map.clone()),
         ..Default::default()
-    });
-}
-
-/// Emit map+version and wait for engine `apply_progress` (timeout if no pump).
-async fn emit_force_persist_and_wait(ctx: &TransferContext, map: &SegmentMap, active: u32) {
-    let ack = Arc::new(Notify::new());
-    emit_force_persist(
-        ctx,
-        map,
-        active,
-        Some(ProgressHint::Starting),
-        Some(ack.clone()),
-    );
-    tokio::select! {
-        _ = ack.notified() => {}
-        // Direct tests have no engine pump; ctx.job already has version=1.
-        // 250ms covers the UI 80ms stash so JobsChanged is more likely flushed.
-        _ = sleep(Duration::from_millis(250)) => {}
     }
 }
 
-fn persist_map_exit(ctx: &mut TransferContext, map: &SegmentMap, active: u32) {
+async fn commit_multi_identity(
+    ctx: &mut TransferContext,
+    map: &SegmentMap,
+) -> Result<(), DownloadError> {
+    ctx.committer
+        .commit(&mut ctx.job, multi_identity_commit(map))
+        .await
+        .map_err(|message| download_error(FailureCategory::Internal, message, false))
+}
+
+async fn persist_map_exit(
+    ctx: &mut TransferContext,
+    map: &SegmentMap,
+    active: u32,
+) -> Result<(), DownloadError> {
     ctx.job.segment_map = Some(map.clone());
     ctx.job.downloaded_bytes = map.written_sum();
     ctx.job.progress = progress_percent(map.written_sum(), map.total_bytes);
-    // No Starting hint — pause-exit must not flip the job back to Starting.
-    emit_force_persist(ctx, map, active, None, None);
+    commit_multi_identity(ctx, map).await?;
+    (ctx.on_progress)(TransferEvent::Tick(ProgressTick {
+        downloaded_bytes: Some(map.written_sum()),
+        total_bytes: Some(map.total_bytes),
+        progress: Some(progress_percent(map.written_sum(), map.total_bytes)),
+        active_connections: Some(active),
+        ..Default::default()
+    }));
+    Ok(())
 }
 
 /// One-shot toast when multi actually converts to single-stream.
@@ -342,7 +347,11 @@ const MULTI_FALLBACK_TOAST: &str = "Fell back to a single connection.";
 /// Roll back v1 map. `continue_as_single` publishes live `active_connections=1`
 /// and a convert toast (skipped when this reason was already recorded).
 /// Hard-fail (`false`) stays at 0 connections and never toasts.
-fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str, continue_as_single: bool) {
+async fn rollback_multi_identity(
+    ctx: &mut TransferContext,
+    reason: &str,
+    continue_as_single: bool,
+) {
     let should_toast = continue_as_single && ctx.job.fallback_reason.as_deref() != Some(reason);
     ctx.job.transfer_format_version = 0;
     ctx.job.segment_map = None;
@@ -350,15 +359,26 @@ fn rollback_multi_identity(ctx: &mut TransferContext, reason: &str, continue_as_
     ctx.job.fallback_reason = Some(reason.to_string());
     let active = if continue_as_single { 1 } else { 0 };
     ctx.job.active_connections = active;
-    (ctx.on_progress)(ProgressUpdate {
-        transfer_format_version: Some(0),
-        clear_segment_map: Some(true),
-        transfer_mode: Some(TransferMode::Single),
-        fallback_reason: Some(reason.to_string()),
+    let _ = ctx
+        .committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                transfer_format_version: Some(0),
+                map: MapUpdate::Clear,
+                transfer_mode: Some(TransferMode::Single),
+                fallback_reason: Some(reason.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    (ctx.on_progress)(TransferEvent::Tick(ProgressTick {
         active_connections: Some(active),
-        toast: should_toast.then(|| MULTI_FALLBACK_TOAST.to_string()),
         ..Default::default()
-    });
+    }));
+    if should_toast {
+        (ctx.on_progress)(TransferEvent::Toast(MULTI_FALLBACK_TOAST.to_string()));
+    }
 }
 
 async fn fail_before_workers(
@@ -372,7 +392,7 @@ async fn fail_before_workers(
             // No writer handle yet (open failed or never opened).
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         }
-        rollback_multi_identity(ctx, "multi_start_failed", false);
+        rollback_multi_identity(ctx, "multi_start_failed", false).await;
     }
     Err(error)
 }
@@ -381,7 +401,7 @@ async fn fallback_to_single(
     ctx: &mut TransferContext,
     reason: &str,
 ) -> Result<DownloadOutcome, DownloadError> {
-    rollback_multi_identity(ctx, reason, true);
+    rollback_multi_identity(ctx, reason, true).await;
     run_http_download_with_ctx(ctx).await
 }
 
@@ -470,7 +490,7 @@ struct SegmentTask {
     pinned_url: String,
     host: String,
     control: Arc<std::sync::atomic::AtomicU8>,
-    on_progress: super::http::ProgressCallback,
+    on_progress: TransferEventCallback,
     handoff: Option<super::handoff::HandoffAuth>,
     limiter: Arc<super::bandwidth::GlobalBandwidthLimiter>,
     budget: Arc<ConnectionBudget>,
@@ -1004,11 +1024,11 @@ async fn try_segment_reconnect(
     *short_reconnects = next;
     let total = task.shared.reconnects.fetch_add(1, Ordering::Relaxed) + 1;
     emit_progress(task, false);
-    (task.on_progress)(ProgressUpdate {
+    (task.on_progress)(TransferEvent::Tick(ProgressTick {
         reconnect_count: Some(total),
         state_hint: Some(ProgressHint::Starting),
         ..Default::default()
-    });
+    }));
     Ok(true)
 }
 
@@ -1020,11 +1040,12 @@ fn mark_segment(shared: &SharedMulti, index: u32, f: impl FnOnce(&mut super::seg
 }
 
 fn emit_progress(task: &SegmentTask, sample_window: bool) {
-    let (map, downloaded, total) = {
+    let (downloaded, total, written) = {
         let map = lock_map(&task.shared.map);
         let downloaded = map.written_sum();
         let total = map.total_bytes;
-        (map.clone(), downloaded, total)
+        let written = map.segments.iter().map(|segment| segment.written).collect();
+        (downloaded, total, written)
     };
     let remaining = total.saturating_sub(downloaded);
     let (speed, eta) = if sample_window {
@@ -1034,17 +1055,17 @@ fn emit_progress(task: &SegmentTask, sample_window: bool) {
     } else {
         last_smoothed(&task.shared)
     };
-    (task.on_progress)(ProgressUpdate {
+    (task.on_progress)(TransferEvent::Tick(ProgressTick {
         downloaded_bytes: Some(downloaded),
         total_bytes: Some(total),
         speed,
         eta_secs: eta,
         progress: Some(progress_percent(downloaded, total)),
         state_hint: Some(ProgressHint::Downloading),
-        segment_map: Some(map),
+        segment_written: Some(written),
         active_connections: Some(task.shared.active.load(Ordering::Relaxed)),
         ..Default::default()
-    });
+    }));
 }
 
 async fn finalize_completed(
@@ -1075,7 +1096,7 @@ async fn finalize_completed(
         verify_sha256_if_expected(&ctx.job.temp_path, ctx.job.expected_sha256.as_deref()).await
     {
         // Hash fail is a Failed transfer: keep .part and retain the completed map.
-        persist_map_exit(ctx, map, 0);
+        persist_map_exit(ctx, map, 0).await?;
         return Err(error);
     }
 
@@ -1089,17 +1110,26 @@ async fn finalize_completed(
 
     let downloaded = map.written_sum().max(map.total_bytes);
     ctx.job.downloaded_bytes = downloaded;
-    (ctx.on_progress)(ProgressUpdate::completed_tick(
-        downloaded,
-        map.total_bytes.max(downloaded),
-        final_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string()),
-        Some(final_path),
-        Some(ctx.job.temp_path.clone()),
-        Some(true),
-    ));
+    let temp_path = ctx.job.temp_path.clone();
+    ctx.committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(downloaded),
+                total_bytes: Some(map.total_bytes.max(downloaded)),
+                progress: Some(100.0),
+                filename: final_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string()),
+                target_path: Some(final_path),
+                temp_path: Some(temp_path),
+                resume_supported: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
     Ok(DownloadOutcome::Completed)
 }
 
@@ -1110,8 +1140,8 @@ mod tests {
     use crate::download::engine::EngineRuntimeConfig;
     use crate::download::filesystem::{looks_like_preallocate_hole, reconcile_partial_progress};
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
-    use crate::download::http::ProgressCallback;
     use crate::download::job::Job;
+    use crate::download::progress::{NoopIdentity, TestProgress};
     use crate::download::segment::{Segment, MIN_SEGMENT_SIZE};
     use crate::download::transfer::run_transfer;
     use crate::download::verify::{sha256_hex, SHA256_EMPTY};
@@ -1131,9 +1161,25 @@ mod tests {
 
     fn test_ctx(
         job: Job,
-        on_progress: ProgressCallback,
+        on_progress: TransferEventCallback,
         handoff: Option<HandoffAuth>,
         max_segments: u32,
+    ) -> TransferContext {
+        test_ctx_commit(
+            job,
+            on_progress,
+            handoff,
+            max_segments,
+            Arc::new(NoopIdentity),
+        )
+    }
+
+    fn test_ctx_commit(
+        job: Job,
+        on_progress: TransferEventCallback,
+        handoff: Option<HandoffAuth>,
+        max_segments: u32,
+        committer: Arc<dyn crate::download::progress::IdentityCommit>,
     ) -> TransferContext {
         TransferContext::from_runtime(
             job,
@@ -1142,6 +1188,7 @@ mod tests {
             handoff,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(32, 8),
+            committer,
             &EngineRuntimeConfig {
                 multi_min_bytes: 1,
                 multi_max_segments: max_segments,
@@ -1375,19 +1422,15 @@ mod tests {
         let url = format!("{base}/file.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
+        let progress = TestProgress::new();
         let ctx = TransferContext::from_runtime(
             job,
             Arc::new(AtomicU8::new(0)),
-            on_progress,
+            progress.callback(),
             None,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(8, 4),
+            progress.identity.clone(),
             &EngineRuntimeConfig {
                 multi_min_bytes: 1,
                 multi_max_segments: 2,
@@ -1412,20 +1455,25 @@ mod tests {
             "expected per-segment Range GETs, got {seen:?}"
         );
 
-        let published = patches.lock().unwrap();
-        assert!(published
+        let snaps = progress.snapshots();
+        assert!(snaps
             .iter()
-            .any(|p| p.transfer_mode == Some(TransferMode::Multi)));
-        assert!(published
+            .any(|job| job.transfer_mode == Some(TransferMode::Multi)));
+        assert!(snaps
             .iter()
-            .any(|p| p.transfer_format_version == Some(1) && p.segment_map.is_some()));
-        // Progress must never jump to full file len before completion.
-        let mid_downloading = published.iter().filter(|p| {
-            p.state_hint == Some(ProgressHint::Downloading)
-                && p.progress.is_some_and(|pct| pct < 100.0)
+            .any(|job| job.transfer_format_version == 1 && job.segment_map.is_some()));
+        let published = progress.events();
+        let mid_downloading = published.iter().filter_map(|event| match event {
+            TransferEvent::Tick(tick)
+                if tick.state_hint == Some(ProgressHint::Downloading)
+                    && tick.progress.is_some_and(|pct| pct < 100.0) =>
+            {
+                Some(tick)
+            }
+            _ => None,
         });
-        for patch in mid_downloading {
-            if let Some(bytes) = patch.downloaded_bytes {
+        for tick in mid_downloading {
+            if let Some(bytes) = tick.downloaded_bytes {
                 assert!(
                     bytes < body.len() as u64,
                     "pre-complete tick must not use file len ({bytes} >= {})",
@@ -1462,7 +1510,7 @@ mod tests {
         job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
         job.downloaded_bytes = MIN_SEGMENT_SIZE;
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, None, 2);
 
         let outcome = run_transfer(ctx).await.expect("resume multi");
@@ -1516,7 +1564,7 @@ mod tests {
                 value: "sid=abc123".into(),
             }],
         };
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, Some(auth), 1);
 
         let outcome = run_transfer(ctx).await.expect("handoff multi");
@@ -1571,7 +1619,7 @@ mod tests {
         job.downloaded_bytes = 0;
         job.transfer_format_version = 0;
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, None, 1);
 
         let outcome = run_transfer(ctx)
@@ -1601,7 +1649,7 @@ mod tests {
         let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
         job.expected_sha256 = Some(expected);
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, None, 2);
 
         let outcome = run_transfer(ctx).await.expect("hash match");
@@ -1628,12 +1676,8 @@ mod tests {
         let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
         job.expected_sha256 = Some(SHA256_EMPTY.into());
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let err = run_transfer(ctx)
             .await
@@ -1643,13 +1687,11 @@ mod tests {
         assert!(temp.exists(), "hash fail must keep .part");
         assert!(!target.exists(), "hash fail must not rename");
 
-        let published = patches.lock().unwrap();
-        let last_map = published.iter().rev().find_map(|p| p.segment_map.as_ref());
+        let snaps = progress.snapshots();
+        let last_map = snaps.iter().rev().find_map(|job| job.segment_map.as_ref());
         let map = last_map.expect("hash fail must retain segment map");
         assert_eq!(map.written_sum(), body.len() as u64);
-        assert!(published
-            .iter()
-            .any(|p| p.transfer_format_version == Some(1)));
+        assert!(snaps.iter().any(|job| job.transfer_format_version == 1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1668,12 +1710,8 @@ mod tests {
         let url = format!("{base}/file.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let outcome = run_transfer(ctx)
             .await
@@ -1681,17 +1719,20 @@ mod tests {
         assert!(matches!(outcome, DownloadOutcome::Completed));
         assert_eq!(std::fs::read(&target).expect("final file"), body);
 
-        let published = patches.lock().unwrap();
+        let snaps = progress.snapshots();
         // Mid-probe GET bytes=1-1 sees the ignored Range (200) and stays single
         // before workers start — do not enter multi then convert.
-        assert!(published.iter().any(|p| {
-            p.fallback_reason.as_deref() == Some("ranges_unsupported")
-                && p.transfer_mode == Some(TransferMode::Single)
+        assert!(snaps.iter().any(|job| {
+            job.fallback_reason.as_deref() == Some("ranges_unsupported")
+                && job.transfer_mode == Some(TransferMode::Single)
         }));
-        assert!(published.iter().any(|p| p.toast.as_deref()
-            == Some(
-                "Multi-connection unavailable for this large file; using a single connection."
-            )));
+        assert!(progress.events().iter().any(|event| {
+            matches!(
+                event,
+                TransferEvent::Toast(msg) if msg
+                    == "Multi-connection unavailable for this large file; using a single connection."
+            )
+        }));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1722,12 +1763,8 @@ mod tests {
         job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
         job.downloaded_bytes = MIN_SEGMENT_SIZE;
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let err = run_transfer(ctx)
             .await
@@ -1741,28 +1778,26 @@ mod tests {
             ".part must stay preallocated length; no set_len(prefix)"
         );
 
-        let published = patches.lock().unwrap();
+        let snaps = progress.snapshots();
         assert!(
-            !published.iter().any(|p| p.clear_segment_map == Some(true)),
+            snaps.iter().all(|job| job.segment_map.is_some()),
             "map must be retained, not cleared"
         );
         assert!(
-            !published
-                .iter()
-                .any(|p| p.transfer_format_version == Some(0)),
+            snaps.iter().all(|job| job.transfer_format_version != 0),
             "must not roll back version after written > 0"
         );
         assert!(
-            !published.iter().any(|p| {
-                p.fallback_reason.as_deref() == Some("multi_resume_fallback")
-                    || p.transfer_mode == Some(TransferMode::Single)
+            !snaps.iter().any(|job| {
+                job.fallback_reason.as_deref() == Some("multi_resume_fallback")
+                    || job.transfer_mode == Some(TransferMode::Single)
             }),
             "must not enter single-stream fallback"
         );
-        let last_map = published
+        let last_map = snaps
             .iter()
             .rev()
-            .find_map(|p| p.segment_map.clone())
+            .find_map(|job| job.segment_map.clone())
             .expect("map must stay published");
         assert_eq!(last_map.segments[0].written, MIN_SEGMENT_SIZE);
         assert_eq!(last_map.segments[1].written, 0);
@@ -1783,7 +1818,7 @@ mod tests {
         let url = format!("{base}/file.bin");
         let job = Job::new(url, "out.bin".into(), target, temp.clone());
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, None, 2);
 
         let result = run_transfer(ctx).await;
@@ -1812,30 +1847,35 @@ mod tests {
         let url = format!("{base}/file.bin");
         let job = Job::new(url, "out.bin".into(), target, temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let result = run_transfer(ctx).await;
         assert!(result.is_err(), "403 should fail after fallback");
 
-        let seen = patches.lock().unwrap();
-        let rollback = seen
+        let snaps = progress.snapshots();
+        let rollback = snaps
             .iter()
-            .find(|p| p.fallback_reason.as_deref() == Some("multi_http_fallback"))
+            .find(|job| job.fallback_reason.as_deref() == Some("multi_http_fallback"))
             .expect("convert should publish fallback_reason");
         assert_eq!(rollback.transfer_mode, Some(TransferMode::Single));
-        assert_eq!(
-            rollback.active_connections,
-            Some(1),
+        let events = progress.events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                TransferEvent::Tick(tick) if tick.active_connections == Some(1)
+            )),
             "continuing as single must keep a live connection"
         );
-        let toasts: Vec<_> = seen.iter().filter(|p| p.toast.is_some()).collect();
+        let toasts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TransferEvent::Toast(msg) => Some(msg.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(toasts.len(), 1, "convert toast must be one-shot");
-        assert_eq!(toasts[0].toast.as_deref(), Some(MULTI_FALLBACK_TOAST));
+        assert_eq!(toasts[0], MULTI_FALLBACK_TOAST);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1854,24 +1894,26 @@ mod tests {
         let mut job = Job::new(url, "out.bin".into(), target, temp);
         job.fallback_reason = Some("multi_http_fallback".into());
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let _ = run_transfer(ctx).await;
 
-        let seen = patches.lock().unwrap();
+        let events = progress.events();
         assert!(
-            seen.iter().all(|p| p.toast.is_none()),
+            events
+                .iter()
+                .all(|event| !matches!(event, TransferEvent::Toast(_))),
             "same convert reason must not re-toast"
         );
-        assert!(seen.iter().any(|p| {
-            p.fallback_reason.as_deref() == Some("multi_http_fallback")
-                && p.active_connections == Some(1)
-        }));
+        assert!(progress
+            .snapshots()
+            .iter()
+            .any(|job| job.fallback_reason.as_deref() == Some("multi_http_fallback")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransferEvent::Tick(tick) if tick.active_connections == Some(1)
+        )));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1892,23 +1934,27 @@ mod tests {
         let url = format!("{base}/file.bin");
         let job = Job::new(url, "out.bin".into(), target, temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let result = run_transfer(ctx).await;
         assert!(result.is_err(), "start checklist should fail");
 
-        let seen = patches.lock().unwrap();
-        let rollback = seen
+        assert!(progress
+            .snapshots()
             .iter()
-            .find(|p| p.fallback_reason.as_deref() == Some("multi_start_failed"))
-            .expect("hard-fail rollback should publish reason");
-        assert_eq!(rollback.active_connections, Some(0));
-        assert!(rollback.toast.is_none(), "hard fail must not toast");
+            .any(|job| job.fallback_reason.as_deref() == Some("multi_start_failed")));
+        let events = progress.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransferEvent::Tick(tick) if tick.active_connections == Some(0)
+        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, TransferEvent::Toast(_))),
+            "hard fail must not toast"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1940,12 +1986,8 @@ mod tests {
         job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
         job.downloaded_bytes = MIN_SEGMENT_SIZE;
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-        let ctx = test_ctx(job, on_progress, None, 2);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(job, progress.callback(), None, 2, progress.identity.clone());
 
         let err = run_transfer(ctx)
             .await
@@ -1956,21 +1998,19 @@ mod tests {
             "expected transfer error, got {err:?}"
         );
 
-        let published = patches.lock().unwrap();
+        let snaps = progress.snapshots();
         assert!(
-            !published.iter().any(|p| p.clear_segment_map == Some(true)),
+            snaps.iter().all(|job| job.segment_map.is_some()),
             "must not clear the map on non-prefix failure"
         );
         assert!(
-            !published
-                .iter()
-                .any(|p| p.transfer_format_version == Some(0)),
+            snaps.iter().all(|job| job.transfer_format_version != 0),
             "must not roll back version on non-prefix failure"
         );
-        let last_map = published
+        let last_map = snaps
             .iter()
             .rev()
-            .find_map(|p| p.segment_map.clone())
+            .find_map(|job| job.segment_map.clone())
             .expect("map must stay published");
         assert_eq!(last_map.segments[0].start, 0);
         assert_eq!(last_map.segments[0].end, MIN_SEGMENT_SIZE - 1);
@@ -1978,10 +2018,10 @@ mod tests {
         assert_eq!(last_map.segments[1].start, MIN_SEGMENT_SIZE);
         assert_eq!(last_map.segments[1].end, total as u64 - 1);
         assert!(
-            !published.iter().any(
-                |p| p.fallback_reason.as_deref() == Some("multi_http_fallback")
-                    || p.fallback_reason.as_deref() == Some("multi_network_fallback")
-            ),
+            !snaps.iter().any(|job| {
+                job.fallback_reason.as_deref() == Some("multi_http_fallback")
+                    || job.fallback_reason.as_deref() == Some("multi_network_fallback")
+            }),
             "convert fallback_reason must not be set when written > 0"
         );
         assert!(temp.exists(), "non-prefix failure must keep the .part");

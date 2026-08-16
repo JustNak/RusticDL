@@ -4968,6 +4968,7 @@ name = "rusticdl"
 version = "0.3.4"
 dependencies = [
  "async-channel 2.5.0",
+ "async-trait",
  "dirs 6.0.0",
  "futures-util",
  "gpui",
