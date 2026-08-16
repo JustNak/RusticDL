@@ -188,6 +188,13 @@ impl BrowserPromptWindow {
     }
 }
 
+/// Confirm starts the 100ms poller so Accept can morph into Progress without
+/// spawning a second task. Keep it alive through Confirm / Conflict / Progress;
+/// stop once the HUD reaches Complete (or the window is gone).
+fn capture_sync_timer_should_continue(phase: &CapturePhase) -> bool {
+    !matches!(phase, CapturePhase::Complete { .. })
+}
+
 fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
     cx.spawn(async move |this, cx| loop {
         cx.background_executor()
@@ -196,10 +203,8 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
         let keep_going = this.update(cx, |this, cx| {
             if matches!(this.phase, CapturePhase::Progress { .. }) {
                 this.sync_from_bridge(cx);
-                true
-            } else {
-                false
             }
+            capture_sync_timer_should_continue(&this.phase)
         });
         match keep_going {
             Ok(true) => {}
@@ -244,5 +249,35 @@ impl Render for BrowserPromptWindow {
             ))
             .child(v_flex().flex_1().w_full().px_4().py_3().gap_3().child(body))
             .children(dialog_layer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn progress_phase() -> CapturePhase {
+        CapturePhase::Progress {
+            job_id: None,
+            url: "https://example.com/f.bin".into(),
+        }
+    }
+
+    #[test]
+    fn sync_timer_stays_alive_until_complete() {
+        // Confirm starts the poller; if it exits here the Progress HUD stays
+        // stuck on "Starting…" after Accept (job never binds).
+        assert!(capture_sync_timer_should_continue(&CapturePhase::Confirm));
+        assert!(capture_sync_timer_should_continue(&CapturePhase::Conflict));
+        assert!(capture_sync_timer_should_continue(&progress_phase()));
+        assert!(!capture_sync_timer_should_continue(
+            &CapturePhase::Complete {
+                job_id: "j1".into(),
+                filename: "f.bin".into(),
+                target_path: PathBuf::from("C:\\dl\\f.bin"),
+                total_bytes: 1,
+            }
+        ));
     }
 }
