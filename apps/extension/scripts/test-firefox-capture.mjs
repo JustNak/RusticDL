@@ -57,6 +57,7 @@ const {
   lookupFilenameHint,
   rememberDeterminedFilename,
   resolveSuggestedFilename,
+  applyDeterminedFilename,
 } = require(chromiumOutfile);
 const {
   firefoxWebRequestDownloadCandidate,
@@ -64,7 +65,6 @@ const {
   abortFirefoxResponseBody,
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
-  shouldWaitForSuggestedFilename,
   downloadCreatedAction,
   knownDownloadBytes,
   matchesInterceptedDownload,
@@ -950,6 +950,11 @@ assert(
 );
 
 assert(
+  'does not treat an extension-less real name as a CDN token',
+  isWeakSuggestedFilename('LICENSE') === false,
+);
+
+assert(
   'prefers the Content-Disposition name over a URL token',
   preferredSuggestedFilename(realVideoName, tokenName) === realVideoName,
 );
@@ -968,20 +973,20 @@ assert(
 );
 
 assert(
-  'waits for a real filename when Chromium only has the URL token',
+  'unknown-size non-captured .mkv + octet-stream is ignore, not a size wait',
   downloadCreatedAction(
     {
-      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
-      filename: tokenName,
+      url: 'https://cdn.example.com/files/movie.mkv',
+      filename: 'movie.mkv',
       mime: 'application/octet-stream',
-      totalBytes: 950 * 1024 * 1024,
+      totalBytes: -1,
     },
     defaultSettings,
-  ) === 'wait',
+  ) === 'ignore',
 );
 
 assert(
-  'captures immediately once Content-Disposition supplied the real name',
+  'token + octet-stream is still a capture decision (name wait is separate)',
   downloadCreatedAction(
     {
       url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
@@ -990,7 +995,6 @@ assert(
       totalBytes: 950 * 1024 * 1024,
     },
     defaultSettings,
-    [realVideoName],
   ) === 'capture',
 );
 
@@ -1008,14 +1012,8 @@ assert(
 );
 
 assert(
-  'shouldWaitForSuggestedFilename is false once a real name is known',
-  shouldWaitForSuggestedFilename(
-    {
-      url: `https://store-073.wnam.tb-cdn.example/${tokenName}`,
-      filename: tokenName,
-    },
-    [realVideoName],
-  ) === false,
+  'resolved name is strong once a Content-Disposition candidate exists',
+  isWeakSuggestedFilename(preferredSuggestedFilename(realVideoName, tokenName)) === false,
 );
 
 const tokenUrl = `https://store-073.wnam.tb-cdn.example/${tokenName}`;
@@ -1050,6 +1048,34 @@ assert(
     url: 'https://cdn.example.com/download/abc',
     filename: 'abc',
   }) === realVideoName,
+);
+
+assert(
+  'does not cache Content-Length from ordinary page responses',
+  rememberResponseFilenameHint({
+    url: 'https://cdn.example.com/assets/app.css',
+    responseHeaders: [
+      { name: 'content-type', value: 'text/css' },
+      { name: 'content-length', value: '4096' },
+    ],
+  }) === undefined
+    && lookupFilenameHint('https://cdn.example.com/assets/app.css') === undefined,
+);
+
+let suggestedOverride = 'unset';
+const determined = applyDeterminedFilename(
+  {
+    id: 9,
+    url: tokenUrl,
+    filename: realVideoName,
+  },
+  (suggestion) => {
+    suggestedOverride = suggestion;
+  },
+);
+assert(
+  'onDeterminingFilename observes the name without rewriting Chrome',
+  determined === realVideoName && suggestedOverride === undefined,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

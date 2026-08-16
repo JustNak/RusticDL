@@ -8,7 +8,7 @@
  */
 import {
   filenameFromContentDisposition,
-  isWeakSuggestedFilename,
+  mimeLooksLikeDownload,
   normalizeCaptureUrl,
   preferredSuggestedFilename,
 } from './captureFilter';
@@ -72,8 +72,16 @@ export function rememberResponseFilenameHint(
   }
   const disposition = headerValue(details.responseHeaders, 'content-disposition') ?? '';
   const filename = filenameFromContentDisposition(disposition);
+  const mime = (headerValue(details.responseHeaders, 'content-type') ?? '')
+    .toLowerCase()
+    .split(';')[0]
+    .trim();
   const totalBytes = contentLength(details.responseHeaders);
-  if (!filename && totalBytes == null) {
+  const downloadLike =
+    Boolean(filename)
+    || /\battachment\b/i.test(disposition)
+    || mimeLooksLikeDownload(mime);
+  if (!downloadLike || (!filename && totalBytes == null)) {
     return undefined;
   }
   const hint: FilenameHint = { filename, totalBytes, ts: Date.now() };
@@ -101,7 +109,7 @@ export function lookupDeterminedFilename(id: number | undefined): string | undef
   return determinedFilenames.get(id)?.filename;
 }
 
-export function hintNamesForDownload(item: {
+function hintNamesForDownload(item: {
   id?: number;
   url?: string;
   finalUrl?: string;
@@ -169,24 +177,19 @@ export function getChromiumDeterminingFilenameApi(): {
 }
 
 /**
- * Call `suggest` synchronously (Chrome times out otherwise). Prefer a
- * Content-Disposition name so a restored browser download keeps the real file.
+ * Observe Chrome's determined name. Always `suggest()` with no override —
+ * rewriting the shelf name is a side effect when we are not capturing.
+ * Chrome times out if suggest is not called synchronously.
  */
 export function applyDeterminedFilename(
   item: ChromiumDeterminingFilenameItem,
   suggest: SuggestFn,
 ): string | undefined {
-  const name = resolveSuggestedFilename(item);
-  rememberDeterminedFilename(item.id, name);
-  const base = name?.split(/[\\/]/).pop();
-  if (base && !isWeakSuggestedFilename(base) && !/[\\/]/.test(base)) {
-    try {
-      suggest({ filename: base });
-    } catch {
-      suggest();
-    }
-  } else {
+  try {
     suggest();
+  } catch {
+    // already settled / API rejected a second suggest
   }
-  return name;
+  rememberDeterminedFilename(item.id, item.filename);
+  return resolveSuggestedFilename(item);
 }

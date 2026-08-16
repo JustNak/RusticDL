@@ -121,8 +121,6 @@ export function filenameFromContentDisposition(value: string): string | undefine
 
 /**
  * True when the name is a CDN token / Chrome temp name, not a user-facing file.
- * `9daaa83c-7e52-4f70-a1b9-17dee6eb5cb2` and `Unconfirmed 12345.crdownload`
- * must not be handed off as suggestedFilename.
  */
 export function isWeakSuggestedFilename(filename: string | undefined): boolean {
   const base = downloadBasename(filename);
@@ -132,8 +130,7 @@ export function isWeakSuggestedFilename(filename: string | undefined): boolean {
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(base)) {
     return true;
   }
-  if (/^[0-9a-f]{20,}$/i.test(base)) return true;
-  return filenameExtension(base) == null;
+  return /^[0-9a-f]{20,}$/i.test(base);
 }
 
 /** Prefer a Content-Disposition / Chrome-determined name over a URL token. */
@@ -144,15 +141,6 @@ export function preferredSuggestedFilename(
     .map(downloadBasename)
     .filter((value): value is string => Boolean(value));
   return names.find((name) => !isWeakSuggestedFilename(name)) ?? names[0];
-}
-
-export function shouldWaitForSuggestedFilename(
-  item: DownloadItemLike,
-  extraNames: Array<string | undefined> = [],
-): boolean {
-  return isWeakSuggestedFilename(
-    preferredSuggestedFilename(...extraNames, item.filename),
-  );
 }
 
 export function isWeakCaptureExtension(ext: string | undefined): boolean {
@@ -255,49 +243,27 @@ export function shouldWaitForDownloadSize(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
 ): boolean {
-  if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
-  const url = item.finalUrl || item.url;
-  if (!url || !(url.startsWith('http://') || url.startsWith('https://'))) return false;
-  if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
-  if (item.byExtensionId) return false;
-  if (url.startsWith('blob:') || url.startsWith('data:')) return false;
-
-  const mime = (item.mime || '').toLowerCase().split(';')[0].trim();
-  if (isPageOrApiMime(mime)) return false;
-
-  const ext = filenameExtension(item.filename);
-  const ignored = new Set(
-    (settings.ignoredFileExtensions ?? []).map((e) => e.toLowerCase()),
-  );
-  if (ext && ignored.has(ext)) return false;
-
-  const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
-  const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
-  if (!strongName && !mimeLooksLikeDownload(mime)) return false;
-
-  return knownDownloadBytes(item) == null;
+  if (knownDownloadBytes(item) != null) return false;
+  // Assume a non-stub size so wait matches the eventual capture decision.
+  return shouldCaptureDownloadItem({ ...item, totalBytes: MIN_CAPTURE_BYTES }, settings);
 }
 
 /** Wait for size before capturing unknown-size strong names (3 KB wait-page stubs). */
 export function downloadCreatedAction(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
-  extraNames: Array<string | undefined> = [],
 ): 'wait' | 'capture' | 'ignore' {
   if (shouldWaitForDownloadSize(item, settings)) return 'wait';
-  if (!shouldCaptureDownloadItem(item, settings)) return 'ignore';
-  // Chromium onCreated uses the URL token (UUID) before Content-Disposition.
-  if (shouldWaitForSuggestedFilename(item, extraNames)) return 'wait';
-  return 'capture';
+  if (shouldCaptureDownloadItem(item, settings)) return 'capture';
+  return 'ignore';
 }
 
 /** Pause immediately — do not let Firefox keep reading the body while we wait or hand off. */
 export function shouldPauseDownloadItem(
   item: DownloadItemLike,
   settings: ExtensionIntegrationSettings,
-  extraNames: Array<string | undefined> = [],
 ): boolean {
-  const action = downloadCreatedAction(item, settings, extraNames);
+  const action = downloadCreatedAction(item, settings);
   return action === 'capture' || action === 'wait';
 }
 

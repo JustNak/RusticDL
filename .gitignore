@@ -18,6 +18,9 @@ Desktop.ini
 # Local review / tooling scratch
 .ui-review/
 
+# Generated docs / local output
+/out/
+
 # Logs and env
 *.log
 .env
