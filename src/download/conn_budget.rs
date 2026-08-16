@@ -136,7 +136,6 @@ impl ConnectionBudget {
         let key = Self::normalize_host(host);
         let host_sem = self.host_semaphore(key).await;
         let host = acquire_owned_interruptible(host_sem, control).await?;
-        // Host permit drops via RAII if this waits and then sees pause/cancel.
         let global = acquire_owned_interruptible(self.global.clone(), control).await?;
 
         Ok(ConnectionPermit {
@@ -357,6 +356,37 @@ mod tests {
         assert!(
             budget.try_acquire("host.example").await.is_some(),
             "paused waiter must not keep a host or global slot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_interruptible_drops_partial_host_permit_on_cancel() {
+        // Global=1, per-host=2: A holds the only global slot. B can take its host
+        // slot then must wait on global — that is the partial-permit window.
+        let budget = ConnectionBudget::new(1, 2);
+        let held = budget.acquire("a.com").await;
+        let control = Arc::new(AtomicU8::new(0));
+        let control2 = control.clone();
+        let budget2 = budget.clone();
+
+        let blocked =
+            tokio::spawn(async move { budget2.acquire_interruptible("b.com", &control2).await });
+
+        sleep(Duration::from_millis(80)).await;
+        control.store(2, Ordering::Relaxed);
+
+        let result = timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("should not hang on cancel")
+            .expect("task");
+        assert!(
+            matches!(result, Err(DownloadOutcome::Canceled)),
+            "acquire_interruptible must return Canceled when control is set"
+        );
+        drop(held);
+        assert!(
+            budget.try_acquire("b.com").await.is_some(),
+            "canceled waiter must release the host slot taken before the global wait"
         );
     }
 

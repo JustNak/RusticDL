@@ -491,6 +491,43 @@ mod tests {
     }
 
     #[test]
+    fn planner_v1_map_missing_still_resume_required_when_multi_disabled() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 10 * 1024 * 1024;
+        job.resume_supported = true;
+        let pf = preflight(Some(10 * 1024 * 1024), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, false);
+        assert!(plan.reason.is_resume_required());
+        assert_eq!(plan.reason, TransferPlanReason::MapMissing);
+        assert_eq!(
+            plan.to_progress_update().fallback_reason.as_deref(),
+            Some("map_missing")
+        );
+    }
+
+    #[test]
+    fn planner_v1_map_inconsistent_still_resume_required_when_multi_disabled() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 1000;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 2,
+            segments: vec![],
+            preallocated: false,
+        });
+        let pf = preflight(Some(1000), Some(true));
+        let plan = plan_transfer(&job, Some(&pf), 1, false);
+        assert!(plan.reason.is_resume_required());
+        assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
+        assert_eq!(
+            plan.to_progress_update().fallback_reason.as_deref(),
+            Some("map_inconsistent")
+        );
+    }
+
+    #[test]
     fn planner_multi_disabled_publishes_reason_and_label() {
         let job = sample_job();
         let pf = preflight(Some(10 * 1024 * 1024), Some(true));
