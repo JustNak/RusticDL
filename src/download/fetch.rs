@@ -481,7 +481,12 @@ fn classify_range_status(response: &reqwest::Response, requested_start: u64) -> 
 }
 
 fn should_try_http3(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || error.is_request() || looks_like_tls_failure(error)
+    should_try_http3_flags(
+        error.is_connect(),
+        error.is_timeout(),
+        error.is_request(),
+        &format_error_chain(error),
+    )
 }
 
 fn should_try_http3_flags(
@@ -491,10 +496,6 @@ fn should_try_http3_flags(
     chain: &str,
 ) -> bool {
     is_connect || is_timeout || is_request || looks_like_tls_failure_text(chain)
-}
-
-fn looks_like_tls_failure(error: &reqwest::Error) -> bool {
-    looks_like_tls_failure_text(&format_error_chain(error))
 }
 
 fn looks_like_tls_failure_text(text: &str) -> bool {
