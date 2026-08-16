@@ -1135,6 +1135,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_identity_skips_set_after_cancel_delete_partial() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Downloading);
+        job.id = "cancel-set".into();
+        job.clear_transfer_identity();
+        let job_id = job.id.clone();
+        let temp_path = job.temp_path.clone();
+        let inner = test_inner(job.clone(), event_tx);
+        inner
+            .lock()
+            .await
+            .pending_partial_deletes
+            .insert(job_id.clone(), temp_path);
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    downloaded_bytes: Some(50),
+                    transfer_format_version: Some(1),
+                    map: MapUpdate::Set(SegmentMap {
+                        total_bytes: 1000,
+                        segment_count: 1,
+                        segments: vec![Segment {
+                            index: 0,
+                            start: 0,
+                            end: 999,
+                            written: 50,
+                            state: SegmentState::Active,
+                        }],
+                        preallocated: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = inner.lock().await;
+        let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert!(canonical.segment_map.is_none());
+        assert_eq!(canonical.transfer_format_version, 0);
+    }
+
+    #[tokio::test]
     async fn engine_identity_patches_canonical_job_without_state_change() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let mut job = sample_job(JobState::Queued);

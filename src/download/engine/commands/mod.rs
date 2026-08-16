@@ -105,6 +105,38 @@ mod tests {
         spawn_engine(jobs, test_config(), Arc::new(MemoryJobStore::default()))
     }
 
+    fn spawn_test_engine_store(
+        jobs: Vec<Job>,
+        store: Arc<MemoryJobStore>,
+    ) -> (
+        EngineHandle,
+        tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    ) {
+        spawn_engine(jobs, test_config(), store)
+    }
+
+    async fn wait_store_identity_cleared(store: &MemoryJobStore, id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cleared = store
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .and_then(|snap| snap.iter().find(|job| job.id == id))
+                    .is_some_and(|job| {
+                        job.transfer_format_version == 0 && job.segment_map.is_none()
+                    });
+                if cleared {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("store never persisted version 0 without map");
+    }
+
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rusticdl-dup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -565,7 +597,8 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_test_engine(vec![job]);
+        let store = Arc::new(MemoryJobStore::default());
+        let (engine, mut events) = spawn_test_engine_store(vec![job], store.clone());
         engine.send(EngineCommand::Restart(id.clone()));
 
         let jobs = next_jobs(&mut events).await;
@@ -582,6 +615,7 @@ mod tests {
         assert!(restarted.transfer_mode.is_none());
         assert!(restarted.fallback_reason.is_none());
         assert!(!restarted.resume_supported);
+        wait_store_identity_cleared(&store, &id).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), "Restart deletes .part");
@@ -611,7 +645,8 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_test_engine(vec![job]);
+        let store = Arc::new(MemoryJobStore::default());
+        let (engine, mut events) = spawn_test_engine_store(vec![job], store.clone());
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: true,
@@ -627,6 +662,7 @@ mod tests {
         assert_eq!(canceled.progress, 0.0);
         assert!(canceled.validators.is_empty());
         assert_eq!(canceled.active_connections, 0);
+        wait_store_identity_cleared(&store, &id).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), "Cancel+delete removes .part");

@@ -20,12 +20,14 @@ const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl DownloadApp {
     pub(crate) fn on_jobs_changed(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
-        self.latest_jobs = Arc::clone(&jobs);
-        if self.last_ui_update.elapsed() < Duration::from_millis(80) {
-            self.pending_jobs = Some(jobs);
-            return;
+        if let Some(jobs) = note_jobs_changed(
+            &mut self.latest_jobs,
+            &mut self.pending_jobs,
+            self.last_ui_update,
+            jobs,
+        ) {
+            self.apply_jobs(jobs, cx);
         }
-        self.apply_jobs(jobs, cx);
     }
 
     pub(crate) fn apply_jobs(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
@@ -173,6 +175,23 @@ impl DownloadApp {
     }
 }
 
+const JOBS_UI_THROTTLE: Duration = Duration::from_millis(80);
+
+/// Update `latest_jobs` on every event. Returns `Some` when render should apply.
+fn note_jobs_changed(
+    latest_jobs: &mut Arc<Vec<Job>>,
+    pending_jobs: &mut Option<Arc<Vec<Job>>>,
+    last_ui_update: Instant,
+    jobs: Arc<Vec<Job>>,
+) -> Option<Arc<Vec<Job>>> {
+    *latest_jobs = Arc::clone(&jobs);
+    if last_ui_update.elapsed() < JOBS_UI_THROTTLE {
+        *pending_jobs = Some(jobs);
+        return None;
+    }
+    Some(jobs)
+}
+
 /// Newest event snapshot. `rendered` is the last applied frame and may be older.
 fn persist_source<'a>(latest_jobs: &'a [Job], _rendered: &'a [Job]) -> &'a [Job] {
     latest_jobs
@@ -201,10 +220,11 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{jobs_need_immediate_persist, persist_source};
+    use super::{jobs_need_immediate_persist, note_jobs_changed, persist_source};
     use crate::download::{Job, JobState};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Instant;
 
     fn sample_job(id: &str, state: JobState) -> Job {
         let mut job = Job::new(
@@ -248,9 +268,19 @@ mod tests {
         rendered_job.transfer_format_version = 0;
         let rendered = Arc::new(vec![rendered_job]);
 
-        let mut latest_job = sample_job("a", JobState::Downloading);
-        latest_job.transfer_format_version = 1;
-        let latest = Arc::new(vec![latest_job]);
+        let mut latest = Arc::clone(&rendered);
+        let mut pending = None;
+        let last_ui_update = Instant::now();
+
+        let mut incoming_job = sample_job("a", JobState::Downloading);
+        incoming_job.transfer_format_version = 1;
+        let incoming = Arc::new(vec![incoming_job]);
+
+        assert!(
+            note_jobs_changed(&mut latest, &mut pending, last_ui_update, incoming,).is_none(),
+            "same-frame JobsChanged must stay throttled"
+        );
+        assert!(pending.is_some());
 
         let flushed = persist_source(&latest, &rendered);
         assert_eq!(flushed[0].transfer_format_version, 1);

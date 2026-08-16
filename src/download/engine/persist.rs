@@ -86,10 +86,11 @@ impl IdentityCommit for EngineIdentity {
         apply_commit_identity(job, &c);
         let applied = {
             let mut guard = self.inner.lock().await;
-            let requeued = guard.requeue_on_cancel.contains_key(&job.id);
+            let identity_wiped = guard.requeue_on_cancel.contains_key(&job.id)
+                || guard.pending_partial_deletes.contains_key(&job.id);
             if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
-                // Restart already wiped identity and requeued; do not restore the canceled worker's map.
-                if requeued
+                // Restart / cancel+delete already wiped identity; do not restore the worker's map.
+                if identity_wiped
                     && canonical.segment_map.is_none()
                     && canonical.transfer_format_version == 0
                     && matches!(c.map, MapUpdate::Set(_) | MapUpdate::Clear)
@@ -122,8 +123,6 @@ mod tests {
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
     use tokio::sync::Notify;
 
     fn sample_job(id: &str) -> Job {
@@ -161,44 +160,23 @@ mod tests {
         }
     }
 
-    struct SlowFirstStore {
-        snapshots: StdMutex<Vec<Vec<Job>>>,
-        writes: StdMutex<u32>,
+    fn last_snapshot(store: &MemoryJobStore) -> Vec<Job> {
+        store
+            .snapshots
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 
-    impl SlowFirstStore {
-        fn new() -> Self {
-            Self {
-                snapshots: StdMutex::new(Vec::new()),
-                writes: StdMutex::new(0),
-            }
-        }
-
-        fn last(&self) -> Vec<Job> {
-            self.snapshots
-                .lock()
-                .unwrap()
-                .last()
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    impl JobStore for SlowFirstStore {
-        fn persist_jobs(&self, jobs: &[Job]) -> Result<(), String> {
-            let n = {
-                let mut writes = self.writes.lock().unwrap();
-                *writes += 1;
-                *writes
-            };
-            // First writer sleeps so a stale snapshot can finish last if the
-            // actor is not re-reading live jobs.
-            if n == 1 {
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            self.snapshots.lock().unwrap().push(jobs.to_vec());
-            Ok(())
-        }
+    fn assert_later_identities(jobs: &[Job]) {
+        let saved_a = jobs.iter().find(|j| j.id == "job-a").expect("job-a");
+        let saved_b = jobs.iter().find(|j| j.id == "job-b").expect("job-b");
+        assert_eq!(saved_a.transfer_format_version, 1);
+        assert_eq!(saved_a.segment_map.as_ref().unwrap().total_bytes, 100);
+        assert_eq!(saved_b.transfer_format_version, 1);
+        assert_eq!(saved_b.segment_map.as_ref().unwrap().total_bytes, 200);
     }
 
     async fn inner_with_store(jobs: Vec<Job>, store: Arc<dyn JobStore>) -> Arc<Mutex<EngineInner>> {
@@ -252,40 +230,85 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_commits_keep_later_identity_of_each_job() {
-        let store = Arc::new(SlowFirstStore::new());
+        let store = Arc::new(MemoryJobStore::default());
         let job_a = sample_job("job-a");
         let job_b = sample_job("job-b");
-        let inner = inner_with_store(vec![job_a.clone(), job_b.clone()], store.clone()).await;
+        let inner = inner_with_store(vec![job_a, job_b], store.clone()).await;
 
-        // In-flight persist of the pre-commit queue; without a live re-read this
-        // write can finish after A/B apply and drop both later identities.
-        let dummy = persist_live_jobs(&inner);
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let persist_tx = {
+            let guard = inner.lock().await;
+            guard.persist_tx.clone()
+        };
 
-        let ident_a = EngineIdentity {
-            inner: inner.clone(),
-        };
-        let ident_b = EngineIdentity {
-            inner: inner.clone(),
-        };
-        let mut job_a = job_a;
-        let mut job_b = job_b;
-        let (dummy_res, a_res, b_res) = tokio::join!(
-            dummy,
-            ident_a.commit(&mut job_a, v1_commit(100)),
-            ident_b.commit(&mut job_b, v1_commit(200)),
+        // Persist is queued while the job lock is held. The actor blocks on that
+        // lock to clone live jobs; both identities are applied before it can write.
+        // A caller-built snapshot taken when the persist was queued would be v0/v0.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        {
+            let mut guard = inner.lock().await;
+            persist_tx.send(PersistReq { ack: ack_tx }).await.unwrap();
+            tokio::task::yield_now().await;
+
+            if let Some(job) = find_job_mut(&mut guard.jobs, "job-a") {
+                apply_commit_identity(job, &v1_commit(100));
+            }
+            if let Some(job) = find_job_mut(&mut guard.jobs, "job-b") {
+                apply_commit_identity(job, &v1_commit(200));
+            }
+        }
+        ack_rx.await.unwrap().unwrap();
+
+        let snaps = store.snapshots.lock().unwrap().clone();
+        assert!(
+            !snaps.is_empty(),
+            "queued persist must write after the lock drops"
         );
-        dummy_res.unwrap();
-        a_res.unwrap();
-        b_res.unwrap();
+        for snap in &snaps {
+            assert_later_identities(snap);
+        }
+    }
 
-        let last = store.last();
-        let saved_a = last.iter().find(|j| j.id == "job-a").expect("job-a");
-        let saved_b = last.iter().find(|j| j.id == "job-b").expect("job-b");
-        assert_eq!(saved_a.transfer_format_version, 1);
-        assert_eq!(saved_a.segment_map.as_ref().unwrap().total_bytes, 100);
-        assert_eq!(saved_b.transfer_format_version, 1);
-        assert_eq!(saved_b.segment_map.as_ref().unwrap().total_bytes, 200);
+    #[tokio::test]
+    async fn cancel_delete_partial_keeps_store_cleared_after_worker_map_commit() {
+        let store = Arc::new(MemoryJobStore::default());
+        let mut job = sample_job("cancel-active");
+        job.state = JobState::Downloading;
+        job.transfer_format_version = 1;
+        job.segment_map = Some(v1_map(1000));
+        let job_id = job.id.clone();
+        let temp_path = job.temp_path.clone();
+        let inner = inner_with_store(vec![job.clone()], store.clone()).await;
+
+        {
+            let mut guard = inner.lock().await;
+            guard
+                .pending_partial_deletes
+                .insert(job_id.clone(), temp_path);
+            if let Some(canonical) = find_job_mut(&mut guard.jobs, &job_id) {
+                canonical.clear_transfer_identity();
+            }
+        }
+        persist_live_jobs(&inner).await.unwrap();
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer.commit(&mut job, v1_commit(1000)).await.unwrap();
+
+        {
+            let mut guard = inner.lock().await;
+            guard.pending_partial_deletes.remove(&job_id);
+            if let Some(canonical) = find_job_mut(&mut guard.jobs, &job_id) {
+                canonical.state = JobState::Canceled;
+                canonical.clear_transfer_identity();
+            }
+        }
+
+        let saved = last_snapshot(&store)
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("job in store");
+        assert_eq!(saved.transfer_format_version, 0);
+        assert!(saved.segment_map.is_none());
     }
 }

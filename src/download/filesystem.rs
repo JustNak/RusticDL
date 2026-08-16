@@ -175,7 +175,7 @@ pub fn looks_like_preallocate_hole(downloaded: u64, on_disk: u64, total: u64) ->
 }
 
 /// v0, no map, no recorded progress, and on-disk length looks like a hole.
-/// New multi starts persist identity before set_len; this remains for legacy fixtures.
+/// v0 fixtures can still have a preallocate hole with no map.
 pub fn is_untracked_preallocate_hole(job: &Job, on_disk: u64) -> bool {
     job.downloaded_bytes == 0
         && job.transfer_format_version == 0
