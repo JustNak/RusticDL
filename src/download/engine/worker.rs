@@ -220,11 +220,22 @@ pub(super) async fn finalize_worker(
     control: &Arc<AtomicU8>,
     final_result: Result<DownloadOutcome, DownloadError>,
 ) {
-    let partial_to_delete = {
+    let (partial_to_delete, defer_start) = {
         let mut guard = inner.lock().await;
+        let requeue = guard.requeue_on_cancel.contains_key(job_id);
+        let has_partial = guard.pending_partial_deletes.contains_key(job_id);
+        // Restart leaves a startable Queued job; wait until the leftover .part is gone.
+        let defer_start = requeue && has_partial;
+
         guard.active.remove(job_id);
-        let requeue = guard.requeue_on_cancel.remove(job_id).is_some();
-        let partial_to_delete = guard.pending_partial_deletes.remove(job_id);
+        if !defer_start {
+            guard.requeue_on_cancel.remove(job_id);
+        }
+        let partial_to_delete = if defer_start {
+            guard.pending_partial_deletes.get(job_id).cloned()
+        } else {
+            guard.pending_partial_deletes.remove(job_id)
+        };
 
         if requeue {
             // Restart already reset the job to Queued; do not overwrite with Canceled.
@@ -294,11 +305,20 @@ pub(super) async fn finalize_worker(
         }
         guard.controls.remove(job_id);
         emit_jobs_locked(&guard);
-        guard.wake.notify_one();
-        partial_to_delete
+        if !defer_start {
+            guard.wake.notify_one();
+        }
+        (partial_to_delete, defer_start)
     };
 
     if let Some(path) = partial_to_delete {
         remove_partial(&path).await;
+    }
+
+    if defer_start {
+        let mut guard = inner.lock().await;
+        guard.pending_partial_deletes.remove(job_id);
+        guard.requeue_on_cancel.remove(job_id);
+        guard.wake.notify_one();
     }
 }

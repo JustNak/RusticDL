@@ -239,16 +239,18 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
                 Vec::new()
             } else {
                 let slots = max - active;
-                let active_ids: std::collections::HashSet<String> =
-                    guard.active.keys().cloned().collect();
                 let mut ids = Vec::new();
-                for job in &mut guard.jobs {
+                for job in &guard.jobs {
                     if ids.len() >= slots {
                         break;
                     }
-                    if job.state == JobState::Queued && !active_ids.contains(&job.id) {
-                        job.state = JobState::Starting;
+                    if job_is_startable(&guard, &job.id) {
                         ids.push(job.id.clone());
+                    }
+                }
+                for id in &ids {
+                    if let Some(job) = find_job_mut(&mut guard.jobs, id) {
+                        job.state = JobState::Starting;
                     }
                 }
                 if !ids.is_empty() {
@@ -346,6 +348,18 @@ async fn apply_tick_event(inner: &Arc<Mutex<EngineInner>>, id: &str, tick: Progr
             emit_jobs_locked(&guard);
         }
     }
+}
+
+/// Restart holds `requeue_on_cancel` / `pending_partial_deletes` until the old
+/// `.part` is gone so a replacement worker cannot open it.
+pub(super) fn job_is_startable(guard: &EngineInner, id: &str) -> bool {
+    guard.jobs.iter().any(|job| {
+        job.id == id
+            && job.state == JobState::Queued
+            && !guard.active.contains_key(id)
+            && !guard.requeue_on_cancel.contains_key(id)
+            && !guard.pending_partial_deletes.contains_key(id)
+    })
 }
 
 /// Zero live transfer metrics when a worker leaves the job (every finalizer path).
@@ -653,6 +667,30 @@ mod tests {
         assert_eq!(job.active_connections, 0);
         assert_eq!(job.speed, 0);
         assert_eq!(job.eta_secs, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_marks_block_start_until_partial_gone() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "block-start".into();
+        let job_id = job.id.clone();
+        let temp = job.temp_path.clone();
+        let inner = test_inner(job, event_tx);
+        {
+            let guard = inner.lock().await;
+            assert!(job_is_startable(&guard, &job_id));
+        }
+        {
+            let mut guard = inner.lock().await;
+            guard.pending_partial_deletes.insert(job_id.clone(), temp);
+            assert!(!job_is_startable(&guard, &job_id));
+            guard.pending_partial_deletes.remove(&job_id);
+            guard.requeue_on_cancel.insert(job_id.clone(), ());
+            assert!(!job_is_startable(&guard, &job_id));
+            guard.requeue_on_cancel.remove(&job_id);
+            assert!(job_is_startable(&guard, &job_id));
+        }
     }
 
     /// Multiple ticks merge into one pending; take drains once.

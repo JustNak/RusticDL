@@ -173,7 +173,7 @@ pub(super) async fn retry(inner: &Arc<Mutex<EngineInner>>, id: String) {
 }
 
 pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
-    let immediate_partial = {
+    let (immediate_partial, worker_running) = {
         let mut guard = inner.lock().await;
         if let Some(ctrl) = guard.controls.get(&id) {
             store_control(ctrl, WorkerControl::Canceled);
@@ -208,16 +208,27 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
             }
             None
         } else {
+            // Scheduler 500ms poll would start this Queued job; block until delete returns.
+            if let Some(path) = temp_path.clone() {
+                guard.pending_partial_deletes.insert(id.clone(), path);
+            }
             temp_path
         };
 
         emit_jobs_locked(&guard);
-        guard.wake.notify_one();
-        immediate
+        if worker_running {
+            guard.wake.notify_one();
+        }
+        (immediate, worker_running)
     };
     let _ = persist_live_jobs(inner).await;
     if let Some(path) = immediate_partial {
         remove_partial(&path).await;
+    }
+    if !worker_running {
+        let mut guard = inner.lock().await;
+        guard.pending_partial_deletes.remove(&id);
+        guard.wake.notify_one();
     }
 }
 

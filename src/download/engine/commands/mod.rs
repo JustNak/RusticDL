@@ -685,17 +685,21 @@ mod tests {
 
         job_control::restart(&inner, id.clone()).await;
 
-        assert!(
-            part.exists(),
-            "Restart must not delete .part while the worker is active"
-        );
         {
-            let guard = inner.lock().await;
+            let mut guard = inner.lock().await;
             assert!(
                 guard.pending_partial_deletes.contains_key(&id),
-                "active restart queues the .part for the finalizer"
+                "active restart queues the .part; delete is not attempted while the worker is live"
             );
             assert!(guard.requeue_on_cancel.contains_key(&id));
+            assert!(!super::super::job_is_startable(&guard, &id));
+            // Dummy active is not the only block: restart marks must hold after it drops.
+            guard.active.remove(&id);
+            assert!(
+                !super::super::job_is_startable(&guard, &id),
+                "Queued+restarting job must not start until finalize deletes the .part"
+            );
+            guard.active.insert(id.clone(), ());
             let restarted = guard.jobs.iter().find(|j| j.id == id).expect("job remains");
             assert_eq!(restarted.state, JobState::Queued);
             assert_eq!(restarted.downloaded_bytes, 0);
@@ -715,9 +719,63 @@ mod tests {
             assert!(!guard.pending_partial_deletes.contains_key(&id));
             assert!(!guard.requeue_on_cancel.contains_key(&id));
             assert!(!guard.active.contains_key(&id));
+            assert!(super::super::job_is_startable(&guard, &id));
             let restarted = guard.jobs.iter().find(|j| j.id == id).expect("job remains");
             assert_eq!(restarted.state, JobState::Queued);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn inactive_restart_is_startable_only_after_part_delete() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/inactive-restart.bin",
+            JobState::Paused,
+            &dir,
+        );
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls: HashMap::new(),
+            active: HashMap::new(),
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::restart(&inner, id.clone()).await;
+
+        {
+            let guard = inner.lock().await;
+            assert!(
+                !guard.pending_partial_deletes.contains_key(&id),
+                "inactive restart must drop the start block after delete"
+            );
+            assert!(super::super::job_is_startable(&guard, &id));
+        }
+        assert!(
+            !part.exists(),
+            "inactive Restart deletes .part before start"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
