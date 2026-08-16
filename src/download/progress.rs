@@ -94,8 +94,8 @@ pub type TransferEventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 
 #[async_trait]
 pub trait IdentityCommit: Send + Sync {
-    /// Apply `c` onto `job`. Engine impl also patches the canonical job by id
-    /// and returns only after that patch is visible.
+    /// Apply `c` onto `job`. Engine impl patches the canonical job and returns
+    /// only after that write is durable.
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String>;
 }
 

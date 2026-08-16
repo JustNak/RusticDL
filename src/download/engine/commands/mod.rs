@@ -76,7 +76,9 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::engine::{spawn_engine, EngineEvent, EngineRuntimeConfig};
+    use crate::download::engine::{
+        spawn_engine, EngineEvent, EngineHandle, EngineRuntimeConfig, MemoryJobStore,
+    };
     use crate::download::handoff::EnqueueStatus;
     use crate::download::job::{ContentValidators, FailureCategory, Job, JobState, TransferMode};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
@@ -92,6 +94,47 @@ mod tests {
         cfg.auto_retry = 0;
         cfg.speed_limit_kib = 0;
         cfg
+    }
+
+    fn spawn_test_engine(
+        jobs: Vec<Job>,
+    ) -> (
+        EngineHandle,
+        tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    ) {
+        spawn_engine(jobs, test_config(), Arc::new(MemoryJobStore::default()))
+    }
+
+    fn spawn_test_engine_store(
+        jobs: Vec<Job>,
+        store: Arc<MemoryJobStore>,
+    ) -> (
+        EngineHandle,
+        tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    ) {
+        spawn_engine(jobs, test_config(), store)
+    }
+
+    async fn wait_store_identity_cleared(store: &MemoryJobStore, id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let cleared = store
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .and_then(|snap| snap.iter().find(|job| job.id == id))
+                    .is_some_and(|job| {
+                        job.transfer_format_version == 0 && job.segment_map.is_none()
+                    });
+                if cleared {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("store never persisted version 0 without map");
     }
 
     fn temp_dir() -> PathBuf {
@@ -173,7 +216,7 @@ mod tests {
         let existing_id = existing.id.clone();
         let existing_name = existing.filename.clone();
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/a.zip".into(),
@@ -209,7 +252,7 @@ mod tests {
         b.state = JobState::Paused;
         let first_id = a.id.clone();
 
-        let (engine, mut events) = spawn_engine(vec![a, b], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![a, b]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/a.zip\nhttps://example.com/b.zip".into(),
@@ -239,7 +282,7 @@ mod tests {
         let dir = temp_dir();
         let existing = sample_job("https://example.com/old.zip", JobState::Paused, &dir);
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/old.zip\nhttps://example.com/new.zip".into(),
@@ -279,7 +322,7 @@ mod tests {
     async fn paused_blocks_same_request_url_redownload() {
         let dir = temp_dir();
         let existing = sample_job("https://example.com/paused.bin", JobState::Paused, &dir);
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/paused.bin".into(),
@@ -303,7 +346,7 @@ mod tests {
         let existing = sample_job(url, state, &dir);
         let old_id = existing.id.clone();
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: url.into(),
@@ -349,7 +392,7 @@ mod tests {
     async fn same_batch_non_adjacent_duplicate_skips_second_a() {
         // extract_http_urls only collapses consecutive exact dups, so A\nB\nA reaches the engine.
         let dir = temp_dir();
-        let (engine, mut events) = spawn_engine(vec![], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/a.zip\nhttps://example.com/b.zip\nhttps://example.com/a.zip"
@@ -390,7 +433,7 @@ mod tests {
         // First paste URL is an active dup; suggested name should land on the first *new* job.
         let dir = temp_dir();
         let existing = sample_job("https://example.com/old.zip", JobState::Paused, &dir);
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/old.zip\nhttps://example.com/new-resource".into(),
@@ -423,7 +466,7 @@ mod tests {
         let dir = temp_dir();
         let existing = sample_job("https://short.example/abc", JobState::Paused, &dir);
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://cdn.example/real/file.bin".into(),
@@ -455,7 +498,7 @@ mod tests {
         let part = job.temp_path.clone();
         job.state = JobState::Queued;
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         // Consume initial JobsChanged from spawn if any; then cancel.
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
@@ -481,7 +524,7 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: false,
@@ -507,7 +550,7 @@ mod tests {
         let dir = temp_dir();
         let job = sample_job("https://example.com/once.bin", JobState::Paused, &dir);
         let id = job.id.clone();
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
 
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
@@ -554,7 +597,8 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let store = Arc::new(MemoryJobStore::default());
+        let (engine, mut events) = spawn_test_engine_store(vec![job], store.clone());
         engine.send(EngineCommand::Restart(id.clone()));
 
         let jobs = next_jobs(&mut events).await;
@@ -571,6 +615,7 @@ mod tests {
         assert!(restarted.transfer_mode.is_none());
         assert!(restarted.fallback_reason.is_none());
         assert!(!restarted.resume_supported);
+        wait_store_identity_cleared(&store, &id).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), "Restart deletes .part");
@@ -600,7 +645,8 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let store = Arc::new(MemoryJobStore::default());
+        let (engine, mut events) = spawn_test_engine_store(vec![job], store.clone());
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: true,
@@ -616,6 +662,7 @@ mod tests {
         assert_eq!(canceled.progress, 0.0);
         assert!(canceled.validators.is_empty());
         assert_eq!(canceled.active_connections, 0);
+        wait_store_identity_cleared(&store, &id).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), "Cancel+delete removes .part");
@@ -639,7 +686,7 @@ mod tests {
         };
         let id = job.id.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: false,
@@ -672,7 +719,7 @@ mod tests {
         let id = job.id.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Resume(id.clone()));
 
         let jobs = next_jobs(&mut events).await;
@@ -704,7 +751,7 @@ mod tests {
         job.downloaded_bytes = 100;
         let id = job.id.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Retry(id.clone()));
 
         let jobs = next_jobs(&mut events).await;
@@ -726,7 +773,7 @@ mod tests {
         let id = job.id.clone();
         let target = job.target_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Remove {
             id: id.clone(),
             delete_partial: true,
@@ -752,7 +799,7 @@ mod tests {
         let target = job.target_path.clone();
         let part = job.temp_path.clone();
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Remove {
             id: id.clone(),
             delete_partial: true,
@@ -776,7 +823,7 @@ mod tests {
         let id = job.id.clone();
         assert!(!job.target_path.exists());
 
-        let (engine, mut events) = spawn_engine(vec![job], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![job]);
         engine.send(EngineCommand::Remove {
             id,
             delete_partial: true,
@@ -796,7 +843,7 @@ mod tests {
         let target = dir.join("same.bin");
         std::fs::write(&target, b"keep-until-finalize").expect("write existing");
 
-        let (engine, mut events) = spawn_engine(vec![], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/same.bin".into(),
@@ -831,7 +878,7 @@ mod tests {
         let part = dir.join("same.bin.part");
         std::fs::write(&part, b"stale-partial").expect("write part");
 
-        let (engine, mut events) = spawn_engine(vec![], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/same.bin".into(),
@@ -863,7 +910,7 @@ mod tests {
         // sample_job always uses file.bin — keep that name for the collision.
         let existing_name = existing.filename.clone();
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/other.bin".into(),
@@ -896,7 +943,7 @@ mod tests {
         let existing = sample_job("https://example.com/failed.bin", JobState::Failed, &dir);
         let existing_name = existing.filename.clone();
 
-        let (engine, mut events) = spawn_engine(vec![existing], test_config());
+        let (engine, mut events) = spawn_test_engine(vec![existing]);
         let (reply_tx, reply_rx) = oneshot::channel();
         engine.send(EngineCommand::Add {
             url: "https://example.com/other.bin".into(),

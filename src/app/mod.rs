@@ -61,6 +61,8 @@ use widgets::render_vignette_overlay;
 
 pub struct DownloadApp {
     jobs: Arc<Vec<Job>>,
+    /// Newest JobsChanged snapshot, including events still waiting on the render throttle.
+    latest_jobs: Arc<Vec<Job>>,
     settings: Settings,
     paths: AppPaths,
     engine: EngineHandle,
@@ -474,6 +476,7 @@ impl DownloadApp {
         let extension_committed = settings.extension.clone();
         let draft_multi_connection_enabled = settings.multi_connection_enabled;
         let mut app = Self {
+            latest_jobs: Arc::clone(&jobs),
             jobs,
             settings,
             paths,

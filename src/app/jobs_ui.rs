@@ -20,11 +20,14 @@ const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl DownloadApp {
     pub(crate) fn on_jobs_changed(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
-        if self.last_ui_update.elapsed() < Duration::from_millis(80) {
-            self.pending_jobs = Some(jobs);
-            return;
+        if let Some(jobs) = note_jobs_changed(
+            &mut self.latest_jobs,
+            &mut self.pending_jobs,
+            self.last_ui_update,
+            jobs,
+        ) {
+            self.apply_jobs(jobs, cx);
         }
-        self.apply_jobs(jobs, cx);
     }
 
     pub(crate) fn apply_jobs(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
@@ -168,12 +171,33 @@ impl DownloadApp {
         }
         self.jobs_dirty = false;
         self.last_jobs_save = Instant::now();
-        let _ = save_jobs(&self.paths, &self.jobs);
+        let _ = save_jobs(&self.paths, persist_source(&self.latest_jobs, &self.jobs));
     }
 }
 
-/// Persist immediately on membership, state, version, or structural map changes.
-/// `written`-only map ticks stay on the 1s debounce (§2.8 accepted lag).
+const JOBS_UI_THROTTLE: Duration = Duration::from_millis(80);
+
+/// Update `latest_jobs` on every event. Returns `Some` when render should apply.
+fn note_jobs_changed(
+    latest_jobs: &mut Arc<Vec<Job>>,
+    pending_jobs: &mut Option<Arc<Vec<Job>>>,
+    last_ui_update: Instant,
+    jobs: Arc<Vec<Job>>,
+) -> Option<Arc<Vec<Job>>> {
+    *latest_jobs = Arc::clone(&jobs);
+    if last_ui_update.elapsed() < JOBS_UI_THROTTLE {
+        *pending_jobs = Some(jobs);
+        return None;
+    }
+    Some(jobs)
+}
+
+/// Newest event snapshot. `rendered` is the last applied frame and may be older.
+fn persist_source<'a>(latest_jobs: &'a [Job], _rendered: &'a [Job]) -> &'a [Job] {
+    latest_jobs
+}
+
+/// Persist immediately on membership or JobState changes. Scalar ticks stay debounced.
 fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     if previous.len() != next.len() {
         return true;
@@ -183,11 +207,7 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     for job in next {
         match prev.get(job.id.as_str()) {
             None => return true,
-            Some(prev_job)
-                if prev_job.state != job.state
-                    || prev_job.transfer_format_version != job.transfer_format_version
-                    || segment_map_structure_changed(&prev_job.segment_map, &job.segment_map) =>
-            {
+            Some(prev_job) if prev_job.state != job.state => {
                 return true;
             }
             _ => {}
@@ -198,24 +218,13 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
         .any(|job| !next.iter().any(|n| n.id == job.id))
 }
 
-/// Force persist on Some/None or bounds/state/preallocated diffs — not `written`.
-fn segment_map_structure_changed(
-    previous: &Option<crate::download::segment::SegmentMap>,
-    next: &Option<crate::download::segment::SegmentMap>,
-) -> bool {
-    match (previous, next) {
-        (None, None) => false,
-        (Some(_), None) | (None, Some(_)) => true,
-        (Some(a), Some(b)) => !a.structure_eq(b),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::jobs_need_immediate_persist;
-    use crate::download::segment::{Segment, SegmentMap, SegmentState};
+    use super::{jobs_need_immediate_persist, note_jobs_changed, persist_source};
     use crate::download::{Job, JobState};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     fn sample_job(id: &str, state: JobState) -> Job {
         let mut job = Job::new(
@@ -227,30 +236,6 @@ mod tests {
         job.id = id.into();
         job.state = state;
         job
-    }
-
-    fn two_seg_map(written0: u64, written1: u64) -> SegmentMap {
-        SegmentMap {
-            total_bytes: 1000,
-            segment_count: 2,
-            segments: vec![
-                Segment {
-                    index: 0,
-                    start: 0,
-                    end: 499,
-                    written: written0,
-                    state: SegmentState::Active,
-                },
-                Segment {
-                    index: 1,
-                    start: 500,
-                    end: 999,
-                    written: written1,
-                    state: SegmentState::Pending,
-                },
-            ],
-            preallocated: true,
-        }
     }
 
     #[test]
@@ -270,34 +255,36 @@ mod tests {
     }
 
     #[test]
-    fn persist_forces_on_transfer_format_version_change() {
+    fn persist_debounces_identity_only_changes() {
         let prev = vec![sample_job("a", JobState::Downloading)];
         let mut next = vec![sample_job("a", JobState::Downloading)];
         next[0].transfer_format_version = 1;
-        assert!(jobs_need_immediate_persist(&prev, &next));
+        assert!(!jobs_need_immediate_persist(&prev, &next));
     }
 
     #[test]
-    fn persist_forces_on_segment_map_structural_diff() {
-        let mut prev = vec![sample_job("a", JobState::Downloading)];
-        prev[0].transfer_format_version = 1;
-        prev[0].segment_map = Some(two_seg_map(10, 0));
+    fn stale_ui_snapshot_is_not_flush_source_after_newer_jobs_changed() {
+        let mut rendered_job = sample_job("a", JobState::Downloading);
+        rendered_job.transfer_format_version = 0;
+        let rendered = Arc::new(vec![rendered_job]);
 
-        let mut next = prev.clone();
-        assert!(!jobs_need_immediate_persist(&prev, &next));
+        let mut latest = Arc::clone(&rendered);
+        let mut pending = None;
+        let last_ui_update = Instant::now();
 
-        // written-only tick: debounce (same bounds/state/preallocated).
-        next[0].segment_map = Some(two_seg_map(20, 0));
-        assert!(!jobs_need_immediate_persist(&prev, &next));
+        let mut incoming_job = sample_job("a", JobState::Downloading);
+        incoming_job.transfer_format_version = 1;
+        let incoming = Arc::new(vec![incoming_job]);
 
-        // SegmentState change with same written: structural — force persist.
-        let mut state_changed = two_seg_map(10, 0);
-        state_changed.segments[0].state = SegmentState::Completed;
-        next[0].segment_map = Some(state_changed);
-        assert!(jobs_need_immediate_persist(&prev, &next));
+        assert!(
+            note_jobs_changed(&mut latest, &mut pending, last_ui_update, incoming,).is_none(),
+            "same-frame JobsChanged must stay throttled"
+        );
+        assert!(pending.is_some());
 
-        next[0].segment_map = None;
-        assert!(jobs_need_immediate_persist(&prev, &next));
+        let flushed = persist_source(&latest, &rendered);
+        assert_eq!(flushed[0].transfer_format_version, 1);
+        assert_eq!(rendered[0].transfer_format_version, 0);
     }
 
     #[test]

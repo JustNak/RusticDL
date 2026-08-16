@@ -23,7 +23,7 @@ mod window_placement;
 use app::DownloadApp;
 use assets::Assets;
 use branding::{APP_NAME, APP_USER_MODEL_ID};
-use download::{spawn_engine, EngineRuntimeConfig};
+use download::{spawn_engine, EngineRuntimeConfig, FileJobStore};
 use gpui::{
     point, px, size, App, AppContext, Application, Bounds, SharedString, WindowBounds,
     WindowDecorations, WindowOptions,
@@ -57,8 +57,13 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = runtime.enter();
 
-    let (engine, mut event_rx) =
-        spawn_engine(jobs.clone(), EngineRuntimeConfig::from_settings(&settings));
+    let (engine, mut event_rx) = spawn_engine(
+        jobs.clone(),
+        EngineRuntimeConfig::from_settings(&settings),
+        Arc::new(FileJobStore {
+            paths: paths.clone(),
+        }),
+    );
 
     let ipc_bridge = IpcBridge::new(engine.clone(), &settings, paths.clone());
     ipc_bridge.update_jobs(Arc::new(jobs.clone()));

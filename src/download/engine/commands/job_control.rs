@@ -9,6 +9,7 @@ use super::super::super::http::store_control;
 use super::super::super::job::{FailureCategory, Job, JobState, WorkerControl};
 use super::super::super::multi::RESUME_RESTART_MESSAGE;
 use super::super::super::resume::{resume_oracle, FALLBACK_MAP_INCONSISTENT, FALLBACK_MAP_MISSING};
+use super::super::persist::persist_live_jobs;
 use super::super::{emit_jobs_locked, find_job_mut, EngineInner};
 
 /// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
@@ -141,6 +142,10 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
         immediate
     };
 
+    if delete_partial {
+        let _ = persist_live_jobs(inner).await;
+    }
+
     if let Some(path) = immediate_partial {
         remove_partial(&path).await;
     }
@@ -203,6 +208,8 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
     }
     emit_jobs_locked(&guard);
     guard.wake.notify_one();
+    drop(guard);
+    let _ = persist_live_jobs(inner).await;
 }
 
 pub(super) async fn remove(

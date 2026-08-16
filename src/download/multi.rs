@@ -7,6 +7,7 @@
 //! Convert multi→single only when every segment `written == 0`. After any
 //! `written > 0`, an unusable Range is a Resume error and the map is kept.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,7 +33,8 @@ use super::job::{
     TransferMode,
 };
 use super::progress::{
-    CommitIdentity, MapUpdate, ProgressHint, ProgressTick, TransferEvent, TransferEventCallback,
+    CommitIdentity, IdentityCommit, MapUpdate, ProgressHint, ProgressTick, TransferEvent,
+    TransferEventCallback,
 };
 use super::resume::{
     resume_oracle, ResumeOracle, FALLBACK_LEGACY_PARTIAL, FALLBACK_MAP_INCONSISTENT,
@@ -126,82 +128,14 @@ pub async fn run_multi_segment_download(
         }
     }
 
-    let total = known_total(&ctx.job)?;
-    let prepared = match prepare_segment_map(&ctx.job, total, ctx.multi_max_segments) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let reason = match ctx.job.segment_map.as_ref() {
-                None => FALLBACK_MAP_MISSING,
-                Some(_) => FALLBACK_MAP_INCONSISTENT,
-            };
-            ctx.job.fallback_reason = Some(reason.to_string());
-            if let Err(message) = ctx
-                .committer
-                .commit(
-                    &mut ctx.job,
-                    CommitIdentity {
-                        fallback_reason: Some(reason.to_string()),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                return Err(download_error(FailureCategory::Internal, message, false));
-            }
-            return Err(error);
-        }
-    };
-    let reused = matches!(prepared, PreparedMap::Reuse(_));
-    let mut map = match prepared {
-        PreparedMap::Reuse(map) | PreparedMap::Fresh(map) => map,
-    };
-
-    // version=1 on the in-memory job *before* any set_len so same-process resume is safe.
-    apply_multi_identity(ctx, &map, total);
-    commit_multi_identity(ctx, &map).await?;
-
-    if let Err(message) = ensure_parent_directory(&ctx.job.target_path).await {
-        return fail_before_workers(
-            ctx,
-            reused,
-            false,
-            download_error(FailureCategory::Disk, message, false),
-        )
-        .await;
-    }
-    if let Err(message) = ensure_parent_directory(&ctx.job.temp_path).await {
-        return fail_before_workers(
-            ctx,
-            reused,
-            false,
-            download_error(FailureCategory::Disk, message, false),
-        )
-        .await;
-    }
-
-    let remaining = total.saturating_sub(map.written_sum());
-    let did_preallocate = if remaining == 0 {
-        map.preallocated
-    } else {
-        match try_preallocate(&ctx.job.temp_path, total, remaining).await {
-            Ok(true) => {
-                map.preallocated = true;
-                ctx.job.segment_map = Some(map.clone());
-                commit_multi_identity(ctx, &map).await?;
-                true
-            }
-            Ok(false) => false,
-            Err(message) => {
-                return fail_before_workers(
-                    ctx,
-                    reused,
-                    false,
-                    download_error(FailureCategory::Disk, message, false),
-                )
-                .await;
-            }
-        }
-    };
+    let persist = Arc::clone(&ctx.committer);
+    let reused = ctx.job.segment_map.is_some();
+    let map = multi_start_checklist(ctx, persist.as_ref(), |path, total, remaining| {
+        let path = path.to_path_buf();
+        async move { try_preallocate(&path, total, remaining).await }
+    })
+    .await?;
+    let did_preallocate = map.preallocated;
 
     let temp_path = ctx.job.temp_path.clone();
     let writer =
@@ -235,6 +169,7 @@ pub async fn run_multi_segment_download(
             }
         };
 
+    let total = map.total_bytes;
     if map.written_sum() >= total && total > 0 {
         return finalize_completed(ctx, writer, &map).await;
     }
@@ -286,6 +221,113 @@ fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
         "Multi-connection requires a known file size.".into(),
         false,
     ))
+}
+
+/// Persist v1+map before `preallocate` / `set_len` so a crash cannot leave an untracked hole.
+async fn multi_start_checklist<F, Fut>(
+    ctx: &mut TransferContext,
+    persist: &dyn IdentityCommit,
+    preallocate: F,
+) -> Result<SegmentMap, DownloadError>
+where
+    F: FnOnce(&Path, u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    let total = known_total(&ctx.job)?;
+    let prepared = match prepare_segment_map(&ctx.job, total, ctx.multi_max_segments) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let reason = match ctx.job.segment_map.as_ref() {
+                None => FALLBACK_MAP_MISSING,
+                Some(_) => FALLBACK_MAP_INCONSISTENT,
+            };
+            ctx.job.fallback_reason = Some(reason.to_string());
+            if let Err(message) = persist
+                .commit(
+                    &mut ctx.job,
+                    CommitIdentity {
+                        fallback_reason: Some(reason.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                return Err(download_error(FailureCategory::Internal, message, false));
+            }
+            return Err(error);
+        }
+    };
+    let reused = matches!(prepared, PreparedMap::Reuse(_));
+    let mut map = match prepared {
+        PreparedMap::Reuse(map) | PreparedMap::Fresh(map) => map,
+    };
+
+    apply_multi_identity(ctx, &map, total);
+    if let Err(message) = persist
+        .commit(&mut ctx.job, multi_identity_commit(&map))
+        .await
+    {
+        return Err(fail_start(
+            ctx,
+            reused,
+            false,
+            download_error(FailureCategory::Disk, message, false),
+        )
+        .await);
+    }
+
+    if let Err(message) = ensure_parent_directory(&ctx.job.target_path).await {
+        return Err(fail_start(
+            ctx,
+            reused,
+            false,
+            download_error(FailureCategory::Disk, message, false),
+        )
+        .await);
+    }
+    if let Err(message) = ensure_parent_directory(&ctx.job.temp_path).await {
+        return Err(fail_start(
+            ctx,
+            reused,
+            false,
+            download_error(FailureCategory::Disk, message, false),
+        )
+        .await);
+    }
+
+    let remaining = total.saturating_sub(map.written_sum());
+    if remaining != 0 {
+        match preallocate(&ctx.job.temp_path, total, remaining).await {
+            Ok(true) => {
+                map.preallocated = true;
+                ctx.job.segment_map = Some(map.clone());
+                if let Err(message) = persist
+                    .commit(&mut ctx.job, multi_identity_commit(&map))
+                    .await
+                {
+                    return Err(fail_start(
+                        ctx,
+                        reused,
+                        true,
+                        download_error(FailureCategory::Disk, message, false),
+                    )
+                    .await);
+                }
+            }
+            Ok(false) => {}
+            Err(message) => {
+                return Err(fail_start(
+                    ctx,
+                    reused,
+                    false,
+                    download_error(FailureCategory::Disk, message, false),
+                )
+                .await);
+            }
+        }
+    }
+
+    Ok(map)
 }
 
 fn apply_multi_identity(ctx: &mut TransferContext, map: &SegmentMap, total: u64) {
@@ -383,20 +425,29 @@ async fn rollback_multi_identity(
     }
 }
 
+async fn fail_start(
+    ctx: &mut TransferContext,
+    reused: bool,
+    did_preallocate: bool,
+    error: DownloadError,
+) -> DownloadError {
+    if !reused {
+        if did_preallocate {
+            // Delete a set_len'd file only when this process created it.
+            let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
+        }
+        rollback_multi_identity(ctx, "multi_start_failed", false).await;
+    }
+    error
+}
+
 async fn fail_before_workers(
     ctx: &mut TransferContext,
     reused: bool,
     did_preallocate: bool,
     error: DownloadError,
 ) -> Result<DownloadOutcome, DownloadError> {
-    if !reused {
-        if did_preallocate {
-            // No writer handle yet (open failed or never opened).
-            let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
-        }
-        rollback_multi_identity(ctx, "multi_start_failed", false).await;
-    }
-    Err(error)
+    Err(fail_start(ctx, reused, did_preallocate, error).await)
 }
 
 async fn fallback_to_single(
@@ -1144,7 +1195,7 @@ mod tests {
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use crate::download::job::Job;
     use crate::download::progress::{
-        apply_commit_identity, IdentityCommit, NoopIdentity, TestProgress,
+        apply_commit_identity, IdentityCommit, MemoryIdentity, NoopIdentity, TestProgress,
     };
     use crate::download::segment::{Segment, MIN_SEGMENT_SIZE};
     use crate::download::transfer::run_transfer;
@@ -2011,6 +2062,102 @@ mod tests {
             "set_len must run after the first v1+map commit, got {snaps:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn preallocate_sees_memory_identity_v1_map_snapshot() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-chk-pre-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = dir.join("out.bin.part");
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "out.bin".into(),
+            target,
+            temp,
+        );
+        job.total_bytes = 2 * MIN_SEGMENT_SIZE;
+        job.validators.expected_size = Some(2 * MIN_SEGMENT_SIZE);
+
+        let identity = Arc::new(MemoryIdentity::default());
+        let persist = identity.clone();
+        let mut ctx = test_ctx_commit(job, Arc::new(|_| {}), None, 2, identity.clone());
+        let saw_v1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_v1_flag = saw_v1.clone();
+        let persist_for_pre = persist.clone();
+
+        let result =
+            multi_start_checklist(&mut ctx, persist.as_ref(), move |_path, _total, _rem| {
+                let persist_for_pre = persist_for_pre.clone();
+                let saw_v1_flag = saw_v1_flag.clone();
+                async move {
+                    let snaps = persist_for_pre.snapshots.lock().unwrap();
+                    let last = snaps.last().expect("commit before preallocate");
+                    assert_eq!(last.transfer_format_version, 1);
+                    assert!(last.segment_map.is_some());
+                    saw_v1_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(false)
+                }
+            })
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            saw_v1.load(std::sync::atomic::Ordering::SeqCst),
+            "injected preallocate must run after v1+map commit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn persist_failure_aborts_multi_start_and_rolls_back() {
+        struct FailPersist;
+
+        #[async_trait::async_trait]
+        impl IdentityCommit for FailPersist {
+            async fn commit(
+                &self,
+                job: &mut crate::download::job::Job,
+                c: CommitIdentity,
+            ) -> Result<(), String> {
+                apply_commit_identity(job, &c);
+                Err("disk persist failed".into())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-chk-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = dir.join("out.bin.part");
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "out.bin".into(),
+            target,
+            temp,
+        );
+        job.total_bytes = 2 * MIN_SEGMENT_SIZE;
+        job.validators.expected_size = Some(2 * MIN_SEGMENT_SIZE);
+
+        let persist = Arc::new(FailPersist);
+        let mut ctx = test_ctx_commit(job, Arc::new(|_| {}), None, 2, persist.clone());
+        let persist = Arc::clone(&ctx.committer);
+
+        let result =
+            multi_start_checklist(&mut ctx, persist.as_ref(), |_path, _total, _rem| async {
+                panic!("preallocate must not run after persist failure");
+            })
+            .await;
+
+        assert!(result.is_err(), "persist failure must abort start");
+        let err = result.unwrap_err();
+        assert_eq!(err.category, FailureCategory::Disk);
+        assert_eq!(ctx.job.transfer_format_version, 0);
+        assert!(ctx.job.segment_map.is_none());
+        assert_eq!(
+            ctx.job.fallback_reason.as_deref(),
+            Some("multi_start_failed")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
