@@ -331,11 +331,13 @@ async fn persist_map_exit(
     ctx.job.downloaded_bytes = map.written_sum();
     ctx.job.progress = progress_percent(map.written_sum(), map.total_bytes);
     commit_multi_identity(ctx, map).await?;
+    let written: Vec<u64> = map.segments.iter().map(|segment| segment.written).collect();
     (ctx.on_progress)(TransferEvent::Tick(ProgressTick {
         downloaded_bytes: Some(map.written_sum()),
         total_bytes: Some(map.total_bytes),
         progress: Some(progress_percent(map.written_sum(), map.total_bytes)),
         active_connections: Some(active),
+        segment_written: Some(written),
         ..Default::default()
     }));
     Ok(())
@@ -1141,7 +1143,9 @@ mod tests {
     use crate::download::filesystem::{looks_like_preallocate_hole, reconcile_partial_progress};
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use crate::download::job::Job;
-    use crate::download::progress::{NoopIdentity, TestProgress};
+    use crate::download::progress::{
+        apply_commit_identity, IdentityCommit, NoopIdentity, TestProgress,
+    };
     use crate::download::segment::{Segment, MIN_SEGMENT_SIZE};
     use crate::download::transfer::run_transfer;
     use crate::download::verify::{sha256_hex, SHA256_EMPTY};
@@ -1914,6 +1918,98 @@ mod tests {
             event,
             TransferEvent::Tick(tick) if tick.active_connections == Some(1)
         )));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn persist_map_exit_tick_includes_written() {
+        let mut job = sample_job();
+        job.total_bytes = 100;
+        let map = SegmentMap {
+            total_bytes: 100,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 99,
+                written: 40,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        };
+        let progress = TestProgress::new();
+        let mut ctx = test_ctx_commit(job, progress.callback(), None, 1, progress.identity.clone());
+        persist_map_exit(&mut ctx, &map, 0).await.unwrap();
+
+        let ticks: Vec<_> = progress
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TransferEvent::Tick(tick) => Some(tick),
+                TransferEvent::Toast(_) => None,
+            })
+            .collect();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].downloaded_bytes, Some(40));
+        assert_eq!(ticks[0].segment_written.as_deref(), Some(&[40][..]));
+    }
+
+    #[tokio::test]
+    async fn v1_map_is_committed_before_set_len() {
+        struct OrderIdentity {
+            snaps: Mutex<Vec<(u32, bool, u64)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl IdentityCommit for OrderIdentity {
+            async fn commit(
+                &self,
+                job: &mut crate::download::job::Job,
+                c: CommitIdentity,
+            ) -> Result<(), String> {
+                apply_commit_identity(job, &c);
+                let len = std::fs::metadata(&job.temp_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                self.snaps.lock().unwrap().push((
+                    job.transfer_format_version,
+                    job.segment_map.as_ref().is_some_and(|m| m.preallocated),
+                    len,
+                ));
+                Ok(())
+            }
+        }
+
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 17) as u8).collect();
+        let (base, _seen, _handle) = spawn_range_server(body.clone(), RangeServeMode::Honest).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-multi-ord-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target, temp);
+
+        let identity = Arc::new(OrderIdentity {
+            snaps: Mutex::new(Vec::new()),
+        });
+        let ctx = test_ctx_commit(job, Arc::new(|_| {}), None, 1, identity.clone());
+        let outcome = run_transfer(ctx).await.expect("transfer");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+
+        let snaps = identity.snaps.lock().unwrap().clone();
+        let first_v1 = snaps
+            .iter()
+            .find(|(version, _, _)| *version >= 1)
+            .expect("v1+map must be committed");
+        assert_eq!(first_v1.2, 0, "v1+map must be committed before set_len");
+        assert!(
+            snaps
+                .iter()
+                .any(|(version, preallocated, len)| *version >= 1 && *preallocated && *len > 0),
+            "set_len must run after the first v1+map commit, got {snaps:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -8,14 +8,14 @@ use async_trait::async_trait;
 use super::job::{ContentValidators, Job, JobState, TransferMode};
 use super::segment::SegmentMap;
 
-/// Progress *channel* payload. Identity never travels here.
+/// Tick or toast from a transfer worker.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
     Tick(ProgressTick),
     Toast(String),
 }
 
-/// Coalesced scalars. No map, no validators, no toast.
+/// Coalesced progress scalars.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressTick {
     pub downloaded_bytes: Option<u64>,
@@ -26,7 +26,7 @@ pub struct ProgressTick {
     pub state_hint: Option<ProgressHint>,
     pub active_connections: Option<u32>,
     pub reconnect_count: Option<u32>,
-    /// Optional in-place `written` counters (index-aligned). Not a persist trigger.
+    /// Index-aligned written counters; ignored when lengths differ.
     pub segment_written: Option<Vec<u64>>,
 }
 
@@ -219,7 +219,10 @@ pub fn apply_tick(job: &mut Job, tick: ProgressTick) -> bool {
         if let Some(map) = job.segment_map.as_mut() {
             if written.len() == map.segments.len() {
                 for (segment, n) in map.segments.iter_mut().zip(written) {
-                    segment.written = n;
+                    // Persist ticks may omit written; do not roll counters back after commit().
+                    if n > segment.written {
+                        segment.written = n;
+                    }
                 }
             }
         }
@@ -495,6 +498,30 @@ mod tests {
         assert_eq!(after.segments[0].end, map.segments[0].end);
         assert_eq!(job.downloaded_bytes, 40);
         assert_eq!(job.validators, ContentValidators::default());
+    }
+
+    #[test]
+    fn apply_tick_does_not_roll_written_backward_after_commit() {
+        let mut job = sample_job(JobState::Downloading);
+        let mut map = sample_map();
+        map.segments[0].written = 100;
+        job.segment_map = Some(map);
+        job.downloaded_bytes = 100;
+
+        let pending = ProgressTick {
+            segment_written: Some(vec![80]),
+            ..Default::default()
+        };
+        let persist = ProgressTick {
+            downloaded_bytes: Some(100),
+            segment_written: None,
+            ..Default::default()
+        };
+        let merged = pending.merge(persist);
+        assert_eq!(merged.segment_written.as_deref(), Some(&[80][..]));
+        apply_tick(&mut job, merged);
+        assert_eq!(job.segment_map.as_ref().unwrap().segments[0].written, 100);
+        assert_eq!(job.downloaded_bytes, 100);
     }
 
     #[test]

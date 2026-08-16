@@ -73,7 +73,7 @@ pub struct TransferPlan {
     pub reason: TransferPlanReason,
 }
 
-/// Planner Tick plus an optional one-shot toast. Identity is a separate commit.
+/// Planner Tick plus an optional one-shot toast.
 #[derive(Debug, Clone)]
 pub struct VisibilityUpdate {
     pub tick: ProgressTick,

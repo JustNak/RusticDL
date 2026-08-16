@@ -133,7 +133,8 @@ pub async fn run_http_download_with_ctx(
     let mut target_path = ctx.job.target_path.clone();
     let mut temp_path = ctx.job.temp_path.clone();
     let mut filename = ctx.job.filename.clone();
-    // Mutated on full-replace so reconnect oracle matches the progress patch (v1+ → 0).
+    // Mutated on full-replace so the reconnect oracle matches the committed
+    // identity (v1+ → contiguous v0).
     let mut transfer_format_version = ctx.job.transfer_format_version;
     let mut total_bytes: u64;
     let mut resume_supported = ctx.job.resume_supported;

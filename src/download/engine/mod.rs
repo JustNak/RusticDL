@@ -18,8 +18,8 @@ use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::store_control;
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
 use super::progress::{
-    apply_commit_identity, apply_tick, CommitIdentity, IdentityCommit, ProgressTick, TransferEvent,
-    TransferEventCallback,
+    apply_commit_identity, apply_tick, CommitIdentity, IdentityCommit, MapUpdate, ProgressTick,
+    TransferEvent, TransferEventCallback,
 };
 use super::resume::{resume_oracle, ResumeOracle};
 use super::transfer::run_transfer;
@@ -522,7 +522,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     });
 }
 
-/// In-memory identity committer. Locks the engine, patches the canonical job, emits.
+/// In-memory identity committer.
 pub(crate) struct EngineIdentity {
     inner: Arc<Mutex<EngineInner>>,
 }
@@ -532,7 +532,16 @@ impl IdentityCommit for EngineIdentity {
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String> {
         apply_commit_identity(job, &c);
         let mut guard = self.inner.lock().await;
+        let requeued = guard.requeue_on_cancel.contains_key(&job.id);
         if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
+            // Restart already wiped identity and requeued; do not restore the canceled worker's map.
+            if requeued
+                && canonical.segment_map.is_none()
+                && canonical.transfer_format_version == 0
+                && matches!(c.map, MapUpdate::Set(_) | MapUpdate::Clear)
+            {
+                return Ok(());
+            }
             apply_commit_identity(canonical, &c);
             emit_jobs_locked(&guard);
         }
@@ -1024,6 +1033,120 @@ mod tests {
         assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(job.progress, 0.0);
         assert_eq!(job.speed, 0);
+    }
+
+    #[tokio::test]
+    async fn persist_tick_without_written_does_not_roll_map_backward_after_commit() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Downloading);
+        job.id = "persist-stale-written".into();
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 100,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 99,
+                written: 0,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        });
+        let job_id = job.id.clone();
+        let inner = test_inner(job, event_tx);
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        let mut worker_job = {
+            let guard = inner.lock().await;
+            guard.jobs.iter().find(|j| j.id == job_id).unwrap().clone()
+        };
+        let mut committed = worker_job.segment_map.clone().unwrap();
+        committed.segments[0].written = 100;
+        committer
+            .commit(
+                &mut worker_job,
+                CommitIdentity {
+                    downloaded_bytes: Some(100),
+                    map: MapUpdate::Set(committed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
+        tx.send(TransferEvent::Tick(ProgressTick {
+            segment_written: Some(vec![80]),
+            ..Default::default()
+        }))
+        .unwrap();
+        tx.send(TransferEvent::Tick(ProgressTick {
+            downloaded_bytes: Some(100),
+            segment_written: None,
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+        pump.await.expect("pump join");
+
+        let guard = inner.lock().await;
+        let job = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert_eq!(job.downloaded_bytes, 100);
+        assert_eq!(job.segment_map.as_ref().unwrap().segments[0].written, 100);
+    }
+
+    #[tokio::test]
+    async fn engine_identity_skips_set_after_restart_requeue() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "restart-set".into();
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 0.0;
+        job.clear_transfer_identity();
+        let job_id = job.id.clone();
+        let inner = test_inner(job.clone(), event_tx);
+        inner
+            .lock()
+            .await
+            .requeue_on_cancel
+            .insert(job_id.clone(), ());
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    downloaded_bytes: Some(50),
+                    transfer_format_version: Some(1),
+                    map: MapUpdate::Set(SegmentMap {
+                        total_bytes: 1000,
+                        segment_count: 1,
+                        segments: vec![Segment {
+                            index: 0,
+                            start: 0,
+                            end: 999,
+                            written: 50,
+                            state: SegmentState::Active,
+                        }],
+                        preallocated: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = inner.lock().await;
+        let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert!(canonical.segment_map.is_none());
+        assert_eq!(canonical.transfer_format_version, 0);
+        assert_eq!(canonical.downloaded_bytes, 0);
     }
 
     #[tokio::test]
