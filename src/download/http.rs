@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
-use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
@@ -25,10 +24,13 @@ use super::filesystem::{
 use super::handoff::{handoff_auth_for_request_url, is_allowed_handoff_header, HandoffAuth};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
-    TransferMode, WorkerControl,
+    WorkerControl,
+};
+use super::progress::{
+    CommitIdentity, MapUpdate, NoopIdentity, ProgressHint, ProgressTick, TransferEvent,
+    TransferEventCallback,
 };
 use super::resume::{resume_oracle, ResumeOracle};
-use super::segment::SegmentMap;
 use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
@@ -46,183 +48,8 @@ const CONTROL_CONTINUE: u8 = 0;
 const CONTROL_PAUSED: u8 = 1;
 const CONTROL_CANCELED: u8 = 2;
 
-/// Partial progress patch. `None` = leave the field unchanged on apply/merge.
-/// Structured fields (`validators`, metrics) stay sparse `None` on speed ticks so
-/// coalesce never clears them.
-#[derive(Debug, Clone, Default)]
-pub struct ProgressUpdate {
-    pub downloaded_bytes: Option<u64>,
-    pub total_bytes: Option<u64>,
-    pub speed: Option<u64>,
-    pub eta_secs: Option<u64>,
-    pub progress: Option<f64>,
-    pub filename: Option<String>,
-    pub target_path: Option<std::path::PathBuf>,
-    pub temp_path: Option<std::path::PathBuf>,
-    pub resume_supported: Option<bool>,
-    pub state_hint: Option<ProgressHint>,
-    pub validators: Option<ContentValidators>,
-    /// When `Some(true)`, `validators` **replaces** job identity (not `merge_present`).
-    /// Used on 200 full-replace so stale ETags cannot thrash subsequent resumes.
-    pub replace_validators: Option<bool>,
-    pub transfer_format_version: Option<u32>,
-    pub active_connections: Option<u32>,
-    pub reconnect_count: Option<u32>,
-    pub transfer_mode: Option<TransferMode>,
-    pub fallback_reason: Option<String>,
-    /// One-shot UI toast (engine emits `EngineEvent::Toast`; not stored on Job).
-    pub toast: Option<String>,
-    /// None = unchanged. Speed ticks must not clear a stored map.
-    pub segment_map: Option<SegmentMap>,
-    /// When `Some(true)`, clear `job.segment_map` (multi→single rollback).
-    pub clear_segment_map: Option<bool>,
-    /// Engine `apply_progress` notifies this after the patch is applied (or skipped).
-    pub persist_ack: Option<Arc<Notify>>,
-}
-
 const FULL_REPLACE_NOTICE: &str =
     "Remote file changed or server ignored resume; restarting download from the beginning.";
-
-impl ProgressUpdate {
-    /// Merge two patches in order: `later` wins on `Some` fields (`later.or(self)`).
-    pub fn merge(self, later: Self) -> Self {
-        Self {
-            downloaded_bytes: later.downloaded_bytes.or(self.downloaded_bytes),
-            total_bytes: later.total_bytes.or(self.total_bytes),
-            speed: later.speed.or(self.speed),
-            eta_secs: later.eta_secs.or(self.eta_secs),
-            progress: later.progress.or(self.progress),
-            filename: later.filename.or(self.filename),
-            target_path: later.target_path.or(self.target_path),
-            temp_path: later.temp_path.or(self.temp_path),
-            resume_supported: later.resume_supported.or(self.resume_supported),
-            state_hint: later.state_hint.or(self.state_hint),
-            validators: later.validators.or(self.validators),
-            replace_validators: later.replace_validators.or(self.replace_validators),
-            transfer_format_version: later
-                .transfer_format_version
-                .or(self.transfer_format_version),
-            active_connections: later.active_connections.or(self.active_connections),
-            reconnect_count: later.reconnect_count.or(self.reconnect_count),
-            transfer_mode: later.transfer_mode.or(self.transfer_mode),
-            fallback_reason: later.fallback_reason.or(self.fallback_reason),
-            toast: later.toast.or(self.toast),
-            segment_map: later.segment_map.or(self.segment_map),
-            clear_segment_map: later.clear_segment_map.or(self.clear_segment_map),
-            persist_ack: later.persist_ack.or(self.persist_ack),
-        }
-    }
-
-    /// Starting metadata tick (paths/filename/resume/validators + zero speed).
-    pub fn starting_tick(
-        downloaded: u64,
-        total: u64,
-        filename: Option<String>,
-        target_path: Option<std::path::PathBuf>,
-        temp_path: Option<std::path::PathBuf>,
-        resume_supported: Option<bool>,
-        validators: Option<ContentValidators>,
-    ) -> Self {
-        Self {
-            downloaded_bytes: Some(downloaded),
-            total_bytes: Some(total),
-            speed: Some(0),
-            eta_secs: Some(0),
-            progress: Some(progress_percent(downloaded, total)),
-            filename,
-            target_path,
-            temp_path,
-            resume_supported,
-            state_hint: Some(ProgressHint::Starting),
-            validators,
-            replace_validators: None,
-            transfer_format_version: None,
-            active_connections: Some(1),
-            reconnect_count: None,
-            transfer_mode: None,
-            fallback_reason: None,
-            toast: None,
-            segment_map: None,
-            clear_segment_map: None,
-            persist_ack: None,
-        }
-    }
-
-    /// Periodic downloading scalar tick (no path/filename/validator changes).
-    pub fn downloading_tick(
-        downloaded: u64,
-        total: u64,
-        speed: u64,
-        eta: u64,
-        progress: f64,
-    ) -> Self {
-        Self {
-            downloaded_bytes: Some(downloaded),
-            total_bytes: Some(total),
-            speed: Some(speed),
-            eta_secs: Some(eta),
-            progress: Some(progress),
-            filename: None,
-            target_path: None,
-            temp_path: None,
-            resume_supported: None,
-            state_hint: Some(ProgressHint::Downloading),
-            validators: None,
-            replace_validators: None,
-            transfer_format_version: None,
-            active_connections: None,
-            reconnect_count: None,
-            transfer_mode: None,
-            fallback_reason: None,
-            toast: None,
-            segment_map: None,
-            clear_segment_map: None,
-            persist_ack: None,
-        }
-    }
-
-    /// Final completion patch (100%, zero speed, final paths).
-    pub fn completed_tick(
-        downloaded: u64,
-        total: u64,
-        filename: Option<String>,
-        target_path: Option<std::path::PathBuf>,
-        temp_path: Option<std::path::PathBuf>,
-        resume_supported: Option<bool>,
-    ) -> Self {
-        Self {
-            downloaded_bytes: Some(downloaded),
-            total_bytes: Some(total),
-            speed: Some(0),
-            eta_secs: Some(0),
-            progress: Some(100.0),
-            filename,
-            target_path,
-            temp_path,
-            resume_supported,
-            state_hint: Some(ProgressHint::Downloading),
-            validators: None,
-            replace_validators: None,
-            transfer_format_version: None,
-            active_connections: None,
-            reconnect_count: None,
-            transfer_mode: None,
-            fallback_reason: None,
-            toast: None,
-            segment_map: None,
-            clear_segment_map: None,
-            persist_ack: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressHint {
-    Starting,
-    Downloading,
-}
-
-pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 pub use super::context::TransferContext;
 
@@ -230,7 +57,7 @@ pub async fn run_http_download(
     job: &Job,
     limiter: Arc<GlobalBandwidthLimiter>,
     control: Arc<AtomicU8>,
-    on_progress: ProgressCallback,
+    on_progress: TransferEventCallback,
     handoff_auth: Option<&HandoffAuth>,
 ) -> Result<DownloadOutcome, DownloadError> {
     let config = EngineRuntimeConfig::default();
@@ -244,6 +71,7 @@ pub async fn run_http_download(
             config.max_total_connections,
             config.max_connections_per_host,
         ),
+        Arc::new(NoopIdentity),
         &config,
     );
     run_http_download_with_ctx(&mut ctx).await
@@ -305,7 +133,8 @@ pub async fn run_http_download_with_ctx(
     let mut target_path = ctx.job.target_path.clone();
     let mut temp_path = ctx.job.temp_path.clone();
     let mut filename = ctx.job.filename.clone();
-    // Mutated on full-replace so reconnect oracle matches the progress patch (v1+ → 0).
+    // Mutated on full-replace so the reconnect oracle matches the committed
+    // identity (v1+ → contiguous v0).
     let mut transfer_format_version = ctx.job.transfer_format_version;
     let mut total_bytes: u64;
     let mut resume_supported = ctx.job.resume_supported;
@@ -318,6 +147,7 @@ pub async fn run_http_download_with_ctx(
 
     let control = ctx.control.clone();
     let on_progress = ctx.on_progress.clone();
+    let committer = ctx.committer.clone();
     let handoff_auth = ctx.handoff_auth.clone();
     let limiter = ctx.limiter.clone();
 
@@ -578,28 +408,51 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
             }
         }
 
-        let mut starting = ProgressUpdate::starting_tick(
-            existing_bytes,
-            total_bytes,
-            Some(filename.clone()),
-            Some(target_path.clone()),
-            Some(temp_path.clone()),
-            Some(resume_supported),
-            validators_patch,
-        );
         if full_replace {
-            // Replace identity + clear multi version; surface a non-fatal user notice.
-            // Keep local oracle in sync with the Job progress patch (v1+ → contiguous v0).
+            // Keep local oracle in sync with the committed identity (v1+ → contiguous v0).
             transfer_format_version = 0;
-            starting.replace_validators = Some(true);
-            starting.transfer_format_version = Some(0);
-            starting.clear_segment_map = Some(true);
-            starting.toast = Some(FULL_REPLACE_NOTICE.into());
         }
+        committer
+            .commit(
+                &mut ctx.job,
+                CommitIdentity {
+                    downloaded_bytes: Some(existing_bytes),
+                    total_bytes: Some(total_bytes),
+                    progress: Some(progress_percent(existing_bytes, total_bytes)),
+                    filename: Some(filename.clone()),
+                    target_path: Some(target_path.clone()),
+                    temp_path: Some(temp_path.clone()),
+                    resume_supported: Some(resume_supported),
+                    validators: validators_patch,
+                    replace_validators: full_replace,
+                    transfer_format_version: full_replace.then_some(0),
+                    map: if full_replace {
+                        MapUpdate::Clear
+                    } else {
+                        MapUpdate::Unchanged
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+        let mut starting = ProgressTick {
+            downloaded_bytes: Some(existing_bytes),
+            total_bytes: Some(total_bytes),
+            speed: Some(0),
+            eta_secs: Some(0),
+            progress: Some(progress_percent(existing_bytes, total_bytes)),
+            state_hint: Some(ProgressHint::Starting),
+            active_connections: Some(1),
+            ..Default::default()
+        };
         if cumulative_reconnects > reconnect_baseline {
             starting.reconnect_count = Some(cumulative_reconnects);
         }
-        on_progress(starting);
+        on_progress(TransferEvent::Tick(starting));
+        if full_replace {
+            on_progress(TransferEvent::Toast(FULL_REPLACE_NOTICE.into()));
+        }
 
         ensure_parent_directory(&temp_path)
             .await
@@ -641,13 +494,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
         let mut window_bytes: u64 = 0;
         let mut eta_smoother = EtaSmoother::new();
 
-        on_progress(ProgressUpdate::downloading_tick(
+        on_progress(TransferEvent::Tick(ProgressTick::downloading(
             downloaded,
             total_bytes,
             0,
             0,
             progress_percent(downloaded, total_bytes),
-        ));
+        )));
 
         // Body read loop — body/network errors trigger mid-transfer reconnect.
         let body_result: Result<DownloadOutcome, DownloadError> = async {
@@ -723,13 +576,13 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                     let remaining = total_bytes.saturating_sub(downloaded);
                     let (_, eta_secs) = eta_smoother.observe(speed, remaining);
 
-                    on_progress(ProgressUpdate::downloading_tick(
+                    on_progress(TransferEvent::Tick(ProgressTick::downloading(
                         downloaded,
                         total_bytes,
                         speed,
                         eta_secs,
                         progress_percent(downloaded, total_bytes),
-                    ));
+                    )));
                     last_progress = Instant::now();
                 }
             }
@@ -760,21 +613,29 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
                 .await
                 .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-            on_progress(ProgressUpdate::completed_tick(
-                downloaded,
-                if total_bytes == 0 {
-                    downloaded
-                } else {
-                    total_bytes
-                },
-                final_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string()),
-                Some(final_path),
-                Some(temp_path.clone()),
-                Some(resume_supported),
-            ));
+            committer
+                .commit(
+                    &mut ctx.job,
+                    CommitIdentity {
+                        downloaded_bytes: Some(downloaded),
+                        total_bytes: Some(if total_bytes == 0 {
+                            downloaded
+                        } else {
+                            total_bytes
+                        }),
+                        progress: Some(100.0),
+                        filename: final_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string()),
+                        target_path: Some(final_path),
+                        temp_path: Some(temp_path.clone()),
+                        resume_supported: Some(resume_supported),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
 
             Ok(DownloadOutcome::Completed)
         }
@@ -843,7 +704,7 @@ async fn prepare_reconnect(
     transfer_format_version: u32,
     temp_path: &std::path::Path,
     control: &AtomicU8,
-    on_progress: &ProgressCallback,
+    on_progress: &TransferEventCallback,
     cumulative_reconnects: &mut u32,
 ) -> ReconnectAction {
     if !can_mid_transfer_reconnect(
@@ -859,14 +720,14 @@ async fn prepare_reconnect(
     *cumulative_reconnects = cumulative_reconnects.saturating_add(1);
     let next_short = short_reconnects + 1;
 
-    on_progress(ProgressUpdate {
+    on_progress(TransferEvent::Tick(ProgressTick {
         downloaded_bytes: Some(existing_bytes),
         speed: Some(0),
         eta_secs: Some(0),
         reconnect_count: Some(*cumulative_reconnects),
         state_hint: Some(ProgressHint::Starting),
         ..Default::default()
-    });
+    }));
 
     let delay = reconnect_backoff(next_short);
     if let Some(outcome) = sleep_interruptible(control, delay).await {
@@ -1167,30 +1028,26 @@ pub(crate) async fn apply_preflight(
     )
     .await?;
     ctx.resolved_url = info.final_url.clone();
-    let patch = preflight_progress_patch(&ctx.job, &info);
-    if let Some(total) = patch.total_bytes {
-        ctx.job.total_bytes = total;
-    }
-    if let Some(resume) = patch.resume_supported {
-        ctx.job.resume_supported = resume;
-    }
+    let identity = preflight_commit_identity(&ctx.job, &info);
     // Do not merge preflight ETag/LM onto the transfer-local job: If-Range
     // must keep the validators that match bytes already on disk.
-    if let Some(filename) = patch.filename.clone() {
-        ctx.job.filename = filename;
-    }
-    (ctx.on_progress)(patch);
+    let _ = ctx.committer.commit(&mut ctx.job, identity).await;
+    (ctx.on_progress)(TransferEvent::Tick(ProgressTick {
+        total_bytes: info.total_bytes.filter(|&n| n > 0),
+        state_hint: Some(ProgressHint::Starting),
+        ..Default::default()
+    }));
     Some(info)
 }
 
-/// Early ProgressUpdate from preflight (size / validators / resume hint).
+/// Early identity from preflight (size / validators / resume hint).
 ///
 /// Sparse only: never forces `progress` (would zero a resume job) or overwrites a
-/// user/uniquified `filename` — GET `starting_tick` owns rename + path updates.
-pub(crate) fn preflight_progress_patch(
+/// user/uniquified `filename` — GET start commit owns rename + path updates.
+pub(crate) fn preflight_commit_identity(
     job: &Job,
     info: &super::preflight::PreflightInfo,
-) -> ProgressUpdate {
+) -> CommitIdentity {
     let total = info.total_bytes.filter(|&n| n > 0);
     let validators = if job.validators.etag.is_none() && job.validators.last_modified.is_none() {
         let captured = ContentValidators {
@@ -1218,13 +1075,10 @@ pub(crate) fn preflight_progress_patch(
             None
         }
     });
-    ProgressUpdate {
+    CommitIdentity {
         total_bytes: total,
-        // Leave progress / downloaded_bytes / speed / eta None so resume partials
-        // and coalesce do not flash 0%.
         filename,
         resume_supported: info.accept_ranges,
-        state_hint: Some(ProgressHint::Starting),
         validators,
         ..Default::default()
     }
@@ -1593,14 +1447,18 @@ fn should_sync_data_on_exit(outcome: DownloadOutcome) -> bool {
     matches!(outcome, DownloadOutcome::Paused)
 }
 
-fn emit_control_exit_progress(on_progress: &ProgressCallback, downloaded: u64, total_bytes: u64) {
-    on_progress(ProgressUpdate::downloading_tick(
+fn emit_control_exit_progress(
+    on_progress: &TransferEventCallback,
+    downloaded: u64,
+    total_bytes: u64,
+) {
+    on_progress(TransferEvent::Tick(ProgressTick::downloading(
         downloaded,
         total_bytes,
         0,
         0,
         progress_percent(downloaded, total_bytes),
-    ));
+    )));
 }
 
 pub(crate) fn should_retry_status(status: StatusCode) -> bool {
@@ -1645,60 +1503,6 @@ mod tests {
         assert!(!looks_like_tls_interference("connection refused"));
     }
 
-    /// Coalesce merge order: later patch wins on Some; earlier Some preserved when later is None.
-    #[test]
-    fn progress_update_merge_later_wins() {
-        let earlier = ProgressUpdate {
-            downloaded_bytes: Some(10),
-            total_bytes: Some(100),
-            speed: Some(1),
-            eta_secs: Some(90),
-            progress: Some(10.0),
-            filename: Some("a.bin".into()),
-            target_path: Some(PathBuf::from("/tmp/a")),
-            temp_path: Some(PathBuf::from("/tmp/a.part")),
-            resume_supported: Some(true),
-            state_hint: Some(ProgressHint::Starting),
-            validators: Some(ContentValidators {
-                etag: Some("\"v1\"".into()),
-                last_modified: None,
-                expected_size: Some(100),
-            }),
-            ..Default::default()
-        };
-        let later = ProgressUpdate {
-            downloaded_bytes: Some(50),
-            total_bytes: None,
-            speed: Some(5),
-            eta_secs: None,
-            progress: Some(50.0),
-            filename: None,
-            target_path: None,
-            temp_path: None,
-            resume_supported: None,
-            state_hint: Some(ProgressHint::Downloading),
-            // Speed tick leaves validators None → earlier preserved.
-            validators: None,
-            ..Default::default()
-        };
-
-        let merged = earlier.merge(later);
-        assert_eq!(merged.downloaded_bytes, Some(50));
-        assert_eq!(merged.total_bytes, Some(100)); // preserved from earlier
-        assert_eq!(merged.speed, Some(5));
-        assert_eq!(merged.eta_secs, Some(90)); // preserved from earlier
-        assert_eq!(merged.progress, Some(50.0));
-        assert_eq!(merged.filename.as_deref(), Some("a.bin"));
-        assert_eq!(merged.target_path, Some(PathBuf::from("/tmp/a")));
-        assert_eq!(merged.temp_path, Some(PathBuf::from("/tmp/a.part")));
-        assert_eq!(merged.resume_supported, Some(true));
-        assert_eq!(merged.state_hint, Some(ProgressHint::Downloading));
-        assert_eq!(
-            merged.validators.as_ref().and_then(|v| v.etag.as_deref()),
-            Some("\"v1\"")
-        );
-    }
-
     #[test]
     fn content_validators_from_headers_captures_etag_lm_size() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -1738,9 +1542,13 @@ mod tests {
     }
 
     #[test]
-    fn starting_tick_empty_validators_leave_none() {
-        let tick = ProgressUpdate::starting_tick(0, 0, None, None, None, Some(true), None);
-        assert!(tick.validators.is_none());
+    fn starting_commit_empty_validators_leave_none() {
+        let identity = CommitIdentity {
+            resume_supported: Some(true),
+            ..Default::default()
+        };
+        assert!(identity.validators.is_none());
+        assert!(!identity.replace_validators);
     }
 
     #[tokio::test]
@@ -1780,10 +1588,11 @@ mod tests {
         let mut ctx = TransferContext::from_runtime(
             job,
             Arc::new(AtomicU8::new(0)),
-            Arc::new(|_: ProgressUpdate| {}),
+            Arc::new(|_: TransferEvent| {}),
             None,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(32, 8),
+            Arc::new(NoopIdentity),
             &EngineRuntimeConfig::default(),
         );
         ctx.preflight_done = true;
@@ -1809,19 +1618,15 @@ mod tests {
 
     #[test]
     fn downloading_tick_sets_scalars_only() {
-        let tick = ProgressUpdate::downloading_tick(25, 100, 10, 7, 25.0);
+        let tick = ProgressTick::downloading(25, 100, 10, 7, 25.0);
         assert_eq!(tick.downloaded_bytes, Some(25));
         assert_eq!(tick.total_bytes, Some(100));
         assert_eq!(tick.speed, Some(10));
-        assert!(tick.validators.is_none());
-        assert!(tick.transfer_format_version.is_none());
-        assert!(tick.segment_map.is_none());
+        assert!(tick.segment_written.is_none());
         assert_eq!(tick.eta_secs, Some(7));
         assert_eq!(tick.progress, Some(25.0));
-        assert!(tick.filename.is_none());
-        assert!(tick.target_path.is_none());
-        assert!(tick.temp_path.is_none());
-        assert!(tick.resume_supported.is_none());
+        assert!(tick.active_connections.is_none());
+        assert!(tick.reconnect_count.is_none());
         assert_eq!(tick.state_hint, Some(ProgressHint::Downloading));
     }
 
@@ -1882,12 +1687,10 @@ mod tests {
             last_modified: None,
             final_url: job.url.clone(),
         };
-        let patch = preflight_progress_patch(&job, &info);
+        let patch = preflight_commit_identity(&job, &info);
         assert_eq!(patch.total_bytes, Some(1_000_000));
         assert!(patch.progress.is_none(), "must not force 0% on resume");
         assert!(patch.downloaded_bytes.is_none());
-        assert!(patch.speed.is_none());
-        assert!(patch.eta_secs.is_none());
         assert_eq!(patch.resume_supported, Some(true));
         assert_eq!(
             patch.validators.as_ref().and_then(|v| v.etag.as_deref()),
@@ -2089,7 +1892,7 @@ mod tests {
             last_modified: None,
             final_url: job.url.clone(),
         };
-        let patch = preflight_progress_patch(&job, &info);
+        let patch = preflight_commit_identity(&job, &info);
         assert!(
             patch.filename.is_none(),
             "uniquified name must not be overwritten"
@@ -2097,7 +1900,7 @@ mod tests {
 
         // Generic fallback still allows CD rename hint.
         job.filename = "download.bin".into();
-        let patch = preflight_progress_patch(&job, &info);
+        let patch = preflight_commit_identity(&job, &info);
         assert_eq!(patch.filename.as_deref(), Some("server-name.zip"));
     }
 
@@ -2277,7 +2080,7 @@ mod tests {
         let control = AtomicU8::new(CONTROL_CONTINUE);
         let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
+        let on_progress: TransferEventCallback = Arc::new(move |u: TransferEvent| {
             patches_cb.lock().unwrap().push(u);
         });
 
@@ -2311,9 +2114,12 @@ mod tests {
         assert_eq!(cumulative, 4);
         let held = patches.lock().unwrap();
         assert_eq!(held.len(), 1);
-        assert_eq!(held[0].reconnect_count, Some(4));
-        assert_eq!(held[0].downloaded_bytes, Some(64));
-        assert_eq!(held[0].state_hint, Some(ProgressHint::Starting));
+        let TransferEvent::Tick(tick) = &held[0] else {
+            panic!("expected Tick, got {:?}", held[0]);
+        };
+        assert_eq!(tick.reconnect_count, Some(4));
+        assert_eq!(tick.downloaded_bytes, Some(64));
+        assert_eq!(tick.state_hint, Some(ProgressHint::Starting));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

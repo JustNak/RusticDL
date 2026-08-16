@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 
@@ -14,8 +15,12 @@ use super::filesystem::{
     metadata_len, reconcile_from_oracle, remove_partial, FilenameConflictPolicy,
 };
 use super::handoff::{EnqueueOutcome, HandoffAuth};
-use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate};
+use super::http::store_control;
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
+use super::progress::{
+    apply_commit_identity, apply_tick, CommitIdentity, IdentityCommit, MapUpdate, ProgressTick,
+    TransferEvent, TransferEventCallback,
+};
 use super::resume::{resume_oracle, ResumeOracle};
 use super::transfer::run_transfer;
 use crate::settings::Settings;
@@ -347,10 +352,13 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 store_control(&control, WorkerControl::Continue);
             }
 
-            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel::<TransferEvent>();
             let progress_pump = spawn_progress_pump(inner.clone(), job_id.clone(), progress_rx);
-            let on_progress: ProgressCallback = Arc::new(move |update: ProgressUpdate| {
-                let _ = progress_tx.send(update);
+            let on_progress: TransferEventCallback = Arc::new(move |event: TransferEvent| {
+                let _ = progress_tx.send(event);
+            });
+            let committer = Arc::new(EngineIdentity {
+                inner: inner.clone(),
             });
 
             // Re-read live knobs so UpdateSettings applies to the next attempt.
@@ -367,6 +375,7 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
                 handoff_auth.clone(),
                 limiter.clone(),
                 conn_budget,
+                committer,
                 &config,
             );
             let attempt_result = run_transfer(ctx).await;
@@ -513,34 +522,56 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     });
 }
 
-/// Coalesce progress patches (merge Option fields) then apply at most every
-/// `PROGRESS_COALESCE`. Immediate flush when the channel closes.
+/// In-memory identity committer.
+pub(crate) struct EngineIdentity {
+    inner: Arc<Mutex<EngineInner>>,
+}
+
+#[async_trait]
+impl IdentityCommit for EngineIdentity {
+    async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String> {
+        apply_commit_identity(job, &c);
+        let mut guard = self.inner.lock().await;
+        let requeued = guard.requeue_on_cancel.contains_key(&job.id);
+        if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
+            // Restart already wiped identity and requeued; do not restore the canceled worker's map.
+            if requeued
+                && canonical.segment_map.is_none()
+                && canonical.transfer_format_version == 0
+                && matches!(c.map, MapUpdate::Set(_) | MapUpdate::Clear)
+            {
+                return Ok(());
+            }
+            apply_commit_identity(canonical, &c);
+            emit_jobs_locked(&guard);
+        }
+        Ok(())
+    }
+}
+
+/// Coalesce ticks then apply at most every `PROGRESS_COALESCE`. Toasts flush now.
 fn spawn_progress_pump(
     inner: Arc<Mutex<EngineInner>>,
     job_id: String,
-    mut progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
+    mut progress_rx: mpsc::UnboundedReceiver<TransferEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut pending: Option<ProgressUpdate> = None;
+        let mut pending: Option<ProgressTick> = None;
         let mut flush_at: Option<TokioInstant> = None;
 
         loop {
             match flush_at {
                 None => match progress_rx.recv().await {
-                    Some(update) => {
-                        let immediate = should_flush_immediately(&update);
-                        coalesce_push(&mut pending, update);
-                        if immediate {
-                            if let Some(update) = pending.take() {
-                                apply_progress(&inner, &job_id, update).await;
-                            }
-                        } else {
-                            flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
-                        }
+                    Some(TransferEvent::Tick(tick)) => {
+                        coalesce_push(&mut pending, tick);
+                        flush_at = Some(TokioInstant::now() + PROGRESS_COALESCE);
+                    }
+                    Some(TransferEvent::Toast(message)) => {
+                        emit_toast(&inner, message).await;
                     }
                     None => {
-                        if let Some(update) = pending.take() {
-                            apply_progress(&inner, &job_id, update).await;
+                        if let Some(tick) = pending.take() {
+                            apply_tick_event(&inner, &job_id, tick).await;
                         }
                         break;
                     }
@@ -549,29 +580,23 @@ fn spawn_progress_pump(
                     tokio::select! {
                         item = progress_rx.recv() => {
                             match item {
-                                Some(update) => {
-                                    let immediate = should_flush_immediately(&update);
-                                    // Deadline already set ⇒ pending is Some.
-                                    coalesce_push(&mut pending, update);
-                                    if immediate {
-                                        if let Some(update) = pending.take() {
-                                            apply_progress(&inner, &job_id, update).await;
-                                        }
-                                        flush_at = None;
-                                    }
-                                    // Else keep existing deadline so the first patch opens the window.
+                                Some(TransferEvent::Tick(tick)) => {
+                                    coalesce_push(&mut pending, tick);
+                                }
+                                Some(TransferEvent::Toast(message)) => {
+                                    emit_toast(&inner, message).await;
                                 }
                                 None => {
-                                    if let Some(update) = pending.take() {
-                                        apply_progress(&inner, &job_id, update).await;
+                                    if let Some(tick) = pending.take() {
+                                        apply_tick_event(&inner, &job_id, tick).await;
                                     }
                                     break;
                                 }
                             }
                         }
                         _ = sleep_until(deadline) => {
-                            if let Some(update) = pending.take() {
-                                apply_progress(&inner, &job_id, update).await;
+                            if let Some(tick) = pending.take() {
+                                apply_tick_event(&inner, &job_id, tick).await;
                             }
                             flush_at = None;
                         }
@@ -582,127 +607,21 @@ fn spawn_progress_pump(
     })
 }
 
-/// Map + version (or explicit clear) must hit Job before multi workers write.
-fn should_flush_immediately(update: &ProgressUpdate) -> bool {
-    (update.segment_map.is_some() && update.transfer_format_version.is_some())
-        || update.clear_segment_map == Some(true)
-        || update.persist_ack.is_some()
-}
-
-/// Merge `update` into the coalesce buffer (later wins on Some).
-fn coalesce_push(pending: &mut Option<ProgressUpdate>, update: ProgressUpdate) {
+/// Merge `tick` into the coalesce buffer (later wins on Some).
+fn coalesce_push(pending: &mut Option<ProgressTick>, tick: ProgressTick) {
     *pending = Some(match pending.take() {
-        Some(prev) => prev.merge(update),
-        None => update,
+        Some(prev) => prev.merge(tick),
+        None => tick,
     });
 }
 
-async fn apply_progress(inner: &Arc<Mutex<EngineInner>>, id: &str, update: ProgressUpdate) {
-    let toast = update.toast.clone();
-    let ack = update.persist_ack.clone();
-    {
-        let mut guard = inner.lock().await;
-        if let Some(job) = find_job_mut(&mut guard.jobs, id) {
-            if apply_progress_patch(job, update) {
-                emit_jobs_locked(&guard);
-            }
+async fn apply_tick_event(inner: &Arc<Mutex<EngineInner>>, id: &str, tick: ProgressTick) {
+    let mut guard = inner.lock().await;
+    if let Some(job) = find_job_mut(&mut guard.jobs, id) {
+        if apply_tick(job, tick) {
+            emit_jobs_locked(&guard);
         }
     }
-    // Always ack so multi-start does not wait out the timeout when the job
-    // is missing or not in-flight.
-    if let Some(ack) = ack {
-        ack.notify_one();
-    }
-    // One-shot notice (e.g. full-replace after 200-on-partial). Outside the jobs lock.
-    if let Some(message) = toast {
-        emit_toast(inner, message).await;
-    }
-}
-
-/// Apply a partial progress patch. `None` fields leave the job value unchanged.
-/// Returns false if the job is not in an in-flight transfer state (no mutation).
-///
-/// Only `Starting` / `Downloading` accept progress: rejects `Queued` (restart),
-/// `Paused`, and terminal states so deferred coalesce cannot resurrect progress
-/// after external lifecycle writes.
-fn apply_progress_patch(job: &mut Job, update: ProgressUpdate) -> bool {
-    if !matches!(job.state, JobState::Starting | JobState::Downloading) {
-        return false;
-    }
-
-    // state_hint: None ⇒ do not change job.state.
-    if let Some(hint) = update.state_hint {
-        match hint {
-            ProgressHint::Starting => {
-                job.state = JobState::Starting;
-            }
-            ProgressHint::Downloading => {
-                job.state = JobState::Downloading;
-            }
-        }
-    }
-
-    if let Some(v) = update.downloaded_bytes {
-        job.downloaded_bytes = v;
-    }
-    if let Some(v) = update.total_bytes {
-        job.total_bytes = v;
-    }
-    if let Some(v) = update.speed {
-        job.speed = v;
-    }
-    if let Some(v) = update.eta_secs {
-        job.eta_secs = v;
-    }
-    if let Some(v) = update.progress {
-        job.progress = v;
-    }
-    if let Some(name) = update.filename {
-        job.filename = name;
-    }
-    if let Some(path) = update.target_path {
-        job.target_path = path;
-    }
-    if let Some(path) = update.temp_path {
-        job.temp_path = path;
-    }
-    if let Some(resume) = update.resume_supported {
-        job.resume_supported = resume;
-    }
-    // replace_validators: full identity snapshot (200 full-replace).
-    // Otherwise field-wise merge so sparse CDN captures never wipe stored ETag/LM.
-    if update.replace_validators == Some(true) {
-        job.validators = update.validators.unwrap_or_default();
-    } else if let Some(validators) = update.validators {
-        job.validators.merge_present(validators);
-    }
-    if let Some(version) = update.transfer_format_version {
-        job.transfer_format_version = version;
-    }
-    if let Some(n) = update.active_connections {
-        job.active_connections = n;
-    }
-    if let Some(n) = update.reconnect_count {
-        job.reconnect_count = n;
-    }
-    if let Some(mode) = update.transfer_mode {
-        job.transfer_mode = Some(mode);
-        if mode == super::job::TransferMode::Multi && update.fallback_reason.is_none() {
-            job.fallback_reason = None;
-        }
-    }
-    if let Some(reason) = update.fallback_reason {
-        job.fallback_reason = Some(reason);
-    }
-    // None = unchanged; lifecycle (Restart / Cancel+delete / Completed) clears.
-    // Multi→single rollback is the only transfer-path clear.
-    if update.clear_segment_map == Some(true) {
-        job.segment_map = None;
-    } else if let Some(map) = update.segment_map {
-        job.segment_map = Some(map);
-    }
-
-    true
 }
 
 /// Zero live transfer metrics when a worker leaves the job (every finalizer path).
@@ -772,7 +691,8 @@ pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::job::{download_error, ContentValidators, FailureCategory, TransferMode};
+    use super::super::job::{download_error, ContentValidators, FailureCategory};
+    use super::super::progress::ProgressHint;
     use super::super::segment::{Segment, SegmentMap, SegmentState};
     use super::*;
     use std::path::PathBuf;
@@ -817,18 +737,14 @@ mod tests {
     #[test]
     fn state_hint_none_does_not_clobber_state() {
         let mut job = sample_job(JobState::Downloading);
-        let ok = apply_progress_patch(
+        let ok = apply_tick(
             &mut job,
-            ProgressUpdate {
+            ProgressTick {
                 downloaded_bytes: Some(40),
                 total_bytes: None,
                 speed: Some(8),
                 eta_secs: Some(7),
                 progress: Some(40.0),
-                filename: None,
-                target_path: None,
-                temp_path: None,
-                resume_supported: None,
                 state_hint: None,
                 ..Default::default()
             },
@@ -845,9 +761,9 @@ mod tests {
     #[test]
     fn state_hint_none_preserves_starting() {
         let mut job = sample_job(JobState::Starting);
-        apply_progress_patch(
+        apply_tick(
             &mut job,
-            ProgressUpdate {
+            ProgressTick {
                 downloaded_bytes: Some(0),
                 speed: Some(0),
                 state_hint: None,
@@ -860,21 +776,15 @@ mod tests {
     #[test]
     fn state_hint_some_transitions_to_downloading() {
         let mut job = sample_job(JobState::Starting);
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(1, 100, 1, 99, 1.0),
-        );
+        apply_tick(&mut job, ProgressTick::downloading(1, 100, 1, 99, 1.0));
         assert_eq!(job.state, JobState::Downloading);
     }
 
     #[test]
-    fn apply_progress_skips_terminal_jobs() {
+    fn apply_tick_skips_terminal_jobs() {
         let mut job = sample_job(JobState::Completed);
         let before = job.downloaded_bytes;
-        let ok = apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(99, 100, 1, 0, 99.0),
-        );
+        let ok = apply_tick(&mut job, ProgressTick::downloading(99, 100, 1, 0, 99.0));
         assert!(!ok);
         assert_eq!(job.downloaded_bytes, before);
         assert_eq!(job.state, JobState::Completed);
@@ -882,15 +792,12 @@ mod tests {
 
     /// Restart zeros job to Queued; deferred coalesce must not resurrect progress.
     #[test]
-    fn apply_progress_skips_queued_jobs() {
+    fn apply_tick_skips_queued_jobs() {
         let mut job = sample_job(JobState::Queued);
         job.downloaded_bytes = 0;
         job.total_bytes = 0;
         job.progress = 0.0;
-        let ok = apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(50, 100, 10, 5, 50.0),
-        );
+        let ok = apply_tick(&mut job, ProgressTick::downloading(50, 100, 10, 5, 50.0));
         assert!(!ok);
         assert_eq!(job.state, JobState::Queued);
         assert_eq!(job.downloaded_bytes, 0);
@@ -899,13 +806,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_progress_skips_paused_jobs() {
+    fn apply_tick_skips_paused_jobs() {
         let mut job = sample_job(JobState::Paused);
         let before = job.downloaded_bytes;
-        let ok = apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(99, 100, 1, 0, 99.0),
-        );
+        let ok = apply_tick(&mut job, ProgressTick::downloading(99, 100, 1, 0, 99.0));
         assert!(!ok);
         assert_eq!(job.downloaded_bytes, before);
         assert_eq!(job.state, JobState::Paused);
@@ -914,14 +818,14 @@ mod tests {
     #[test]
     fn option_none_scalars_leave_job_unchanged() {
         let mut job = sample_job(JobState::Downloading);
-        apply_progress_patch(
+        apply_tick(
             &mut job,
-            ProgressUpdate {
-                filename: Some("renamed.bin".into()),
+            ProgressTick {
+                active_connections: Some(1),
                 ..Default::default()
             },
         );
-        assert_eq!(job.filename, "renamed.bin");
+        assert_eq!(job.active_connections, 1);
         assert_eq!(job.downloaded_bytes, 10);
         assert_eq!(job.total_bytes, 100);
         assert_eq!(job.speed, 1);
@@ -931,174 +835,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_progress_sets_validators_and_preserves_on_none() {
-        let mut job = sample_job(JobState::Starting);
+    fn apply_tick_does_not_clear_validators_or_map() {
+        let mut job = sample_job(JobState::Downloading);
         let validators = ContentValidators {
             etag: Some("\"etag-1\"".into()),
             last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
             expected_size: Some(100),
         };
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                validators: Some(validators.clone()),
-                state_hint: Some(ProgressHint::Starting),
-                ..Default::default()
-            },
-        );
-        assert_eq!(job.validators, validators);
-
-        // Speed tick with validators: None must not clear stored validators.
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(20, 100, 5, 16, 20.0),
-        );
-        assert_eq!(job.validators, validators);
-        assert_eq!(job.downloaded_bytes, 20);
-    }
-
-    /// Empty / sparse validator patches must not wipe persisted ETag/LM.
-    #[test]
-    fn apply_progress_empty_or_sparse_validators_preserve_identity() {
-        let mut job = sample_job(JobState::Downloading);
-        job.validators = ContentValidators {
-            etag: Some("\"keep\"".into()),
-            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
-            expected_size: Some(100),
-        };
-
-        // None = unchanged
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                validators: None,
-                ..Default::default()
-            },
-        );
-        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
-
-        // Empty Some (bug if wholesale replace) — field-wise merge is no-op
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                validators: Some(ContentValidators::default()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
-        assert_eq!(
-            job.validators.last_modified.as_deref(),
-            Some("Wed, 21 Oct 2015 07:28:00 GMT")
-        );
-
-        // Size-only capture updates expected_size, keeps ETag/LM
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                validators: Some(ContentValidators {
-                    etag: None,
-                    last_modified: None,
-                    expected_size: Some(999),
-                }),
-                ..Default::default()
-            },
-        );
-        assert_eq!(job.validators.etag.as_deref(), Some("\"keep\""));
-        assert_eq!(
-            job.validators.last_modified.as_deref(),
-            Some("Wed, 21 Oct 2015 07:28:00 GMT")
-        );
-        assert_eq!(job.validators.expected_size, Some(999));
-    }
-
-    /// Full-replace path: replace_validators clears stale ETag even when 200 omits it.
-    #[test]
-    fn apply_progress_replace_validators_clears_stale_identity() {
-        let mut job = sample_job(JobState::Downloading);
-        job.validators = ContentValidators {
-            etag: Some("\"stale-strong\"".into()),
-            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
-            expected_size: Some(1000),
-        };
-        job.transfer_format_version = 1;
-
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                validators: Some(ContentValidators {
-                    etag: None,
-                    last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
-                    expected_size: Some(2000),
-                }),
-                replace_validators: Some(true),
-                transfer_format_version: Some(0),
-                ..Default::default()
-            },
-        );
-
-        assert!(job.validators.etag.is_none());
-        assert_eq!(
-            job.validators.last_modified.as_deref(),
-            Some("Tue, 02 Jan 2024 00:00:00 GMT")
-        );
-        assert_eq!(job.validators.expected_size, Some(2000));
-        assert_eq!(job.transfer_format_version, 0);
-        assert!(job.fallback_reason.is_none());
-    }
-
-    #[test]
-    fn apply_progress_sets_metrics_placeholders() {
-        let mut job = sample_job(JobState::Downloading);
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                transfer_format_version: Some(1),
-                active_connections: Some(4),
-                reconnect_count: Some(2),
-                transfer_mode: Some(TransferMode::Multi),
-                fallback_reason: Some("planner".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(job.transfer_format_version, 1);
-        assert_eq!(job.active_connections, 4);
-        assert_eq!(job.reconnect_count, 2);
-        assert_eq!(job.transfer_mode, Some(TransferMode::Multi));
-        assert_eq!(job.fallback_reason.as_deref(), Some("planner"));
-    }
-
-    #[test]
-    fn apply_progress_clear_segment_map() {
-        let mut job = sample_job(JobState::Downloading);
-        job.segment_map = Some(SegmentMap {
-            total_bytes: 1000,
-            segment_count: 1,
-            segments: vec![Segment {
-                index: 0,
-                start: 0,
-                end: 999,
-                written: 10,
-                state: SegmentState::Active,
-            }],
-            preallocated: false,
-        });
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate {
-                transfer_format_version: Some(0),
-                clear_segment_map: Some(true),
-                transfer_mode: Some(TransferMode::Single),
-                ..Default::default()
-            },
-        );
-        assert!(job.segment_map.is_none());
-        assert_eq!(job.transfer_format_version, 0);
-        assert_eq!(job.transfer_mode, Some(TransferMode::Single));
-    }
-
-    #[test]
-    fn apply_progress_sets_segment_map_and_preserves_on_none() {
-        let mut job = sample_job(JobState::Downloading);
         let map = SegmentMap {
             total_bytes: 1000,
             segment_count: 1,
@@ -1111,20 +854,29 @@ mod tests {
             }],
             preallocated: true,
         };
-        apply_progress_patch(
+        job.validators = validators.clone();
+        job.segment_map = Some(map.clone());
+        apply_tick(&mut job, ProgressTick::downloading(20, 100, 5, 16, 20.0));
+        assert_eq!(job.validators, validators);
+        assert_eq!(job.segment_map, Some(map));
+        assert_eq!(job.downloaded_bytes, 20);
+    }
+
+    #[test]
+    fn apply_tick_sets_live_metrics() {
+        let mut job = sample_job(JobState::Downloading);
+        apply_tick(
             &mut job,
-            ProgressUpdate {
-                segment_map: Some(map.clone()),
+            ProgressTick {
+                active_connections: Some(4),
+                reconnect_count: Some(2),
                 ..Default::default()
             },
         );
-        assert_eq!(job.segment_map, Some(map.clone()));
-
-        apply_progress_patch(
-            &mut job,
-            ProgressUpdate::downloading_tick(20, 100, 5, 16, 20.0),
-        );
-        assert_eq!(job.segment_map, Some(map));
+        assert_eq!(job.active_connections, 4);
+        assert_eq!(job.reconnect_count, 2);
+        assert_eq!(job.transfer_format_version, 0);
+        assert!(job.transfer_mode.is_none());
     }
 
     #[test]
@@ -1174,27 +926,26 @@ mod tests {
         assert_eq!(job.eta_secs, 0);
     }
 
-    /// Multiple patches merge into one pending; take drains once.
+    /// Multiple ticks merge into one pending; take drains once.
     #[test]
     fn coalesce_push_merges_then_take_flushes_once() {
-        let mut pending: Option<ProgressUpdate> = None;
+        let mut pending: Option<ProgressTick> = None;
         coalesce_push(
             &mut pending,
-            ProgressUpdate {
+            ProgressTick {
                 downloaded_bytes: Some(10),
                 total_bytes: Some(100),
-                filename: Some("a.bin".into()),
                 state_hint: Some(ProgressHint::Starting),
                 ..Default::default()
             },
         );
         coalesce_push(
             &mut pending,
-            ProgressUpdate::downloading_tick(50, 100, 5, 10, 50.0),
+            ProgressTick::downloading(50, 100, 5, 10, 50.0),
         );
         coalesce_push(
             &mut pending,
-            ProgressUpdate {
+            ProgressTick {
                 speed: Some(9),
                 ..Default::default()
             },
@@ -1207,7 +958,6 @@ mod tests {
         assert_eq!(flushed.speed, Some(9)); // latest wins
         assert_eq!(flushed.eta_secs, Some(10));
         assert_eq!(flushed.progress, Some(50.0));
-        assert_eq!(flushed.filename.as_deref(), Some("a.bin")); // preserved
         assert_eq!(flushed.state_hint, Some(ProgressHint::Downloading));
     }
 
@@ -1225,10 +975,14 @@ mod tests {
         let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
 
         // Buffer two patches then close: merge + flush-on-close (no wait for deadline).
-        tx.send(ProgressUpdate::downloading_tick(10, 100, 1, 90, 10.0))
-            .unwrap();
-        tx.send(ProgressUpdate::downloading_tick(40, 100, 4, 15, 40.0))
-            .unwrap();
+        tx.send(TransferEvent::Tick(ProgressTick::downloading(
+            10, 100, 1, 90, 10.0,
+        )))
+        .unwrap();
+        tx.send(TransferEvent::Tick(ProgressTick::downloading(
+            40, 100, 4, 15, 40.0,
+        )))
+        .unwrap();
         drop(tx);
 
         pump.await.expect("pump join");
@@ -1266,8 +1020,10 @@ mod tests {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
-        tx.send(ProgressUpdate::downloading_tick(80, 100, 10, 2, 80.0))
-            .unwrap();
+        tx.send(TransferEvent::Tick(ProgressTick::downloading(
+            80, 100, 10, 2, 80.0,
+        )))
+        .unwrap();
         drop(tx);
         pump.await.expect("pump join");
 
@@ -1277,5 +1033,168 @@ mod tests {
         assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(job.progress, 0.0);
         assert_eq!(job.speed, 0);
+    }
+
+    #[tokio::test]
+    async fn persist_tick_without_written_does_not_roll_map_backward_after_commit() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Downloading);
+        job.id = "persist-stale-written".into();
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 100,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 99,
+                written: 0,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        });
+        let job_id = job.id.clone();
+        let inner = test_inner(job, event_tx);
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        let mut worker_job = {
+            let guard = inner.lock().await;
+            guard.jobs.iter().find(|j| j.id == job_id).unwrap().clone()
+        };
+        let mut committed = worker_job.segment_map.clone().unwrap();
+        committed.segments[0].written = 100;
+        committer
+            .commit(
+                &mut worker_job,
+                CommitIdentity {
+                    downloaded_bytes: Some(100),
+                    map: MapUpdate::Set(committed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
+        tx.send(TransferEvent::Tick(ProgressTick {
+            segment_written: Some(vec![80]),
+            ..Default::default()
+        }))
+        .unwrap();
+        tx.send(TransferEvent::Tick(ProgressTick {
+            downloaded_bytes: Some(100),
+            segment_written: None,
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+        pump.await.expect("pump join");
+
+        let guard = inner.lock().await;
+        let job = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert_eq!(job.downloaded_bytes, 100);
+        assert_eq!(job.segment_map.as_ref().unwrap().segments[0].written, 100);
+    }
+
+    #[tokio::test]
+    async fn engine_identity_skips_set_after_restart_requeue() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "restart-set".into();
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 0.0;
+        job.clear_transfer_identity();
+        let job_id = job.id.clone();
+        let inner = test_inner(job.clone(), event_tx);
+        inner
+            .lock()
+            .await
+            .requeue_on_cancel
+            .insert(job_id.clone(), ());
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    downloaded_bytes: Some(50),
+                    transfer_format_version: Some(1),
+                    map: MapUpdate::Set(SegmentMap {
+                        total_bytes: 1000,
+                        segment_count: 1,
+                        segments: vec![Segment {
+                            index: 0,
+                            start: 0,
+                            end: 999,
+                            written: 50,
+                            state: SegmentState::Active,
+                        }],
+                        preallocated: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = inner.lock().await;
+        let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert!(canonical.segment_map.is_none());
+        assert_eq!(canonical.transfer_format_version, 0);
+        assert_eq!(canonical.downloaded_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_identity_patches_canonical_job_without_state_change() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "commit-test".into();
+        let inner = test_inner(job.clone(), event_tx);
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    transfer_format_version: Some(1),
+                    map: super::super::progress::MapUpdate::Set(SegmentMap {
+                        total_bytes: 1000,
+                        segment_count: 1,
+                        segments: vec![Segment {
+                            index: 0,
+                            start: 0,
+                            end: 999,
+                            written: 0,
+                            state: SegmentState::Pending,
+                        }],
+                        preallocated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.transfer_format_version, 1);
+        assert!(job.segment_map.is_some());
+
+        let guard = inner.lock().await;
+        let canonical = guard.jobs.iter().find(|j| j.id == "commit-test").unwrap();
+        assert_eq!(canonical.state, JobState::Queued);
+        assert_eq!(canonical.transfer_format_version, 1);
+        assert!(canonical.segment_map.is_some());
+        drop(guard);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(EngineEvent::JobsChanged(_))
+        ));
     }
 }

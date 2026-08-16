@@ -10,10 +10,13 @@
 //! - Surface `fallback_reason` whenever the planner stays on single-stream.
 
 use super::context::TransferContext;
-use super::http::{apply_preflight, control_outcome, run_http_download_with_ctx, ProgressUpdate};
-use super::job::{DownloadError, DownloadOutcome, Job, TransferMode};
+use super::http::{apply_preflight, control_outcome, run_http_download_with_ctx};
+use super::job::{
+    download_error, DownloadError, DownloadOutcome, FailureCategory, Job, TransferMode,
+};
 use super::multi::{resume_restart_required, run_multi_segment_download};
 use super::preflight::PreflightInfo;
+use super::progress::{CommitIdentity, ProgressTick, TransferEvent};
 use super::resume::{resume_oracle, ResumeOracle};
 
 /// Why the planner chose single-stream, or that multi qualified.
@@ -70,9 +73,16 @@ pub struct TransferPlan {
     pub reason: TransferPlanReason,
 }
 
+/// Planner Tick plus an optional one-shot toast.
+#[derive(Debug, Clone)]
+pub struct VisibilityUpdate {
+    pub tick: ProgressTick,
+    pub toast: Option<String>,
+}
+
 impl TransferPlan {
-    pub fn to_progress_update(self) -> ProgressUpdate {
-        ProgressUpdate {
+    pub fn to_commit_identity(self) -> CommitIdentity {
+        CommitIdentity {
             transfer_mode: self.published_mode(),
             fallback_reason: self.fallback_reason().map(str::to_string),
             ..Default::default()
@@ -96,7 +106,7 @@ impl TransferPlan {
         }
     }
 
-    /// Planner patch plus connections and a one-shot toast for large files.
+    /// Connections tick plus a one-shot toast for large files.
     ///
     /// Toast only when ranges are unknown/unsupported on a file at or above
     /// `multi_min_bytes`.
@@ -108,20 +118,22 @@ impl TransferPlan {
         size: Option<u64>,
         multi_min_bytes: u64,
         existing_reason: Option<&str>,
-    ) -> ProgressUpdate {
-        let mut patch = self.to_progress_update();
+    ) -> VisibilityUpdate {
+        let mut tick = ProgressTick::default();
         if self.chosen == TransferMode::Single {
-            patch.active_connections = Some(1);
+            tick.active_connections = Some(1);
         }
-        if matches!(
+        let toast = if matches!(
             self.reason,
             TransferPlanReason::RangesUnknown | TransferPlanReason::RangesUnsupported
         ) && size.is_some_and(|n| n >= multi_min_bytes)
             && existing_reason != Some(self.reason.as_str())
         {
-            patch.toast = Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST.into());
-        }
-        patch
+            Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST.into())
+        } else {
+            None
+        };
+        VisibilityUpdate { tick, toast }
     }
 }
 
@@ -230,12 +242,17 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
     if let Some(reason) = plan.fallback_reason() {
         ctx.job.fallback_reason = Some(reason.to_string());
     }
+    ctx.committer
+        .commit(&mut ctx.job, plan.to_commit_identity())
+        .await
+        .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
     let size = known_size(&ctx.job, preflight.as_ref());
-    (ctx.on_progress)(plan.to_visibility_update(
-        size,
-        ctx.multi_min_bytes,
-        existing_reason.as_deref(),
-    ));
+    let visibility =
+        plan.to_visibility_update(size, ctx.multi_min_bytes, existing_reason.as_deref());
+    (ctx.on_progress)(TransferEvent::Tick(visibility.tick));
+    if let Some(toast) = visibility.toast {
+        (ctx.on_progress)(TransferEvent::Toast(toast));
+    }
 
     // v1 map missing/inconsistent: never invent Range from metadata_len or a fresh partition.
     if plan.reason.is_resume_required() {
@@ -255,9 +272,9 @@ mod tests {
     use crate::download::bandwidth::GlobalBandwidthLimiter;
     use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::EngineRuntimeConfig;
-    use crate::download::http::ProgressCallback;
     use crate::download::job::{fallback_reason_label, FailureCategory, Job};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
+    use crate::download::progress::{NoopIdentity, TestProgress, TransferEventCallback};
     use crate::download::verify::{sha256_hex, SHA256_EMPTY};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU8;
@@ -274,14 +291,23 @@ mod tests {
         )
     }
 
-    fn test_ctx(job: Job, on_progress: ProgressCallback) -> TransferContext {
+    fn test_ctx(job: Job, on_progress: TransferEventCallback) -> TransferContext {
         test_ctx_cfg(job, on_progress, EngineRuntimeConfig::default())
     }
 
     fn test_ctx_cfg(
         job: Job,
-        on_progress: ProgressCallback,
+        on_progress: TransferEventCallback,
         config: EngineRuntimeConfig,
+    ) -> TransferContext {
+        test_ctx_commit(job, on_progress, config, Arc::new(NoopIdentity))
+    }
+
+    fn test_ctx_commit(
+        job: Job,
+        on_progress: TransferEventCallback,
+        config: EngineRuntimeConfig,
+        committer: Arc<dyn crate::download::progress::IdentityCommit>,
     ) -> TransferContext {
         TransferContext::from_runtime(
             job,
@@ -290,6 +316,7 @@ mod tests {
             None,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(32, 8),
+            committer,
             &config,
         )
     }
@@ -323,7 +350,7 @@ mod tests {
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert_eq!(plan.reason.as_str(), "multi_qualified");
-        assert!(plan.to_progress_update().fallback_reason.is_none());
+        assert!(plan.to_commit_identity().fallback_reason.is_none());
     }
 
     #[test]
@@ -333,7 +360,7 @@ mod tests {
         let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnknown);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("ranges_unknown")
         );
     }
@@ -346,7 +373,7 @@ mod tests {
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("ranges_unsupported")
         );
     }
@@ -359,7 +386,7 @@ mod tests {
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("below_multi_min_bytes")
         );
     }
@@ -372,7 +399,7 @@ mod tests {
         assert_eq!(plan.chosen, TransferMode::Multi);
         assert!(plan.reason.would_qualify_multi());
         assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
-        let patch = plan.to_progress_update();
+        let patch = plan.to_commit_identity();
         assert_eq!(patch.transfer_mode, Some(TransferMode::Multi));
         assert!(patch.fallback_reason.is_none());
     }
@@ -448,7 +475,7 @@ mod tests {
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(plan.reason, TransferPlanReason::LegacyContiguousPartial);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("legacy_contiguous_partial")
         );
     }
@@ -464,7 +491,7 @@ mod tests {
         assert!(plan.reason.is_resume_required());
         assert_eq!(plan.reason, TransferPlanReason::MapMissing);
         assert_eq!(plan.chosen, TransferMode::Single);
-        let patch = plan.to_progress_update();
+        let patch = plan.to_commit_identity();
         assert_eq!(patch.fallback_reason.as_deref(), Some("map_missing"));
         assert!(patch.transfer_mode.is_none());
     }
@@ -485,7 +512,7 @@ mod tests {
         assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
         assert!(plan.reason.is_resume_required());
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("map_inconsistent")
         );
     }
@@ -501,7 +528,7 @@ mod tests {
         assert!(plan.reason.is_resume_required());
         assert_eq!(plan.reason, TransferPlanReason::MapMissing);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("map_missing")
         );
     }
@@ -522,7 +549,7 @@ mod tests {
         assert!(plan.reason.is_resume_required());
         assert_eq!(plan.reason, TransferPlanReason::MapInconsistent);
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("map_inconsistent")
         );
     }
@@ -536,7 +563,7 @@ mod tests {
         assert_eq!(plan.chosen, TransferMode::Single);
         assert_eq!(plan.reason.as_str(), "multi_disabled");
         assert_eq!(
-            plan.to_progress_update().fallback_reason.as_deref(),
+            plan.to_commit_identity().fallback_reason.as_deref(),
             Some("multi_disabled")
         );
         assert_eq!(
@@ -548,7 +575,7 @@ mod tests {
             patch.toast.is_none(),
             "user-disabled multi must not fire the unavailable toast"
         );
-        assert_eq!(patch.active_connections, Some(1));
+        assert_eq!(patch.tick.active_connections, Some(1));
     }
 
     #[test]
@@ -591,29 +618,37 @@ Accept-Ranges: bytes\r\n\
         let url = format!("{base}/small.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx(job, on_progress);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
         let data = std::fs::read(&target).expect("final file");
         assert_eq!(data, body);
 
-        let seen = patches.lock().unwrap();
-        let mode_patch = seen.iter().find(|p| p.transfer_mode.is_some());
-        let mode_patch = mode_patch.expect("planner should publish transfer_mode");
-        assert_eq!(mode_patch.transfer_mode, Some(TransferMode::Single));
+        let snaps = progress.snapshots();
+        let mode_job = snaps
+            .iter()
+            .find(|job| job.transfer_mode.is_some())
+            .expect("planner should publish transfer_mode");
+        assert_eq!(mode_job.transfer_mode, Some(TransferMode::Single));
         assert_eq!(
-            mode_patch.fallback_reason.as_deref(),
+            mode_job.fallback_reason.as_deref(),
             Some("below_multi_min_bytes")
         );
-        assert!(mode_patch.toast.is_none());
-        assert_eq!(mode_patch.active_connections, Some(1));
+        assert!(progress
+            .events()
+            .iter()
+            .all(|event| !matches!(event, TransferEvent::Toast(_))));
+        assert!(progress.events().iter().any(|event| matches!(
+            event,
+            TransferEvent::Tick(tick) if tick.active_connections == Some(1)
+        )));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -625,13 +660,16 @@ Accept-Ranges: bytes\r\n\
         let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(8 * 1024 * 1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
-        assert_eq!(patch.transfer_mode, Some(TransferMode::Single));
-        assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
+        assert_eq!(
+            plan.to_commit_identity().transfer_mode,
+            Some(TransferMode::Single)
+        );
+        assert_eq!(plan.fallback_reason(), Some("ranges_unsupported"));
         assert_eq!(
             patch.toast.as_deref(),
             Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST)
         );
-        assert_eq!(patch.active_connections, Some(1));
+        assert_eq!(patch.tick.active_connections, Some(1));
     }
 
     #[test]
@@ -641,7 +679,7 @@ Accept-Ranges: bytes\r\n\
         let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::RangesUnsupported);
-        assert_eq!(patch.fallback_reason.as_deref(), Some("ranges_unsupported"));
+        assert_eq!(plan.fallback_reason(), Some("ranges_unsupported"));
         assert!(patch.toast.is_none());
     }
 
@@ -652,10 +690,7 @@ Accept-Ranges: bytes\r\n\
         let plan = plan_transfer(&job, Some(&pf), 5 * 1024 * 1024, true);
         let patch = plan.to_visibility_update(Some(1024), 5 * 1024 * 1024, None);
         assert_eq!(plan.reason, TransferPlanReason::BelowMinSize);
-        assert_eq!(
-            patch.fallback_reason.as_deref(),
-            Some("below_multi_min_bytes")
-        );
+        assert_eq!(plan.fallback_reason(), Some("below_multi_min_bytes"));
         assert!(patch.toast.is_none());
     }
 
@@ -672,14 +707,11 @@ Accept-Ranges: bytes\r\n\
         let second = plan.to_visibility_update(
             Some(8 * 1024 * 1024),
             5 * 1024 * 1024,
-            first.fallback_reason.as_deref(),
+            plan.fallback_reason(),
         );
-        assert_eq!(
-            second.fallback_reason.as_deref(),
-            Some("ranges_unsupported")
-        );
+        assert_eq!(plan.fallback_reason(), Some("ranges_unsupported"));
         assert!(second.toast.is_none(), "retry/resume must not re-toast");
-        assert_eq!(second.active_connections, Some(1));
+        assert_eq!(second.tick.active_connections, Some(1));
     }
 
     #[tokio::test]
@@ -711,27 +743,30 @@ Content-Length: {}\r\n\
         let url = format!("{base}/big.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx(job, on_progress);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
-        let seen = patches.lock().unwrap();
-        let toasts: Vec<_> = seen.iter().filter(|p| p.toast.is_some()).collect();
+        let toasts: Vec<_> = progress
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TransferEvent::Toast(msg) => Some(msg.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(toasts.len(), 1, "toast must be one-shot, got {toasts:?}");
-        assert_eq!(
-            toasts[0].toast.as_deref(),
-            Some(LARGE_FILE_MULTI_UNAVAILABLE_TOAST)
-        );
-        assert_eq!(
-            toasts[0].fallback_reason.as_deref(),
-            Some("ranges_unsupported")
-        );
+        assert_eq!(toasts[0], LARGE_FILE_MULTI_UNAVAILABLE_TOAST);
+        assert!(progress
+            .snapshots()
+            .iter()
+            .any(|job| job.fallback_reason.as_deref() == Some("ranges_unsupported")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -764,24 +799,27 @@ Content-Length: {}\r\n\
         let mut job = Job::new(url, "out.bin".into(), target, temp);
         job.fallback_reason = Some("ranges_unsupported".into());
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx(job, on_progress);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
-        let seen = patches.lock().unwrap();
         assert!(
-            seen.iter().all(|p| p.toast.is_none()),
+            progress
+                .events()
+                .iter()
+                .all(|event| !matches!(event, TransferEvent::Toast(_))),
             "retry/resume with same reason must not toast"
         );
-        assert!(seen
+        assert!(progress
+            .snapshots()
             .iter()
-            .any(|p| p.fallback_reason.as_deref() == Some("ranges_unsupported")));
+            .any(|job| job.fallback_reason.as_deref() == Some("ranges_unsupported")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -815,19 +853,15 @@ Accept-Ranges: none\r\n\
         let url = format!("{base}/big.bin");
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx_cfg(
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
             job,
-            on_progress,
+            progress.callback(),
             EngineRuntimeConfig {
                 multi_min_bytes: 1,
                 ..Default::default()
             },
+            progress.identity.clone(),
         );
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
@@ -847,13 +881,13 @@ Accept-Ranges: none\r\n\
             "Accept-Ranges: none must not issue multi Range GETs, got {seen:?}"
         );
 
-        let published = patches.lock().unwrap();
-        assert!(published
+        let snaps = progress.snapshots();
+        assert!(snaps
             .iter()
-            .any(|p| p.transfer_mode == Some(TransferMode::Single)));
-        assert!(published
+            .any(|job| job.transfer_mode == Some(TransferMode::Single)));
+        assert!(snaps
             .iter()
-            .any(|p| p.fallback_reason.as_deref() == Some("ranges_unsupported")));
+            .any(|job| job.fallback_reason.as_deref() == Some("ranges_unsupported")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -885,19 +919,15 @@ Content-Length: {}\r\n\
         job.downloaded_bytes = 16;
         job.resume_supported = true;
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx_cfg(
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
             job,
-            on_progress,
+            progress.callback(),
             EngineRuntimeConfig {
                 multi_min_bytes: 1,
                 ..Default::default()
             },
+            progress.identity.clone(),
         );
 
         let err = run_transfer(ctx)
@@ -907,11 +937,11 @@ Content-Length: {}\r\n\
         assert_eq!(err.message, RESUME_RESTART_MESSAGE);
         assert_eq!(std::fs::read(&temp).unwrap(), &body[..16]);
 
-        let published = patches.lock().unwrap();
-        assert!(published
+        let snaps = progress.snapshots();
+        assert!(snaps
             .iter()
-            .any(|p| p.fallback_reason.as_deref() == Some("map_missing")));
-        assert!(!published.iter().any(|p| p.segment_map.is_some()));
+            .any(|job| job.fallback_reason.as_deref() == Some("map_missing")));
+        assert!(snaps.iter().all(|job| job.segment_map.is_none()));
 
         let seen = seen.lock().unwrap();
         let gets: Vec<_> = seen
@@ -964,34 +994,30 @@ Content-Length: 48\r\n\
         job.total_bytes = body.len() as u64;
         job.resume_supported = true;
 
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
-        let patches_cb = patches.clone();
-        let on_progress: ProgressCallback = Arc::new(move |u: ProgressUpdate| {
-            patches_cb.lock().unwrap().push(u);
-        });
-
-        let ctx = test_ctx_cfg(
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
             job,
-            on_progress,
+            progress.callback(),
             EngineRuntimeConfig {
                 multi_min_bytes: 1,
                 multi_max_segments: 2,
                 ..Default::default()
             },
+            progress.identity.clone(),
         );
 
         let outcome = run_transfer(ctx).await.expect("legacy single");
         assert!(matches!(outcome, DownloadOutcome::Completed));
         assert_eq!(std::fs::read(&target).unwrap(), body);
 
-        let published = patches.lock().unwrap();
-        assert!(published
+        let snaps = progress.snapshots();
+        assert!(snaps
             .iter()
-            .any(|p| p.transfer_mode == Some(TransferMode::Single)));
-        assert!(published
+            .any(|job| job.transfer_mode == Some(TransferMode::Single)));
+        assert!(snaps
             .iter()
-            .any(|p| p.fallback_reason.as_deref() == Some("legacy_contiguous_partial")));
-        assert!(!published.iter().any(|p| p.segment_map.is_some()));
+            .any(|job| job.fallback_reason.as_deref() == Some("legacy_contiguous_partial")));
+        assert!(snaps.iter().all(|job| job.segment_map.is_none()));
 
         let seen = seen.lock().unwrap();
         let body_gets: Vec<_> = seen
@@ -1128,10 +1154,11 @@ Content-Length: {}\r\n\
         let ctx = TransferContext::from_runtime(
             job,
             Arc::new(AtomicU8::new(0)),
-            Arc::new(|_: ProgressUpdate| {}),
+            Arc::new(|_: TransferEvent| {}),
             None,
             GlobalBandwidthLimiter::new(None),
             budget.clone(),
+            Arc::new(NoopIdentity),
             &EngineRuntimeConfig::default(),
         );
 
@@ -1187,7 +1214,7 @@ Accept-Ranges: bytes\r\n\
         let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
         job.expected_sha256 = expected_sha256;
 
-        let on_progress: ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress);
         (dir, target, temp, ctx)
     }

@@ -766,8 +766,8 @@ Accept-Ranges: bytes\r\n\
         use crate::download::conn_budget::ConnectionBudget;
         use crate::download::context::TransferContext;
         use crate::download::engine::EngineRuntimeConfig;
-        use crate::download::http::ProgressUpdate;
         use crate::download::job::Job;
+        use crate::download::progress::{NoopIdentity, TransferEvent};
         use crate::download::transfer::run_transfer;
         use std::path::PathBuf;
         use std::sync::Mutex;
@@ -829,9 +829,9 @@ Accept-Ranges: bytes\r\n\
         let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
 
         let control = Arc::new(AtomicU8::new(0));
-        let patches: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+        let patches: Arc<Mutex<Vec<TransferEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let patches_cb = patches.clone();
-        let on_progress = Arc::new(move |u: ProgressUpdate| {
+        let on_progress = Arc::new(move |u: TransferEvent| {
             patches_cb.lock().unwrap().push(u);
         });
 
@@ -842,6 +842,7 @@ Accept-Ranges: bytes\r\n\
             None,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(32, 8),
+            Arc::new(NoopIdentity),
             &EngineRuntimeConfig::default(),
         );
         let outcome = run_transfer(ctx)
@@ -871,8 +872,8 @@ Accept-Ranges: bytes\r\n\
         use crate::download::conn_budget::ConnectionBudget;
         use crate::download::context::TransferContext;
         use crate::download::engine::EngineRuntimeConfig;
-        use crate::download::http::ProgressUpdate;
         use crate::download::job::Job;
+        use crate::download::progress::{NoopIdentity, TransferEvent};
         use std::path::PathBuf;
 
         let head = "HTTP/1.1 200 OK\r\n\
@@ -886,7 +887,7 @@ Content-Length: 99\r\n\
         let url = format!("{base}/pin.bin");
         let client = download_client().unwrap();
         let control = Arc::new(AtomicU8::new(0));
-        let on_progress: crate::download::http::ProgressCallback = Arc::new(|_: ProgressUpdate| {});
+        let on_progress = Arc::new(|_: TransferEvent| {});
 
         let job = Job::new(
             url.clone(),
@@ -901,6 +902,7 @@ Content-Length: 99\r\n\
             None,
             GlobalBandwidthLimiter::new(None),
             ConnectionBudget::new(32, 8),
+            Arc::new(NoopIdentity),
             &EngineRuntimeConfig::default(),
         );
         assert_eq!(ctx.resolved_url, url);

@@ -8,8 +8,8 @@ use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
 use super::engine::EngineRuntimeConfig;
 use super::handoff::HandoffAuth;
-use super::http::ProgressCallback;
 use super::job::Job;
+use super::progress::{IdentityCommit, TransferEventCallback};
 
 /// Attempt-local context. `resolved_url` is pinned after a successful redirect
 /// chain so subsequent requests do not re-walk independent redirect races.
@@ -17,7 +17,8 @@ use super::job::Job;
 pub struct TransferContext {
     pub job: Job,
     pub control: Arc<AtomicU8>,
-    pub on_progress: ProgressCallback,
+    pub on_progress: TransferEventCallback,
+    pub committer: Arc<dyn IdentityCommit>,
     /// Memory-only browser session headers (snapshot from `EngineInner`).
     pub handoff_auth: Option<HandoffAuth>,
     pub limiter: Arc<GlobalBandwidthLimiter>,
@@ -36,13 +37,15 @@ pub struct TransferContext {
 }
 
 impl TransferContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_runtime(
         job: Job,
         control: Arc<AtomicU8>,
-        on_progress: ProgressCallback,
+        on_progress: TransferEventCallback,
         handoff_auth: Option<HandoffAuth>,
         limiter: Arc<GlobalBandwidthLimiter>,
         conn_budget: Arc<ConnectionBudget>,
+        committer: Arc<dyn IdentityCommit>,
         config: &EngineRuntimeConfig,
     ) -> Self {
         let resolved_url = job.url.clone();
@@ -50,6 +53,7 @@ impl TransferContext {
             job,
             control,
             on_progress,
+            committer,
             handoff_auth,
             limiter,
             multi_min_bytes: config.multi_min_bytes,
