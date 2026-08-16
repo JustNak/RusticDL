@@ -15,10 +15,9 @@ use super::http::{
     apply_preflight, control_outcome, run_http_download_with_ctx, ProgressUpdate, TransferContext,
 };
 use super::job::{DownloadError, DownloadOutcome, Job, TransferMode};
-use super::multi::{
-    multi_resume_policy, resume_restart_required, run_multi_segment_download, MultiResumePolicy,
-};
+use super::multi::{resume_restart_required, run_multi_segment_download};
 use super::preflight::PreflightInfo;
+use super::resume::{resume_oracle, ResumeOracle};
 
 /// Why the planner chose single-stream, or that multi qualified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,27 +144,22 @@ pub fn plan_transfer(
     }
 }
 
-fn job_has_resumable_map(job: &Job) -> bool {
-    job.segment_map
-        .as_ref()
-        .is_some_and(|map| map.is_consistent())
-}
-
 fn plan_reason(
     job: &Job,
     preflight: Option<&PreflightInfo>,
     multi_min_bytes: u64,
 ) -> TransferPlanReason {
-    match multi_resume_policy(job) {
-        MultiResumePolicy::MapMissing => return TransferPlanReason::MapMissing,
-        MultiResumePolicy::MapInconsistent => return TransferPlanReason::MapInconsistent,
-        MultiResumePolicy::LegacySingle => return TransferPlanReason::LegacyContiguousPartial,
-        MultiResumePolicy::Proceed => {}
-    }
-
-    // In-progress map must not fall through to single-stream (MultiMap / Restart).
-    if job_has_resumable_map(job) {
-        return TransferPlanReason::MultiQualified;
+    match resume_oracle(job) {
+        ResumeOracle::RestartRequired => {
+            return if job.segment_map.is_none() {
+                TransferPlanReason::MapMissing
+            } else {
+                TransferPlanReason::MapInconsistent
+            };
+        }
+        ResumeOracle::LegacySingle => return TransferPlanReason::LegacyContiguousPartial,
+        ResumeOracle::Multi { .. } => return TransferPlanReason::MultiQualified,
+        ResumeOracle::FreshSingle => {}
     }
 
     let Some(size) = known_size(job, preflight) else {
@@ -375,6 +369,30 @@ mod tests {
         job.total_bytes = 2 * 1024 * 1024;
         job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
         // Flaky preflight: unknown size / ranges, and min-size raised above total.
+        let pf = preflight(None, None);
+        let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024);
+        assert_eq!(plan.chosen, TransferMode::Multi);
+        assert_eq!(plan.reason, TransferPlanReason::MultiQualified);
+    }
+
+    #[test]
+    fn planner_one_segment_map_is_multi() {
+        let mut job = sample_job();
+        job.transfer_format_version = 1;
+        job.total_bytes = 1000;
+        job.downloaded_bytes = 250;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![crate::download::segment::Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 250,
+                state: crate::download::segment::SegmentState::Active,
+            }],
+            preallocated: true,
+        });
         let pf = preflight(None, None);
         let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024);
         assert_eq!(plan.chosen, TransferMode::Multi);

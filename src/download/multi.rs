@@ -31,6 +31,10 @@ use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
     TransferMode,
 };
+use super::resume::{
+    resume_oracle, ResumeOracle, FALLBACK_LEGACY_PARTIAL, FALLBACK_MAP_INCONSISTENT,
+    FALLBACK_MAP_MISSING,
+};
 use super::segment::{partition, SegmentMap, SegmentState};
 use super::segment_io::{try_preallocate, SegmentFileWriter};
 use super::verify::verify_sha256_if_expected;
@@ -42,52 +46,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 pub(crate) const RESUME_RESTART_MESSAGE: &str = "Multi-part incomplete; Restart required.";
 pub(crate) const RANGE_IGNORED_MESSAGE: &str =
     "Server ignored Range on a multi-segment resume. Use Restart.";
-pub(crate) const FALLBACK_LEGACY_PARTIAL: &str = "legacy_contiguous_partial";
-pub(crate) const FALLBACK_MAP_MISSING: &str = "map_missing";
-pub(crate) const FALLBACK_MAP_INCONSISTENT: &str = "map_inconsistent";
-
-/// Normative resume policy for an existing job (before planner qualification).
-///
-/// - Convert multi→single **only** when every `written == 0` (see
-///   [`may_convert_multi_to_single`]); never because a prefix segment is complete.
-/// - Legacy v0 contiguous `.part` stays single until Restart.
-/// - v1 map missing/inconsistent → Resume error; do not invent Range offsets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultiResumePolicy {
-    /// Fresh v0 start, or a present consistent map (reuse — never repartition).
-    Proceed,
-    /// v0 contiguous partial — stay single until Restart.
-    LegacySingle,
-    /// `transfer_format_version >= 1` and no map.
-    MapMissing,
-    /// Map present but fails structural consistency.
-    MapInconsistent,
-}
-
-impl MultiResumePolicy {
-    pub(crate) fn fallback_reason(self) -> Option<&'static str> {
-        match self {
-            Self::Proceed => None,
-            Self::LegacySingle => Some(FALLBACK_LEGACY_PARTIAL),
-            Self::MapMissing => Some(FALLBACK_MAP_MISSING),
-            Self::MapInconsistent => Some(FALLBACK_MAP_INCONSISTENT),
-        }
-    }
-
-    pub(crate) fn is_resume_error(self) -> bool {
-        matches!(self, Self::MapMissing | Self::MapInconsistent)
-    }
-}
-
-pub(crate) fn multi_resume_policy(job: &super::job::Job) -> MultiResumePolicy {
-    match job.segment_map.as_ref() {
-        Some(map) if map.is_consistent() => MultiResumePolicy::Proceed,
-        Some(_) => MultiResumePolicy::MapInconsistent,
-        None if job.transfer_format_version >= 1 => MultiResumePolicy::MapMissing,
-        None if is_legacy_contiguous_partial(job) => MultiResumePolicy::LegacySingle,
-        None => MultiResumePolicy::Proceed,
-    }
-}
 
 /// Outcome of the multi-start map step (reuse vs fresh partition).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,18 +136,13 @@ fn should_fallback_to_single(map: &SegmentMap, error: &DownloadError) -> bool {
     may_convert_multi_to_single(map) || is_range_capability_error(error)
 }
 
-/// v0 contiguous `.part` must stay single until Restart (do not invent holes).
-pub(crate) fn is_legacy_contiguous_partial(job: &super::job::Job) -> bool {
-    job.segment_map.is_none() && job.transfer_format_version == 0 && job.downloaded_bytes > 0
-}
-
 /// Run multi-segment transfer. Falls back to single-stream when every
 /// segment still has `written == 0`, or when the server ignores Range and a
 /// contiguous prefix can be salvaged.
 pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
-    if is_legacy_contiguous_partial(&ctx.job) {
+    if matches!(resume_oracle(&ctx.job), ResumeOracle::LegacySingle) {
         return fallback_to_single(ctx, FALLBACK_LEGACY_PARTIAL).await;
     }
 
@@ -1394,19 +1347,19 @@ mod tests {
     }
 
     #[test]
-    fn resume_policy_legacy_and_map_errors() {
+    fn resume_oracle_legacy_and_map_errors() {
         let mut job = sample_job();
         job.downloaded_bytes = 10;
-        assert_eq!(multi_resume_policy(&job), MultiResumePolicy::LegacySingle);
+        assert_eq!(resume_oracle(&job), ResumeOracle::LegacySingle);
         assert_eq!(
-            multi_resume_policy(&job).fallback_reason(),
+            resume_oracle(&job).fallback_reason(),
             Some(FALLBACK_LEGACY_PARTIAL)
         );
 
         job.downloaded_bytes = 0;
         job.transfer_format_version = 1;
-        assert_eq!(multi_resume_policy(&job), MultiResumePolicy::MapMissing);
-        assert!(multi_resume_policy(&job).is_resume_error());
+        assert_eq!(resume_oracle(&job), ResumeOracle::RestartRequired);
+        assert!(resume_oracle(&job).is_resume_error());
 
         job.segment_map = Some(SegmentMap {
             total_bytes: 100,
@@ -1414,10 +1367,7 @@ mod tests {
             segments: vec![],
             preallocated: false,
         });
-        assert_eq!(
-            multi_resume_policy(&job),
-            MultiResumePolicy::MapInconsistent
-        );
+        assert_eq!(resume_oracle(&job), ResumeOracle::RestartRequired);
     }
 
     #[test]
@@ -1425,13 +1375,13 @@ mod tests {
         let mut job = sample_job();
         job.downloaded_bytes = 10;
         job.transfer_format_version = 0;
-        assert!(is_legacy_contiguous_partial(&job));
+        assert!(matches!(resume_oracle(&job), ResumeOracle::LegacySingle));
         job.downloaded_bytes = 0;
-        assert!(!is_legacy_contiguous_partial(&job));
+        assert!(matches!(resume_oracle(&job), ResumeOracle::FreshSingle));
         job.segment_map = Some(two_seg_map(10, 0));
         job.downloaded_bytes = 10;
         job.transfer_format_version = 1;
-        assert!(!is_legacy_contiguous_partial(&job));
+        assert!(matches!(resume_oracle(&job), ResumeOracle::Multi { .. }));
     }
 
     #[tokio::test]

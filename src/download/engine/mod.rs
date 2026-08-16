@@ -10,12 +10,12 @@ use tokio::time::{sleep, sleep_until, Instant as TokioInstant};
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::conn_budget::ConnectionBudget;
 use super::filesystem::{
-    apply_partial_progress_from_disk, apply_progress_from_sum, is_untracked_preallocate_hole,
-    metadata_len, remove_partial, FilenameConflictPolicy,
+    metadata_len, reconcile_from_oracle, remove_partial, FilenameConflictPolicy,
 };
 use super::handoff::{EnqueueOutcome, HandoffAuth};
 use super::http::{store_control, ProgressCallback, ProgressHint, ProgressUpdate, TransferContext};
 use super::job::{DownloadOutcome, Job, JobState, WorkerControl};
+use super::resume::{resume_oracle, ResumeOracle};
 use super::transfer::run_transfer;
 use crate::settings::Settings;
 
@@ -301,44 +301,36 @@ fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
         // Per-attempt progress pump: drain (flush pending) after each attempt so
         // restart/retry state writes cannot race a deferred coalesce window.
         let final_result = loop {
-            // Disk is authoritative for single-stream (v0) resume. Snapshot path
-            // under the lock, then await metadata without holding it. v1+ is
-            // map-authoritative — skip metadata_len so a sparse `.part` cannot lie.
-            let (temp_path, skip_disk) = {
+            // Disk is authoritative for FreshSingle / LegacySingle. Snapshot under
+            // the lock, then await metadata without holding it. Multi / Restart
+            // skip metadata_len so a sparse `.part` cannot lie.
+            let (temp_path, need_disk) = {
                 let guard = inner.lock().await;
-                let job = guard.jobs.iter().find(|j| j.id == job_id);
-                (
-                    job.map(|j| j.temp_path.clone()),
-                    job.map(|j| j.transfer_format_version >= 1 || j.segment_map.is_some())
-                        .unwrap_or(false),
-                )
+                match guard.jobs.iter().find(|j| j.id == job_id) {
+                    Some(job) => (
+                        Some(job.temp_path.clone()),
+                        matches!(
+                            resume_oracle(job),
+                            ResumeOracle::FreshSingle | ResumeOracle::LegacySingle
+                        ),
+                    ),
+                    None => (None, false),
+                }
             };
-            let on_disk = if skip_disk {
-                None
-            } else {
+            let on_disk = if need_disk {
                 Some(match temp_path.as_ref() {
                     Some(path) => metadata_len(path).await.unwrap_or(0),
                     None => 0,
                 })
+            } else {
+                None
             };
             {
                 let mut guard = inner.lock().await;
                 let restarting = guard.requeue_on_cancel.contains_key(&job_id);
                 if !restarting {
                     if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
-                        if let Some(on_disk) = on_disk {
-                            // Hole / first-start crash: leave downloaded=0 so multi can
-                            // delete after preflight knows size. Single-stream still
-                            // uses its own metadata_len Range oracle.
-                            if !is_untracked_preallocate_hole(job, on_disk) {
-                                apply_partial_progress_from_disk(job, on_disk);
-                            }
-                        } else if let Some(map) = job.segment_map.as_ref() {
-                            if map.is_consistent() {
-                                let sum = map.written_sum();
-                                apply_progress_from_sum(job, sum);
-                            }
-                        }
+                        reconcile_from_oracle(job, on_disk);
                         job.state = JobState::Downloading;
                         job.error = None;
                         attempt_job = job.clone();

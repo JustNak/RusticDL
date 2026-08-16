@@ -12,6 +12,7 @@ pub mod http;
 pub mod job;
 pub mod multi;
 pub mod preflight;
+pub mod resume;
 pub mod segment;
 pub mod segment_io;
 pub mod transfer;

@@ -26,6 +26,7 @@ use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
     TransferMode, WorkerControl,
 };
+use super::resume::{resume_oracle, ResumeOracle};
 use super::segment::SegmentMap;
 use super::verify::verify_sha256_if_expected;
 
@@ -306,11 +307,12 @@ pub async fn run_http_download_with_ctx(
         return Ok(outcome);
     }
 
-    // Skip metadata_len when map/v1 — preallocate would lie; never invent a Range.
-    let mut existing_bytes = match resume_decision(&ctx.job) {
-        ResumeDecision::NeedDiskLen => metadata_len(&ctx.job.temp_path).await.unwrap_or(0),
-        ResumeDecision::Contiguous { offset } => offset,
-        ResumeDecision::MultiMap => {
+    // Planner must not send Multi / RestartRequired here. 1-segment maps are Multi.
+    let mut existing_bytes = match resume_oracle(&ctx.job) {
+        ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
+            metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
+        }
+        ResumeOracle::Multi { .. } => {
             return Err(download_error(
                 FailureCategory::Resume,
                 "Multi-connection partial; single-stream resume is not supported. Use Restart."
@@ -318,7 +320,7 @@ pub async fn run_http_download_with_ctx(
                 false,
             ));
         }
-        ResumeDecision::RestartRequired => {
+        ResumeOracle::RestartRequired => {
             return Err(download_error(
                 FailureCategory::Resume,
                 "Multi-part incomplete; Restart required.".into(),
@@ -1180,10 +1182,10 @@ pub(crate) async fn apply_preflight(
     }
     ctx.preflight_done = true;
     let client = download_client().ok()?;
-    let policy = super::multi::multi_resume_policy(&ctx.job);
+    let oracle = resume_oracle(&ctx.job);
     let plan = super::preflight::PreflightPlan {
-        skip_range_probes: policy.is_resume_error(),
-        prove_ranges: matches!(policy, super::multi::MultiResumePolicy::Proceed),
+        skip_range_probes: oracle.is_resume_error(),
+        prove_ranges: matches!(oracle, ResumeOracle::FreshSingle),
         multi_min_bytes: ctx.multi_min_bytes,
     };
     let info = super::preflight::run_preflight_planned(
@@ -1506,36 +1508,6 @@ pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
 
-/// How single-stream should pick a Range start. Never treats `written_sum` as a prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResumeDecision {
-    /// v0, no map — caller should `metadata_len` (contiguous `.part`).
-    NeedDiskLen,
-    /// One consistent segment: Range starts at `start + written`.
-    Contiguous { offset: u64 },
-    /// Consistent multi map — per-segment remaining; single-stream must not seek.
-    MultiMap,
-    /// v1 + missing map, or present map that is inconsistent — do not invent Range.
-    RestartRequired,
-}
-
-fn resume_decision(job: &Job) -> ResumeDecision {
-    match job.segment_map.as_ref() {
-        Some(map) if !map.is_consistent() => ResumeDecision::RestartRequired,
-        Some(map) if map.segments.len() <= 1 => {
-            let offset = map
-                .segments
-                .first()
-                .map(super::segment::Segment::remaining_start)
-                .unwrap_or(0);
-            ResumeDecision::Contiguous { offset }
-        }
-        Some(_) => ResumeDecision::MultiMap,
-        None if job.transfer_format_version >= 1 => ResumeDecision::RestartRequired,
-        None => ResumeDecision::NeedDiskLen,
-    }
-}
-
 /// Strong ETags are usable for If-Range. Weak form is `W/"…"` (RFC 7232).
 fn is_strong_etag(etag: &str) -> bool {
     let t = etag.trim();
@@ -1802,41 +1774,23 @@ mod tests {
         assert!(tick.validators.is_none());
     }
 
-    #[test]
-    fn resume_decision_v0_uses_disk_len() {
-        let mut job = Job::new(
-            "https://example.com/f.bin".into(),
-            "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
-        );
-        job.downloaded_bytes = 42;
-        job.transfer_format_version = 0;
-        assert_eq!(resume_decision(&job), ResumeDecision::NeedDiskLen);
-    }
+    #[tokio::test]
+    async fn single_stream_one_segment_map_rejects_without_seek() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-http-1seg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let original = vec![0xABu8; 1000];
+        std::fs::write(&temp, &original).unwrap();
 
-    #[test]
-    fn resume_decision_v1_no_map_does_not_invent() {
         let mut job = Job::new(
             "https://example.com/f.bin".into(),
             "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
+            target,
+            temp.clone(),
         );
-        job.downloaded_bytes = 42;
-        job.transfer_format_version = 1;
-        assert_eq!(resume_decision(&job), ResumeDecision::RestartRequired);
-    }
-
-    #[test]
-    fn resume_decision_single_segment_uses_remaining_start() {
-        let mut job = Job::new(
-            "https://example.com/f.bin".into(),
-            "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
-        );
-        job.downloaded_bytes = 42;
+        job.downloaded_bytes = 250;
+        job.total_bytes = 1000;
         job.segment_map = Some(crate::download::segment::SegmentMap {
             total_bytes: 1000,
             segment_count: 1,
@@ -1849,77 +1803,37 @@ mod tests {
             }],
             preallocated: true,
         });
+        assert!(matches!(
+            resume_oracle(&job),
+            ResumeOracle::Multi { ref map } if map.segments.len() == 1
+        ));
+
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_: ProgressUpdate| {}),
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.preflight_done = true;
+
+        let err = run_http_download_with_ctx(&mut ctx)
+            .await
+            .expect_err("1-segment map must not enter single-stream");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(
+            err.message
+                .contains("single-stream resume is not supported"),
+            "got {}",
+            err.message
+        );
         assert_eq!(
-            resume_decision(&job),
-            ResumeDecision::Contiguous { offset: 250 }
+            std::fs::read(&temp).unwrap(),
+            original,
+            "must not open/seek a preallocated 1-segment .part"
         );
-    }
 
-    #[test]
-    fn resume_decision_multi_map_does_not_invent_prefix() {
-        let mut job = Job::new(
-            "https://example.com/f.bin".into(),
-            "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
-        );
-        job.downloaded_bytes = 42;
-        job.transfer_format_version = 0;
-        job.segment_map = Some(crate::download::segment::SegmentMap {
-            total_bytes: 1000,
-            segment_count: 2,
-            segments: vec![
-                crate::download::segment::Segment {
-                    index: 0,
-                    start: 0,
-                    end: 499,
-                    written: 100,
-                    state: crate::download::segment::SegmentState::Active,
-                },
-                crate::download::segment::Segment {
-                    index: 1,
-                    start: 500,
-                    end: 999,
-                    written: 25,
-                    state: crate::download::segment::SegmentState::Pending,
-                },
-            ],
-            preallocated: true,
-        });
-        assert_eq!(resume_decision(&job), ResumeDecision::MultiMap);
-    }
-
-    #[test]
-    fn resume_decision_inconsistent_map_restart_required() {
-        let mut job = Job::new(
-            "https://example.com/f.bin".into(),
-            "f.bin".into(),
-            PathBuf::from("C:\\dl\\f.bin"),
-            PathBuf::from("C:\\dl\\f.bin.part"),
-        );
-        job.transfer_format_version = 1;
-        job.segment_map = Some(crate::download::segment::SegmentMap {
-            total_bytes: 1000,
-            segment_count: 2,
-            segments: vec![
-                crate::download::segment::Segment {
-                    index: 0,
-                    start: 0,
-                    end: 499,
-                    written: 100,
-                    state: crate::download::segment::SegmentState::Active,
-                },
-                crate::download::segment::Segment {
-                    index: 1,
-                    start: 0,
-                    end: 999,
-                    written: 25,
-                    state: crate::download::segment::SegmentState::Pending,
-                },
-            ],
-            preallocated: true,
-        });
-        assert_eq!(resume_decision(&job), ResumeDecision::RestartRequired);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
