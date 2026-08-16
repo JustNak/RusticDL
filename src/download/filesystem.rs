@@ -207,11 +207,10 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
     }
 }
 
-/// Sync mutate of `downloaded_bytes` from [`resume_oracle`]. The only mutator
-/// used by `start_worker` and [`reconcile_partial_progress`].
+/// Align `downloaded_bytes` from [`resume_oracle`].
 ///
-/// `FreshSingle` / `LegacySingle` require `Some(on_disk)` — callers `metadata_len`
-/// first. Never pass `None` into those arms.
+/// `FreshSingle` / `LegacySingle` require `Some(on_disk)` — `None` would invent
+/// a resume offset without a `.part` length.
 pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileResult {
     let version_gated = job.transfer_format_version >= 1;
     match resume_oracle(job) {
@@ -266,9 +265,6 @@ pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileRe
 /// - Map present but inconsistent, or `version >= 1` with no map: leave bytes unchanged,
 ///   set `resume_required` (Fail Resume — do not invent Range, do not use file len).
 /// - version 0 and no map: single-stream — set `downloaded_bytes` from `.part` length.
-///
-/// Engine uses the same [`reconcile_from_oracle`] core after a lock-split
-/// `metadata_len`; this wrapper remains for tests and exclusive-job call sites.
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
     let need_disk = matches!(
         resume_oracle(job),

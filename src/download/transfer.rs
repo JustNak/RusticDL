@@ -151,7 +151,6 @@ fn plan_reason(
 ) -> TransferPlanReason {
     match resume_oracle(job) {
         ResumeOracle::RestartRequired => {
-            // Distinct visibility keys; not a second oracle.
             return if job.segment_map.is_none() {
                 TransferPlanReason::MapMissing
             } else {

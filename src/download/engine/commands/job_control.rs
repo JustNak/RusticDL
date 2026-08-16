@@ -20,7 +20,6 @@ pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
     job.error = Some(RESUME_RESTART_MESSAGE.into());
     job.failure_category = Some(FailureCategory::Resume);
     job.mark_finished();
-    // Distinct visibility keys; not a second oracle.
     let reason = if job.segment_map.is_none() {
         FALLBACK_MAP_MISSING
     } else {

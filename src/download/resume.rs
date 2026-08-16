@@ -39,8 +39,6 @@ impl ResumeOracle {
         matches!(self, Self::RestartRequired)
     }
 
-    /// Visibility key. `RestartRequired` is split at the publish site via
-    /// `job.segment_map.is_none()` (`map_missing` vs `map_inconsistent`).
     pub fn fallback_reason(&self) -> Option<&'static str> {
         match self {
             Self::LegacySingle => Some(FALLBACK_LEGACY_PARTIAL),

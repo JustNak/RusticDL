@@ -1774,6 +1774,68 @@ mod tests {
         assert!(tick.validators.is_none());
     }
 
+    #[tokio::test]
+    async fn single_stream_one_segment_map_rejects_without_seek() {
+        let dir = std::env::temp_dir().join(format!("rusticdl-http-1seg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let original = vec![0xABu8; 1000];
+        std::fs::write(&temp, &original).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/f.bin".into(),
+            "f.bin".into(),
+            target,
+            temp.clone(),
+        );
+        job.downloaded_bytes = 250;
+        job.total_bytes = 1000;
+        job.segment_map = Some(crate::download::segment::SegmentMap {
+            total_bytes: 1000,
+            segment_count: 1,
+            segments: vec![crate::download::segment::Segment {
+                index: 0,
+                start: 0,
+                end: 999,
+                written: 250,
+                state: crate::download::segment::SegmentState::Active,
+            }],
+            preallocated: true,
+        });
+        assert!(matches!(
+            resume_oracle(&job),
+            ResumeOracle::Multi { ref map } if map.segments.len() == 1
+        ));
+
+        let mut ctx = TransferContext::new(
+            job,
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_: ProgressUpdate| {}),
+            None,
+            GlobalBandwidthLimiter::new(None),
+        );
+        ctx.preflight_done = true;
+
+        let err = run_http_download_with_ctx(&mut ctx)
+            .await
+            .expect_err("1-segment map must not enter single-stream");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(
+            err.message
+                .contains("single-stream resume is not supported"),
+            "got {}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read(&temp).unwrap(),
+            original,
+            "must not open/seek a preallocated 1-segment .part"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn downloading_tick_sets_scalars_only() {
         let tick = ProgressUpdate::downloading_tick(25, 100, 10, 7, 25.0);
