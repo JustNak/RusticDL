@@ -1,4 +1,5 @@
 pub mod bandwidth;
+pub mod body;
 pub mod client;
 pub mod conn_budget;
 pub mod context;
@@ -6,6 +7,7 @@ pub mod drop_files;
 pub mod duplicates;
 pub mod engine;
 pub mod eta;
+pub mod fetch;
 pub mod file_type;
 pub mod filesystem;
 pub mod handoff;

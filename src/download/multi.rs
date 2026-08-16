@@ -12,20 +12,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
-use reqwest::StatusCode;
-use tokio::time::sleep;
-
+use super::body::{stream_body, PositionedSink, StreamEnd};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::context::TransferContext;
 use super::eta::EtaSmoother;
+use super::fetch::{
+    classify_segment_status, control_outcome, fetch_range, FetchRequest, RangeSpec,
+};
 use super::filesystem::{
     ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
 };
 use super::http::{
-    content_range_size_mismatch, control_outcome, progress_percent, reconnect_backoff,
-    run_http_download_with_ctx, send_segment_get, should_retry_status, sleep_interruptible,
+    progress_percent, reconnect_backoff, run_http_download_with_ctx, sleep_interruptible,
     RECONNECT_MAX,
 };
 use super::job::{
@@ -44,13 +43,10 @@ use super::segment::{partition, SegmentMap, SegmentState};
 use super::segment_io::{try_preallocate, SegmentFileWriter};
 use super::verify::verify_sha256_if_expected;
 
-const CONTROL_POLL: Duration = Duration::from_millis(200);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
 /// User-visible Resume error when a v1 map is missing or inconsistent.
 pub(crate) const RESUME_RESTART_MESSAGE: &str = "Multi-part incomplete; Restart required.";
-pub(crate) const RANGE_IGNORED_MESSAGE: &str =
-    "Server ignored Range on a multi-segment resume. Use Restart.";
 
 /// Outcome of the multi-start map step (reuse vs fresh partition).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,167 +715,51 @@ async fn run_segment_loop(
         }
 
         let range_start = start.saturating_add(written);
-        let fetch = send_segment_get(
+        let fetch = fetch_range(FetchRequest {
             client,
-            &task.job_url,
-            &task.pinned_url,
-            range_start,
-            end,
-            &task.validators,
-            task.handoff.as_ref(),
-        )
+            job_url: &task.job_url,
+            url: &task.pinned_url,
+            range: RangeSpec::Closed {
+                start: range_start,
+                end,
+            },
+            validators: &task.validators,
+            handoff: task.handoff.as_ref(),
+            follow_redirects: false,
+            control: &task.control,
+        })
         .await;
 
-        let response = match fetch {
-            Ok(response) => response,
-            Err(error) => {
-                if control_outcome(&task.control).is_some() {
-                    return Ok(());
-                }
-                if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
-                    continue;
-                }
-                if control_outcome(&task.control).is_some() {
-                    return Ok(());
-                }
-                mark_segment(&task.shared, task.index, |s| {
-                    s.state = SegmentState::Failed;
-                });
-                return Err(error);
-            }
+        let (response, range_status) = match fetch {
+            Ok(outcome) => (outcome.response, outcome.status),
+            Err(error) => match fail_or_reconnect(task, error, &mut short_reconnects).await {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(error) => return Err(error),
+            },
         };
 
         if control_outcome(&task.control).is_some() {
             return Ok(());
         }
 
-        let status = response.status();
-        if status.is_redirection() {
-            let error = download_error(
-                FailureCategory::Network,
-                "Unexpected redirect on segment request.".into(),
-                true,
-            );
-            if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
-                continue;
-            }
-            if control_outcome(&task.control).is_some() {
-                return Ok(());
-            }
-            mark_segment(&task.shared, task.index, |s| {
-                s.state = SegmentState::Failed;
-            });
-            return Err(error);
-        }
-
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            mark_segment(&task.shared, task.index, |s| {
-                s.state = SegmentState::Failed;
-            });
-            return Err(download_error(
-                FailureCategory::Http,
-                format!(
-                    "Download failed with HTTP {status}. Access denied — the link may require a browser session, cookies, or a fresh token."
-                ),
-                false,
-            ));
-        }
-
-        if status == StatusCode::RANGE_NOT_SATISFIABLE {
-            mark_segment(&task.shared, task.index, |s| {
-                s.state = SegmentState::Failed;
-            });
-            return Err(download_error(
-                FailureCategory::Resume,
-                format!(
-                    "Server rejected resume at {range_start} bytes. Use Restart to download from zero."
-                ),
-                false,
-            ));
-        }
-
-        if status == StatusCode::OK && range_start > 0 {
-            // 200 is a full entity. Never write file-from-zero at a non-zero offset
-            // (non-first segment, mid-segment resume, or If-Range mismatch).
-            mark_segment(&task.shared, task.index, |s| {
-                s.state = SegmentState::Failed;
-            });
-            return Err(download_error(
-                FailureCategory::Resume,
-                RANGE_IGNORED_MESSAGE.into(),
-                false,
-            ));
-        }
-
-        if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-            let retryable = should_retry_status(status);
-            let error = download_error(
-                FailureCategory::Http,
-                format!("Download failed with HTTP {status}."),
-                retryable,
-            );
-            if retryable && try_segment_reconnect(task, &error, &mut short_reconnects).await? {
-                continue;
-            }
-            if control_outcome(&task.control).is_some() {
-                return Ok(());
-            }
-            mark_segment(&task.shared, task.index, |s| {
-                s.state = SegmentState::Failed;
-            });
-            return Err(error);
-        }
-
-        let parsed_range = response
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(super::filesystem::parse_content_range);
-
-        if status == StatusCode::PARTIAL_CONTENT {
-            match parsed_range {
-                Some((got_start, _end, _total)) if got_start == range_start => {}
-                Some((got_start, _end, _total)) => {
-                    mark_segment(&task.shared, task.index, |s| {
-                        s.state = SegmentState::Failed;
-                    });
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        format!(
-                            "Unexpected resume range (got start {got_start}, expected {range_start}). Use Restart."
-                        ),
-                        false,
-                    ));
-                }
-                None if range_start > 0 => {
-                    mark_segment(&task.shared, task.index, |s| {
-                        s.state = SegmentState::Failed;
-                    });
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                        false,
-                    ));
-                }
-                None => {}
-            }
-        }
-
-        let range_total = parsed_range.and_then(|(_s, _e, total)| total);
-        if let Some((total, expected)) =
-            content_range_size_mismatch(range_total, task.validators.expected_size)
+        if let Err(error) =
+            classify_segment_status(&range_status, range_start, task.validators.expected_size)
         {
+            if error.retryable && try_segment_reconnect(task, &error, &mut short_reconnects).await?
+            {
+                continue;
+            }
+            if control_outcome(&task.control).is_some() {
+                return Ok(());
+            }
             mark_segment(&task.shared, task.index, |s| {
                 s.state = SegmentState::Failed;
             });
-            return Err(download_error(
-                FailureCategory::Resume,
-                format!("Remote size changed ({total} bytes vs expected {expected}). Use Restart."),
-                false,
-            ));
+            return Err(error);
         }
 
-        match stream_segment_body(response, task, range_start, end).await {
+        match stream_segment(response, task, range_start, end).await {
             Ok(true) => {
                 mark_segment(&task.shared, task.index, |s| {
                     s.state = SegmentState::Completed;
@@ -887,167 +767,86 @@ async fn run_segment_loop(
                 emit_progress(task, false);
                 return Ok(());
             }
-            Ok(false) => return Ok(()), // pause/cancel
-            Err(error) => {
-                if control_outcome(&task.control).is_some() {
-                    return Ok(());
-                }
-                if try_segment_reconnect(task, &error, &mut short_reconnects).await? {
-                    continue;
-                }
-                if control_outcome(&task.control).is_some() {
-                    return Ok(());
-                }
-                mark_segment(&task.shared, task.index, |s| {
-                    s.state = SegmentState::Failed;
-                });
-                return Err(error);
-            }
+            Ok(false) => return Ok(()),
+            Err(error) => match fail_or_reconnect(task, error, &mut short_reconnects).await {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(error) => return Err(error),
+            },
         }
     }
 }
 
+/// `Ok(true)` retry, `Ok(false)` pause/cancel, `Err` after marking Failed.
+async fn fail_or_reconnect(
+    task: &SegmentTask,
+    error: DownloadError,
+    short_reconnects: &mut u32,
+) -> Result<bool, DownloadError> {
+    if control_outcome(&task.control).is_some() {
+        return Ok(false);
+    }
+    if try_segment_reconnect(task, &error, short_reconnects).await? {
+        return Ok(true);
+    }
+    if control_outcome(&task.control).is_some() {
+        return Ok(false);
+    }
+    mark_segment(&task.shared, task.index, |s| {
+        s.state = SegmentState::Failed;
+    });
+    Err(error)
+}
+
 /// `true` when the segment is complete; `false` on pause/cancel.
-async fn stream_segment_body(
+async fn stream_segment(
     response: reqwest::Response,
     task: &SegmentTask,
-    mut offset: u64,
+    offset: u64,
     end: u64,
 ) -> Result<bool, DownloadError> {
-    let mut stream = response.bytes_stream();
+    let mut sink = PositionedSink::new(task.writer.clone(), offset, end);
     let mut last_progress = Instant::now();
+    let mut written_at = offset;
+    let result = stream_body(
+        response,
+        &mut sink,
+        &task.control,
+        task.limiter.as_ref(),
+        |n| {
+            written_at = written_at.saturating_add(n);
+            record_window_bytes(&task.shared, n);
+            {
+                let mut map = lock_map(&task.shared.map);
+                if let Some(segment) = map.segments.get_mut(task.index as usize) {
+                    segment.written = written_at
+                        .saturating_sub(segment.start)
+                        .min(segment.length());
+                    if segment.written >= segment.length() {
+                        segment.state = SegmentState::Completed;
+                    }
+                }
+            }
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                emit_progress(task, true);
+                last_progress = Instant::now();
+            }
+        },
+    )
+    .await;
 
-    loop {
-        if let Some(outcome) = control_outcome(&task.control) {
+    match result {
+        Ok(StreamEnd::Control(outcome)) => {
             if matches!(outcome, DownloadOutcome::Paused) {
                 let writer = task.writer.clone();
                 let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
             }
             emit_progress(task, false);
-            return Ok(false);
+            Ok(false)
         }
-
-        let next = tokio::select! {
-            item = stream.next() => item,
-            _ = sleep(CONTROL_POLL) => {
-                continue;
-            }
-        };
-
-        let Some(chunk_result) = next else {
-            break;
-        };
-
-        let chunk = match chunk_result {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let retryable = error.is_timeout()
-                    || error.is_connect()
-                    || error.is_request()
-                    || error.is_body()
-                    || error.is_decode();
-                return Err(download_error(
-                    FailureCategory::Network,
-                    format!("Download stream failed: {error}"),
-                    retryable,
-                ));
-            }
-        };
-
-        if chunk.is_empty() {
-            continue;
-        }
-
-        let acquired = task
-            .limiter
-            .acquire(chunk.len(), Some(task.control.as_ref()))
-            .await;
-
-        let writer = task.writer.clone();
-        let data_len = chunk.len();
-        let write_offset = offset;
-        let n = tokio::task::spawn_blocking(move || writer.write_at(write_offset, &chunk[..], end))
-            .await
-            .map_err(|error| {
-                download_error(
-                    FailureCategory::Disk,
-                    format!("Segment write task failed: {error}"),
-                    false,
-                )
-            })?
-            .map_err(|error| {
-                download_error(
-                    FailureCategory::Disk,
-                    format!("Could not write download data: {error}"),
-                    false,
-                )
-            })?;
-
-        if n == 0 {
-            break;
-        }
-
-        offset = offset.saturating_add(n as u64);
-        record_window_bytes(&task.shared, n as u64);
-
-        let (written, length, capped) = {
-            let mut map = lock_map(&task.shared.map);
-            if let Some(segment) = map.segments.get_mut(task.index as usize) {
-                segment.written = offset.saturating_sub(segment.start).min(segment.length());
-                if segment.written >= segment.length() {
-                    segment.state = SegmentState::Completed;
-                }
-                (
-                    segment.written,
-                    segment.length(),
-                    n < data_len || segment.written >= segment.length(),
-                )
-            } else {
-                (0, 0, n < data_len)
-            }
-        };
-
-        if !acquired {
-            emit_progress(task, false);
-            return Ok(false);
-        }
-
-        // End-cap truncated the chunk (or segment is full) — do not write_at past end.
-        if capped || written >= length {
-            break;
-        }
-
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            emit_progress(task, true);
-            last_progress = Instant::now();
-        }
+        Ok(StreamEnd::Exhausted { .. }) => Ok(true),
+        Err(error) => Err(error),
     }
-
-    if let Some(outcome) = control_outcome(&task.control) {
-        if matches!(outcome, DownloadOutcome::Paused) {
-            let writer = task.writer.clone();
-            let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
-        }
-        emit_progress(task, false);
-        return Ok(false);
-    }
-
-    let (written, needed) = {
-        let map = lock_map(&task.shared.map);
-        map.segments
-            .get(task.index as usize)
-            .map(|segment| (segment.written, segment.length()))
-            .unwrap_or((0, 0))
-    };
-    if written < needed {
-        return Err(download_error(
-            FailureCategory::Network,
-            format!("Download incomplete ({written} of {needed} bytes in segment)."),
-            true,
-        ));
-    }
-
-    Ok(true)
 }
 
 /// Returns `true` when the caller should retry the segment GET.
@@ -1191,6 +990,7 @@ mod tests {
     use super::*;
     use crate::download::bandwidth::GlobalBandwidthLimiter;
     use crate::download::engine::EngineRuntimeConfig;
+    use crate::download::fetch::RANGE_IGNORED_MESSAGE;
     use crate::download::filesystem::{looks_like_preallocate_hole, reconcile_partial_progress};
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use crate::download::job::Job;
@@ -1793,7 +1593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_ignored_on_resume_salvages_prefix() {
+    async fn range_ignored_on_resume_is_restart_not_salvage() {
         let total = 2 * MIN_SEGMENT_SIZE as usize;
         let body: Vec<u8> = (0..total).map(|i| (i % 193) as u8).collect();
         let (base, _seen, _handle) =
