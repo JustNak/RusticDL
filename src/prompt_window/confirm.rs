@@ -16,7 +16,10 @@ use gpui_component::{
 
 use super::helpers::{default_prompt_filename, shorten_path, truncate_middle};
 use super::start_sync_timer;
-use super::{BrowserPromptWindow, CapturePhase, CAPTURE_CONFLICT_H, CAPTURE_WINDOW_H};
+use super::{
+    BrowserPromptWindow, CapturePhase, CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W, CAPTURE_WINDOW_H,
+    CAPTURE_WINDOW_W,
+};
 use crate::appearance::apply_window_opacity;
 use crate::download::EngineHandle;
 use crate::format::format_bytes;
@@ -86,10 +89,10 @@ impl BrowserPromptWindow {
             speed_samples: VecDeque::new(),
             peak_speed: 0,
             reduce_motion: settings.reduce_motion,
-            fitted_height: Some(if opens_conflict {
-                CAPTURE_CONFLICT_H
+            fitted_size: Some(if opens_conflict {
+                (CAPTURE_CONFLICT_W, CAPTURE_CONFLICT_H)
             } else {
-                CAPTURE_WINDOW_H
+                (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H)
             }),
             cascade_index,
         }
