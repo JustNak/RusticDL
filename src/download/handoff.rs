@@ -122,6 +122,30 @@ pub fn handoff_headers_for_request<'a>(
     out
 }
 
+/// Preflight must not pin a hop it already fetched when a browser session
+/// minted that Location. Inst-FS / Drive tokens are one-use; the real GET
+/// then 401s with the "fresh token" message.
+pub fn should_pin_preflight_url(handoff_auth: Option<&HandoffAuth>) -> bool {
+    handoff_auth.is_none()
+}
+
+/// After 401/403 on a redirected hop, replay the original session URL once
+/// so Canvas can mint a new Location. Same URL cannot remint itself.
+pub fn session_url_after_auth_denied<'a>(
+    job_url: &'a str,
+    current_url: &'a str,
+    handoff_auth: Option<&HandoffAuth>,
+    already_replayed: bool,
+) -> Option<&'a str> {
+    if already_replayed || handoff_auth.is_none() {
+        return None;
+    }
+    if job_url == current_url {
+        return None;
+    }
+    Some(job_url)
+}
+
 /// Apply handoff headers only when the request URL is same-origin as the job URL.
 ///
 /// Prefer [`handoff_headers_for_request`] when origin-scoped cookies are present.
@@ -233,5 +257,41 @@ mod tests {
             Some(&auth),
         )
         .is_none());
+    }
+
+    #[test]
+    fn preflight_pin_skipped_when_handoff_present() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=1")],
+            ..Default::default()
+        };
+        assert!(!should_pin_preflight_url(Some(&auth)));
+        assert!(should_pin_preflight_url(None));
+    }
+
+    #[test]
+    fn auth_denied_replays_session_url_once() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=1")],
+            ..Default::default()
+        };
+        let job = "https://school.instructure.com/files/1/download";
+        let burned = "https://inst-fs.example/files/abc?token=used";
+        assert_eq!(
+            session_url_after_auth_denied(job, burned, Some(&auth), false),
+            Some(job)
+        );
+        assert_eq!(
+            session_url_after_auth_denied(job, burned, Some(&auth), true),
+            None
+        );
+        assert_eq!(
+            session_url_after_auth_denied(job, job, Some(&auth), false),
+            None
+        );
+        assert_eq!(
+            session_url_after_auth_denied(job, burned, None, false),
+            None
+        );
     }
 }

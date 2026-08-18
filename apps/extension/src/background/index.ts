@@ -15,6 +15,7 @@ import {
   MIN_CAPTURE_BYTES,
   matchesInterceptedDownload,
   normalizeCaptureUrl,
+  rememberDownloadRedirect,
   urlIsClaimed,
   type InterceptedDownload,
 } from './captureFilter';
@@ -36,6 +37,7 @@ import {
   firefoxBeforeRequestDownloadCandidate,
   firefoxWebRequestDownloadCandidate,
   getFirefoxBlockingWebRequest,
+  lookupRedirectSessionUrl,
   type FirefoxBeforeRequestDetails,
   type FirefoxCaptureCandidate,
   type FirefoxHeadersReceivedDetails,
@@ -754,6 +756,12 @@ function registerChromiumFilenameHints(): void {
       }
     }
   }
+  webRequest?.onBeforeRedirect?.addListener(
+    (details) => {
+      if (details.redirectUrl) rememberDownloadRedirect(details.url, details.redirectUrl);
+    },
+    { urls: ['http://*/*', 'https://*/*'] },
+  );
 
   const determining = getChromiumDeterminingFilenameApi();
   determining?.addListener(onChromiumDeterminingFilename);
@@ -763,7 +771,9 @@ async function handoffFirefoxCandidate(
   candidate: FirefoxCaptureCandidate,
   settings: ExtensionIntegrationSettings,
 ) {
-  const attempt = await handOffUrl(candidate.url, settings, {
+  const sessionUrl = lookupRedirectSessionUrl(candidate.url);
+  const url = sessionUrl ?? candidate.url;
+  const attempt = await handOffUrl(url, settings, {
     suggestedFilename: candidate.filename,
     totalBytes: candidate.totalBytes,
   }, {
@@ -771,10 +781,11 @@ async function handoffFirefoxCandidate(
     referrer: candidate.referrer,
     incognito: candidate.incognito,
     cookieStoreId: candidate.cookieStoreId,
+    finalUrl: url === candidate.url ? undefined : candidate.url,
   });
   if (attempt === 'rejected') {
     await restoreBrowserDownload({
-      url: candidate.url,
+      url,
       filename: candidate.filename,
     });
   }
@@ -802,6 +813,13 @@ function registerFirefoxWebRequestInterception() {
       handleFirefoxHeadersReceivedSync(details, webRequest),
     filter,
     ['blocking', 'responseHeaders'],
+  );
+
+  webRequest.onBeforeRedirect?.addListener(
+    (details) => {
+      if (details.redirectUrl) rememberDownloadRedirect(details.url, details.redirectUrl);
+    },
+    { urls: ['http://*/*', 'https://*/*'] },
   );
 }
 

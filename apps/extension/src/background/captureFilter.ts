@@ -325,6 +325,9 @@ export function matchesInterceptedDownload(
  * browser already used. Replay the original http(s) URL so the desktop can
  * mint a fresh Location with the tab session.
  */
+const REDIRECT_TTL_MS = 15_000;
+const redirectSessionByUrl = new Map<string, { sessionUrl: string; ts: number }>();
+
 export function httpOrigin(url: string | undefined): string | undefined {
   if (!url) return undefined;
   try {
@@ -340,15 +343,119 @@ export function isHttpDownloadUrl(url: string | undefined): url is string {
   return Boolean(httpOrigin(url));
 }
 
+/** One-time Inst-FS / Drive / verifier hops the browser may already have used. */
+export function isEphemeralSignedUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    const query = parsed.search.toLowerCase();
+    if (
+      host.includes('inst-fs')
+      || host.endsWith('.inscloudgate.net')
+      || host.endsWith('.googleusercontent.com')
+    ) {
+      return true;
+    }
+    if (query.includes('verifier=') || /[?&]confirm=/.test(parsed.search)) {
+      return true;
+    }
+    if (
+      (host === 'drive.google.com' || host.endsWith('.drive.google.com'))
+      && (path.includes('/uc') || path.includes('/download'))
+      && (query.includes('export=download') || query.includes('confirm='))
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** LMS / app gateway that can mint a fresh signed Location with the tab session. */
+export function isSessionGatewayUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname;
+    const query = parsed.search.toLowerCase();
+    if (query.includes('download_frd=')) return true;
+    if (/\/files\/\d+\/download\/?$/i.test(path)) return true;
+    if (/\/courses\/\d+\/files\/\d+/i.test(path)) return true;
+    if (
+      (host.includes('instructure') || host.includes('canvas'))
+      && /\/download\/?$/i.test(path)
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function pruneDownloadRedirects(now = Date.now()): void {
+  for (const [key, entry] of redirectSessionByUrl) {
+    if (now - entry.ts > REDIRECT_TTL_MS) redirectSessionByUrl.delete(key);
+  }
+}
+
+export function resetDownloadRedirectsForTests(): void {
+  redirectSessionByUrl.clear();
+}
+
+/**
+ * Remember Canvas → Inst-FS / Drive so a download whose `url` is already the
+ * signed hop can still replay the session gateway.
+ */
+export function rememberDownloadRedirect(from: string, to: string): void {
+  if (!isHttpDownloadUrl(from) || !isHttpDownloadUrl(to)) return;
+  pruneDownloadRedirects();
+  const fromKey = normalizeCaptureUrl(from);
+  const inherited = redirectSessionByUrl.get(fromKey)?.sessionUrl;
+  const session = isSessionGatewayUrl(from)
+    ? from
+    : inherited ?? (isEphemeralSignedUrl(to) && !isEphemeralSignedUrl(from) ? from : undefined);
+  if (!session || !isHttpDownloadUrl(session)) return;
+  const rec = { sessionUrl: session, ts: Date.now() };
+  redirectSessionByUrl.set(fromKey, rec);
+  redirectSessionByUrl.set(normalizeCaptureUrl(to), rec);
+}
+
+export function lookupRedirectSessionUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  pruneDownloadRedirects();
+  return redirectSessionByUrl.get(normalizeCaptureUrl(url))?.sessionUrl;
+}
+
 export function handoffUrlForCapturedDownload(item: {
   url?: string;
   finalUrl?: string;
 }): string | undefined {
   const original = isHttpDownloadUrl(item.url) ? item.url : undefined;
   const final = isHttpDownloadUrl(item.finalUrl) ? item.finalUrl : undefined;
-  const originalOrigin = httpOrigin(original);
-  const finalOrigin = httpOrigin(final);
-  if (original && final && originalOrigin && finalOrigin && originalOrigin !== finalOrigin) {
+  const remembered = lookupRedirectSessionUrl(final)
+    ?? lookupRedirectSessionUrl(original);
+  if (remembered && isHttpDownloadUrl(remembered)) {
+    return remembered;
+  }
+  if (original && final && original !== final) {
+    const originalOrigin = httpOrigin(original);
+    const finalOrigin = httpOrigin(final);
+    if (originalOrigin && finalOrigin && originalOrigin !== finalOrigin) {
+      return original;
+    }
+    if (isEphemeralSignedUrl(final) && !isEphemeralSignedUrl(original)) {
+      return original;
+    }
+    if (isSessionGatewayUrl(original) && isEphemeralSignedUrl(final)) {
+      return original;
+    }
+  }
+  if (original && isSessionGatewayUrl(original)) {
     return original;
   }
   return final || original;
@@ -378,10 +485,11 @@ export function cookieStoreIdForHandoff(
   extra: { incognito?: boolean; cookieStoreId?: string },
 ): string | undefined {
   if (extra.cookieStoreId) return extra.cookieStoreId;
-  if (extra.incognito) {
+  // Never guess store "0" — Chromium MV3 getAll({ storeId: "0" }) can return [].
+  if (extra.incognito === true) {
     return stores.find((store) => store.incognito === true)?.id;
   }
-  return stores.find((store) => store.incognito === false)?.id;
+  return undefined;
 }
 
 export function urlIsClaimed(

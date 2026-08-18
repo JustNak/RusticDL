@@ -245,7 +245,11 @@ export async function collectHandoffAuth(
       extra.referrer,
       extra.pageUrl,
     ])) {
-      const cookies = await browser.cookies.getAll(storeId ? { url: cookieUrl, storeId } : { url: cookieUrl });
+      let cookies = await browser.cookies.getAll(storeId ? { url: cookieUrl, storeId } : { url: cookieUrl });
+      // Chromium MV3 can return [] when storeId is guessed ("0"). Retry unbound.
+      if (cookies.length === 0 && storeId) {
+        cookies = await browser.cookies.getAll({ url: cookieUrl });
+      }
       if (cookies.length === 0) continue;
       const origin = httpOrigin(cookieUrl);
       if (!origin) continue;

@@ -9,13 +9,14 @@
 
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED,
+    LOCATION,
 };
 use reqwest::{Client, StatusCode};
 use std::sync::atomic::AtomicU8;
 
 use super::fetch::{
-    build_transfer_request, control_outcome, send_following_redirects, TransferRequestKind,
-    PREFLIGHT_TIMEOUT,
+    build_transfer_request, control_outcome, resolve_redirect_location, send_following_redirects,
+    TransferRequestKind, PREFLIGHT_TIMEOUT,
 };
 use super::filesystem::{parse_content_disposition_filename, parse_content_range};
 use super::handoff::HandoffAuth;
@@ -311,6 +312,54 @@ fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+/// Find the session gateway's Location without requesting the signed hop.
+///
+/// Canvas `/files/:id/download` 302s to a one-time Inst-FS / Drive URL. Following
+/// that hop here (HEAD or Range 0-0) consumes the token; the transfer GET then
+/// 401s. Callers pin the Location and let the first transfer request use it.
+pub async fn discover_handoff_location(
+    client: &Client,
+    job_url: &str,
+    start_url: &str,
+    handoff_auth: Option<&HandoffAuth>,
+    control: &AtomicU8,
+) -> Option<String> {
+    for kind in [TransferRequestKind::Head, TransferRequestKind::RangeProbe] {
+        if control_outcome(control).is_some() {
+            return None;
+        }
+        let Ok(response) = build_transfer_request(client, kind, job_url, start_url, handoff_auth)
+            .timeout(PREFLIGHT_TIMEOUT)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let status = response.status();
+        if status.is_redirection() {
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                continue;
+            };
+            let Ok(next) = resolve_redirect_location(start_url, location) else {
+                continue;
+            };
+            if next != start_url {
+                return Some(next);
+            }
+            return None;
+        }
+        if status.is_success() {
+            // File is at the session URL itself — no one-time hop to protect.
+            return None;
+        }
+    }
+    None
+}
+
 async fn send_with_redirects(
     client: &Client,
     kind: TransferRequestKind,
@@ -424,6 +473,116 @@ Content-Range: bytes {start}-{start}/{total}\r\n\
 Content-Length: 1\r\n\
 \r\nx"
         )
+    }
+
+    #[tokio::test]
+    async fn discover_handoff_location_does_not_fetch_signed_hop() {
+        let redirect = "HTTP/1.1 302 Found\r\n\
+Connection: close\r\n\
+Location: /signed.bin?token=once\r\n\
+Content-Length: 0\r\n\
+\r\n"
+            .to_string();
+        let must_not_hit = "HTTP/1.1 401 Unauthorized\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![redirect, must_not_hit]).await;
+        let start = format!("{base}/files/1/download");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let auth = HandoffAuth {
+            headers: vec![HandoffAuthHeader {
+                name: "Cookie".into(),
+                value: "canvas=1".into(),
+            }],
+            ..Default::default()
+        };
+
+        let location = discover_handoff_location(&client, &start, &start, Some(&auth), &control)
+            .await
+            .expect("Location");
+        assert_eq!(location, format!("{base}/signed.bin?token=once"));
+
+        let first = reqs.recv().await.expect("session request");
+        assert!(
+            first.starts_with("HEAD ") || first.starts_with("GET "),
+            "session hop: {first}"
+        );
+        assert!(
+            first.to_ascii_lowercase().contains("cookie: canvas=1"),
+            "session hop must send cookies:\n{first}"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(80), reqs.recv())
+            .await
+            .expect_err("signed hop must not be fetched during discover");
+    }
+
+    #[tokio::test]
+    async fn apply_preflight_handoff_pins_unfetched_location() {
+        use crate::download::bandwidth::GlobalBandwidthLimiter;
+        use crate::download::conn_budget::ConnectionBudget;
+        use crate::download::context::TransferContext;
+        use crate::download::engine::EngineRuntimeConfig;
+        use crate::download::http::apply_preflight;
+        use crate::download::job::Job;
+        use crate::download::progress::{NoopIdentity, TransferEvent};
+        use std::path::PathBuf;
+
+        let redirect = "HTTP/1.1 302 Found\r\n\
+Connection: close\r\n\
+Location: /signed.bin?token=once\r\n\
+Content-Length: 0\r\n\
+\r\n"
+            .to_string();
+        let must_not_hit = "HTTP/1.1 401 Unauthorized\r\n\
+Connection: close\r\n\
+Content-Length: 0\r\n\
+\r\n"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![redirect, must_not_hit]).await;
+        let start = format!("{base}/files/1/download");
+        let control = Arc::new(AtomicU8::new(0));
+        let on_progress = Arc::new(|_: TransferEvent| {});
+        let auth = HandoffAuth {
+            headers: vec![HandoffAuthHeader {
+                name: "Cookie".into(),
+                value: "canvas=1".into(),
+            }],
+            ..Default::default()
+        };
+        let job = Job::new(
+            start.clone(),
+            "file.bin".into(),
+            PathBuf::from("C:\\dl\\file.bin"),
+            PathBuf::from("C:\\dl\\file.bin.part"),
+        );
+        let mut ctx = TransferContext::from_runtime(
+            job,
+            control.clone(),
+            on_progress,
+            Some(auth),
+            GlobalBandwidthLimiter::new(None),
+            ConnectionBudget::new(32, 8),
+            Arc::new(NoopIdentity),
+            &EngineRuntimeConfig::default(),
+        );
+
+        let info = apply_preflight(&mut ctx).await;
+        assert!(
+            info.is_none(),
+            "handoff preflight must not consume the signed hop"
+        );
+        assert_eq!(ctx.resolved_url, format!("{base}/signed.bin?token=once"));
+        let first = reqs.recv().await.expect("session request");
+        assert!(
+            first.starts_with("HEAD ") || first.starts_with("GET "),
+            "{first}"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(80), reqs.recv())
+            .await
+            .expect_err("signed hop must stay unused so the transfer GET can use the token");
     }
 
     #[tokio::test]
