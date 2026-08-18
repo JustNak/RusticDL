@@ -6,7 +6,7 @@
 (function () {
   const CACHE_KEY = 'rusticdl-appearance';
   const DEFAULT_ACCENT_COLOR = '#3b82f6';
-  const DEFAULT_APPEARANCE = { theme: 'system', accentColor: DEFAULT_ACCENT_COLOR };
+  const DEFAULT_APPEARANCE = { theme: 'light', accentColor: DEFAULT_ACCENT_COLOR };
   const root = document.documentElement;
 
   function normalizeAccentColor(rawColor) {

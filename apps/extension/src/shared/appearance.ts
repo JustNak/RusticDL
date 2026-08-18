@@ -7,7 +7,7 @@ export const APPEARANCE_CACHE_KEY = 'rusticdl-appearance';
 export const APPEARANCE_STORAGE_KEY = 'appearance-settings';
 
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
-  theme: 'system',
+  theme: 'light',
   accentColor: DEFAULT_ACCENT_COLOR,
 };
 
