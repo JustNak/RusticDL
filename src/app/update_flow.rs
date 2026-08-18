@@ -524,12 +524,11 @@ fn is_product_version_heading(title: &str) -> bool {
 }
 
 fn is_full_changelog_line(line: &str) -> bool {
-    let stripped = line
-        .trim()
-        .trim_start_matches(['*', '-', '#', ' '])
-        .trim_start_matches('*')
-        .trim();
-    stripped.to_ascii_lowercase().starts_with("full changelog")
+    let t = line.trim();
+    if heading_title(t).is_some_and(|title| normalize_heading(title) == "full changelog") {
+        return true;
+    }
+    t.to_ascii_lowercase().starts_with("**full changelog**")
 }
 
 fn is_license_line(line: &str) -> bool {
@@ -544,6 +543,7 @@ fn is_license_line(line: &str) -> bool {
 /// Drop GitHub’s auto `by @user in <url|#n>` suffix from a change line.
 fn strip_github_attribution(line: &str) -> &str {
     let mut search_from = 0;
+    let mut last_start = None;
     while let Some(rel) = line[search_from..].find(" by @") {
         let start = search_from + rel;
         let after_user = start + " by @".len();
@@ -555,12 +555,14 @@ fn strip_github_attribution(line: &str) -> &str {
                 || rest.starts_with('#')
                 || rest.starts_with("[#")
             {
-                return line[..start].trim_end();
+                last_start = Some(start);
             }
         }
         search_from = start + 5;
     }
-    line
+    last_start
+        .map(|start| line[..start].trim_end())
+        .unwrap_or(line)
 }
 
 fn collapse_blank_lines(src: &str) -> String {
@@ -711,5 +713,26 @@ Local-first HTTP(S) download manager.
         assert!(!out.contains("Downloads"));
         assert!(!out.contains("setup.exe"));
         assert!(!out.contains("## RusticDL"));
+    }
+
+    #[test]
+    fn format_changelog_keeps_full_changelog_titled_item() {
+        let raw = r#"## What's Changed
+* Full changelog in What’s New
+* Keep later items
+**Full Changelog**: https://github.com/JustNak/RusticDL/compare/a...b
+"#;
+        let out = format_changelog_notes(raw);
+        assert_eq!(out, "* Full changelog in What’s New\n* Keep later items");
+        assert!(!out.contains("github.com"));
+    }
+
+    #[test]
+    fn format_changelog_strips_only_trailing_github_attribution() {
+        let raw = r#"## What's Changed
+* Revert "Fix foo by @alice in #12" by @bob in https://github.com/JustNak/RusticDL/pull/99
+"#;
+        let out = format_changelog_notes(raw);
+        assert_eq!(out, r#"* Revert "Fix foo by @alice in #12""#);
     }
 }
