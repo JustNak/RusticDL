@@ -223,15 +223,12 @@ impl DownloadApp {
             if let Some(notes) = notes_markdown {
                 body = body.child(
                     GroupBox::new().outline().child(
-                        div()
-                            .w_full()
-                            .h(px(WHATS_NEW_NOTES_H))
-                            .child(
-                                TextView::markdown("whats-new-notes-md", notes, window, cx)
-                                    .selectable(true)
-                                    .scrollable(true)
-                                    .style(changelog_text_style(&theme)),
-                            ),
+                        div().w_full().h(px(WHATS_NEW_NOTES_H)).child(
+                            TextView::markdown("whats-new-notes-md", notes, window, cx)
+                                .selectable(true)
+                                .scrollable(true)
+                                .style(changelog_text_style(&theme)),
+                        ),
                     ),
                 );
             } else {
