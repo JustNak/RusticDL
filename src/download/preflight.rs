@@ -446,6 +446,7 @@ ETag: \"v1\"\r\n\
                 name: "Cookie".into(),
                 value: "session=abc123".into(),
             }],
+            ..Default::default()
         };
 
         let info = run_preflight(&client, &url, &url, Some(&auth), &control)
@@ -491,6 +492,7 @@ Content-Length: 50\r\n\
                 name: "Cookie".into(),
                 value: "session=secret".into(),
             }],
+            ..Default::default()
         };
 
         let info = run_preflight(&client, job_url, &request_url, Some(&auth), &control)

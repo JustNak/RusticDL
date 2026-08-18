@@ -57,8 +57,14 @@ export interface HandoffAuthHeader {
   value: string;
 }
 
+export interface OriginHandoffAuth {
+  origin: string;
+  headers: HandoffAuthHeader[];
+}
+
 export interface HandoffAuth {
   headers: HandoffAuthHeader[];
+  originAuth?: OriginHandoffAuth[];
 }
 
 export interface EnqueueDownloadPayload {
@@ -258,15 +264,41 @@ function normalizeTotalBytes(totalBytes: number | undefined): number | undefined
     : undefined;
 }
 
-function normalizeHandoffAuth(handoffAuth: HandoffAuth | undefined): HandoffAuth | undefined {
-  if (!handoffAuth?.headers?.length) return undefined;
-  const headers = handoffAuth.headers
+function normalizeOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeHandoffHeaders(headers: HandoffAuthHeader[] | undefined): HandoffAuthHeader[] {
+  return (headers ?? [])
     .map((header) => ({
       name: trimMetadata(header.name)?.trim() ?? '',
       value: header.value.slice(0, 16 * 1024),
     }))
     .filter((header) => header.name && header.value);
-  return headers.length ? { headers } : undefined;
+}
+
+function normalizeHandoffAuth(handoffAuth: HandoffAuth | undefined): HandoffAuth | undefined {
+  if (!handoffAuth) return undefined;
+  const headers = normalizeHandoffHeaders(handoffAuth.headers);
+  const originAuth = (handoffAuth.originAuth ?? [])
+    .map((entry) => ({
+      origin: normalizeOrigin(entry.origin) ?? '',
+      headers: normalizeHandoffHeaders(entry.headers),
+    }))
+    .filter((entry) => entry.origin && entry.headers.length)
+    .slice(0, 8);
+  if (!headers.length && !originAuth.length) return undefined;
+  return {
+    headers,
+    ...(originAuth.length ? { originAuth } : {}),
+  };
 }
 
 export function createPingRequest(requestId = createRequestId()): RequestEnvelope<'ping', EmptyPayload> {

@@ -58,6 +58,8 @@ const {
   rememberDeterminedFilename,
   resolveSuggestedFilename,
   applyDeterminedFilename,
+  rememberRequestAuth,
+  lookupOriginAuth,
 } = require(chromiumOutfile);
 const {
   firefoxWebRequestDownloadCandidate,
@@ -75,6 +77,9 @@ const {
   normalizeCaptureUrl,
   shouldPauseDownloadItem,
   urlIsClaimed,
+  cookieStoreIdForHandoff,
+  cookieUrlsForHandoff,
+  handoffUrlForCapturedDownload,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
@@ -1076,6 +1081,80 @@ const determined = applyDeterminedFilename(
 assert(
   'onDeterminingFilename observes the name without rewriting Chrome',
   determined === realVideoName && suggestedOverride === undefined,
+);
+
+assert(
+  'handoff prefers Canvas session URL over Drive/Inst-FS finalUrl',
+  handoffUrlForCapturedDownload({
+    url: 'https://school.instructure.com/files/99/download?download_frd=1',
+    finalUrl: 'https://drive.google.com/uc?export=download&id=abc',
+  }) === 'https://school.instructure.com/files/99/download?download_frd=1',
+);
+
+assert(
+  'handoff keeps same-origin finalUrl (CDN path after redirect)',
+  handoffUrlForCapturedDownload({
+    url: 'https://cdn.example.com/ticket/abc',
+    finalUrl: 'https://cdn.example.com/files/app.zip',
+  }) === 'https://cdn.example.com/files/app.zip',
+);
+
+assert(
+  'cookie URLs are one http(s) URL per origin',
+  JSON.stringify(cookieUrlsForHandoff([
+    'https://school.instructure.com/files/1/download?download_frd=1',
+    'https://school.instructure.com/courses/2/files',
+    'https://drive.google.com/uc?id=abc',
+    'blob:https://school.instructure.com/uuid',
+  ])) === JSON.stringify([
+    'https://school.instructure.com/files/1/download?download_frd=1',
+    'https://drive.google.com/uc?id=abc',
+  ]),
+);
+
+assert(
+  'Chromium cookie stores without incognito do not guess a storeId',
+  cookieStoreIdForHandoff([{ id: '0', tabIds: [1] }], { incognito: false }) === undefined,
+);
+
+assert(
+  'Firefox cookieStoreId is preferred over store listing',
+  cookieStoreIdForHandoff(
+    [{ id: 'firefox-default', incognito: false }],
+    { cookieStoreId: 'firefox-container-1', incognito: false },
+  ) === 'firefox-container-1',
+);
+
+assert(
+  'Firefox incognito store is selected only when the flag is present',
+  cookieStoreIdForHandoff(
+    [
+      { id: 'firefox-default', incognito: false },
+      { id: 'firefox-private', incognito: true },
+    ],
+    { incognito: true },
+  ) === 'firefox-private',
+);
+
+rememberRequestAuth({
+  url: 'https://school.instructure.com/files/99/download?download_frd=1',
+  requestHeaders: [
+    { name: 'Cookie', value: 'canvas_session=abc' },
+    { name: 'Authorization', value: 'Bearer canvas-token' },
+    { name: 'Accept', value: '*/*' },
+  ],
+});
+const capturedAuth = lookupOriginAuth([
+  'https://school.instructure.com/files/99/download?download_frd=1',
+  'https://drive.google.com/uc?id=abc',
+]);
+assert(
+  'captures Cookie and Authorization from Chromium request headers',
+  capturedAuth.length === 1
+    && capturedAuth[0].origin === 'https://school.instructure.com'
+    && capturedAuth[0].headers.some((header) => header.name === 'Cookie')
+    && capturedAuth[0].headers.some((header) => header.name === 'Authorization')
+    && !capturedAuth[0].headers.some((header) => header.name === 'Accept'),
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

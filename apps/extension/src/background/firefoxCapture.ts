@@ -52,9 +52,13 @@ export type FirefoxCaptureCandidate = {
 export {
   MIN_CAPTURE_BYTES,
   canonicalDownloadFilename,
+  cookieStoreIdForHandoff,
+  cookieUrlsForHandoff,
   downloadBasename,
   downloadCreatedAction,
   filenameFromContentDisposition,
+  handoffUrlForCapturedDownload,
+  httpOrigin,
   isWeakSuggestedFilename,
   knownDownloadBytes,
   matchesInterceptedDownload,

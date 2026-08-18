@@ -41,4 +41,5 @@ Only `http` and `https` URLs are accepted.
 - Extension is untrusted; desktop re-validates URLs, sizes, and rate limits.
 - Destination path is never accepted from the extension.
 - Browser session headers (`handoffAuth`) are memory-only and never written to `state.json`.
+- `handoffAuth.originAuth` is optional per-origin Cookie/Authorization so a Canvas → Drive redirect can keep the Drive session without sending Canvas cookies cross-origin.
 - Named pipe rejects remote clients.

@@ -10,14 +10,15 @@ use tokio::sync::oneshot;
 use super::bridge::{BrowserPrompt, IpcBridge, PromptDecision, DOWNLOAD_PROMPT_TIMEOUT};
 use super::protocol::{
     is_side_effect_rate_limited, parse_enqueue_payload, validate_host_request, EnqueuePayload,
-    HostRequest, HostResponse, RawHandoffAuth, MAX_METADATA_LENGTH,
+    HostRequest, HostResponse, RawHandoffAuth, RawHandoffAuthHeader, MAX_METADATA_LENGTH,
 };
 use crate::download::{
     derive_filename_from_url, find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus,
-    FilenameConflictPolicy, HandoffAuth, HandoffAuthHeader,
+    FilenameConflictPolicy, HandoffAuth, HandoffAuthHeader, OriginHandoffAuth,
 };
 use crate::extension_settings::ExtensionIntegrationSettings;
 use crate::persistence::save_settings;
+use url::Url;
 
 const ENQUEUE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -100,20 +101,51 @@ fn save_extension_settings(
     }
 }
 
+fn parse_handoff_headers(headers: Vec<RawHandoffAuthHeader>) -> Vec<HandoffAuthHeader> {
+    headers
+        .into_iter()
+        .filter(|h| !h.name.trim().is_empty() && !h.value.is_empty())
+        .take(32)
+        .map(|h| HandoffAuthHeader {
+            name: h.name.chars().take(MAX_METADATA_LENGTH).collect(),
+            value: h.value.chars().take(16 * 1024).collect(),
+        })
+        .collect()
+}
+
+fn parse_origin(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw.trim()).ok()?;
+    match parsed.origin() {
+        url::Origin::Tuple(..) => Some(parsed.origin().ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
 fn parse_handoff_auth(raw: Option<RawHandoffAuth>) -> Option<HandoffAuth> {
-    raw.map(|auth| HandoffAuth {
-        headers: auth
-            .headers
-            .into_iter()
-            .filter(|h| !h.name.trim().is_empty() && !h.value.is_empty())
-            .take(32)
-            .map(|h| HandoffAuthHeader {
-                name: h.name.chars().take(MAX_METADATA_LENGTH).collect(),
-                value: h.value.chars().take(16 * 1024).collect(),
-            })
-            .collect(),
-    })
-    .filter(|auth| !auth.headers.is_empty())
+    let auth = raw?;
+    let headers = parse_handoff_headers(auth.headers);
+    let origin_auth = auth
+        .origin_auth
+        .into_iter()
+        .filter_map(|entry| {
+            let origin = parse_origin(&entry.origin)?;
+            let headers = parse_handoff_headers(entry.headers);
+            if headers.is_empty() {
+                None
+            } else {
+                Some(OriginHandoffAuth { origin, headers })
+            }
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    if headers.is_empty() && origin_auth.is_empty() {
+        None
+    } else {
+        Some(HandoffAuth {
+            headers,
+            origin_auth,
+        })
+    }
 }
 
 async fn enqueue_download(

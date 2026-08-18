@@ -34,6 +34,8 @@ pub use filesystem::{
     derive_filename_from_url, find_filename_collision, sanitize_filename, FilenameCollision,
     FilenameConflictPolicy,
 };
-pub use handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader};
+pub use handoff::{
+    EnqueueOutcome, EnqueueStatus, HandoffAuth, HandoffAuthHeader, OriginHandoffAuth,
+};
 pub use job::{fallback_reason_label, Job, JobState};
 pub use urls::extract_http_urls;
