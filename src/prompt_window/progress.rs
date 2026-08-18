@@ -8,7 +8,7 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme, StyledExt,
 };
 
-use super::helpers::{capture_progress_bar, speed_sparkline};
+use super::helpers::{capture_progress_bar, sparkline_status, speed_sparkline};
 use super::start_sync_timer;
 use super::{
     BrowserPromptWindow, CapturePhase, CAPTURE_COMPLETE_H, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
@@ -296,17 +296,12 @@ impl BrowserPromptWindow {
         };
 
         let samples: Vec<u64> = self.speed_samples.iter().copied().collect();
-        let spark_status = if self
-            .job
-            .as_ref()
-            .is_some_and(|j| j.state == JobState::Paused)
-        {
-            "paused"
-        } else if samples.iter().any(|&s| s > 0) {
-            "live"
-        } else {
-            "waiting…"
-        };
+        let spark_status = sparkline_status(
+            self.job
+                .as_ref()
+                .is_some_and(|j| j.state == JobState::Paused),
+            &samples,
+        );
 
         v_flex()
             .gap_2()

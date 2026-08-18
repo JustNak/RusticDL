@@ -455,7 +455,11 @@ pub async fn run_http_download_with_ctx(
                 window_start = Instant::now();
                 window_bytes = 0;
                 let remaining = total_bytes.saturating_sub(downloaded);
-                let (_, eta_secs) = eta_smoother.observe(speed, remaining);
+                let eta_secs = if speed == 0 {
+                    0
+                } else {
+                    eta_smoother.observe(speed, remaining).1
+                };
                 on_progress(TransferEvent::Tick(ProgressTick::downloading(
                     downloaded,
                     total_bytes,
@@ -1123,9 +1127,12 @@ mod tests {
             "Download incomplete (100 of 500 bytes).".into(),
             true,
         );
+        let stalled = crate::download::body::stall_error(std::time::Duration::from_secs(30));
         // Mid-body with resume support.
         assert!(can_mid_transfer_reconnect(&body_err, false, 0, 100, true));
         assert!(can_mid_transfer_reconnect(&incomplete, false, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&stalled, false, 0, 100, true));
+        assert!(!can_mid_transfer_reconnect(&stalled, false, 0, 100, false));
         // Exhausted short budget.
         assert!(!can_mid_transfer_reconnect(
             &body_err,

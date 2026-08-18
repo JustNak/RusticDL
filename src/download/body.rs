@@ -1,9 +1,9 @@
-//! Shared transfer body loop: control poll, limiter-then-write, incomplete-at-end.
+//! Shared transfer body loop: control poll, limiter-then-write, stall, incomplete-at-end.
 
 use std::path::Path;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -17,6 +17,13 @@ use super::job::{download_error, DownloadError, DownloadOutcome, FailureCategory
 use super::segment_io::SegmentFileWriter;
 
 pub(crate) const CONTROL_POLL: Duration = Duration::from_millis(200);
+
+/// No application data for this long is a retryable stall (reconnect / retry).
+///
+/// Shorter than the client `read_timeout` (120s) so a silent TCP/HTTP2 body
+/// does not sit at 98% with a stale live speed. Empty frames that reset
+/// reqwest's read timer do not reset this clock.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const WRITE_BUF: usize = 256 * 1024;
 
@@ -208,9 +215,22 @@ pub async fn stream_body(
     sink: &mut impl BodySink,
     control: &AtomicU8,
     limiter: &GlobalBandwidthLimiter,
+    on_chunk: impl FnMut(u64),
+) -> Result<StreamEnd, DownloadError> {
+    stream_body_with_stall(response, sink, control, limiter, STALL_TIMEOUT, on_chunk).await
+}
+
+/// Same as [`stream_body`] with an injectable stall budget (tests use a short one).
+pub(crate) async fn stream_body_with_stall(
+    response: reqwest::Response,
+    sink: &mut impl BodySink,
+    control: &AtomicU8,
+    limiter: &GlobalBandwidthLimiter,
+    stall_timeout: Duration,
     mut on_chunk: impl FnMut(u64),
 ) -> Result<StreamEnd, DownloadError> {
     let mut stream = response.bytes_stream();
+    let mut last_byte = Instant::now();
 
     loop {
         if let Some(outcome) = control_outcome(control) {
@@ -218,53 +238,61 @@ pub async fn stream_body(
             return Ok(StreamEnd::Control(outcome));
         }
 
-        let next = tokio::select! {
-            item = stream.next() => item,
+        tokio::select! {
+            item = stream.next() => {
+                let Some(chunk_result) = item else {
+                    break;
+                };
+
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(error) => {
+                        sink.flush().await?;
+                        let retryable = error.is_timeout()
+                            || error.is_connect()
+                            || error.is_request()
+                            || error.is_body()
+                            || error.is_decode();
+                        return Err(download_error(
+                            FailureCategory::Network,
+                            format!("Download stream failed: {}", format_reqwest_error(&error)),
+                            retryable,
+                        ));
+                    }
+                };
+
+                // Empty frames reset reqwest's read timeout but are not progress.
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                last_byte = Instant::now();
+
+                // Must write a delivered chunk — dropping it leaves a Range-resume hole.
+                let acquired = limiter.acquire(chunk.len(), Some(control)).await;
+                let n = sink.write_chunk(&chunk).await?;
+                if n > 0 {
+                    on_chunk(n as u64);
+                }
+
+                if !acquired {
+                    sink.flush().await?;
+                    let outcome = control_outcome(control).unwrap_or(DownloadOutcome::Paused);
+                    return Ok(StreamEnd::Control(outcome));
+                }
+
+                if n == 0 || n < chunk.len() {
+                    break;
+                }
+            }
             _ = sleep(CONTROL_POLL) => {
-                continue;
+                if last_byte.elapsed() >= stall_timeout {
+                    sink.flush().await?;
+                    return Err(stall_error(stall_timeout));
+                }
+                // Let callers emit speed=0 so the HUD/queue do not keep a stale live rate.
+                on_chunk(0);
             }
-        };
-
-        let Some(chunk_result) = next else {
-            break;
-        };
-
-        let chunk = match chunk_result {
-            Ok(c) => c,
-            Err(error) => {
-                sink.flush().await?;
-                let retryable = error.is_timeout()
-                    || error.is_connect()
-                    || error.is_request()
-                    || error.is_body()
-                    || error.is_decode();
-                return Err(download_error(
-                    FailureCategory::Network,
-                    format!("Download stream failed: {}", format_reqwest_error(&error)),
-                    retryable,
-                ));
-            }
-        };
-
-        if chunk.is_empty() {
-            continue;
-        }
-
-        // Must write a delivered chunk — dropping it leaves a Range-resume hole.
-        let acquired = limiter.acquire(chunk.len(), Some(control)).await;
-        let n = sink.write_chunk(&chunk).await?;
-        if n > 0 {
-            on_chunk(n as u64);
-        }
-
-        if !acquired {
-            sink.flush().await?;
-            let outcome = control_outcome(control).unwrap_or(DownloadOutcome::Paused);
-            return Ok(StreamEnd::Control(outcome));
-        }
-
-        if n == 0 || n < chunk.len() {
-            break;
         }
     }
 
@@ -297,6 +325,14 @@ fn disk_write_error(error: std::io::Error) -> DownloadError {
     )
 }
 
+pub(crate) fn stall_error(idle: Duration) -> DownloadError {
+    download_error(
+        FailureCategory::Network,
+        format!("Download stalled (no data for {}s).", idle.as_secs().max(1)),
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +340,7 @@ mod tests {
     use std::sync::atomic::AtomicU8;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     async fn serve_body(body: &[u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -538,6 +575,119 @@ mod tests {
             payload,
             "delivered chunk must be written after acquire abort"
         );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    async fn serve_partial_then_hang(
+        body: &[u8],
+        advertised_len: usize,
+    ) -> (String, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.to_vec();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut collected = Vec::new();
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: {advertised_len}\r\n\r\n"
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.write_all(&payload).await;
+            let _ = socket.flush().await;
+            let _ = release_rx.await;
+            drop(socket);
+        });
+        (format!("http://{addr}/file.bin"), release_tx)
+    }
+
+    #[tokio::test]
+    async fn stream_body_silent_server_is_retryable_stall() {
+        let payload = b"partial";
+        let (url, hold) = serve_partial_then_hang(payload, 1000).await;
+        let response = get_response(&url).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-stall-sink-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap().with_target(1000);
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_body_with_stall(
+                response,
+                &mut sink,
+                &control,
+                limiter.as_ref(),
+                Duration::from_millis(80),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("stall should fire well before 2s")
+        .expect_err("silent body must stall, not hang");
+        assert_eq!(err.category, FailureCategory::Network);
+        assert!(err.retryable);
+        assert!(err.message.contains("Download stalled"));
+        assert_eq!(sink.offset(), payload.len() as u64);
+        drop(hold);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn stream_body_emits_idle_zero_ticks_before_stall() {
+        let payload = b"head";
+        let (url, hold) = serve_partial_then_hang(payload, 1000).await;
+        let response = get_response(&url).await;
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-idle-tick-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap();
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let ticks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ticks_cb = ticks.clone();
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_body_with_stall(
+                response,
+                &mut sink,
+                &control,
+                limiter.as_ref(),
+                Duration::from_millis(700),
+                move |n| ticks_cb.lock().unwrap().push(n),
+            ),
+        )
+        .await
+        .expect("stall should fire")
+        .expect_err("silent body must stall");
+        assert!(err.message.contains("Download stalled"));
+        let ticks = ticks.lock().unwrap().clone();
+        assert!(
+            ticks.iter().any(|&n| n > 0),
+            "should credit the delivered prefix, got {ticks:?}"
+        );
+        assert!(
+            ticks.iter().any(|&n| n == 0),
+            "idle polls must emit zero-byte ticks so UI speed can drop, got {ticks:?}"
+        );
+        drop(hold);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

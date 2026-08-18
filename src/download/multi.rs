@@ -902,7 +902,13 @@ fn emit_progress(task: &SegmentTask, sample_window: bool) {
     let remaining = total.saturating_sub(downloaded);
     let (speed, eta) = if sample_window {
         take_due_sample(&task.shared, remaining)
-            .map(|(s, e)| (Some(s), Some(e)))
+            .map(|(s, e)| {
+                if s == 0 {
+                    (Some(0), Some(0))
+                } else {
+                    (Some(s), Some(e))
+                }
+            })
             .unwrap_or_else(|| last_smoothed(&task.shared))
     } else {
         last_smoothed(&task.shared)

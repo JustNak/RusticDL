@@ -117,6 +117,19 @@ pub(super) fn capture_progress_bar(
         .rounded_full()
 }
 
+/// HUD graph status: live while the latest sample is moving, stalled after zeros.
+pub(super) fn sparkline_status(paused: bool, samples: &[u64]) -> &'static str {
+    if paused {
+        "paused"
+    } else if samples.last().is_some_and(|&s| s > 0) {
+        "live"
+    } else if samples.iter().any(|&s| s > 0) {
+        "stalled"
+    } else {
+        "waiting…"
+    }
+}
+
 /// Compact throughput graph of recent bytes/sec samples.
 pub(super) fn speed_sparkline(
     samples: &[u64],
@@ -676,6 +689,15 @@ mod tests {
         let cols = vec![None, Some(10), Some(0), Some(20)];
         assert_eq!(visible_average(&cols), Some(10));
         assert_eq!(visible_average(&[None, None]), None);
+    }
+
+    #[test]
+    fn sparkline_status_uses_latest_sample_not_any_history() {
+        assert_eq!(sparkline_status(true, &[1_000_000]), "paused");
+        assert_eq!(sparkline_status(false, &[]), "waiting…");
+        assert_eq!(sparkline_status(false, &[0, 0]), "waiting…");
+        assert_eq!(sparkline_status(false, &[1_140_000]), "live");
+        assert_eq!(sparkline_status(false, &[1_140_000, 0, 0]), "stalled");
     }
 
     #[test]
