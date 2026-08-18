@@ -1,33 +1,41 @@
+/*
+ * Visual tokens mirror the desktop gpui-component Theme (zinc / hue 240).
+ * Accent is overlaid at runtime from the desktop appearance DTO — do not invent
+ * a third palette here.
+ */
 :root {
   color-scheme: light;
-  --color-background: oklch(98.5% 0.003 247);
-  --color-foreground: oklch(20% 0.012 247);
-  --color-surface: oklch(96.8% 0.004 247);
-  --color-sidebar: oklch(98.9% 0.003 247);
-  --color-command: oklch(98.2% 0.003 247);
-  --color-header: oklch(96.2% 0.004 247);
-  --color-muted: oklch(93.5% 0.005 247);
-  --color-muted-foreground: oklch(48% 0.012 247);
-  --color-card: oklch(100% 0 0);
-  --color-border: oklch(88.5% 0.007 247);
-  --color-input: oklch(86.8% 0.008 247);
-  --color-row-hover: oklch(97.2% 0.006 247);
-  --color-selected: oklch(93.4% 0.031 255);
+  --color-background: hsl(0 0% 100%);
+  --color-foreground: hsl(240 10% 3.9%);
+  --color-surface: hsl(240 5% 96%);
+  --color-sidebar: hsl(240 4.8% 95.9%);
+  --color-command: hsl(240 5% 97%);
+  --color-header: hsl(240 4.8% 95.9%);
+  --color-muted: hsl(240 4.8% 95.9%);
+  --color-muted-foreground: hsl(240 3.8% 46.1%);
+  --color-card: hsl(0 0% 100%);
+  --color-border: hsl(240 5.9% 90%);
+  --color-input: hsl(240 5.9% 90%);
+  --color-row-hover: hsl(240 4.8% 95.9%);
+  --color-selected: color-mix(in srgb, var(--color-primary) 12%, var(--color-background));
   --color-primary: #3b82f6;
-  --color-primary-soft: color-mix(in oklch, var(--color-primary) 20%, var(--color-background));
+  --color-primary-soft: color-mix(in srgb, var(--color-primary) 14%, var(--color-background));
   --color-primary-foreground: #ffffff;
-  --color-accent: color-mix(in oklch, var(--color-primary) 20%, var(--color-background));
+  --color-accent: color-mix(in srgb, var(--color-primary) 12%, var(--color-background));
   --color-accent-foreground: var(--color-primary);
-  --color-destructive: oklch(57% 0.18 26);
-  --color-destructive-soft: color-mix(in oklch, var(--color-destructive) 14%, var(--color-background));
-  --color-success: oklch(55% 0.14 145);
-  --color-success-soft: color-mix(in oklch, var(--color-success) 14%, var(--color-background));
-  --color-warning: oklch(65% 0.17 55);
-  --color-warning-soft: color-mix(in oklch, var(--color-warning) 16%, var(--color-background));
+  --color-destructive: hsl(0 72% 51%);
+  --color-destructive-soft: color-mix(in srgb, var(--color-destructive) 12%, var(--color-background));
+  --color-success: hsl(142 71% 36%);
+  --color-success-soft: color-mix(in srgb, var(--color-success) 12%, var(--color-background));
+  --color-warning: hsl(38 92% 40%);
+  --color-warning-soft: color-mix(in srgb, var(--color-warning) 14%, var(--color-background));
   --color-ring: var(--color-primary);
+  --color-title-bar: hsl(240 5% 96.5%);
+  --color-title-bar-border: hsl(240 5.9% 90%);
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
+  --font-size: 14px;
   font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
@@ -37,62 +45,50 @@
 
 :root.dark {
   color-scheme: dark;
-  --color-background: oklch(16% 0.008 247);
-  --color-foreground: oklch(94% 0.005 247);
-  --color-surface: oklch(13.5% 0.008 247);
-  --color-sidebar: oklch(15% 0.008 247);
-  --color-command: oklch(17% 0.008 247);
-  --color-header: oklch(20% 0.009 247);
-  --color-muted: oklch(24% 0.009 247);
-  --color-muted-foreground: oklch(66% 0.01 247);
-  --color-card: oklch(18% 0.008 247);
-  --color-border: oklch(27% 0.009 247);
-  --color-input: oklch(31% 0.009 247);
-  --color-row-hover: oklch(21% 0.009 247);
-  --color-selected: oklch(27% 0.045 257);
-  --color-primary-foreground: oklch(12% 0.01 247);
-  --color-destructive: oklch(62% 0.17 25);
-  --color-success: oklch(67% 0.15 145);
-  --color-warning: oklch(75% 0.15 65);
+  --color-background: hsl(240 10% 3.9%);
+  --color-foreground: hsl(0 0% 98%);
+  --color-surface: hsl(240 8% 5.5%);
+  --color-sidebar: hsl(240 6% 6%);
+  --color-command: hsl(240 6% 7%);
+  --color-header: hsl(240 5% 8%);
+  --color-muted: hsl(240 3.7% 15.9%);
+  --color-muted-foreground: hsl(240 5% 64.9%);
+  --color-card: hsl(240 8% 6.5%);
+  --color-border: hsl(240 3.7% 18%);
+  --color-input: hsl(240 3.7% 22%);
+  --color-row-hover: hsl(240 4% 12%);
+  --color-selected: color-mix(in srgb, var(--color-primary) 18%, var(--color-background));
+  --color-primary-foreground: hsl(240 10% 4%);
+  --color-destructive: hsl(0 72% 61%);
+  --color-success: hsl(142 69% 48%);
+  --color-warning: hsl(38 92% 55%);
+  --color-title-bar: hsl(240 8% 5.5%);
+  --color-title-bar-border: hsl(240 3.7% 18%);
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not(.light):not(.dark):not(.oled-dark) {
+  :root:not(.light):not(.dark) {
     color-scheme: dark;
-    --color-background: oklch(16% 0.008 247);
-    --color-foreground: oklch(94% 0.005 247);
-    --color-surface: oklch(13.5% 0.008 247);
-    --color-sidebar: oklch(15% 0.008 247);
-    --color-command: oklch(17% 0.008 247);
-    --color-header: oklch(20% 0.009 247);
-    --color-muted: oklch(24% 0.009 247);
-    --color-muted-foreground: oklch(66% 0.01 247);
-    --color-card: oklch(18% 0.008 247);
-    --color-border: oklch(27% 0.009 247);
-    --color-input: oklch(31% 0.009 247);
-    --color-row-hover: oklch(21% 0.009 247);
-    --color-selected: oklch(27% 0.045 257);
-    --color-primary-foreground: oklch(12% 0.01 247);
-    --color-destructive: oklch(62% 0.17 25);
-    --color-success: oklch(67% 0.15 145);
-    --color-warning: oklch(75% 0.15 65);
+    --color-background: hsl(240 10% 3.9%);
+    --color-foreground: hsl(0 0% 98%);
+    --color-surface: hsl(240 8% 5.5%);
+    --color-sidebar: hsl(240 6% 6%);
+    --color-command: hsl(240 6% 7%);
+    --color-header: hsl(240 5% 8%);
+    --color-muted: hsl(240 3.7% 15.9%);
+    --color-muted-foreground: hsl(240 5% 64.9%);
+    --color-card: hsl(240 8% 6.5%);
+    --color-border: hsl(240 3.7% 18%);
+    --color-input: hsl(240 3.7% 22%);
+    --color-row-hover: hsl(240 4% 12%);
+    --color-selected: color-mix(in srgb, var(--color-primary) 18%, var(--color-background));
+    --color-primary-foreground: hsl(240 10% 4%);
+    --color-destructive: hsl(0 72% 61%);
+    --color-success: hsl(142 69% 48%);
+    --color-warning: hsl(38 92% 55%);
+    --color-title-bar: hsl(240 8% 5.5%);
+    --color-title-bar-border: hsl(240 3.7% 18%);
   }
-}
-
-:root.oled-dark {
-  --color-background: #000000;
-  --color-foreground: oklch(96% 0.004 247);
-  --color-surface: #000000;
-  --color-sidebar: #020202;
-  --color-command: #030303;
-  --color-header: #060606;
-  --color-muted: #101010;
-  --color-muted-foreground: oklch(68% 0.01 247);
-  --color-card: #050505;
-  --color-border: #1b1b1b;
-  --color-input: #242424;
-  --color-row-hover: #080808;
-  --color-selected: color-mix(in oklch, var(--color-primary) 24%, #000000);
 }
 
 * {
@@ -108,6 +104,7 @@ body {
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: inherit;
+  font-size: var(--font-size);
   letter-spacing: 0;
 }
 
@@ -121,7 +118,7 @@ select {
 button:focus-visible,
 input:focus-visible,
 select:focus-visible {
-  outline: 2px solid color-mix(in oklch, var(--color-ring) 70%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--color-ring) 70%, transparent);
   outline-offset: 2px;
 }
 
@@ -139,9 +136,9 @@ p {
 .popup-shell {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  background: var(--color-surface);
+  gap: 12px;
+  padding: 12px 14px 14px;
+  background: var(--color-background);
 }
 
 .popup-header,
@@ -158,11 +155,12 @@ p {
 .popup-header {
   justify-content: space-between;
   gap: 10px;
+  min-height: 34px;
 }
 
 .brand-lockup {
   min-width: 0;
-  gap: 9px;
+  gap: 10px;
 }
 
 .brand-icon {
@@ -181,7 +179,7 @@ p {
 .brand-text h1,
 .title-block h1 {
   color: var(--color-foreground);
-  font-weight: 750;
+  font-weight: 600;
 }
 
 .brand-text h1 {
@@ -189,8 +187,8 @@ p {
   align-items: center;
   gap: 7px;
   overflow: hidden;
-  font-size: 13px;
-  line-height: 18px;
+  font-size: 14px;
+  line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -209,7 +207,7 @@ p {
 .save-state,
 .panel-note,
 .eyebrow {
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .control {
@@ -217,9 +215,9 @@ p {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 58px;
+  min-height: 52px;
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--color-card);
   padding: 10px 12px;
 }
@@ -227,22 +225,23 @@ p {
 .label {
   color: var(--color-foreground);
   font-size: 14px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: 18px;
 }
 
 .hint,
 .description {
-  margin-top: 3px;
+  margin-top: 2px;
   font-size: 12px;
-  line-height: 17px;
+  line-height: 16px;
+  font-weight: 400;
 }
 
 .switch {
   position: relative;
   display: inline-flex;
-  width: 44px;
-  height: 24px;
+  width: 40px;
+  height: 22px;
   flex: 0 0 auto;
   cursor: pointer;
 }
@@ -264,12 +263,12 @@ p {
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   border: 1px solid var(--color-border);
   border-radius: 999px;
   background: var(--color-card);
-  box-shadow: 0 1px 2px color-mix(in oklch, var(--color-foreground) 14%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--color-foreground) 12%, transparent);
   transition: transform 140ms ease, background 140ms ease;
 }
 
@@ -279,8 +278,8 @@ p {
 }
 
 .switch input:checked ~ .thumb {
-  transform: translateX(20px);
-  border-color: color-mix(in oklch, var(--color-primary) 70%, var(--color-card));
+  transform: translateX(18px);
+  border-color: color-mix(in srgb, var(--color-primary) 70%, var(--color-card));
   background: var(--color-primary-foreground);
 }
 
@@ -306,7 +305,7 @@ p {
 }
 
 .version-compat-panel.protocol-mismatch {
-  border-color: color-mix(in oklch, var(--color-destructive) 42%, var(--color-border));
+  border-color: color-mix(in srgb, var(--color-destructive) 42%, var(--color-border));
   background: var(--color-destructive-soft);
 }
 
@@ -323,7 +322,7 @@ p {
   align-items: flex-start;
   flex-direction: column;
   gap: 10px;
-  border-color: color-mix(in oklch, var(--color-warning) 42%, var(--color-border));
+  border-color: color-mix(in srgb, var(--color-warning) 42%, var(--color-border));
   background: var(--color-warning-soft);
 }
 
@@ -361,15 +360,15 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
-  border: 1px solid var(--color-input);
+  min-height: 32px;
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   background: var(--color-background);
   color: var(--color-foreground);
   cursor: pointer;
   padding: 0 12px;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 600;
   transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 }
 
@@ -385,11 +384,21 @@ button:hover {
 }
 
 .button.primary:hover {
-  background: color-mix(in oklch, var(--color-primary) 86%, var(--color-foreground));
+  background: color-mix(in srgb, var(--color-primary) 86%, var(--color-foreground));
+}
+
+.button.secondary {
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  color: var(--color-foreground);
+}
+
+.button.secondary:hover {
+  background: var(--color-muted);
 }
 
 .button.danger {
-  border-color: color-mix(in oklch, var(--color-destructive) 42%, var(--color-border));
+  border-color: color-mix(in srgb, var(--color-destructive) 42%, var(--color-border));
   background: var(--color-destructive-soft);
   color: var(--color-destructive);
 }
@@ -398,13 +407,13 @@ button:hover {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 4px;
   flex: 0 0 auto;
 }
 
 .icon-action {
-  width: 30px;
-  min-height: 30px;
+  width: 28px;
+  min-height: 28px;
   border: 0;
   border-radius: var(--radius-md);
   background: transparent;
@@ -414,6 +423,7 @@ button:hover {
 
 .icon-action:hover {
   color: var(--color-foreground);
+  background: var(--color-muted);
 }
 
 .icon-action svg {
@@ -432,6 +442,7 @@ button:hover {
   height: 7px;
   flex: 0 0 auto;
   border-radius: 999px;
+  background: var(--color-muted-foreground);
 }
 
 .connection-dot.connected {
@@ -444,33 +455,41 @@ button:hover {
   animation: connection-pulse-warning 1.8s ease-out infinite;
 }
 
-.connection-dot.disconnected {
+.connection-dot.disconnected,
+.connection-dot.error,
+.connection-dot.host_missing,
+.connection-dot.app_missing,
+.connection-dot.app_unreachable {
   background: var(--color-destructive);
   animation: connection-pulse-destructive 1.8s ease-out infinite;
 }
 
 @keyframes connection-pulse-success {
-  0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-success) 34%, transparent); }
-  70% { box-shadow: 0 0 0 7px color-mix(in oklch, var(--color-success) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-success) 0%, transparent); }
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-success) 34%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
 
 @keyframes connection-pulse-warning {
-  0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-warning) 34%, transparent); }
-  70% { box-shadow: 0 0 0 7px color-mix(in oklch, var(--color-warning) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-warning) 0%, transparent); }
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-warning) 34%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
 
 @keyframes connection-pulse-destructive {
-  0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-destructive) 34%, transparent); }
-  70% { box-shadow: 0 0 0 7px color-mix(in oklch, var(--color-destructive) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-destructive) 0%, transparent); }
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-destructive) 34%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .connection-dot.connected,
   .connection-dot.checking,
-  .connection-dot.disconnected {
+  .connection-dot.disconnected,
+  .connection-dot.error,
+  .connection-dot.host_missing,
+  .connection-dot.app_missing,
+  .connection-dot.app_unreachable {
     animation: none;
   }
 }
@@ -495,20 +514,20 @@ select:disabled {
 
 .status {
   flex: 0 0 auto;
-  border: 1px solid color-mix(in oklch, var(--color-warning) 35%, var(--color-border));
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border));
   border-radius: 999px;
   background: var(--color-warning-soft);
   color: var(--color-warning);
   padding: 4px 8px;
   font-size: 10px;
-  font-weight: 800;
+  font-weight: 600;
   line-height: 13px;
   text-transform: uppercase;
   white-space: nowrap;
 }
 
 .status.connected {
-  border-color: color-mix(in oklch, var(--color-success) 35%, var(--color-border));
+  border-color: color-mix(in srgb, var(--color-success) 35%, var(--color-border));
   background: var(--color-success-soft);
   color: var(--color-success);
 }
@@ -517,9 +536,15 @@ select:disabled {
 .status.host_missing,
 .status.app_missing,
 .status.app_unreachable {
-  border-color: color-mix(in oklch, var(--color-destructive) 35%, var(--color-border));
+  border-color: color-mix(in srgb, var(--color-destructive) 35%, var(--color-border));
   background: var(--color-destructive-soft);
   color: var(--color-destructive);
+}
+
+.status-line {
+  font-size: 12px;
+  color: var(--color-muted-foreground);
+  white-space: pre-wrap;
 }
 
 .options-page {
@@ -537,12 +562,12 @@ select:disabled {
   position: sticky;
   top: 0;
   z-index: 2;
-  min-height: 82px;
+  min-height: 56px;
   justify-content: space-between;
-  gap: 18px;
-  border-bottom: 1px solid var(--color-border);
-  background: color-mix(in oklch, var(--color-background) 92%, transparent);
-  padding: 14px 32px;
+  gap: 16px;
+  border-bottom: 1px solid var(--color-title-bar-border);
+  background: var(--color-title-bar);
+  padding: 12px 24px;
 }
 
 .title-block {
@@ -551,14 +576,14 @@ select:disabled {
 
 .eyebrow {
   margin-bottom: 2px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
+  font-weight: 600;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
 .title-block h1 {
-  font-size: 22px;
-  line-height: 28px;
+  font-size: 18px;
+  line-height: 24px;
 }
 
 .subtitle {
@@ -576,18 +601,18 @@ select:disabled {
 .header-actions {
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
 }
 
 .content {
-  width: min(1040px, calc(100vw - 32px));
+  width: min(720px, calc(100vw - 32px));
   margin: 0 auto;
-  padding: 24px 0 42px;
+  padding: 20px 0 36px;
 }
 
 .sections {
   display: grid;
-  gap: 14px;
+  gap: 12px;
 }
 
 .panel {
@@ -599,30 +624,32 @@ select:disabled {
 
 .panel-header {
   display: flex;
-  min-height: 48px;
+  min-height: 40px;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
   border-bottom: 1px solid var(--color-border);
-  background: var(--color-header);
-  padding: 0 18px;
+  background: transparent;
+  padding: 0 16px;
 }
 
 .panel-header h2 {
-  color: var(--color-foreground);
-  font-size: 15px;
-  font-weight: 750;
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .setting-row {
   display: grid;
-  grid-template-columns: minmax(210px, 300px) minmax(0, 1fr);
+  grid-template-columns: minmax(210px, 1fr) auto;
   align-items: center;
-  gap: 20px;
-  min-height: 72px;
-  border-bottom: 1px solid color-mix(in oklch, var(--color-border) 70%, transparent);
+  gap: 16px;
+  min-height: 56px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
   background: var(--color-card);
-  padding: 12px 18px;
+  padding: 10px 16px;
 }
 
 .setting-row:last-child {
@@ -635,9 +662,10 @@ select:disabled {
 
 select,
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+input[type="search"] {
   width: 100%;
-  height: 36px;
+  height: 32px;
   border: 1px solid var(--color-input);
   border-radius: var(--radius-md);
   background: var(--color-background);
@@ -649,9 +677,10 @@ input[type="number"] {
 
 select:focus,
 input[type="text"]:focus,
-input[type="number"]:focus {
+input[type="number"]:focus,
+input[type="search"]:focus {
   border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-ring) 20%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-ring) 20%, transparent);
 }
 
 .input-action {
@@ -665,14 +694,14 @@ input[type="number"]:focus {
 }
 
 .icon-button {
-  width: 36px;
-  min-height: 36px;
+  width: 32px;
+  min-height: 32px;
   padding: 0;
 }
 
 .icon-button svg {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
@@ -692,13 +721,13 @@ input[type="number"]:focus {
   align-items: center;
   gap: 6px;
   min-height: 28px;
-  border: 1px solid color-mix(in oklch, var(--color-primary) 46%, var(--color-border));
+  border: 1px solid color-mix(in srgb, var(--color-primary) 40%, var(--color-border));
   border-radius: var(--radius-md);
   background: var(--color-primary-soft);
   color: var(--color-foreground);
   padding: 0 7px;
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .chip button {
@@ -735,7 +764,7 @@ input[type="number"]:focus {
   }
 
   .content {
-    width: min(100% - 24px, 760px);
+    width: min(100% - 24px, 720px);
   }
 
   .options-topbar {
