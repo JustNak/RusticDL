@@ -38,8 +38,9 @@ use crate::updater::{
     check_for_update, launch_updater, open_url, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
 
-/// Scroll height for the post-update changelog body.
-const WHATS_NEW_NOTES_MAX_H: f32 = 280.0;
+/// Fixed height for the scrollable post-update changelog body.
+/// `TextView::scrollable(true)` requires a definite parent height (not only max_h).
+const WHATS_NEW_NOTES_H: f32 = 280.0;
 
 impl DownloadApp {
     /// Label for the single update action (check or advance cached release).
@@ -228,11 +229,11 @@ impl DownloadApp {
                         div()
                             .id("whats-new-notes")
                             .w_full()
-                            .max_h(px(WHATS_NEW_NOTES_MAX_H))
-                            .overflow_y_scroll()
+                            .h(px(WHATS_NEW_NOTES_H))
                             .child(
                                 TextView::markdown("whats-new-notes-md", notes, window, cx)
                                     .selectable(true)
+                                    .scrollable(true)
                                     .style(changelog_text_style(&theme)),
                             ),
                     ),
