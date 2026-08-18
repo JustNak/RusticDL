@@ -18,7 +18,7 @@ use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
     sanitize_filename,
 };
-use super::handoff::HandoffAuth;
+use super::handoff::{session_url_after_auth_denied, HandoffAuth};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
 };
@@ -134,6 +134,8 @@ pub async fn run_http_download_with_ctx(
     let mut short_reconnects: u32 = 0;
     let mut cumulative_reconnects = ctx.job.reconnect_count;
     let reconnect_baseline = ctx.job.reconnect_count;
+    // One remint from job.url after a 401 on a burned Inst-FS / Drive hop.
+    let mut replayed_session = false;
 
     let control = ctx.control.clone();
     let on_progress = ctx.on_progress.clone();
@@ -190,6 +192,22 @@ pub async fn run_http_download_with_ctx(
                 }
             }
         };
+        if let RangeStatus::AuthDenied { status } = range_status {
+            if let Some(replay) = session_url_after_auth_denied(
+                &job_url,
+                &final_url,
+                handoff_auth.as_ref(),
+                replayed_session,
+            ) {
+                replayed_session = true;
+                current_url = replay.to_string();
+                ctx.resolved_url = current_url.clone();
+                drop(response);
+                continue;
+            }
+            return Err(http_status_error(status, false));
+        }
+
         current_url = final_url;
         ctx.resolved_url = current_url.clone();
 
@@ -709,6 +727,24 @@ pub(crate) async fn apply_preflight(
     }
     ctx.preflight_done = true;
     let client = download_client().ok()?;
+    // Browser captures mint a one-time Inst-FS / Drive Location. Discover that
+    // hop without fetching it — a preflight GET/HEAD on the signed URL burns
+    // the token and the transfer GET then 401s.
+    if ctx.handoff_auth.is_some() {
+        if let Some(location) = super::preflight::discover_handoff_location(
+            &client,
+            &ctx.job.url,
+            &ctx.resolved_url,
+            ctx.handoff_auth.as_ref(),
+            &ctx.control,
+        )
+        .await
+        {
+            ctx.resolved_url = location;
+        }
+        return None;
+    }
+
     let oracle = resume_oracle(&ctx.job);
     let plan = super::preflight::PreflightPlan {
         skip_range_probes: oracle.is_resume_error(),

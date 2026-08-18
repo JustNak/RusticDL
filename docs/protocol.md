@@ -42,4 +42,5 @@ Only `http` and `https` URLs are accepted.
 - Destination path is never accepted from the extension.
 - Browser session headers (`handoffAuth`) are memory-only and never written to `state.json`.
 - `handoffAuth.originAuth` is optional per-origin Cookie/Authorization so a Canvas → Drive redirect can keep the Drive session without sending Canvas cookies cross-origin.
+- Browser captures replay the LMS session URL (not a consumed Inst-FS / Drive `finalUrl`). The desktop discovers the signed Location without fetching it during preflight; a 401 on that hop remints once from the session URL.
 - Named pipe rejects remote clients.

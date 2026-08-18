@@ -80,6 +80,11 @@ const {
   cookieStoreIdForHandoff,
   cookieUrlsForHandoff,
   handoffUrlForCapturedDownload,
+  isEphemeralSignedUrl,
+  isSessionGatewayUrl,
+  lookupRedirectSessionUrl,
+  rememberDownloadRedirect,
+  resetDownloadRedirectsForTests,
   MIN_CAPTURE_BYTES,
   MIN_XHR_CAPTURE_BYTES,
 } = require(outfile);
@@ -1098,6 +1103,48 @@ assert(
     finalUrl: 'https://cdn.example.com/files/app.zip',
   }) === 'https://cdn.example.com/files/app.zip',
 );
+
+assert(
+  'same-origin Canvas verifier is treated as a consumed hop',
+  handoffUrlForCapturedDownload({
+    url: 'https://school.instructure.com/files/99/download?download_frd=1',
+    finalUrl: 'https://school.instructure.com/files/99/download?verifier=USED',
+  }) === 'https://school.instructure.com/files/99/download?download_frd=1',
+);
+
+assert(
+  'Inst-FS and Drive export URLs are ephemeral signed hops',
+  isEphemeralSignedUrl('https://inst-fs-iad-prod.inscloudgate.net/files/abc?token=1')
+    && isEphemeralSignedUrl('https://drive.google.com/uc?export=download&id=abc')
+    && !isEphemeralSignedUrl('https://cdn.example.com/files/app.zip'),
+);
+
+assert(
+  'Canvas file download URLs are session gateways',
+  isSessionGatewayUrl('https://school.instructure.com/files/99/download?download_frd=1')
+    && isSessionGatewayUrl('https://school.instructure.com/courses/2/files/99')
+    && !isSessionGatewayUrl('https://cdn.example.com/files/app.zip'),
+);
+
+resetDownloadRedirectsForTests();
+rememberDownloadRedirect(
+  'https://school.instructure.com/files/99/download?download_frd=1',
+  'https://inst-fs-iad-prod.inscloudgate.net/files/abc?token=1',
+);
+rememberDownloadRedirect(
+  'https://inst-fs-iad-prod.inscloudgate.net/files/abc?token=1',
+  'https://drive.google.com/uc?export=download&id=abc',
+);
+assert(
+  'redirect chain maps Drive/Inst-FS back to the Canvas session URL',
+  lookupRedirectSessionUrl('https://drive.google.com/uc?export=download&id=abc')
+    === 'https://school.instructure.com/files/99/download?download_frd=1'
+    && handoffUrlForCapturedDownload({
+      url: 'https://inst-fs-iad-prod.inscloudgate.net/files/abc?token=1',
+      finalUrl: 'https://drive.google.com/uc?export=download&id=abc',
+    }) === 'https://school.instructure.com/files/99/download?download_frd=1',
+);
+resetDownloadRedirectsForTests();
 
 assert(
   'cookie URLs are one http(s) URL per origin',

@@ -59,7 +59,12 @@ export {
   filenameFromContentDisposition,
   handoffUrlForCapturedDownload,
   httpOrigin,
+  isEphemeralSignedUrl,
+  isSessionGatewayUrl,
   isWeakSuggestedFilename,
+  lookupRedirectSessionUrl,
+  rememberDownloadRedirect,
+  resetDownloadRedirectsForTests,
   knownDownloadBytes,
   matchesInterceptedDownload,
   normalizeCaptureUrl,
@@ -474,6 +479,12 @@ type BlockingWebRequest = {
       ) => { cancel?: boolean },
       filter: { urls: string[]; types?: string[] },
       extraInfoSpec: string[],
+    ): void;
+  };
+  onBeforeRedirect?: {
+    addListener(
+      listener: (details: { url: string; redirectUrl?: string }) => void,
+      filter: { urls: string[]; types?: string[] },
     ): void;
   };
   filterResponseData?: (requestId: string) => FirefoxStreamFilter;

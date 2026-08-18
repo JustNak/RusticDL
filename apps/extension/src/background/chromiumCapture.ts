@@ -200,6 +200,12 @@ type ChromiumWebRequestApi = {
       extraInfoSpec: string[],
     ): void;
   };
+  onBeforeRedirect?: {
+    addListener(
+      listener: (details: { url: string; redirectUrl?: string }) => void,
+      filter: { urls: string[] },
+    ): void;
+  };
 };
 
 export function getChromiumWebRequest(): ChromiumWebRequestApi | null {
