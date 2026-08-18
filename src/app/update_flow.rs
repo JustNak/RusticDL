@@ -15,13 +15,15 @@
 
 use std::time::Duration;
 
-use gpui::{
-    div, px, Context, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, Window,
-};
+use gpui::{div, px, rems, Context, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
-    h_flex, v_flex, ActiveTheme, Sizable, WindowExt,
+    group_box::{GroupBox, GroupBoxVariants},
+    h_flex,
+    highlighter::HighlightTheme,
+    text::{TextView, TextViewStyle},
+    v_flex, ActiveTheme, Sizable, Theme, WindowExt,
 };
 
 use super::toast::{ToastActionKind, ToastKind};
@@ -33,8 +35,9 @@ use crate::updater::{
     check_for_update, launch_updater, open_url, LaunchUpdaterOpts, UpdateCheck, UpdateInfo,
 };
 
-/// Scroll height for the post-update changelog body.
-const WHATS_NEW_NOTES_MAX_H: f32 = 200.0;
+/// Fixed height for the scrollable post-update changelog body.
+/// `TextView::scrollable(true)` requires a definite parent height (not only max_h).
+const WHATS_NEW_NOTES_H: f32 = 280.0;
 
 impl DownloadApp {
     /// Label for the single update action (check or advance cached release).
@@ -180,7 +183,7 @@ impl DownloadApp {
         let from = pending.from_version.clone();
         let release_name = pending.release_name.clone();
         let html_url = pending.html_url.clone();
-        let notes_display = pending
+        let notes_markdown = pending
             .notes
             .as_ref()
             .map(|n| format_changelog_notes(n))
@@ -195,10 +198,10 @@ impl DownloadApp {
             let from = from.clone();
             let release_name = release_name.clone();
             let html_url = html_url.clone();
-            let notes_display = notes_display.clone();
+            let notes_markdown = notes_markdown.clone();
 
-            let est_h = if notes_display.is_some() {
-                380.0
+            let est_h = if notes_markdown.is_some() {
+                460.0
             } else {
                 240.0
             };
@@ -209,6 +212,7 @@ impl DownloadApp {
             let mut body = v_flex().gap_3().child(
                 div()
                     .text_sm()
+                    .text_color(theme.foreground)
                     .child(format!("You were on v{from}. Here’s what changed.")),
             );
 
@@ -216,21 +220,16 @@ impl DownloadApp {
                 body = body.child(div().text_xs().text_color(muted).child(release_name));
             }
 
-            if let Some(notes) = notes_display {
+            if let Some(notes) = notes_markdown {
                 body = body.child(
-                    div()
-                        .id("whats-new-notes")
-                        .w_full()
-                        .max_h(px(WHATS_NEW_NOTES_MAX_H))
-                        .overflow_y_scroll()
-                        .p_2()
-                        .rounded(theme.radius_lg)
-                        .border_1()
-                        .border_color(theme.border.opacity(0.4))
-                        .bg(theme.popover.opacity(0.55))
-                        .text_xs()
-                        .text_color(muted)
-                        .child(notes),
+                    GroupBox::new().outline().child(
+                        div().w_full().h(px(WHATS_NEW_NOTES_H)).child(
+                            TextView::markdown("whats-new-notes-md", notes, window, cx)
+                                .selectable(true)
+                                .scrollable(true)
+                                .style(changelog_text_style(&theme)),
+                        ),
+                    ),
                 );
             } else {
                 body = body.child(
@@ -379,61 +378,61 @@ pub(crate) fn spawn_update_check(
     .detach();
 }
 
-/// Format GitHub release Markdown lightly for a readable plain-text changelog.
+/// Compact Markdown style that follows the desktop theme (density, dark/light).
+fn changelog_text_style(theme: &Theme) -> TextViewStyle {
+    let mut style = TextViewStyle::default();
+    style.paragraph_gap = rems(0.55);
+    style.heading_base_font_size = theme.font_size;
+    style.heading_font_size = Some(std::sync::Arc::new(|level, base| match level {
+        1 => base * 1.35,
+        2 => base * 1.2,
+        3 => base * 1.08,
+        _ => base,
+    }));
+    style.is_dark = theme.is_dark();
+    style.highlight_theme = if theme.is_dark() {
+        HighlightTheme::default_dark()
+    } else {
+        HighlightTheme::default_light()
+    };
+    style
+}
+
+/// Prepare GitHub release Markdown for `TextView` (structure stays; comments go).
 fn format_changelog_notes(notes: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in notes.lines() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            // Collapse runs of blank lines to a single spacer at most.
-            if lines.last().is_some_and(|l| !l.is_empty()) {
-                lines.push(String::new());
-            }
-            continue;
-        }
-        // Horizontal rules / HTML comments — skip.
-        if trimmed
-            .chars()
-            .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace())
-            && trimmed.len() >= 3
-        {
-            continue;
-        }
-        if trimmed.starts_with("<!--") {
-            continue;
-        }
-
-        let mut line = trimmed.to_string();
-        // ATX headers → plain title text.
-        if line.starts_with('#') {
-            line = line.trim_start_matches('#').trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-        }
-        // Unescape common emphasis markers for quieter display.
-        line = line.replace("**", "").replace("__", "");
-        // Normalize list markers to a bullet.
-        if let Some(rest) = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .or_else(|| line.strip_prefix("+ "))
-        {
-            line = format!("• {rest}");
-        } else if let Some(rest) = line.strip_prefix("-").or_else(|| line.strip_prefix("*")) {
-            let rest = rest.trim_start();
-            if !rest.is_empty() {
-                line = format!("• {rest}");
-            }
-        }
-
-        lines.push(line);
+    let stripped = strip_html_comments(notes);
+    let mut lines: Vec<&str> = stripped.lines().collect();
+    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+        lines.remove(0);
     }
-    // Trim trailing blank lines.
-    while lines.last().is_some_and(|l| l.is_empty()) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    lines.join("\n")
+    let mut out: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push("");
+            }
+        } else {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+fn strip_html_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start + 4..].find("-->") {
+            Some(rel) => rest = &rest[start + 4 + rel + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -441,27 +440,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_changelog_preserves_structure() {
-        let raw = r#"## What's new
+    fn format_changelog_preserves_markdown() {
+        let raw = r#"<!-- generated -->
+## What's new
 
 - Fix tray exit
 - Add What's new dialog
 
 ### Notes
-**Important** change
+**Important** change with `inline`
+
+```
+code fence
+```
+
+[Open notes](https://example.com)
 "#;
         let out = format_changelog_notes(raw);
-        assert!(out.contains("What's new"));
-        assert!(out.contains("• Fix tray exit"));
-        assert!(out.contains("• Add What's new dialog"));
-        assert!(out.contains("Important change"));
-        assert!(!out.contains("##"));
-        assert!(!out.contains("**"));
+        assert!(out.contains("## What's new"));
+        assert!(out.contains("- Fix tray exit"));
+        assert!(out.contains("- Add What's new dialog"));
+        assert!(out.contains("**Important**"));
+        assert!(out.contains("`inline`"));
+        assert!(out.contains("```"));
+        assert!(out.contains("code fence"));
+        assert!(out.contains("[Open notes](https://example.com)"));
+        assert!(!out.contains("<!--"));
+        assert!(!out.contains("generated"));
     }
 
     #[test]
-    fn format_changelog_skips_rules() {
+    fn format_changelog_strips_multiline_comments() {
+        let out = format_changelog_notes("<!--\nRelease notes generated\n-->\n- item\n");
+        assert_eq!(out, "- item");
+    }
+
+    #[test]
+    fn format_changelog_empty_after_comments() {
+        assert!(format_changelog_notes("<!-- only -->\n\n").is_empty());
+    }
+
+    #[test]
+    fn format_changelog_keeps_rules_and_lists() {
         let out = format_changelog_notes("---\n- item\n***");
-        assert_eq!(out, "• item");
+        assert!(out.contains("---"));
+        assert!(out.contains("- item"));
+        assert!(out.contains("***"));
     }
 }
