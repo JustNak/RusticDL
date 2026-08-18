@@ -426,6 +426,11 @@ button:hover {
   background: var(--color-muted);
 }
 
+.icon-action:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .icon-action svg {
   width: 16px;
   height: 16px;
