@@ -56,11 +56,13 @@ impl TrailMotion {
             if self.committed.len() >= cap {
                 self.committed.pop_front();
             }
-            // Commit the true bucket mean (same data), not the eased tip.
+            // Commit the true bucket mean (same data). Snap the display tip to
+            // that mean so the next live column starts there — otherwise a flat
+            // series eases from a mid-ease leftover and dips at the right edge.
             self.committed.push_back(self.live_target);
+            self.live_display = self.live_target;
             self.live_sum = 0;
             self.live_count = 0;
-            self.live_target = self.live_display;
         }
     }
 
@@ -724,6 +726,35 @@ mod tests {
             again[3] > 55.0 && again[3] < 99.0,
             "tip eases, does not snap"
         );
+    }
+
+    #[test]
+    fn trail_flat_series_tip_does_not_dip_below_committed() {
+        let mut trail = TrailMotion::default();
+        trail.push_sample(100, false);
+        trail.push_sample(100, false);
+        let after_commit: Vec<f32> = trail.columns().iter().copied().flatten().collect();
+        assert_eq!(after_commit.len(), 1);
+        assert!((after_commit[0] - 100.0).abs() < 0.01);
+
+        for n in 3..=10 {
+            trail.push_sample(100, false);
+            let cols: Vec<f32> = trail.columns().iter().copied().flatten().collect();
+            let last_committed = cols
+                .iter()
+                .rev()
+                .find(|v| (**v - 100.0).abs() < 0.01)
+                .copied()
+                .expect("committed mean still present");
+            let tip = *cols.last().expect("trail has a tip");
+            assert!(
+                tip + 0.01 >= last_committed,
+                "flat 100 B/s dipped at sample {n}: tip={tip} committed={last_committed} cols={cols:?}"
+            );
+            for (i, v) in cols.iter().enumerate() {
+                assert!(*v + 0.01 >= 100.0, "column {i} dipped to {v} on sample {n}");
+            }
+        }
     }
 
     #[test]
