@@ -87,6 +87,7 @@ impl BrowserPromptWindow {
             waiting_url_noted: false,
             canceling: false,
             speed_samples: VecDeque::new(),
+            trail: Default::default(),
             peak_speed: 0,
             reduce_motion: settings.reduce_motion,
             fitted_size: Some(if opens_conflict {

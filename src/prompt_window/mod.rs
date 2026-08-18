@@ -28,6 +28,8 @@ use crate::download::{EngineHandle, Job};
 use crate::ipc::{BrowserPromptView, IpcBridge};
 use crate::settings::ProgressStyle;
 
+use helpers::TrailMotion;
+
 const CAPTURE_WINDOW_W: f32 = 480.0;
 const CAPTURE_WINDOW_H: f32 = 320.0;
 /// Four medium action buttons (Cancel / Overwrite / Rename / Start download)
@@ -84,6 +86,8 @@ pub struct BrowserPromptWindow {
     canceling: bool,
     /// Rolling bytes/sec samples for the Progress speed sparkline.
     speed_samples: VecDeque<u64>,
+    /// Append-only display trail (eased tip). Same samples, stable motion.
+    trail: TrailMotion,
     /// Highest speed seen this HUD session (sticky Y-scale / peak label).
     peak_speed: u64,
     /// When true, skip animating sample growth (settings reduce_motion).
@@ -108,6 +112,7 @@ impl BrowserPromptWindow {
             self.speed_samples.pop_front();
         }
         self.speed_samples.push_back(speed);
+        self.trail.push_sample(speed, self.reduce_motion);
     }
 
     fn release_ownership(&mut self) {
