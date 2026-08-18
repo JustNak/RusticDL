@@ -62,6 +62,17 @@ pub(crate) struct EnqueuePayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawHandoffAuth {
+    #[serde(default)]
+    pub headers: Vec<RawHandoffAuthHeader>,
+    #[serde(default)]
+    pub origin_auth: Vec<RawOriginHandoffAuth>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawOriginHandoffAuth {
+    pub origin: String,
+    #[serde(default)]
     pub headers: Vec<RawHandoffAuthHeader>,
 }
 

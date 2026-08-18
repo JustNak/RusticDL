@@ -1418,6 +1418,7 @@ mod tests {
                 name: "Cookie".into(),
                 value: "sid=abc123".into(),
             }],
+            ..Default::default()
         };
         let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress, Some(auth), 1);

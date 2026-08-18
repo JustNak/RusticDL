@@ -319,6 +319,71 @@ export function matchesInterceptedDownload(
   return false;
 }
 
+/**
+ * Chrome `downloads` fills `finalUrl` after an LMS/app gateway redirects to
+ * Drive, Inst-FS, or a CDN. That hop often carries a one-time token the
+ * browser already used. Replay the original http(s) URL so the desktop can
+ * mint a fresh Location with the tab session.
+ */
+export function httpOrigin(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+export function isHttpDownloadUrl(url: string | undefined): url is string {
+  return Boolean(httpOrigin(url));
+}
+
+export function handoffUrlForCapturedDownload(item: {
+  url?: string;
+  finalUrl?: string;
+}): string | undefined {
+  const original = isHttpDownloadUrl(item.url) ? item.url : undefined;
+  const final = isHttpDownloadUrl(item.finalUrl) ? item.finalUrl : undefined;
+  const originalOrigin = httpOrigin(original);
+  const finalOrigin = httpOrigin(final);
+  if (original && final && originalOrigin && finalOrigin && originalOrigin !== finalOrigin) {
+    return original;
+  }
+  return final || original;
+}
+
+/** First http(s) URL per origin — Canvas session plus Drive/CDN hop. */
+export function cookieUrlsForHandoff(urls: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const url of urls) {
+    const origin = httpOrigin(url);
+    if (!url || !origin || seen.has(origin)) continue;
+    seen.add(origin);
+    out.push(url);
+  }
+  return out;
+}
+
+/**
+ * Chromium CookieStore has no `incognito` field. Guessing store "0" and
+ * passing it to cookies.getAll can return an empty list in an MV3 worker.
+ * Only pin a store when the download gave cookieStoreId (Firefox) or the
+ * store actually exposes incognito.
+ */
+export function cookieStoreIdForHandoff(
+  stores: Array<{ id: string; incognito?: boolean }>,
+  extra: { incognito?: boolean; cookieStoreId?: string },
+): string | undefined {
+  if (extra.cookieStoreId) return extra.cookieStoreId;
+  if (extra.incognito) {
+    return stores.find((store) => store.incognito === true)?.id;
+  }
+  return stores.find((store) => store.incognito === false)?.id;
+}
+
 export function urlIsClaimed(
   url: string | undefined,
   claimedUrls: Iterable<string>,

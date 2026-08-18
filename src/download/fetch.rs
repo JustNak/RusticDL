@@ -10,7 +10,7 @@ use reqwest::{Client, StatusCode, Version};
 
 use super::client::referer_for_url;
 use super::filesystem::parse_content_range;
-use super::handoff::{handoff_auth_for_request_url, is_allowed_handoff_header, HandoffAuth};
+use super::handoff::{handoff_headers_for_request, is_allowed_handoff_header, HandoffAuth};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
     WorkerControl,
@@ -228,20 +228,18 @@ pub(crate) fn build_transfer_request(
     request = request.header(ACCEPT_ENCODING, "identity");
 
     let mut has_referer = false;
-    if let Some(auth) = handoff_auth_for_request_url(job_url, url, handoff_auth) {
-        for header in &auth.headers {
-            if !is_allowed_handoff_header(&header.name) {
-                continue;
-            }
-            if header.name.eq_ignore_ascii_case("referer") {
-                has_referer = true;
-            }
-            if let (Ok(name), Ok(value)) = (
-                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
-                reqwest::header::HeaderValue::from_str(&header.value),
-            ) {
-                request = request.header(name, value);
-            }
+    for header in handoff_headers_for_request(job_url, url, handoff_auth) {
+        if !is_allowed_handoff_header(&header.name) {
+            continue;
+        }
+        if header.name.eq_ignore_ascii_case("referer") {
+            has_referer = true;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(header.name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&header.value),
+        ) {
+            request = request.header(name, value);
         }
     }
 
@@ -1193,6 +1191,7 @@ Content-Length: 4\r\n\
                 name: "Cookie".into(),
                 value: "sid=abc123".into(),
             }],
+            ..Default::default()
         };
         let outcome = fetch_range(FetchRequest {
             client: &client,
@@ -1238,6 +1237,7 @@ Content-Length: 1\r\n\
                 name: "Cookie".into(),
                 value: "sid=secret".into(),
             }],
+            ..Default::default()
         };
         let job_url = "https://cdn.example.com/file.bin";
         let _ = fetch_range(FetchRequest {
@@ -1256,6 +1256,60 @@ Content-Length: 1\r\n\
         assert!(
             !recorded.to_ascii_lowercase().contains("cookie:"),
             "cross-origin must strip Cookie:\n{recorded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_auth_cookie_sent_on_matching_cross_origin_hop() {
+        let body = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: 1\r\n\
+\r\nx"
+            .to_string();
+        let (base, mut reqs, _handle) = spawn_scripted_server(vec![body]).await;
+        let url = format!("{base}/file.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let validators = ContentValidators::default();
+        let drive_origin = url::Url::parse(&url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let auth = HandoffAuth {
+            headers: vec![HandoffAuthHeader {
+                name: "Cookie".into(),
+                value: "canvas=secret".into(),
+            }],
+            origin_auth: vec![crate::download::handoff::OriginHandoffAuth {
+                origin: drive_origin,
+                headers: vec![HandoffAuthHeader {
+                    name: "Cookie".into(),
+                    value: "SID=drive".into(),
+                }],
+            }],
+        };
+        let job_url = "https://school.instructure.com/files/1/download";
+        let _ = fetch_range(FetchRequest {
+            client: &client,
+            job_url,
+            url: &url,
+            range: RangeSpec::Open { start: 0 },
+            validators: &validators,
+            handoff: Some(&auth),
+            follow_redirects: true,
+            control: &control,
+        })
+        .await
+        .expect("fetch");
+        let recorded = reqs.recv().await.expect("request");
+        let lower = recorded.to_ascii_lowercase();
+        assert!(
+            lower.contains("cookie: sid=drive"),
+            "matching originAuth must send Drive cookie:\n{recorded}"
+        );
+        assert!(
+            !lower.contains("canvas=secret"),
+            "Canvas cookie must not leak to Drive origin:\n{recorded}"
         );
     }
 }

@@ -45,6 +45,17 @@ pub struct HandoffAuthHeader {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffAuth {
+    #[serde(default)]
+    pub headers: Vec<HandoffAuthHeader>,
+    #[serde(default)]
+    pub origin_auth: Vec<OriginHandoffAuth>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginHandoffAuth {
+    pub origin: String,
+    #[serde(default)]
     pub headers: Vec<HandoffAuthHeader>,
 }
 
@@ -511,5 +522,41 @@ mod tests {
                 .map(|h| h.name.as_str()),
             Some("Cookie")
         );
+        assert!(payload
+            .handoff_auth
+            .as_ref()
+            .map(|a| a.origin_auth.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn parse_enqueue_payload_keeps_origin_auth() {
+        let request = request(
+            "enqueue_download",
+            json!({
+                "url": "https://school.instructure.com/files/1/download",
+                "source": {
+                    "entryPoint": "browser_download",
+                    "browser": "chrome",
+                    "extensionVersion": "0.1.0"
+                },
+                "handoffAuth": {
+                    "headers": [{ "name": "Cookie", "value": "canvas=1" }],
+                    "originAuth": [{
+                        "origin": "https://drive.google.com",
+                        "headers": [{ "name": "Cookie", "value": "SID=drive" }]
+                    }]
+                }
+            }),
+        );
+
+        let payload = parse_enqueue_payload(&request).expect("valid enqueue");
+        let origin = payload
+            .handoff_auth
+            .as_ref()
+            .and_then(|a| a.origin_auth.first())
+            .expect("originAuth");
+        assert_eq!(origin.origin, "https://drive.google.com");
+        assert_eq!(origin.headers[0].value, "SID=drive");
     }
 }

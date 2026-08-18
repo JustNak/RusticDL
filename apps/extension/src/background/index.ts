@@ -9,6 +9,7 @@ import browser from './browser';
 import {
   downloadCreatedAction,
   filenameExtension,
+  handoffUrlForCapturedDownload,
   isWeakSuggestedFilename,
   knownDownloadBytes,
   MIN_CAPTURE_BYTES,
@@ -22,8 +23,11 @@ import {
   getChromiumDeterminingFilenameApi,
   getChromiumWebRequest,
   lookupFilenameHint,
+  lookupOriginAuth,
+  rememberRequestAuth,
   rememberResponseFilenameHint,
   resolveSuggestedFilename,
+  type ChromiumBeforeSendHeadersDetails,
   type ChromiumDeterminingFilenameItem,
   type ChromiumHeadersReceivedDetails,
 } from './chromiumCapture';
@@ -433,6 +437,7 @@ async function handOffUrl(
     referrer?: string;
     incognito?: boolean;
     cookieStoreId?: string;
+    finalUrl?: string;
   } = {},
 ): Promise<HandoffAttempt> {
   if (!claimCapture(url)) return 'already_claimed';
@@ -448,8 +453,10 @@ async function handOffUrl(
   const handoffAuth = await collectHandoffAuth(url, {
     referrer: extra.referrer,
     pageUrl: extra.pageUrl,
+    finalUrl: extra.finalUrl,
     incognito: extra.incognito,
     cookieStoreId: extra.cookieStoreId,
+    originAuth: lookupOriginAuth([url, extra.finalUrl, extra.pageUrl, extra.referrer]),
   });
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
     ...metadata,
@@ -481,7 +488,7 @@ async function handoffBrowserDownload(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
 ) {
-  const url = item.finalUrl || item.url;
+  const url = handoffUrlForCapturedDownload(item);
   if (!url) return;
 
   const suggestedFilename = resolveSuggestedFilename(item);
@@ -493,12 +500,13 @@ async function handoffBrowserDownload(
 
   const attempt = await handOffUrl(url, settings, {
     suggestedFilename,
-    totalBytes: knownDownloadBytes(item) ?? lookupFilenameHint(url)?.totalBytes,
+    totalBytes: knownDownloadBytes(item) ?? lookupFilenameHint(item.finalUrl || url)?.totalBytes,
   }, {
     pageUrl: item.referrer,
     referrer: item.referrer,
     incognito: item.incognito,
     cookieStoreId: item.cookieStoreId,
+    finalUrl: item.finalUrl,
   });
 
   if (attempt === 'rejected') {
@@ -699,6 +707,10 @@ function onChromiumHeadersReceived(details: ChromiumHeadersReceivedDetails): voi
   flushPendingFilenameHint(details.url);
 }
 
+function onChromiumBeforeSendHeaders(details: ChromiumBeforeSendHeadersDetails): void {
+  rememberRequestAuth(details);
+}
+
 function onChromiumDeterminingFilename(
   item: ChromiumDeterminingFilenameItem,
   suggest: (suggestion?: { filename?: string }) => void,
@@ -717,11 +729,31 @@ function onChromiumDeterminingFilename(
 
 function registerChromiumFilenameHints(): void {
   const webRequest = getChromiumWebRequest();
-  webRequest?.onHeadersReceived.addListener(
+  webRequest?.onHeadersReceived?.addListener(
     onChromiumHeadersReceived,
     { urls: ['http://*/*', 'https://*/*'] },
     ['responseHeaders'],
   );
+  if (webRequest?.onBeforeSendHeaders) {
+    const filter = { urls: ['http://*/*', 'https://*/*'] };
+    try {
+      webRequest.onBeforeSendHeaders.addListener(
+        onChromiumBeforeSendHeaders,
+        filter,
+        ['requestHeaders', 'extraHeaders'],
+      );
+    } catch {
+      try {
+        webRequest.onBeforeSendHeaders.addListener(
+          onChromiumBeforeSendHeaders,
+          filter,
+          ['requestHeaders'],
+        );
+      } catch {
+        // Observing request auth is optional; cookies.getAll is the fallback.
+      }
+    }
+  }
 
   const determining = getChromiumDeterminingFilenameApi();
   determining?.addListener(onChromiumDeterminingFilename);

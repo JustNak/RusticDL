@@ -11,9 +11,16 @@ import {
   type EnqueueDownloadPayload,
   type ErrorCode,
   type ExtensionIntegrationSettings,
+  type HandoffAuthHeader,
   type HostToExtensionResponse,
+  type OriginHandoffAuth,
   type RequestSource,
 } from '@rusticdl/protocol';
+import {
+  cookieStoreIdForHandoff,
+  cookieUrlsForHandoff,
+  httpOrigin,
+} from './captureFilter';
 import browser from './browser';
 import type { PopupStateResponse } from '../shared/messages';
 
@@ -177,44 +184,86 @@ export async function saveExtensionSettings(
   return sendNativeMessage(createSaveExtensionSettingsRequest(settings));
 }
 
+function mergeOriginHeaders(
+  byOrigin: Map<string, HandoffAuthHeader[]>,
+  origin: string,
+  incoming: HandoffAuthHeader[],
+): void {
+  const existing = byOrigin.get(origin) ?? [];
+  const names = new Set(existing.map((header) => header.name.toLowerCase()));
+  for (const header of incoming) {
+    if (!header.name || !header.value || names.has(header.name.toLowerCase())) continue;
+    existing.push(header);
+    names.add(header.name.toLowerCase());
+  }
+  if (existing.length > 0) {
+    byOrigin.set(origin, existing);
+  }
+}
+
 /**
  * Browser session headers so the desktop GET can replay the same file the
  * tab just requested. Without cookies/referer, file hosts return a 3 KB HTML
  * wait page that still has `filename="Game.rar"`.
+ *
+ * Collect cookies for every origin on the capture (Canvas file URL and the
+ * Drive/Inst-FS hop). Do not log header values.
  */
 export async function collectHandoffAuth(
   url: string,
   extra: {
     referrer?: string;
     pageUrl?: string;
+    finalUrl?: string;
     incognito?: boolean;
     cookieStoreId?: string;
+    originAuth?: OriginHandoffAuth[];
   } = {},
 ): Promise<DownloadRequestMetadata['handoffAuth']> {
-  const headers: NonNullable<DownloadRequestMetadata['handoffAuth']>['headers'] = [];
+  const headers: HandoffAuthHeader[] = [];
+  const byOrigin = new Map<string, HandoffAuthHeader[]>();
+
+  for (const entry of extra.originAuth ?? []) {
+    const origin = httpOrigin(entry.origin) ?? httpOrigin(`${entry.origin}/`);
+    if (!origin || !entry.headers?.length) continue;
+    mergeOriginHeaders(byOrigin, origin, entry.headers);
+  }
 
   try {
-    let storeId: string | undefined = extra.cookieStoreId;
+    let storeId = extra.cookieStoreId;
     if (!storeId) {
       try {
         const stores = await browser.cookies.getAllCookieStores();
-        const match = extra.incognito
-          ? stores.find((store) => store.incognito)
-          : stores.find((store) => !store.incognito);
-        storeId = match?.id;
+        storeId = cookieStoreIdForHandoff(stores, extra);
       } catch {
         // Chromium may omit getAllCookieStores in some contexts.
       }
     }
-    const cookies = await browser.cookies.getAll(storeId ? { url, storeId } : { url });
-    if (cookies.length > 0) {
-      headers.push({
+    for (const cookieUrl of cookieUrlsForHandoff([
+      url,
+      extra.finalUrl,
+      extra.referrer,
+      extra.pageUrl,
+    ])) {
+      const cookies = await browser.cookies.getAll(storeId ? { url: cookieUrl, storeId } : { url: cookieUrl });
+      if (cookies.length === 0) continue;
+      const origin = httpOrigin(cookieUrl);
+      if (!origin) continue;
+      mergeOriginHeaders(byOrigin, origin, [{
         name: 'Cookie',
         value: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
-      });
+      }]);
     }
   } catch {
     // Restricted cookie / missing permission — still send referer/UA.
+  }
+
+  const primaryOrigin = httpOrigin(url);
+  const primaryCookie = primaryOrigin
+    ? byOrigin.get(primaryOrigin)?.find((header) => header.name.toLowerCase() === 'cookie')
+    : undefined;
+  if (primaryCookie) {
+    headers.push(primaryCookie);
   }
 
   const referrer = extra.referrer || extra.pageUrl;
@@ -231,7 +280,15 @@ export async function collectHandoffAuth(
     headers.push({ name: 'User-Agent', value: navigator.userAgent });
   }
 
-  return headers.length > 0 ? { headers } : undefined;
+  const originAuth = [...byOrigin.entries()].map(([origin, originHeaders]) => ({
+    origin,
+    headers: originHeaders,
+  }));
+  if (headers.length === 0 && originAuth.length === 0) return undefined;
+  return {
+    headers,
+    ...(originAuth.length > 0 ? { originAuth } : {}),
+  };
 }
 
 export function buildContextMenuPayload(

@@ -8,6 +8,7 @@
  */
 import {
   filenameFromContentDisposition,
+  httpOrigin,
   mimeLooksLikeDownload,
   normalizeCaptureUrl,
   preferredSuggestedFilename,
@@ -27,6 +28,16 @@ export type ChromiumHeadersReceivedDetails = {
   responseHeaders?: Array<{ name: string; value?: string }>;
 };
 
+export type ChromiumBeforeSendHeadersDetails = {
+  url: string;
+  requestHeaders?: Array<{ name: string; value?: string }>;
+};
+
+export type CapturedOriginAuth = {
+  origin: string;
+  headers: Array<{ name: string; value: string }>;
+};
+
 export type ChromiumDeterminingFilenameItem = {
   id: number;
   url: string;
@@ -38,6 +49,9 @@ type SuggestFn = (suggestion?: { filename?: string }) => void;
 
 const filenameHints = new Map<string, FilenameHint>();
 const determinedFilenames = new Map<number, { filename: string; ts: number }>();
+const REQUEST_AUTH_NAMES = new Set(['cookie', 'authorization']);
+const requestAuthByUrl = new Map<string, CapturedOriginAuth & { ts: number }>();
+const requestAuthByOrigin = new Map<string, CapturedOriginAuth & { ts: number }>();
 
 function headerValue(
   headers: ChromiumHeadersReceivedDetails['responseHeaders'],
@@ -61,6 +75,47 @@ function pruneFilenameHints(now = Date.now()): void {
   for (const [id, entry] of determinedFilenames) {
     if (now - entry.ts > HINT_TTL_MS) determinedFilenames.delete(id);
   }
+  for (const [key, entry] of requestAuthByUrl) {
+    if (now - entry.ts > HINT_TTL_MS) requestAuthByUrl.delete(key);
+  }
+  for (const [key, entry] of requestAuthByOrigin) {
+    if (now - entry.ts > HINT_TTL_MS) requestAuthByOrigin.delete(key);
+  }
+}
+
+/**
+ * Observe Cookie / Authorization the tab actually sent. Values stay in memory
+ * only and are never logged — used to replay the same hop the browser made.
+ */
+export function rememberRequestAuth(
+  details: ChromiumBeforeSendHeadersDetails,
+): CapturedOriginAuth | undefined {
+  const origin = httpOrigin(details.url);
+  if (!origin) return undefined;
+  const headers = (details.requestHeaders ?? [])
+    .filter((header) => REQUEST_AUTH_NAMES.has(header.name.toLowerCase()) && header.value)
+    .map((header) => ({ name: header.name, value: header.value as string }));
+  if (headers.length === 0) return undefined;
+  const captured: CapturedOriginAuth & { ts: number } = { origin, headers, ts: Date.now() };
+  pruneFilenameHints(captured.ts);
+  requestAuthByUrl.set(normalizeCaptureUrl(details.url), captured);
+  requestAuthByOrigin.set(origin, captured);
+  return { origin, headers };
+}
+
+export function lookupOriginAuth(urls: Array<string | undefined>): CapturedOriginAuth[] {
+  pruneFilenameHints();
+  const byOrigin = new Map<string, CapturedOriginAuth['headers']>();
+  for (const url of urls) {
+    if (!url) continue;
+    const fromUrl = requestAuthByUrl.get(normalizeCaptureUrl(url));
+    const origin = httpOrigin(url);
+    const fromOrigin = origin ? requestAuthByOrigin.get(origin) : undefined;
+    const hit = fromUrl ?? fromOrigin;
+    if (!hit || byOrigin.has(hit.origin)) continue;
+    byOrigin.set(hit.origin, hit.headers);
+  }
+  return [...byOrigin.entries()].map(([origin, headers]) => ({ origin, headers }));
 }
 
 export function rememberResponseFilenameHint(
@@ -130,30 +185,32 @@ export function resolveSuggestedFilename(item: {
   return preferredSuggestedFilename(...hintNamesForDownload(item), item.filename);
 }
 
-export function getChromiumWebRequest(): {
-  onHeadersReceived: {
+type ChromiumWebRequestApi = {
+  onHeadersReceived?: {
     addListener(
       listener: (details: ChromiumHeadersReceivedDetails) => void,
       filter: { urls: string[] },
       extraInfoSpec: string[],
     ): void;
   };
-} | null {
+  onBeforeSendHeaders?: {
+    addListener(
+      listener: (details: ChromiumBeforeSendHeadersDetails) => void,
+      filter: { urls: string[] },
+      extraInfoSpec: string[],
+    ): void;
+  };
+};
+
+export function getChromiumWebRequest(): ChromiumWebRequestApi | null {
   if (navigator.userAgent.toLowerCase().includes('firefox')) {
     return null;
   }
-  const wr = (browser as unknown as {
-    webRequest?: {
-      onHeadersReceived?: {
-        addListener(
-          listener: (details: ChromiumHeadersReceivedDetails) => void,
-          filter: { urls: string[] },
-          extraInfoSpec: string[],
-        ): void;
-      };
-    };
-  }).webRequest;
-  return wr?.onHeadersReceived ? { onHeadersReceived: wr.onHeadersReceived } : null;
+  const wr = (browser as unknown as { webRequest?: ChromiumWebRequestApi }).webRequest;
+  if (!wr?.onHeadersReceived && !wr?.onBeforeSendHeaders) {
+    return null;
+  }
+  return wr ?? null;
 }
 
 export function getChromiumDeterminingFilenameApi(): {

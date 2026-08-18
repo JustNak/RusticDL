@@ -8,9 +8,21 @@ pub struct HandoffAuthHeader {
     pub value: String,
 }
 
+/// Cookie / Authorization captured for one origin (Canvas vs Drive after redirect).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OriginHandoffAuth {
+    pub origin: String,
+    pub headers: Vec<HandoffAuthHeader>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffAuth {
+    #[serde(default)]
     pub headers: Vec<HandoffAuthHeader>,
+    /// Per-origin secrets so a Canvas → Google Drive hop keeps Drive cookies
+    /// without sending the Canvas session to a different site.
+    #[serde(default, rename = "originAuth")]
+    pub origin_auth: Vec<OriginHandoffAuth>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +65,66 @@ pub fn is_allowed_handoff_header(name: &str) -> bool {
         || lower.starts_with("sec-ch-ua")
 }
 
+fn http_origin(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    match parsed.origin() {
+        url::Origin::Tuple(..) => Some(parsed.origin().ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
+fn is_secret_handoff_header(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "cookie" || lower == "authorization"
+}
+
+/// Headers to send on this hop: identity headers stay job-origin-only;
+/// Cookie / Authorization come from matching `origin_auth`, else the legacy
+/// job-origin Cookie header.
+pub fn handoff_headers_for_request<'a>(
+    job_url: &str,
+    request_url: &str,
+    handoff_auth: Option<&'a HandoffAuth>,
+) -> Vec<&'a HandoffAuthHeader> {
+    let Some(auth) = handoff_auth else {
+        return Vec::new();
+    };
+    if auth.headers.is_empty() && auth.origin_auth.is_empty() {
+        return Vec::new();
+    }
+
+    let job_origin = http_origin(job_url);
+    let req_origin = http_origin(request_url);
+    let same_origin = job_origin.is_some() && job_origin == req_origin;
+
+    let origin_entry = req_origin.as_ref().and_then(|origin| {
+        auth.origin_auth
+            .iter()
+            .find(|entry| !entry.origin.is_empty() && &entry.origin == origin)
+    });
+
+    let mut out = Vec::new();
+    if same_origin {
+        for header in &auth.headers {
+            if origin_entry.is_some() && is_secret_handoff_header(&header.name) {
+                continue;
+            }
+            out.push(header);
+        }
+    }
+    if let Some(entry) = origin_entry {
+        for header in &entry.headers {
+            if is_allowed_handoff_header(&header.name) {
+                out.push(header);
+            }
+        }
+    }
+    out
+}
+
 /// Apply handoff headers only when the request URL is same-origin as the job URL.
+///
+/// Prefer [`handoff_headers_for_request`] when origin-scoped cookies are present.
 pub fn handoff_auth_for_request_url<'a>(
     job_url: &str,
     request_url: &str,
@@ -69,5 +140,98 @@ pub fn handoff_auth_for_request_url<'a>(
         Some(auth)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookie(value: &str) -> HandoffAuthHeader {
+        HandoffAuthHeader {
+            name: "Cookie".into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn same_origin_keeps_legacy_cookie_when_origin_auth_absent() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=1")],
+            ..Default::default()
+        };
+        let headers = handoff_headers_for_request(
+            "https://school.instructure.com/files/1/download",
+            "https://school.instructure.com/files/1/download",
+            Some(&auth),
+        );
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].value, "canvas=1");
+    }
+
+    #[test]
+    fn cross_origin_strips_legacy_cookie() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=secret")],
+            ..Default::default()
+        };
+        let headers = handoff_headers_for_request(
+            "https://school.instructure.com/files/1/download",
+            "https://drive.google.com/uc?id=abc",
+            Some(&auth),
+        );
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn origin_auth_cookie_follows_matching_redirect_origin() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=secret")],
+            origin_auth: vec![
+                OriginHandoffAuth {
+                    origin: "https://school.instructure.com".into(),
+                    headers: vec![cookie("canvas=secret")],
+                },
+                OriginHandoffAuth {
+                    origin: "https://drive.google.com".into(),
+                    headers: vec![cookie("SID=drive")],
+                },
+            ],
+        };
+        let canvas = handoff_headers_for_request(
+            "https://school.instructure.com/files/1/download",
+            "https://school.instructure.com/files/1/download?download_frd=1",
+            Some(&auth),
+        );
+        assert_eq!(canvas.len(), 1);
+        assert_eq!(canvas[0].value, "canvas=secret");
+
+        let drive = handoff_headers_for_request(
+            "https://school.instructure.com/files/1/download",
+            "https://drive.google.com/uc?export=download&id=abc",
+            Some(&auth),
+        );
+        assert_eq!(drive.len(), 1);
+        assert_eq!(drive[0].value, "SID=drive");
+    }
+
+    #[test]
+    fn legacy_whole_set_filter_still_same_origin_only() {
+        let auth = HandoffAuth {
+            headers: vec![cookie("canvas=secret")],
+            ..Default::default()
+        };
+        assert!(handoff_auth_for_request_url(
+            "https://school.instructure.com/files/1/download",
+            "https://school.instructure.com/files/1/download",
+            Some(&auth),
+        )
+        .is_some());
+        assert!(handoff_auth_for_request_url(
+            "https://school.instructure.com/files/1/download",
+            "https://drive.google.com/uc?id=abc",
+            Some(&auth),
+        )
+        .is_none());
     }
 }
