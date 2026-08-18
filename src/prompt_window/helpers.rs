@@ -3,6 +3,7 @@
 //! Keep local `capture_progress_bar` and `shorten_path` (do not unify with
 //! queue `styled_progress` / widgets path helpers).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use gpui::{
@@ -16,9 +17,86 @@ use crate::format::format_speed;
 use crate::settings::ProgressStyle;
 
 /// Visible columns in the capture speed graph (history is averaged down to this).
-const SPARK_COLUMNS: usize = 40;
+pub(super) const SPARK_COLUMNS: usize = 40;
+/// Samples committed into one trail column. 40 × 2 ≈ the 90-sample / 9s ring.
+const TRAIL_BUCKET: usize = 2;
+/// Per-tick ease toward the live sample. Stays in (0, 1] so the tip cannot overshoot.
+const TRAIL_EASE: f32 = 0.42;
+/// Reduce-motion keeps a short flat trail (matches the sample-ring cap in `mod`).
+const REDUCE_MOTION_COLUMNS: usize = 12;
 /// Keep the plot inside the clip rect so AA does not bleed past the card.
 const SPARK_INSET: f32 = 1.0;
+
+/// Append-only speed trail. Committed columns never rematerialize; only the live
+/// tip eases toward the newest samples. This is the motion fix: same `speed_samples`
+/// data, no jump / reverse / rubber-band from re-bucketing or overshooting curves.
+#[derive(Debug, Clone, Default)]
+pub(super) struct TrailMotion {
+    committed: VecDeque<f32>,
+    live_sum: u64,
+    live_count: u32,
+    live_display: f32,
+    live_target: f32,
+}
+
+impl TrailMotion {
+    pub(super) fn push_sample(&mut self, speed: u64, reduce_motion: bool) {
+        self.live_sum = self.live_sum.saturating_add(speed);
+        self.live_count = self.live_count.saturating_add(1);
+        self.live_target = self.live_sum as f32 / self.live_count as f32;
+        self.step_ease(reduce_motion);
+
+        let bucket = if reduce_motion { 1 } else { TRAIL_BUCKET };
+        if self.live_count as usize >= bucket {
+            let cap = if reduce_motion {
+                REDUCE_MOTION_COLUMNS
+            } else {
+                SPARK_COLUMNS
+            };
+            if self.committed.len() >= cap {
+                self.committed.pop_front();
+            }
+            // Commit the true bucket mean (same data). Snap the display tip to
+            // that mean so the next live column starts there — otherwise a flat
+            // series eases from a mid-ease leftover and dips at the right edge.
+            self.committed.push_back(self.live_target);
+            self.live_display = self.live_target;
+            self.live_sum = 0;
+            self.live_count = 0;
+        }
+    }
+
+    pub(super) fn step_ease(&mut self, reduce_motion: bool) {
+        if self.live_count == 0 {
+            return;
+        }
+        if reduce_motion {
+            self.live_display = self.live_target;
+            return;
+        }
+        self.live_display = ease_toward(self.live_display, self.live_target, TRAIL_EASE);
+    }
+
+    /// Right-aligned columns for the plot. Empty slots are `None` (left pad).
+    pub(super) fn columns(&self) -> Vec<Option<f32>> {
+        let mut vals: Vec<f32> = self.committed.iter().copied().collect();
+        if self.live_count > 0 {
+            vals.push(self.live_display);
+        }
+        pad_left_f32(&vals, SPARK_COLUMNS)
+    }
+}
+
+/// Exponential ease-out toward `target`. `alpha` in (0, 1] never crosses.
+pub(super) fn ease_toward(current: f32, target: f32, alpha: f32) -> f32 {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let next = current + (target - current) * alpha;
+    if (next - target).abs() <= 0.5 {
+        target
+    } else {
+        next
+    }
+}
 
 pub(super) fn capture_progress_bar(
     value: f32,
@@ -42,6 +120,7 @@ pub(super) fn capture_progress_bar(
 /// Compact throughput graph of recent bytes/sec samples.
 pub(super) fn speed_sparkline(
     samples: &[u64],
+    trail: &[Option<f32>],
     session_peak: u64,
     bar_color: Hsla,
     muted: Hsla,
@@ -50,12 +129,15 @@ pub(super) fn speed_sparkline(
     status: &'static str,
 ) -> impl IntoElement {
     let has_data = samples.iter().any(|&s| s > 0);
-    let columns = spark_columns(samples, SPARK_COLUMNS);
-    let visible_max = columns.iter().filter_map(|c| *c).max().unwrap_or(0);
-    let scale_max = sticky_scale(session_peak, visible_max);
-    let avg = visible_average(&columns);
+    let columns = trail.to_vec();
+    let visible_max = columns
+        .iter()
+        .filter_map(|c| *c)
+        .fold(0.0f32, |acc, v| acc.max(v));
+    let scale_max = sticky_scale(session_peak, visible_max.ceil() as u64);
+    let avg = visible_average_f32(&columns);
     let current = samples.last().copied().filter(|&s| s > 0);
-    let peak = session_peak.max(visible_max);
+    let peak = session_peak.max(visible_max.ceil() as u64);
     let smooth = !reduce_motion;
 
     v_flex()
@@ -129,6 +211,10 @@ pub(super) fn speed_sparkline(
 }
 
 /// Average `samples` into at most `columns` buckets, preserving order.
+///
+/// Every sample belongs to exactly one bucket (no live-tip hole). The capture
+/// HUD paints from [`TrailMotion`] instead; this stays as a stateless helper
+/// and for tests.
 fn downsample_avg(samples: &[u64], columns: usize) -> Vec<u64> {
     if columns == 0 || samples.is_empty() {
         return Vec::new();
@@ -139,10 +225,6 @@ fn downsample_avg(samples: &[u64], columns: usize) -> Vec<u64> {
     let n = samples.len();
     (0..columns)
         .map(|i| {
-            // Keep the live tip exact; average the rest so 90 ticks do not become a barcode.
-            if i + 1 == columns {
-                return samples[n - 1];
-            }
             let start = i * n / columns;
             let end = ((i + 1) * n / columns).max(start + 1);
             let chunk = &samples[start..end];
@@ -153,6 +235,16 @@ fn downsample_avg(samples: &[u64], columns: usize) -> Vec<u64> {
 
 /// Right-align history so column width stays stable as samples accrue.
 fn pad_left(samples: &[u64], columns: usize) -> Vec<Option<u64>> {
+    pad_left_f32(
+        &samples.iter().map(|&s| s as f32).collect::<Vec<_>>(),
+        columns,
+    )
+    .into_iter()
+    .map(|slot| slot.map(|v| v.round() as u64))
+    .collect()
+}
+
+fn pad_left_f32(samples: &[f32], columns: usize) -> Vec<Option<f32>> {
     if columns == 0 {
         return Vec::new();
     }
@@ -191,8 +283,24 @@ fn visible_average(columns: &[Option<u64>]) -> Option<u64> {
     sum.checked_div(n)
 }
 
+fn visible_average_f32(columns: &[Option<f32>]) -> Option<u64> {
+    let mut sum = 0.0f32;
+    let mut n = 0u64;
+    for slot in columns {
+        if let Some(speed) = *slot {
+            sum += speed;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        None
+    } else {
+        Some((sum / n as f32).round() as u64)
+    }
+}
+
 /// Populated columns as `(index, speed)`, skipping leading/gap `None`.
-fn plot_samples(columns: &[Option<u64>]) -> Vec<(usize, u64)> {
+fn plot_samples(columns: &[Option<f32>]) -> Vec<(usize, f32)> {
     columns
         .iter()
         .enumerate()
@@ -201,12 +309,69 @@ fn plot_samples(columns: &[Option<u64>]) -> Vec<(usize, u64)> {
 }
 
 /// Pixel height for one sample. Zero speed stays on the baseline (no floor wall).
-fn bar_height_px(speed: u64, max: u64, usable: f32) -> f32 {
-    if speed == 0 || max == 0 || usable <= 0.0 {
+fn bar_height_px(speed: f32, max: f32, usable: f32) -> f32 {
+    if speed <= 0.0 || max <= 0.0 || usable <= 0.0 {
         return 0.0;
     }
-    let h = (speed as f32 / max as f32) * usable;
+    let h = (speed / max) * usable;
     h.clamp(1.0, usable)
+}
+
+/// Fritsch–Carlson monotone cubic tangents. Zero at turning points so the
+/// interpolant cannot overshoot a peak or reverse through a neighbor.
+fn monotone_tangents(xs: &[f32], ys: &[f32]) -> Vec<f32> {
+    let n = ys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0.0];
+    }
+    let mut delta = vec![0.0; n - 1];
+    for i in 0..n - 1 {
+        let dx = xs[i + 1] - xs[i];
+        delta[i] = if dx.abs() < f32::EPSILON {
+            0.0
+        } else {
+            (ys[i + 1] - ys[i]) / dx
+        };
+    }
+    let mut m = vec![0.0; n];
+    m[0] = delta[0];
+    m[n - 1] = delta[n - 2];
+    for i in 1..n - 1 {
+        if delta[i - 1] * delta[i] <= 0.0 {
+            m[i] = 0.0;
+        } else {
+            m[i] = (delta[i - 1] + delta[i]) * 0.5;
+        }
+    }
+    for i in 0..n - 1 {
+        if delta[i].abs() < f32::EPSILON {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+            continue;
+        }
+        let a = m[i] / delta[i];
+        let b = m[i + 1] / delta[i];
+        let s = a * a + b * b;
+        if s > 9.0 {
+            let t = 3.0 / s.sqrt();
+            m[i] = t * a * delta[i];
+            m[i + 1] = t * b * delta[i];
+        }
+    }
+    m
+}
+
+fn hermite_y(y0: f32, y1: f32, m0: f32, m1: f32, dx: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    h00 * y0 + h10 * dx * m0 + h01 * y1 + h11 * dx * m1
 }
 
 fn append_series(builder: &mut PathBuilder, points: &[(f32, f32)], smooth: bool) {
@@ -219,19 +384,23 @@ fn append_series(builder: &mut PathBuilder, points: &[(f32, f32)], smooth: bool)
         }
         return;
     }
+    let xs: Vec<f32> = points.iter().map(|p| p.0).collect();
+    let ys: Vec<f32> = points.iter().map(|p| p.1).collect();
+    let tangents = monotone_tangents(&xs, &ys);
     for i in 0..points.len() - 1 {
         let (x0, y0) = points[i];
         let (x1, y1) = points[i + 1];
-        let mx = (x0 + x1) * 0.5;
-        let my = (y0 + y1) * 0.5;
-        if i == 0 {
-            builder.line_to(point(px(mx), px(my)));
-        } else {
-            builder.curve_to(point(px(mx), px(my)), point(px(x0), px(y0)));
-        }
+        let dx = x1 - x0;
+        let c1x = x0 + dx / 3.0;
+        let c1y = y0 + tangents[i] * dx / 3.0;
+        let c2x = x1 - dx / 3.0;
+        let c2y = y1 - tangents[i + 1] * dx / 3.0;
+        builder.cubic_bezier_to(
+            point(px(x1), px(y1)),
+            point(px(c1x), px(c1y)),
+            point(px(c2x), px(c2y)),
+        );
     }
-    let (lx, ly) = points[points.len() - 1];
-    builder.line_to(point(px(lx), px(ly)));
 }
 
 fn paint_h_line(window: &mut Window, x: f32, y: f32, w: f32, color: Hsla) {
@@ -246,7 +415,7 @@ fn paint_h_line(window: &mut Window, x: f32, y: f32, w: f32, color: Hsla) {
 
 fn paint_speed_graph(
     bounds: Bounds<gpui::Pixels>,
-    columns: &[Option<u64>],
+    columns: &[Option<f32>],
     scale_max: u64,
     avg: Option<u64>,
     line_color: Hsla,
@@ -289,8 +458,9 @@ fn paint_speed_graph(
         muted.opacity(0.22),
     );
 
+    let peak_f = peak as f32;
     if let Some(avg) = avg.filter(|&v| v > 0) {
-        let avg_h = bar_height_px(avg, peak, plot_h);
+        let avg_h = bar_height_px(avg as f32, peak_f, plot_h);
         if avg_h > 0.0 {
             let mut dash = PathBuilder::stroke(px(1.0)).dash_array(&[px(3.0), px(3.0)]);
             let y = base_y - 1.0 - avg_h;
@@ -311,7 +481,7 @@ fn paint_speed_graph(
         .iter()
         .map(|&(i, speed)| {
             let x = x0 + (i as f32 + 0.5) * step;
-            let y = base_y - 1.0 - bar_height_px(speed, peak, plot_h);
+            let y = base_y - 1.0 - bar_height_px(speed, peak_f, plot_h);
             (x, y)
         })
         .collect();
@@ -443,7 +613,25 @@ mod tests {
     #[test]
     fn downsample_averages_even_buckets() {
         let samples: Vec<u64> = (1..=8).collect();
-        assert_eq!(downsample_avg(&samples, 4), vec![1, 3, 5, 8]);
+        // Every sample is in exactly one bucket — no live-tip hole that drops 7.
+        assert_eq!(downsample_avg(&samples, 4), vec![1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn downsample_covers_every_sample() {
+        let samples: Vec<u64> = (1..=90).collect();
+        let cols = downsample_avg(&samples, SPARK_COLUMNS);
+        assert_eq!(cols.len(), SPARK_COLUMNS);
+        let covered: u64 = {
+            // Reconstruct coverage by summing bucket * count is hard; instead
+            // check first/last and that no bucket is the raw last sample alone
+            // while skipping its neighbors (the old rubber-band hole).
+            let last = *cols.last().unwrap();
+            assert!(last < 90, "last bucket should average the tail, not pin 90");
+            assert!(last >= 85);
+            last
+        };
+        let _ = covered;
     }
 
     #[test]
@@ -458,20 +646,22 @@ mod tests {
         let cols = spark_columns(&samples, SPARK_COLUMNS);
         assert_eq!(cols.len(), SPARK_COLUMNS);
         assert!(cols.iter().all(|c| c.is_some()));
-        assert_eq!(cols.last().copied().flatten(), Some(90));
+        let last = cols.last().copied().flatten().unwrap();
+        assert!(last < 90);
+        assert!(last >= 85);
     }
 
     #[test]
     fn bar_height_zero_stays_on_baseline() {
-        assert_eq!(bar_height_px(0, 100, 40.0), 0.0);
-        assert_eq!(bar_height_px(50, 0, 40.0), 0.0);
+        assert_eq!(bar_height_px(0.0, 100.0, 40.0), 0.0);
+        assert_eq!(bar_height_px(50.0, 0.0, 40.0), 0.0);
     }
 
     #[test]
     fn bar_height_peak_fills_track_and_never_exceeds_it() {
-        assert_eq!(bar_height_px(100, 100, 40.0), 40.0);
-        assert!(bar_height_px(1, 100, 40.0) >= 1.0);
-        assert!(bar_height_px(1, 100, 40.0) <= 40.0);
+        assert_eq!(bar_height_px(100.0, 100.0, 40.0), 40.0);
+        assert!(bar_height_px(1.0, 100.0, 40.0) >= 1.0);
+        assert!(bar_height_px(1.0, 100.0, 40.0) <= 40.0);
     }
 
     #[test]
@@ -490,10 +680,110 @@ mod tests {
 
     #[test]
     fn plot_samples_skips_none_and_keeps_last() {
-        let cols = vec![None, None, Some(10), Some(20), Some(5)];
+        let cols = vec![None, None, Some(10.0), Some(20.0), Some(5.0)];
         let plotted = plot_samples(&cols);
-        assert_eq!(plotted, vec![(2, 10), (3, 20), (4, 5)]);
-        assert_eq!(plotted.last().copied(), Some((4, 5)));
+        assert_eq!(plotted, vec![(2, 10.0), (3, 20.0), (4, 5.0)]);
+        assert_eq!(plotted.last().copied(), Some((4, 5.0)));
+    }
+
+    #[test]
+    fn ease_toward_never_crosses_target() {
+        let mut v = 0.0f32;
+        for _ in 0..20 {
+            let next = ease_toward(v, 100.0, 0.42);
+            assert!(next >= v, "must not reverse");
+            assert!(next <= 100.0, "must not overshoot");
+            v = next;
+        }
+        assert_eq!(ease_toward(99.8, 100.0, 0.42), 100.0);
+        let down = ease_toward(80.0, 10.0, 0.42);
+        assert!(down < 80.0 && down >= 10.0);
+    }
+
+    #[test]
+    fn trail_committed_columns_do_not_rematerialize() {
+        let mut trail = TrailMotion::default();
+        for speed in [10u64, 20, 30, 40, 50, 60] {
+            trail.push_sample(speed, false);
+        }
+        // 6 samples / bucket 2 → 3 committed, no live remainder.
+        let first = trail.columns();
+        let committed: Vec<f32> = first.iter().copied().flatten().collect();
+        assert_eq!(committed.len(), 3);
+        assert!((committed[0] - 15.0).abs() < 0.01);
+        assert!((committed[1] - 35.0).abs() < 0.01);
+        assert!((committed[2] - 55.0).abs() < 0.01);
+
+        trail.push_sample(99, false);
+        let second = trail.columns();
+        let again: Vec<f32> = second.iter().copied().flatten().collect();
+        // First three committed values stay put; only a new live tip appears.
+        assert_eq!(again.len(), 4);
+        assert!((again[0] - 15.0).abs() < 0.01);
+        assert!((again[1] - 35.0).abs() < 0.01);
+        assert!((again[2] - 55.0).abs() < 0.01);
+        assert!(
+            again[3] > 55.0 && again[3] < 99.0,
+            "tip eases, does not snap"
+        );
+    }
+
+    #[test]
+    fn trail_flat_series_tip_does_not_dip_below_committed() {
+        let mut trail = TrailMotion::default();
+        trail.push_sample(100, false);
+        trail.push_sample(100, false);
+        let after_commit: Vec<f32> = trail.columns().iter().copied().flatten().collect();
+        assert_eq!(after_commit.len(), 1);
+        assert!((after_commit[0] - 100.0).abs() < 0.01);
+
+        for n in 3..=10 {
+            trail.push_sample(100, false);
+            let cols: Vec<f32> = trail.columns().iter().copied().flatten().collect();
+            let last_committed = cols
+                .iter()
+                .rev()
+                .find(|v| (**v - 100.0).abs() < 0.01)
+                .copied()
+                .expect("committed mean still present");
+            let tip = *cols.last().expect("trail has a tip");
+            assert!(
+                tip + 0.01 >= last_committed,
+                "flat 100 B/s dipped at sample {n}: tip={tip} committed={last_committed} cols={cols:?}"
+            );
+            for (i, v) in cols.iter().enumerate() {
+                assert!(*v + 0.01 >= 100.0, "column {i} dipped to {v} on sample {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn trail_reduce_motion_snaps_and_stays_short() {
+        let mut trail = TrailMotion::default();
+        for speed in 1u64..=20 {
+            trail.push_sample(speed, true);
+        }
+        let cols: Vec<f32> = trail.columns().iter().copied().flatten().collect();
+        assert_eq!(cols.len(), REDUCE_MOTION_COLUMNS);
+        assert!((cols[cols.len() - 1] - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn monotone_curve_does_not_overshoot_a_peak() {
+        let xs = [0.0, 1.0, 2.0, 3.0];
+        let ys = [0.0, 10.0, 0.0, 4.0];
+        let m = monotone_tangents(&xs, &ys);
+        // Local peak at i=1 → tangent 0; samples along the segment stay in [0, 10].
+        assert_eq!(m[1], 0.0);
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let y = hermite_y(ys[0], ys[1], m[0], m[1], 1.0, t);
+            assert!((0.0..=10.0).contains(&y), "overshoot at t={t}: {y}");
+            let y2 = hermite_y(ys[1], ys[2], m[1], m[2], 1.0, t);
+            assert!(
+                (0.0..=10.0).contains(&y2),
+                "overshoot after peak t={t}: {y2}"
+            );
+        }
     }
 
     #[test]
