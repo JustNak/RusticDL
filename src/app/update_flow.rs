@@ -15,10 +15,7 @@
 
 use std::time::Duration;
 
-use gpui::{
-    div, px, rems, Context, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled,
-    Window,
-};
+use gpui::{div, px, rems, Context, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
@@ -227,7 +224,6 @@ impl DownloadApp {
                 body = body.child(
                     GroupBox::new().outline().child(
                         div()
-                            .id("whats-new-notes")
                             .w_full()
                             .h(px(WHATS_NEW_NOTES_H))
                             .child(
