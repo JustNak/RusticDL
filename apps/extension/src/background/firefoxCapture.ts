@@ -57,6 +57,8 @@ export {
   downloadBasename,
   downloadCreatedAction,
   filenameFromContentDisposition,
+  followRestoreSkip,
+  RESTORE_SKIP_TTL_MS,
   handoffUrlForCapturedDownload,
   httpOrigin,
   isEphemeralSignedUrl,
@@ -483,7 +485,7 @@ type BlockingWebRequest = {
   };
   onBeforeRedirect?: {
     addListener(
-      listener: (details: { url: string; redirectUrl?: string }) => void,
+      listener: (details: { url: string; redirectUrl?: string; requestId?: string }) => void,
       filter: { urls: string[]; types?: string[] },
     ): void;
   };

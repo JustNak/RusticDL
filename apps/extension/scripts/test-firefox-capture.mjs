@@ -70,6 +70,8 @@ const {
   downloadCreatedAction,
   knownDownloadBytes,
   matchesInterceptedDownload,
+  followRestoreSkip,
+  RESTORE_SKIP_TTL_MS,
   canonicalDownloadFilename,
   filenameFromContentDisposition,
   isWeakSuggestedFilename,
@@ -1202,6 +1204,84 @@ assert(
     && capturedAuth[0].headers.some((header) => header.name === 'Cookie')
     && capturedAuth[0].headers.some((header) => header.name === 'Authorization')
     && !capturedAuth[0].headers.some((header) => header.name === 'Accept'),
+);
+
+console.log('\nFirefox dismissed restore skip\n');
+
+const restoreUrls = new Map();
+const restoreIds = new Map();
+const canvasSession = 'https://school.instructure.com/files/99/download?download_frd=1';
+const driveHop = 'https://drive.google.com/uc?export=download&id=abc';
+const docsHop = 'https://doc-00-00-docs.googleusercontent.com/docs/securesc/file.docx';
+restoreUrls.set(canvasSession, Date.now());
+
+assert(
+  'skips the restored Canvas session URL',
+  followRestoreSkip({
+    url: canvasSession,
+    requestId: 'req-restore',
+    skippedUrls: restoreUrls,
+    skippedRequestIds: restoreIds,
+  }) === true,
+);
+
+assert(
+  'same Firefox requestId follows a Drive redirect after dismiss',
+  followRestoreSkip({
+    url: driveHop,
+    requestId: 'req-restore',
+    skippedUrls: restoreUrls,
+    skippedRequestIds: restoreIds,
+  }) === true
+    && restoreUrls.has(driveHop),
+);
+
+resetDownloadRedirectsForTests();
+rememberDownloadRedirect(canvasSession, driveHop);
+rememberDownloadRedirect(driveHop, docsHop);
+assert(
+  'skips a Drive hop whose remembered session URL was restored',
+  followRestoreSkip({
+    url: docsHop,
+    skippedUrls: restoreUrls,
+    skippedRequestIds: new Map(),
+    sessionUrl: lookupRedirectSessionUrl(docsHop),
+  }) === true,
+);
+resetDownloadRedirectsForTests();
+
+assert(
+  'does not skip an unrelated later download',
+  followRestoreSkip({
+    url: 'https://cdn.example.com/other.zip',
+    requestId: 'req-other',
+    skippedUrls: restoreUrls,
+    skippedRequestIds: restoreIds,
+  }) === false,
+);
+
+assert(
+  'expired restore skip can be recaptured',
+  followRestoreSkip({
+    url: canvasSession,
+    skippedUrls: new Map([[canvasSession, Date.now() - RESTORE_SKIP_TTL_MS - 1]]),
+    skippedRequestIds: new Map(),
+  }) === false,
+);
+
+assert(
+  'onCreated matches a restored Drive file by filename after redirect',
+  matchesInterceptedDownload(
+    {
+      url: docsHop,
+      filename: 'Google Drive Folder.docx',
+    },
+    [{
+      url: canvasSession,
+      filename: 'Google Drive Folder.docx',
+      ts: Date.now(),
+    }],
+  ) === true,
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);

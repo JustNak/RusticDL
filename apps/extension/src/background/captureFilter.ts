@@ -319,6 +319,51 @@ export function matchesInterceptedDownload(
   return false;
 }
 
+export const RESTORE_SKIP_TTL_MS = 15_000;
+
+export function pruneTimestampMap(
+  map: Map<string, number>,
+  now = Date.now(),
+  ttlMs = RESTORE_SKIP_TTL_MS,
+): void {
+  for (const [key, ts] of map) {
+    if (now - ts > ttlMs) map.delete(key);
+  }
+}
+
+/**
+ * If this hop belongs to a restored (dismissed) download, remember the current
+ * URL and requestId so later Drive / CDN redirects stay skipped.
+ */
+export function followRestoreSkip(args: {
+  url?: string;
+  requestId?: string;
+  skippedUrls: Map<string, number>;
+  skippedRequestIds: Map<string, number>;
+  sessionUrl?: string;
+  now?: number;
+  ttlMs?: number;
+}): boolean {
+  const now = args.now ?? Date.now();
+  const ttlMs = args.ttlMs ?? RESTORE_SKIP_TTL_MS;
+  pruneTimestampMap(args.skippedUrls, now, ttlMs);
+  pruneTimestampMap(args.skippedRequestIds, now, ttlMs);
+
+  const urlKey = args.url ? normalizeCaptureUrl(args.url) : undefined;
+  const sessionKey = args.sessionUrl ? normalizeCaptureUrl(args.sessionUrl) : undefined;
+  const urlHit = Boolean(
+    (urlKey && args.skippedUrls.has(urlKey))
+    || (sessionKey && args.skippedUrls.has(sessionKey)),
+  );
+  const idHit = Boolean(args.requestId && args.skippedRequestIds.has(args.requestId));
+  if (!urlHit && !idHit) return false;
+
+  if (urlKey) args.skippedUrls.set(urlKey, now);
+  if (sessionKey) args.skippedUrls.set(sessionKey, now);
+  if (args.requestId) args.skippedRequestIds.set(args.requestId, now);
+  return true;
+}
+
 /**
  * Chrome `downloads` fills `finalUrl` after an LMS/app gateway redirects to
  * Drive, Inst-FS, or a CDN. That hop often carries a one-time token the
