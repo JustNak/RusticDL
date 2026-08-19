@@ -46,9 +46,10 @@ impl DownloadApp {
         false
     }
 
-    /// Tear down leftover Confirm / Progress / Complete HUDs (extra swapchains).
+    /// Tear down leftover capture HUDs when hiding to tray (extra swapchains).
     ///
-    /// Does not destroy the main window or its D3D swapchain.
+    /// Does not destroy the main window or its D3D swapchain. After hide,
+    /// `poll_browser_capture` may still open Confirm / needed Progress.
     pub(crate) fn close_capture_huds(&mut self, cx: &mut Context<Self>) {
         self.ipc.request_close_capture_windows();
         self.browser_watch_complete_ids.clear();

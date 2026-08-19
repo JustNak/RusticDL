@@ -14,6 +14,17 @@ use crate::prompt_window::{
     open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
 };
 
+/// Confirm / Progress HUDs are independent of the main HWND.
+///
+/// PR 133 parked the hidden idle apply/notify path and closed leftover
+/// Complete HUDs on tray hide. Gating this poll on `window_hidden_to_tray`
+/// also blocked Confirm (and needed Progress) while the main window is
+/// `SW_HIDE`. Idle park still skips clone+notify; this poll is a cheap
+/// queue check and may open a separate capture window.
+pub(crate) fn should_poll_capture_huds(_window_hidden_to_tray: bool) -> bool {
+    true
+}
+
 impl DownloadApp {
     /// Open the floating progress HUD for a queue job that is still downloading.
     ///
@@ -52,6 +63,9 @@ impl DownloadApp {
     }
 
     /// Open at most one pending confirm / progress / complete HUD this tick.
+    ///
+    /// Must run while the main window is tray-hidden (`SW_HIDE`). Capture
+    /// still arrives over IPC; the user sees it through these windows.
     pub(crate) fn poll_browser_capture(&mut self, cx: &mut Context<Self>) {
         if self.open_next_browser_prompt(cx) {
             return;
@@ -157,5 +171,20 @@ impl DownloadApp {
             }
         }
         self.browser_watch_complete_ids = still_watch;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_poll_capture_huds;
+
+    #[test]
+    fn capture_huds_are_polled_while_tray_hidden() {
+        // Regression: PR 133 gated poll_browser_capture on !window_hidden_to_tray.
+        assert!(
+            should_poll_capture_huds(true),
+            "Confirm / Progress must open while the main window is SW_HIDE"
+        );
+        assert!(should_poll_capture_huds(false));
     }
 }

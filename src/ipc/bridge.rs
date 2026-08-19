@@ -592,4 +592,31 @@ mod tests {
         ipc.request_close_capture_windows();
         assert_eq!(ipc.capture_close_epoch(), 2);
     }
+
+    #[test]
+    fn request_close_does_not_block_confirm_or_progress_after_hide() {
+        // Tray-hide close tears down leftover HUDs. A later handoff must still
+        // be claimable so Confirm / Progress can pop while the main window is SW_HIDE.
+        let ipc = test_bridge();
+        ipc.request_close_capture_windows();
+
+        let (prompt, _rx) = test_prompt("after-hide", "https://example.com/after");
+        ipc.enqueue_prompt(prompt).expect("enqueue after hide");
+        assert_eq!(
+            ipc.claim_next_prompt_for_ui()
+                .expect("confirm claimable")
+                .id,
+            "after-hide"
+        );
+
+        ipc.update_jobs(Arc::new(vec![test_job(
+            "j-after",
+            "https://example.com/after-progress",
+        )]));
+        ipc.enqueue_progress_job("j-after".into());
+        assert_eq!(
+            ipc.take_pending_progress_jobs_n(1),
+            vec!["j-after".to_string()]
+        );
+    }
 }
