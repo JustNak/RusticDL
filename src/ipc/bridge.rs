@@ -97,6 +97,8 @@ pub(crate) struct IpcState {
     pub(crate) progress_hud_waiting_urls: HashSet<String>,
     /// Completed jobs for which the Complete HUD was already shown (once per id).
     pub(crate) complete_hud_shown: HashSet<String>,
+    /// Bumped when the main window hides to tray so leftover HUDs can close.
+    pub(crate) capture_close_epoch: u64,
 }
 
 impl IpcBridge {
@@ -115,6 +117,7 @@ impl IpcBridge {
                 progress_hud_owned_jobs: HashSet::new(),
                 progress_hud_waiting_urls: HashSet::new(),
                 complete_hud_shown: HashSet::new(),
+                capture_close_epoch: 0,
             })),
             engine,
             paths,
@@ -425,6 +428,38 @@ impl IpcBridge {
         }
     }
 
+    /// Close leftover Confirm/Progress HUDs when the main window hides to tray.
+    ///
+    /// Dismisses open confirm prompts, releases Progress ownership, and bumps
+    /// the close epoch. Leaves `complete_hud_shown` (and its cap) intact so a
+    /// finished job does not reopen Complete on restore.
+    pub fn request_close_capture_windows(&self) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.capture_close_epoch = guard.capture_close_epoch.wrapping_add(1);
+        let active_ids = std::mem::take(&mut guard.active_prompt_ids);
+        let mut keep = VecDeque::new();
+        while let Some(prompt) = guard.prompt_queue.pop_front() {
+            if active_ids.contains(&prompt.id) {
+                let _ = prompt.reply.send(PromptDecision::Dismiss);
+            } else {
+                keep.push_back(prompt);
+            }
+        }
+        guard.prompt_queue = keep;
+        guard.progress_hud_owned_jobs.clear();
+    }
+
+    /// Tray-hide close generation. Tests and HUD teardown compare against this.
+    pub fn capture_close_epoch(&self) -> u64 {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| guard.capture_close_epoch)
+            .unwrap_or(0)
+    }
+
     pub fn show_progress_after_handoff(&self) -> bool {
         self.inner
             .lock()
@@ -522,5 +557,39 @@ mod tests {
         assert_eq!(ipc.take_pending_progress_jobs_n(1), vec!["j2".to_string()]);
         assert_eq!(ipc.take_pending_progress_jobs(), vec!["j3".to_string()]);
         assert!(ipc.take_pending_progress_jobs_n(1).is_empty());
+    }
+
+    #[test]
+    fn request_close_capture_windows_dismisses_open_huds_and_keeps_caps() {
+        let ipc = test_bridge();
+        let (prompt_open, mut rx_open) = test_prompt("open", "https://example.com/open");
+        let (prompt_queued, mut rx_queued) = test_prompt("queued", "https://example.com/queued");
+        ipc.enqueue_prompt(prompt_open).expect("enqueue open");
+        ipc.enqueue_prompt(prompt_queued).expect("enqueue queued");
+        assert_eq!(ipc.claim_next_prompt_for_ui().unwrap().id, "open");
+
+        assert!(ipc.try_own_progress_job("progress-1"));
+        assert!(ipc.try_claim_complete_hud("done-1"));
+        assert_eq!(ipc.capture_window_count(), 2);
+        assert_eq!(ipc.capture_close_epoch(), 0);
+
+        ipc.request_close_capture_windows();
+
+        assert_eq!(ipc.capture_close_epoch(), 1);
+        assert_eq!(ipc.capture_window_count(), 0);
+        assert!(!ipc.is_progress_hud_owned("progress-1"));
+        assert!(
+            !ipc.try_claim_complete_hud("done-1"),
+            "complete cap must stay"
+        );
+        assert!(matches!(rx_open.try_recv(), Ok(PromptDecision::Dismiss)));
+        assert!(
+            ipc.is_prompt_pending("queued"),
+            "unshown prompts stay queued"
+        );
+        assert!(rx_queued.try_recv().is_err());
+
+        ipc.request_close_capture_windows();
+        assert_eq!(ipc.capture_close_epoch(), 2);
     }
 }

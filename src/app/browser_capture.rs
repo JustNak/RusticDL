@@ -5,7 +5,8 @@
 //! At most one new capture window is created per tick so two HUDs never
 //! `open_window` in the same update.
 
-use gpui::Context;
+use gpui::{Context, WindowHandle};
+use gpui_component::Root;
 
 use super::DownloadApp;
 use crate::download::JobState;
@@ -30,15 +31,23 @@ impl DownloadApp {
             self.show_toast("Progress window is already open.", cx);
             return;
         }
-        let opened = open_browser_progress_window(
+        if !self.remember_capture_window(open_browser_progress_window(
             job_id.to_string(),
             self.ipc.clone(),
             self.engine.clone(),
             &self.settings,
             cx,
-        );
-        if opened.is_none() {
+        )) {
             self.show_toast("Could not open the progress window.", cx);
+        }
+    }
+
+    fn remember_capture_window(&mut self, handle: Option<WindowHandle<Root>>) -> bool {
+        if let Some(handle) = handle {
+            self.capture_windows.push(handle);
+            true
+        } else {
+            false
         }
     }
 
@@ -60,14 +69,13 @@ impl DownloadApp {
         let Some(prompt) = self.ipc.claim_next_prompt_for_ui() else {
             return false;
         };
-        open_browser_prompt_window(
+        self.remember_capture_window(open_browser_prompt_window(
             prompt,
             self.ipc.clone(),
             self.engine.clone(),
             &self.settings,
             cx,
-        )
-        .is_some()
+        ))
     }
 
     /// Open one floating progress HUD for a browser handoff (auto mode + morph fallback).
@@ -93,14 +101,13 @@ impl DownloadApp {
         let Some(job_id) = self.ipc.take_pending_progress_jobs_n(1).into_iter().next() else {
             return false;
         };
-        open_browser_progress_window(
+        self.remember_capture_window(open_browser_progress_window(
             job_id,
             self.ipc.clone(),
             self.engine.clone(),
             &self.settings,
             cx,
-        )
-        .is_some()
+        ))
     }
 
     /// If Progress was closed early, re-open one Complete HUD when a watched job finishes.
@@ -114,10 +121,11 @@ impl DownloadApp {
             return;
         }
 
+        let pending: Vec<String> = self.browser_watch_complete_ids.drain(..).collect();
         let mut still_watch = Vec::new();
         let mut opened = false;
-        for job_id in self.browser_watch_complete_ids.drain(..) {
-            let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
+        for job_id in pending {
+            let Some(job) = self.jobs.iter().find(|j| j.id == job_id).cloned() else {
                 // Job removed — stop watching.
                 continue;
             };
@@ -127,15 +135,15 @@ impl DownloadApp {
                     if self.ipc.is_progress_hud_owned(&job_id) || opened {
                         still_watch.push(job_id);
                     } else {
-                        let handle = open_browser_complete_window(
-                            job.clone(),
+                        let handle_ok = self.remember_capture_window(open_browser_complete_window(
+                            job,
                             self.ipc.clone(),
                             self.engine.clone(),
                             &self.settings,
                             cx,
-                        );
+                        ));
                         // Keep watching on open failure so Complete can retry.
-                        if handle.is_none() {
+                        if !handle_ok {
                             still_watch.push(job_id);
                         } else {
                             opened = true;

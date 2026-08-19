@@ -11,7 +11,8 @@ mod open;
 mod progress;
 
 pub use open::{
-    open_browser_complete_window, open_browser_progress_window, open_browser_prompt_window,
+    close_capture_window, open_browser_complete_window, open_browser_progress_window,
+    open_browser_prompt_window,
 };
 
 use std::collections::VecDeque;

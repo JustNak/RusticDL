@@ -219,14 +219,38 @@ async fn command_loop(
     inner: Arc<Mutex<EngineInner>>,
     mut cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
 ) {
+    let wake = {
+        let guard = inner.lock().await;
+        guard.wake.clone()
+    };
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             EngineCommand::Shutdown => break,
             other => {
                 commands::handle_command(&inner, other).await;
+                // Parked scheduler must resume as soon as any command lands.
+                wake.notify_one();
             }
         }
     }
+}
+
+/// True when the scheduler can sleep until a command or worker wake.
+///
+/// Queued / Starting / Downloading need a tick. Paused and terminal jobs do
+/// not. Restart/cancel bookkeeping also keeps the loop polling.
+fn scheduler_should_park(guard: &EngineInner) -> bool {
+    guard.active.is_empty()
+        && guard.requeue_on_cancel.is_empty()
+        && guard.pending_partial_deletes.is_empty()
+        && !guard.jobs.iter().any(job_keeps_scheduler_awake)
+}
+
+fn job_keeps_scheduler_awake(job: &Job) -> bool {
+    matches!(
+        job.state,
+        JobState::Queued | JobState::Starting | JobState::Downloading
+    )
 }
 
 async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
@@ -264,13 +288,17 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
             worker::start_worker(inner.clone(), id);
         }
 
-        let wake = {
+        let (wake, park) = {
             let guard = inner.lock().await;
-            guard.wake.clone()
+            (guard.wake.clone(), scheduler_should_park(&guard))
         };
-        tokio::select! {
-            _ = wake.notified() => {}
-            _ = sleep(Duration::from_millis(500)) => {}
+        if park {
+            wake.notified().await;
+        } else {
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = sleep(Duration::from_millis(500)) => {}
+            }
         }
     }
 }
@@ -434,6 +462,7 @@ mod tests {
     use super::super::segment::{Segment, SegmentMap, SegmentState};
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn sample_job(state: JobState) -> Job {
         let target = PathBuf::from("C:\\downloads\\file.bin");
@@ -451,6 +480,27 @@ mod tests {
         job.eta_secs = 90;
         job.progress = 10.0;
         job
+    }
+
+    fn idle_engine_inner(job: Job) -> EngineInner {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(1);
+        std::mem::forget(persist_rx);
+        EngineInner {
+            jobs: vec![job],
+            controls: HashMap::new(),
+            active: HashMap::new(),
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            config: EngineRuntimeConfig::default(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store: Arc::new(MemoryJobStore::default()),
+            persist_tx,
+        }
     }
 
     fn test_inner(
@@ -1011,5 +1061,116 @@ mod tests {
             event_rx.try_recv(),
             Ok(EngineEvent::JobsChanged(_))
         ));
+    }
+
+    #[test]
+    fn scheduler_parks_when_queue_is_idle() {
+        assert!(scheduler_should_park(&idle_engine_inner(sample_job(
+            JobState::Completed
+        ))));
+        assert!(scheduler_should_park(&idle_engine_inner(sample_job(
+            JobState::Paused
+        ))));
+    }
+
+    #[test]
+    fn scheduler_stays_awake_for_queued_or_in_flight_work() {
+        for state in [JobState::Queued, JobState::Starting, JobState::Downloading] {
+            let inner = idle_engine_inner(sample_job(state));
+            assert!(
+                !scheduler_should_park(&inner),
+                "{state:?} must keep the scheduler polling"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_stays_awake_for_restart_bookkeeping() {
+        let job = sample_job(JobState::Paused);
+        let id = job.id.clone();
+        let temp = job.temp_path.clone();
+        let mut inner = idle_engine_inner(job);
+        assert!(scheduler_should_park(&inner));
+        inner.pending_partial_deletes.insert(id.clone(), temp);
+        assert!(!scheduler_should_park(&inner));
+        inner.pending_partial_deletes.remove(&id);
+        inner.requeue_on_cancel.insert(id, ());
+        assert!(!scheduler_should_park(&inner));
+    }
+
+    #[tokio::test]
+    async fn scheduler_parks_while_idle_and_wakes_on_queued_job() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut idle = sample_job(JobState::Completed);
+        idle.id = "idle".into();
+        let inner = test_inner(idle, event_tx);
+        tokio::spawn(scheduler_loop(inner.clone()));
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "idle scheduler must not emit or clone the queue"
+        );
+
+        {
+            let mut guard = inner.lock().await;
+            let mut queued = sample_job(JobState::Queued);
+            queued.id = "wake-me".into();
+            guard.jobs.push(queued);
+            guard.wake.notify_one();
+        }
+
+        let ev = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("parked scheduler must wake immediately")
+            .expect("event");
+        assert!(matches!(ev, EngineEvent::JobsChanged(_)));
+        let guard = inner.lock().await;
+        let started = guard
+            .jobs
+            .iter()
+            .find(|job| job.id == "wake-me")
+            .expect("queued job");
+        assert_eq!(started.state, JobState::Starting);
+    }
+
+    #[tokio::test]
+    async fn command_wakes_parked_scheduler_to_start_queued_job() {
+        let (handle, mut event_rx) = spawn_engine(
+            Vec::new(),
+            EngineRuntimeConfig::default(),
+            Arc::new(MemoryJobStore::default()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while event_rx.try_recv().is_ok() {}
+
+        let mut queued = sample_job(JobState::Queued);
+        queued.id = "via-cmd".into();
+        handle.send(EngineCommand::ReplaceJobs(vec![queued]));
+
+        let jobs = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(EngineEvent::JobsChanged(jobs))
+                        if jobs
+                            .iter()
+                            .any(|job| job.id == "via-cmd" && job.state == JobState::Starting) =>
+                    {
+                        break jobs;
+                    }
+                    Some(_) => {}
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("command must wake the parked scheduler");
+        assert!(
+            jobs.iter()
+                .any(|job| job.id == "via-cmd" && job.state == JobState::Starting),
+            "queued job must start without waiting out a 500ms poll"
+        );
+        handle.send(EngineCommand::Shutdown);
     }
 }

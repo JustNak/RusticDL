@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use gpui::Context;
 
 use super::DownloadApp;
-use crate::download::Job;
+use crate::download::{Job, JobState};
 use crate::notifications::{
     compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
     in_app_summary_messages, soft_os_eligible, terminal_edges, InAppToastKind, PendingOsTerminal,
@@ -78,6 +78,17 @@ impl DownloadApp {
         // (unsaved toggles). Never clobber while extension_settings_dirty.
         self.sync_extension_settings_from_bridge(false);
         cx.notify();
+    }
+
+    /// Hidden + no downloads + no pending tick work: skip apply/balloons/persist/capture.
+    pub(crate) fn should_skip_hidden_idle_tick(&self) -> bool {
+        hidden_idle_tick_should_skip(
+            self.window_hidden_to_tray,
+            &self.jobs,
+            &self.latest_jobs,
+            self.pending_jobs.is_some(),
+            !self.os_notify_buffer.pending.is_empty(),
+        )
     }
 
     pub(crate) fn flush_os_notify_if_due(&mut self, cx: &mut Context<Self>) {
@@ -177,6 +188,29 @@ impl DownloadApp {
 
 const JOBS_UI_THROTTLE: Duration = Duration::from_millis(80);
 
+/// Queued / in-flight jobs still need the 80ms apply path even when hidden.
+fn job_needs_ui_tick(state: JobState) -> bool {
+    matches!(
+        state,
+        JobState::Queued | JobState::Starting | JobState::Downloading
+    )
+}
+
+/// When the main window is in the tray and nothing needs a tick, skip the hot path.
+fn hidden_idle_tick_should_skip(
+    hidden: bool,
+    jobs: &[Job],
+    latest_jobs: &[Job],
+    has_pending_jobs: bool,
+    has_pending_os_notify: bool,
+) -> bool {
+    hidden
+        && !has_pending_jobs
+        && !has_pending_os_notify
+        && !jobs.iter().any(|job| job_needs_ui_tick(job.state))
+        && !latest_jobs.iter().any(|job| job_needs_ui_tick(job.state))
+}
+
 /// Update `latest_jobs` on every event. Returns `Some` when render should apply.
 fn note_jobs_changed(
     latest_jobs: &mut Arc<Vec<Job>>,
@@ -220,7 +254,10 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{jobs_need_immediate_persist, note_jobs_changed, persist_source};
+    use super::{
+        hidden_idle_tick_should_skip, jobs_need_immediate_persist, note_jobs_changed,
+        persist_source,
+    };
     use crate::download::{Job, JobState};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -285,6 +322,48 @@ mod tests {
         let flushed = persist_source(&latest, &rendered);
         assert_eq!(flushed[0].transfer_format_version, 1);
         assert_eq!(rendered[0].transfer_format_version, 0);
+    }
+
+    #[test]
+    fn hidden_idle_tick_skips_when_tray_hidden_and_queue_idle() {
+        let completed = vec![sample_job("a", JobState::Completed)];
+        let paused = vec![sample_job("a", JobState::Paused)];
+        assert!(hidden_idle_tick_should_skip(
+            true, &completed, &completed, false, false
+        ));
+        assert!(hidden_idle_tick_should_skip(
+            true, &paused, &paused, false, false
+        ));
+        assert!(hidden_idle_tick_should_skip(true, &[], &[], false, false));
+    }
+
+    #[test]
+    fn hidden_idle_tick_runs_when_visible_or_work_remains() {
+        let queued = vec![sample_job("a", JobState::Queued)];
+        let downloading = vec![sample_job("a", JobState::Downloading)];
+        let completed = vec![sample_job("a", JobState::Completed)];
+        assert!(!hidden_idle_tick_should_skip(
+            false, &completed, &completed, false, false
+        ));
+        assert!(!hidden_idle_tick_should_skip(
+            true, &queued, &queued, false, false
+        ));
+        assert!(!hidden_idle_tick_should_skip(
+            true,
+            &downloading,
+            &downloading,
+            false,
+            false
+        ));
+        assert!(!hidden_idle_tick_should_skip(
+            true, &completed, &completed, true, false
+        ));
+        assert!(!hidden_idle_tick_should_skip(
+            true, &completed, &completed, false, true
+        ));
+        assert!(!hidden_idle_tick_should_skip(
+            true, &completed, &queued, false, false
+        ));
     }
 
     #[test]
