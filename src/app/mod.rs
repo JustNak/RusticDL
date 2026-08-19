@@ -7,6 +7,7 @@ mod filter;
 mod job_row;
 mod jobs_ui;
 mod layout;
+mod queue_filter;
 mod queue_view;
 mod selection;
 mod settings_actions;
@@ -20,6 +21,7 @@ mod toast;
 mod tray_lifecycle;
 mod update_flow;
 mod widgets;
+mod window_layout;
 
 pub use filter::FilterKind;
 pub(crate) use settings_category::SettingsCategory;
@@ -28,10 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, point, prelude::FluentBuilder, px, size, App, AppContext, Bounds, Context,
-    Corners, Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent,
-    MouseButton, MouseDownEvent, NavigationDirection, ParentElement, Render, Styled, Window,
-    WindowBounds, WindowHandle,
+    canvas, div, point, prelude::FluentBuilder, px, size, Bounds, Context, Corners, Entity,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton,
+    MouseDownEvent, NavigationDirection, ParentElement, Render, Styled, Window, WindowHandle,
 };
 use gpui_component::{
     h_flex,
@@ -45,13 +46,12 @@ use crate::appearance::{
 };
 use crate::download::{EngineEvent, EngineHandle, FileTypeKind, Job};
 use crate::extension_settings::ExtensionIntegrationSettings;
-use crate::format::{filter_jobs, job_matches_search, sort_jobs};
 use crate::ipc::IpcBridge;
 use crate::notifications::{BalloonContextMap, OsNotifyBuffer};
-use crate::persistence::{load_pending_whats_new, save_settings, AppPaths, PendingWhatsNew};
+use crate::persistence::{load_pending_whats_new, AppPaths, PendingWhatsNew};
 use crate::settings::{
-    AccentPreset, OsNotifyMode, Settings, SortColumn, SortDirection, WindowLayout,
-    MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
+    AccentPreset, OsNotifyMode, Settings, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY,
+    MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::launched_minimized;
 use crate::tray::{main_window_hwnd, show_main_window, SystemTray, TrayEvent};
@@ -575,80 +575,6 @@ impl DownloadApp {
         app
     }
 
-    /// Snapshot restore-size + maximized from the platform window into settings.
-    fn capture_window_layout(&mut self, window: &Window) {
-        let layout = window_layout_from_window(window);
-        if self.settings.window_layout == layout {
-            return;
-        }
-        self.settings.window_layout = layout;
-        self.window_layout_dirty = true;
-        // Write promptly when quiet; during an active drag, throttle via the timer loop.
-        self.flush_window_layout_if_due();
-    }
-
-    fn flush_window_layout_if_due(&mut self) {
-        if !self.window_layout_dirty {
-            return;
-        }
-        if self.last_window_layout_save.elapsed() < Duration::from_millis(250) {
-            return;
-        }
-        self.window_layout_dirty = false;
-        self.last_window_layout_save = Instant::now();
-        // Do not flush unsaved Browser capture previews via incidental layout writes.
-        let _ = save_settings(&self.paths, &self.settings_for_disk());
-    }
-
-    fn flush_window_layout_now(&mut self) {
-        if !self.window_layout_dirty {
-            return;
-        }
-        self.window_layout_dirty = false;
-        self.last_window_layout_save = Instant::now();
-        let _ = save_settings(&self.paths, &self.settings_for_disk());
-    }
-
-    fn search_query(&self, cx: &App) -> String {
-        self.search_input.read(cx).value().to_string()
-    }
-
-    fn visible_jobs_in<'a>(&self, jobs: &'a [Job], cx: &App) -> Vec<&'a Job> {
-        let query = self.search_query(cx);
-        let query = query.trim().to_lowercase();
-        let mut jobs: Vec<&Job> = filter_jobs(jobs, self.filter.queue_filter())
-            .into_iter()
-            .filter(|job| job_matches_search(job, &query))
-            .collect();
-        sort_jobs(
-            &mut jobs,
-            self.settings.sort_column,
-            self.settings.sort_direction,
-        );
-        jobs
-    }
-
-    fn visible_jobs(&self, cx: &App) -> Vec<&Job> {
-        self.visible_jobs_in(&self.jobs, cx)
-    }
-
-    /// Toggle or switch queue sort; persists the preference immediately.
-    fn set_sort_column(&mut self, column: SortColumn, cx: &mut Context<Self>) {
-        if self.settings.sort_column == column {
-            self.settings.sort_direction = self.settings.sort_direction.toggle();
-        } else {
-            self.settings.sort_column = column;
-            // Name reads naturally A→Z; metrics usually want largest/newest first.
-            self.settings.sort_direction = match column {
-                SortColumn::Name => SortDirection::Asc,
-                _ => SortDirection::Desc,
-            };
-        }
-        // Sort prefs only — do not flush unsaved Browser capture previews.
-        let _ = save_settings(&self.paths, &self.settings_for_disk());
-        cx.notify();
-    }
-
     /// Factory reset of settings prefs into the live draft (keeps window layout + download dir).
     ///
     /// Does **not** call `save_settings`, IPC, engine, or startup-registry updates. The
@@ -822,15 +748,6 @@ impl DownloadApp {
         }
         false
     }
-
-    /// Detail panel job: only when exactly one id is selected.
-    fn selected_job(&self) -> Option<&Job> {
-        if self.selected_ids.len() != 1 {
-            return None;
-        }
-        let id = self.primary_selected_id()?;
-        self.jobs.iter().find(|j| j.id == id)
-    }
 }
 
 impl Drop for DownloadApp {
@@ -840,21 +757,6 @@ impl Drop for DownloadApp {
         self.flush_window_layout_now();
         self.flush_jobs_save_now();
     }
-}
-
-/// Capture restore bounds from the platform window (not the maximized full-screen rect).
-fn window_layout_from_window(window: &Window) -> WindowLayout {
-    let wb = window.window_bounds();
-    let bounds = wb.get_bounds();
-    let mut layout = WindowLayout {
-        width: bounds.size.width.to_f64() as f32,
-        height: bounds.size.height.to_f64() as f32,
-        x: Some(bounds.origin.x.to_f64() as f32),
-        y: Some(bounds.origin.y.to_f64() as f32),
-        maximized: matches!(wb, WindowBounds::Maximized(_)),
-    };
-    layout.sanitize();
-    layout
 }
 
 impl Render for DownloadApp {
