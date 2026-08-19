@@ -80,7 +80,8 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Hidden + no downloads + no pending tick work: skip apply/balloons/persist/capture.
+    /// Hidden + no downloads + no pending tick work: skip apply/balloons/persist.
+    /// Capture HUD poll is separate — Confirm / Progress must still open while SW_HIDE.
     pub(crate) fn should_skip_hidden_idle_tick(&self) -> bool {
         hidden_idle_tick_should_skip(
             self.window_hidden_to_tray,
@@ -335,6 +336,10 @@ mod tests {
             true, &paused, &paused, false, false
         ));
         assert!(hidden_idle_tick_should_skip(true, &[], &[], false, false));
+        // Park is apply/notify/persist only. Capture poll stays armed while SW_HIDE.
+        assert!(super::super::browser_capture::should_poll_capture_huds(
+            true
+        ));
     }
 
     #[test]

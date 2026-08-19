@@ -156,7 +156,8 @@ pub struct DownloadApp {
     /// Queue filter to restore when leaving Settings (Back / Esc / mouse-back).
     /// Never `FilterKind::Settings`.
     settings_return_filter: FilterKind,
-    /// Confirm / Progress / Complete HUD windows. Closed on tray hide (extra swapchains).
+    /// Confirm / Progress / Complete HUD windows. Tray hide closes leftovers;
+    /// new Confirm / Progress may still open while the main window is SW_HIDE.
     capture_windows: Vec<WindowHandle<Root>>,
 }
 
@@ -424,24 +425,25 @@ impl DownloadApp {
                     .await;
                 if this
                     .update(cx, |app, cx| {
-                        // Hidden + empty/idle queue: do not apply/balloons/persist/capture
-                        // or notify. Still poll IPC show_window so tray restore works.
-                        if app.should_skip_hidden_idle_tick() {
-                            app.poll_hidden_window_actions(cx);
-                            return;
+                        // Hidden + empty/idle queue: skip apply/balloons/persist and
+                        // do not notify (PR 133 park). Capture HUDs still poll so
+                        // Confirm / Progress can appear while the main HWND is SW_HIDE.
+                        let skip_apply = app.should_skip_hidden_idle_tick();
+                        if !skip_apply {
+                            if let Some(jobs) = app.pending_jobs.take() {
+                                app.apply_jobs(jobs, cx);
+                            }
+                            // OS balloon burst deadline (Pipeline B).
+                            app.flush_os_notify_if_due(cx);
+                            // Flush a debounced window-layout write after the user stops resizing.
+                            app.flush_window_layout_if_due();
+                            app.flush_jobs_save_if_due();
                         }
-                        if let Some(jobs) = app.pending_jobs.take() {
-                            app.apply_jobs(jobs, cx);
-                        }
-                        // OS balloon burst deadline (Pipeline B).
-                        app.flush_os_notify_if_due(cx);
-                        // Flush a debounced window-layout write after the user stops resizing.
-                        app.flush_window_layout_if_due();
-                        app.flush_jobs_save_if_due();
-                        // Dedicated prompt / progress / complete windows even if main UI is idle.
-                        // Never open these from Render — GPUI crashes if open_window re-enters draw.
-                        // Tray-hidden leftover HUDs are extra swapchains; do not reopen them.
-                        if !app.window_hidden_to_tray {
+                        // Dedicated prompt / progress / complete windows even if main UI is idle
+                        // or tray-hidden. Never open these from Render — GPUI crashes if
+                        // open_window re-enters draw. Tray-hide still closes leftover Complete
+                        // HUDs; this poll is how new Confirm / needed Progress appear.
+                        if browser_capture::should_poll_capture_huds(app.window_hidden_to_tray) {
                             app.poll_browser_capture(cx);
                         }
                         // Second-instance / extension show_window while hidden to tray.
