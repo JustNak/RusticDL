@@ -1,11 +1,20 @@
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::branding::APP_VERSION;
-use crate::download::Job;
+use crate::download::{Job, JobState};
 use crate::settings::Settings;
 use crate::updater::normalize_version;
+
+/// Max `JobState::Completed` rows kept in `state.json`.
+///
+/// Oldest completed jobs are dropped first. Active and paused jobs are never
+/// dropped, nor are Failed / Canceled. Not a Settings field — bump this
+/// constant if the product needs a different bound.
+pub const MAX_COMPLETED_HISTORY: usize = 500;
 
 /// Serializes settings + state writes so UI layout saves cannot race extension IPC.
 fn write_lock() -> &'static Mutex<()> {
@@ -134,22 +143,73 @@ struct PersistedStateRef<'a> {
 }
 
 pub fn load_jobs(paths: &AppPaths) -> Vec<Job> {
-    let Ok(bytes) = fs::read(&paths.state) else {
-        return Vec::new();
-    };
-    serde_json::from_slice::<PersistedState>(&bytes)
-        .map(|s| s.jobs)
-        .unwrap_or_default()
+    load_jobs_with_history_cap(paths, MAX_COMPLETED_HISTORY)
 }
 
 pub fn save_jobs(paths: &AppPaths, jobs: &[Job]) -> Result<(), String> {
+    save_jobs_with_history_cap(paths, jobs, MAX_COMPLETED_HISTORY)
+}
+
+fn load_jobs_with_history_cap(paths: &AppPaths, max_completed: usize) -> Vec<Job> {
+    let Ok(bytes) = fs::read(&paths.state) else {
+        return Vec::new();
+    };
+    let jobs = serde_json::from_slice::<PersistedState>(&bytes)
+        .map(|s| s.jobs)
+        .unwrap_or_default();
+    match cap_completed_history(&jobs, max_completed) {
+        Cow::Borrowed(_) => jobs,
+        Cow::Owned(trimmed) => {
+            // Shrink oversized files on read so old unbounded state.json files
+            // do not stay large until the next progress-driven save.
+            let _ = save_jobs_with_history_cap(paths, &trimmed, max_completed);
+            trimmed
+        }
+    }
+}
+
+fn save_jobs_with_history_cap(
+    paths: &AppPaths,
+    jobs: &[Job],
+    max_completed: usize,
+) -> Result<(), String> {
     let _guard = write_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_app_dirs(paths)?;
-    let json = serde_json::to_vec(&PersistedStateRef { jobs })
-        .map_err(|e| format!("Could not serialize state: {e}"))?;
+    let jobs = cap_completed_history(jobs, max_completed);
+    let json = serde_json::to_vec(&PersistedStateRef {
+        jobs: jobs.as_ref(),
+    })
+    .map_err(|e| format!("Could not serialize state: {e}"))?;
     atomic_write(&paths.state, &json)
+}
+
+/// Keep at most `max_completed` `JobState::Completed` rows, dropping the oldest
+/// by `completed_at` (fallback: `created_at`). Other states are untouched.
+fn cap_completed_history(jobs: &[Job], max_completed: usize) -> Cow<'_, [Job]> {
+    let completed_idxs: Vec<usize> = jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job.state == JobState::Completed)
+        .map(|(idx, _)| idx)
+        .collect();
+    if completed_idxs.len() <= max_completed {
+        return Cow::Borrowed(jobs);
+    }
+
+    let drop_n = completed_idxs.len() - max_completed;
+    let mut oldest = completed_idxs;
+    oldest.sort_by_key(|&idx| jobs[idx].completed_at.unwrap_or(jobs[idx].created_at));
+    let drop_idxs: HashSet<usize> = oldest.into_iter().take(drop_n).collect();
+
+    Cow::Owned(
+        jobs.iter()
+            .enumerate()
+            .filter(|(idx, _)| !drop_idxs.contains(idx))
+            .map(|(_, job)| job.clone())
+            .collect(),
+    )
 }
 
 /// Write via temp file + rename so readers never see a partial JSON document.
@@ -265,6 +325,137 @@ mod tests {
         assert_eq!(loaded[0].id, job_id);
         assert_eq!(loaded[0].filename, "f.bin");
         assert_eq!(loaded[0].url, "https://example.com/f.bin");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    fn sample_job(id: &str, state: JobState, created_at: u64, completed_at: Option<u64>) -> Job {
+        let mut job = Job::new(
+            format!("https://example.com/{id}.bin"),
+            format!("{id}.bin"),
+            PathBuf::from(format!("C:\\dl\\{id}.bin")),
+            PathBuf::from(format!("C:\\dl\\{id}.bin.part")),
+        );
+        job.id = id.into();
+        job.state = state;
+        job.created_at = created_at;
+        job.completed_at = completed_at;
+        job
+    }
+
+    fn write_state_untrimmed(paths: &AppPaths, jobs: &[Job]) {
+        ensure_app_dirs(paths).unwrap();
+        let json = serde_json::to_vec(&PersistedStateRef { jobs }).unwrap();
+        atomic_write(&paths.state, &json).unwrap();
+    }
+
+    fn ids(jobs: &[Job]) -> Vec<&str> {
+        jobs.iter().map(|job| job.id.as_str()).collect()
+    }
+
+    #[test]
+    fn cap_drops_oldest_completed_only() {
+        let jobs = vec![
+            sample_job("active", JobState::Downloading, 1, None),
+            sample_job("old-done", JobState::Completed, 2, Some(10)),
+            sample_job("paused", JobState::Paused, 3, None),
+            sample_job("mid-done", JobState::Completed, 4, Some(20)),
+            sample_job("failed", JobState::Failed, 5, Some(25)),
+            sample_job("new-done", JobState::Completed, 6, Some(30)),
+            sample_job("canceled", JobState::Canceled, 7, Some(35)),
+            sample_job("queued", JobState::Queued, 8, None),
+        ];
+
+        let trimmed = cap_completed_history(&jobs, 2);
+        assert_eq!(
+            ids(&trimmed),
+            ["active", "paused", "mid-done", "failed", "new-done", "canceled", "queued"]
+        );
+        assert!(trimmed.iter().all(|job| job.id != "old-done"));
+        assert_eq!(
+            trimmed
+                .iter()
+                .filter(|job| job.state == JobState::Completed)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn cap_uses_created_at_when_completed_at_missing() {
+        let jobs = vec![
+            sample_job("older", JobState::Completed, 10, None),
+            sample_job("newer", JobState::Completed, 20, None),
+            sample_job("newest", JobState::Completed, 30, Some(5)),
+        ];
+        // newest has an earlier completed_at than the others' created_at fallback.
+        let trimmed = cap_completed_history(&jobs, 2);
+        assert_eq!(ids(&trimmed), ["older", "newer"]);
+    }
+
+    #[test]
+    fn save_jobs_trims_oldest_completed() {
+        let paths = temp_paths("save-cap");
+        let jobs = vec![
+            sample_job("keep-active", JobState::Downloading, 1, None),
+            sample_job("drop", JobState::Completed, 2, Some(10)),
+            sample_job("keep-paused", JobState::Paused, 3, None),
+            sample_job("keep-old", JobState::Completed, 4, Some(20)),
+            sample_job("keep-new", JobState::Completed, 5, Some(30)),
+        ];
+        save_jobs_with_history_cap(&paths, &jobs, 2).unwrap();
+
+        let stored: PersistedState =
+            serde_json::from_slice(&fs::read(&paths.state).unwrap()).unwrap();
+        assert_eq!(
+            ids(&stored.jobs),
+            ["keep-active", "keep-paused", "keep-old", "keep-new"]
+        );
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn load_jobs_trims_and_rewrites_oversized_file() {
+        let paths = temp_paths("load-cap");
+        let jobs = vec![
+            sample_job("keep-active", JobState::Starting, 1, None),
+            sample_job("drop-a", JobState::Completed, 2, Some(10)),
+            sample_job("drop-b", JobState::Completed, 3, Some(11)),
+            sample_job("keep-paused", JobState::Paused, 4, None),
+            sample_job("keep-done", JobState::Completed, 5, Some(40)),
+        ];
+        write_state_untrimmed(&paths, &jobs);
+        let before = fs::read(&paths.state).unwrap();
+        assert!(before.len() > 10, "fixture must write a real state file");
+
+        let loaded = load_jobs_with_history_cap(&paths, 1);
+        assert_eq!(ids(&loaded), ["keep-active", "keep-paused", "keep-done"]);
+
+        let stored: PersistedState =
+            serde_json::from_slice(&fs::read(&paths.state).unwrap()).unwrap();
+        assert_eq!(
+            ids(&stored.jobs),
+            ["keep-active", "keep-paused", "keep-done"]
+        );
+        assert!(
+            fs::read(&paths.state).unwrap().len() < before.len(),
+            "oversized state.json must shrink on load"
+        );
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn load_jobs_under_cap_does_not_rewrite() {
+        let paths = temp_paths("load-nocap");
+        let jobs = vec![
+            sample_job("active", JobState::Queued, 1, None),
+            sample_job("done", JobState::Completed, 2, Some(10)),
+        ];
+        write_state_untrimmed(&paths, &jobs);
+        let before = fs::read(&paths.state).unwrap();
+
+        let loaded = load_jobs_with_history_cap(&paths, 500);
+        assert_eq!(ids(&loaded), ["active", "done"]);
+        assert_eq!(fs::read(&paths.state).unwrap(), before);
         let _ = fs::remove_dir_all(&paths.root);
     }
 }
