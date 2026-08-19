@@ -16,6 +16,13 @@ use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
 use crate::window_placement::cascade_window;
 
+/// Close a capture HUD without touching the main window.
+pub fn close_capture_window(handle: &WindowHandle<Root>, cx: &mut App) {
+    let _ = handle.update(cx, |_root, window, _cx| {
+        window.remove_window();
+    });
+}
+
 /// Open the ask-mode browser confirm window (may morph into progress/complete).
 pub fn open_browser_prompt_window(
     prompt: BrowserPromptView,

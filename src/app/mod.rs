@@ -31,7 +31,7 @@ use gpui::{
     canvas, div, point, prelude::FluentBuilder, px, size, App, AppContext, Bounds, Context,
     Corners, Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent,
     MouseButton, MouseDownEvent, NavigationDirection, ParentElement, Render, Styled, Window,
-    WindowBounds,
+    WindowBounds, WindowHandle,
 };
 use gpui_component::{
     h_flex,
@@ -156,6 +156,8 @@ pub struct DownloadApp {
     /// Queue filter to restore when leaving Settings (Back / Esc / mouse-back).
     /// Never `FilterKind::Settings`.
     settings_return_filter: FilterKind,
+    /// Confirm / Progress / Complete HUD windows. Closed on tray hide (extra swapchains).
+    capture_windows: Vec<WindowHandle<Root>>,
 }
 
 impl DownloadApp {
@@ -422,6 +424,12 @@ impl DownloadApp {
                     .await;
                 if this
                     .update(cx, |app, cx| {
+                        // Hidden + empty/idle queue: do not apply/balloons/persist/capture
+                        // or notify. Still poll IPC show_window so tray restore works.
+                        if app.should_skip_hidden_idle_tick() {
+                            app.poll_hidden_window_actions(cx);
+                            return;
+                        }
                         if let Some(jobs) = app.pending_jobs.take() {
                             app.apply_jobs(jobs, cx);
                         }
@@ -432,7 +440,10 @@ impl DownloadApp {
                         app.flush_jobs_save_if_due();
                         // Dedicated prompt / progress / complete windows even if main UI is idle.
                         // Never open these from Render — GPUI crashes if open_window re-enters draw.
-                        app.poll_browser_capture(cx);
+                        // Tray-hidden leftover HUDs are extra swapchains; do not reopen them.
+                        if !app.window_hidden_to_tray {
+                            app.poll_browser_capture(cx);
+                        }
                         // Second-instance / extension show_window while hidden to tray.
                         app.poll_hidden_window_actions(cx);
                     })
@@ -542,6 +553,7 @@ impl DownloadApp {
             last_clipboard_urls_key: None,
             settings_category: SettingsCategory::General,
             settings_return_filter: FilterKind::All,
+            capture_windows: Vec::new(),
         };
 
         // Post-update What’s new: snapshot written before handoff, shown once after relaunch.

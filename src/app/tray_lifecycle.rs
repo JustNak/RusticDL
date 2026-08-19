@@ -5,6 +5,7 @@ use gpui::{Context, Window};
 use super::DownloadApp;
 use crate::download::open_path;
 use crate::notifications::BalloonOutcome;
+use crate::prompt_window::close_capture_window;
 use crate::settings::OsNotifyMode;
 use crate::tray::{
     hide_main_window, main_window_hwnd, show_main_window, show_main_window_hwnd, SystemTray,
@@ -40,8 +41,20 @@ impl DownloadApp {
         }
         hide_main_window(window);
         self.window_hidden_to_tray = true;
+        self.close_capture_huds(cx);
         cx.notify();
         false
+    }
+
+    /// Tear down leftover Confirm / Progress / Complete HUDs (extra swapchains).
+    ///
+    /// Does not destroy the main window or its D3D swapchain.
+    pub(crate) fn close_capture_huds(&mut self, cx: &mut Context<Self>) {
+        self.ipc.request_close_capture_windows();
+        self.browser_watch_complete_ids.clear();
+        for handle in self.capture_windows.drain(..) {
+            close_capture_window(&handle, cx);
+        }
     }
 
     fn ensure_tray(&mut self, cx: &mut Context<Self>) {
