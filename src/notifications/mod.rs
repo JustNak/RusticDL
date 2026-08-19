@@ -3,6 +3,9 @@
 //!
 //! See design plan A1 (Windows completion notifications).
 
+// Re-exports preserve the former `notifications.rs` public surface.
+#![allow(unused_imports)]
+
 mod balloon;
 mod edges;
 mod in_app;

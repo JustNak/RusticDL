@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, point, prelude::FluentBuilder, px, size, Bounds, Context, Corners, Entity,
-    Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton,
+    canvas, div, point, prelude::FluentBuilder, px, size, AppContext, Bounds, Context, Corners,
+    Entity, Focusable, InteractiveElement, IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton,
     MouseDownEvent, NavigationDirection, ParentElement, Render, Styled, Window, WindowHandle,
 };
 use gpui_component::{
