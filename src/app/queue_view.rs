@@ -4,12 +4,13 @@
 //! state — freeform browser text/URL drag is not supported by GPUI on Windows.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, ExternalPaths, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px, uniform_list, Context, ExternalPaths, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -200,12 +201,14 @@ impl DownloadApp {
             )
             .child(
                 // File-path drops (CF_HDROP → ExternalPaths). Not freeform browser URL drag.
+                // `uniform_list` window-virtualizes fixed-height rows so offscreen
+                // jobs are not built; visible active/paused rows still re-render.
                 div()
                     .id("queue-scroll")
                     .flex_1()
                     .min_h_0()
                     .when(bottom_open, |el| el.min_h(px(LIST_MIN_H)))
-                    .overflow_y_scroll()
+                    .overflow_hidden()
                     .bg(theme.list)
                     .can_drop(|drag, _, _| drag.is::<ExternalPaths>())
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -221,10 +224,38 @@ impl DownloadApp {
                     .when(filtered.is_empty(), |el| {
                         el.child(self.render_filter_empty(has_query, cx))
                     })
-                    .children(filtered.into_iter().map(|job| {
-                        let is_selected = self.is_selected(job.id.as_str());
-                        render_job_row(job, is_selected, cols, main_w, density, progress_style, cx)
-                    })),
+                    .when(!filtered.is_empty(), |el| {
+                        let item_count = filtered.len();
+                        el.child(
+                            uniform_list(
+                                "queue-rows",
+                                item_count,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let jobs = Arc::clone(&this.jobs);
+                                    let visible = this.visible_jobs_in(&jobs, cx);
+                                    range
+                                        .map(|ix| {
+                                            let Some(job) = visible.get(ix) else {
+                                                return div().into_any_element();
+                                            };
+                                            let is_selected = this.is_selected(job.id.as_str());
+                                            render_job_row(
+                                                job,
+                                                is_selected,
+                                                cols,
+                                                main_w,
+                                                density,
+                                                progress_style,
+                                                cx,
+                                            )
+                                            .into_any_element()
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .size_full(),
+                        )
+                    }),
             )
             .when(multi_selected, |el| el.child(self.render_batch_bar(cx)))
             .when_some(detail, |el, job| {
