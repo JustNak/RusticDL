@@ -4,6 +4,7 @@
 //! state — freeform browser text/URL drag is not supported by GPUI on Windows.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -229,7 +230,7 @@ impl DownloadApp {
                             uniform_list(
                                 "queue-rows",
                                 item_count,
-                                cx.processor(move |this, range, _window, cx| {
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
                                     let jobs = Arc::clone(&this.jobs);
                                     let visible = this.visible_jobs_in(&jobs, cx);
                                     range
