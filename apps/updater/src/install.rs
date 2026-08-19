@@ -6,6 +6,14 @@ use std::time::Duration;
 
 use crate::ui::ProgressSink;
 
+/// NSIS flags for an in-app update. `/S` only — never `/R`.
+///
+/// The updater owns the single post-success relaunch. Passing `/R` would start
+/// rusticdl at the end of setup, then this helper would start it again.
+pub fn installer_silent_args() -> &'static [&'static str] {
+    &["/S"]
+}
+
 /// Run a downloaded NSIS setup silently. Updater owns relaunch, so no `/R`.
 pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<(), String> {
     progress.set_status("Installing update…".into());
@@ -23,7 +31,7 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
         const ERROR_ELEVATION_REQUIRED: i32 = 740;
 
         let status = match Command::new(path)
-            .args(["/S"])
+            .args(installer_silent_args())
             .creation_flags(CREATE_NO_WINDOW)
             .status()
         {
@@ -76,7 +84,7 @@ fn run_installer_elevated(path: &Path, progress: &dyn ProgressSink) -> Result<()
     }
 
     let file = wide(path.as_os_str());
-    let params = wide(std::ffi::OsStr::new("/S"));
+    let params = wide(std::ffi::OsStr::new(&installer_silent_args().join(" ")));
     let verb = wide(std::ffi::OsStr::new("runas"));
 
     let mut info = SHELLEXECUTEINFOW {
@@ -162,5 +170,20 @@ pub fn relaunch_app(app_exe: &Path) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Could not start RusticDL: {e}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_install_does_not_relaunch() {
+        let args = installer_silent_args();
+        assert_eq!(args, &["/S"]);
+        assert!(
+            args.iter().all(|a| *a != "/R" && !a.contains("/R")),
+            "updater owns relaunch; NSIS must not start rusticdl"
+        );
     }
 }
