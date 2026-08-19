@@ -9,6 +9,7 @@ import browser from './browser';
 import {
   downloadCreatedAction,
   filenameExtension,
+  followRestoreSkip,
   handoffUrlForCapturedDownload,
   isWeakSuggestedFilename,
   knownDownloadBytes,
@@ -80,8 +81,12 @@ type PendingSizeWait = {
 };
 const pendingSizeWaits = new Map<number, PendingSizeWait>();
 const pausedForCapture = new Set<number>();
-/** URLs we put back in Firefox after a dismissed/failed handoff — do not recapture. */
+/** URLs we put back after a dismissed/failed handoff — do not recapture. */
 const restoreSkipUrls = new Map<string, number>();
+/** Same restore, keyed so Drive/CDN hops can match by filename. */
+const restoreSkipEntries = new Map<string, InterceptedDownload>();
+/** Firefox keeps requestId across 302s of a restored download. */
+const restoreSkipRequestIds = new Map<string, number>();
 
 let cachedSettings: ExtensionIntegrationSettings | null = null;
 
@@ -247,17 +252,57 @@ function pruneStaleClaims(now = Date.now()): void {
   for (const [key, ts] of restoreSkipUrls) {
     if (now - ts > CAPTURE_DEDUPE_TTL_MS) restoreSkipUrls.delete(key);
   }
+  for (const [key, entry] of restoreSkipEntries) {
+    if (now - entry.ts > CAPTURE_DEDUPE_TTL_MS) restoreSkipEntries.delete(key);
+  }
+  for (const [key, ts] of restoreSkipRequestIds) {
+    if (now - ts > CAPTURE_DEDUPE_TTL_MS) restoreSkipRequestIds.delete(key);
+  }
 }
 
-function rememberRestoreSkip(url: string): void {
+function rememberRestoreSkip(snapshot: { url: string; filename?: string }): void {
   pruneStaleClaims();
-  restoreSkipUrls.set(normalizeCaptureUrl(url), Date.now());
+  const key = normalizeCaptureUrl(snapshot.url);
+  const now = Date.now();
+  restoreSkipUrls.set(key, now);
+  restoreSkipEntries.set(key, { url: key, filename: snapshot.filename, ts: now });
 }
 
-function shouldSkipRestoredUrl(url: string | undefined): boolean {
-  if (!url) return false;
+function forgetRestoreSkip(url: string): void {
+  const key = normalizeCaptureUrl(url);
+  restoreSkipUrls.delete(key);
+  restoreSkipEntries.delete(key);
+}
+
+/** Skip restored hops, including Drive/CDN redirects of the same request. */
+function shouldSkipRestoredRequest(url: string | undefined, requestId?: string): boolean {
+  return followRestoreSkip({
+    url,
+    requestId,
+    skippedUrls: restoreSkipUrls,
+    skippedRequestIds: restoreSkipRequestIds,
+    sessionUrl: url ? lookupRedirectSessionUrl(url) : undefined,
+    ttlMs: CAPTURE_DEDUPE_TTL_MS,
+  });
+}
+
+function shouldSkipRestoredItem(item: CapturedDownloadItem): boolean {
+  if (shouldSkipRestoredRequest(item.url) || shouldSkipRestoredRequest(item.finalUrl)) {
+    return true;
+  }
   pruneStaleClaims();
-  return restoreSkipUrls.has(normalizeCaptureUrl(url));
+  if (!matchesInterceptedDownload(
+    item,
+    restoreSkipEntries.values(),
+    Date.now(),
+    CAPTURE_DEDUPE_TTL_MS,
+  )) {
+    return false;
+  }
+  // Filename matched a restore after a redirect — keep the new hop skipped too.
+  if (item.url) rememberRestoreSkip({ url: item.url, filename: item.filename });
+  if (item.finalUrl) rememberRestoreSkip({ url: item.finalUrl, filename: item.filename });
+  return true;
 }
 
 function claimCapture(url: string): boolean {
@@ -289,6 +334,8 @@ function isClaimedItem(item: CapturedDownloadItem): boolean {
 
 function shouldEraseBrowserGhost(item: CapturedDownloadItem): boolean {
   pruneStaleClaims();
+  // Restored downloads must reach the browser; do not treat them as ghosts.
+  if (shouldSkipRestoredItem(item)) return false;
   if (isClaimedItem(item)) return true;
   if (!matchesInterceptedDownload(item, interceptedDownloads.values(), Date.now(), CAPTURE_DEDUPE_TTL_MS)) {
     return false;
@@ -351,6 +398,7 @@ async function eraseBrowserDownload(id: number): Promise<void> {
  */
 function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
   if (item.byExtensionId) return;
+  if (shouldSkipRestoredItem(item)) return;
   if (shouldEraseBrowserGhost(item)) {
     void eraseBrowserDownload(item.id);
     return;
@@ -370,8 +418,12 @@ function pauseIfLikelyCapture(item: CapturedDownloadItem): void {
 async function restoreBrowserDownload(snapshot: {
   url: string;
   filename?: string;
+  relatedUrl?: string;
 }): Promise<void> {
-  rememberRestoreSkip(snapshot.url);
+  rememberRestoreSkip(snapshot);
+  if (snapshot.relatedUrl && snapshot.relatedUrl !== snapshot.url) {
+    rememberRestoreSkip({ url: snapshot.relatedUrl, filename: snapshot.filename });
+  }
   try {
     const options: { url: string; filename?: string } = { url: snapshot.url };
     const name = snapshot.filename?.split(/[\\/]/).pop();
@@ -380,7 +432,8 @@ async function restoreBrowserDownload(snapshot: {
     }
     await browser.downloads.download(options);
   } catch {
-    restoreSkipUrls.delete(normalizeCaptureUrl(snapshot.url));
+    forgetRestoreSkip(snapshot.url);
+    if (snapshot.relatedUrl) forgetRestoreSkip(snapshot.relatedUrl);
   }
 }
 
@@ -587,6 +640,7 @@ async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<Captu
 }
 
 async function finalizePendingCapture(item: CapturedDownloadItem) {
+  if (shouldSkipRestoredItem(item)) return;
   if (shouldEraseBrowserGhost(item)) {
     await eraseBrowserDownload(item.id);
     return;
@@ -608,6 +662,8 @@ async function finalizePendingCapture(item: CapturedDownloadItem) {
 }
 
 async function onDownloadCreated(item: CapturedDownloadItem) {
+  // User dismissed the desktop prompt — leave the restored browser download.
+  if (shouldSkipRestoredItem(item)) return;
   // webRequest already canceled this transfer; the downloads API still emits a
   // failed shelf item. Drop it before any size-wait / second handoff.
   if (shouldEraseBrowserGhost(item)) {
@@ -758,7 +814,11 @@ function registerChromiumFilenameHints(): void {
   }
   webRequest?.onBeforeRedirect?.addListener(
     (details) => {
-      if (details.redirectUrl) rememberDownloadRedirect(details.url, details.redirectUrl);
+      if (!details.redirectUrl) return;
+      rememberDownloadRedirect(details.url, details.redirectUrl);
+      if (shouldSkipRestoredRequest(details.url)) {
+        shouldSkipRestoredRequest(details.redirectUrl);
+      }
     },
     { urls: ['http://*/*', 'https://*/*'] },
   );
@@ -787,6 +847,7 @@ async function handoffFirefoxCandidate(
     await restoreBrowserDownload({
       url,
       filename: candidate.filename,
+      relatedUrl: candidate.url !== url ? candidate.url : undefined,
     });
   }
 }
@@ -817,7 +878,11 @@ function registerFirefoxWebRequestInterception() {
 
   webRequest.onBeforeRedirect?.addListener(
     (details) => {
-      if (details.redirectUrl) rememberDownloadRedirect(details.url, details.redirectUrl);
+      if (!details.redirectUrl) return;
+      rememberDownloadRedirect(details.url, details.redirectUrl);
+      if (shouldSkipRestoredRequest(details.url, details.requestId)) {
+        shouldSkipRestoredRequest(details.redirectUrl, details.requestId);
+      }
     },
     { urls: ['http://*/*', 'https://*/*'] },
   );
@@ -847,7 +912,7 @@ function handleFirefoxBeforeRequestSync(
   details: FirefoxBeforeRequestDetails,
 ): { cancel?: boolean } {
   try {
-    if (shouldSkipRestoredUrl(details.url)) {
+    if (shouldSkipRestoredRequest(details.url, details.requestId)) {
       return {};
     }
     const settings = settingsForSyncCapture();
@@ -873,7 +938,7 @@ function handleFirefoxHeadersReceivedSync(
   webRequest: NonNullable<ReturnType<typeof getFirefoxBlockingWebRequest>>,
 ): { cancel?: boolean } {
   try {
-    if (shouldSkipRestoredUrl(details.url)) {
+    if (shouldSkipRestoredRequest(details.url, details.requestId)) {
       return {};
     }
     const settings = settingsForSyncCapture();
