@@ -5,7 +5,8 @@
 //! 2a. **You're up to date** — or —
 //! 2b. **Update available vX.Y.Z** `[Update]`
 //! 3. On Update: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
-//! 4. Updater downloads, runs NSIS `/S`, relaunches the main app.
+//! 4. Updater downloads, closes rusticdl if still running, runs NSIS `/S`,
+//!    then relaunches the main app once.
 //! 5. **What’s new** — post-relaunch dialog with the release changelog.
 //!
 //! Channel (`UpdateChannel`) selects Stable (`/releases/latest`) vs Nightly

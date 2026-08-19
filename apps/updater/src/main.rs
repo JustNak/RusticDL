@@ -2,10 +2,10 @@
 //!
 //! Invoked by the main app after the user clicks Update:
 //! 1. Show a small progress window.
-//! 2. Wait for the main process to exit.
-//! 3. Download the NSIS setup (or use a local path).
+//! 2. Download the NSIS setup (or use a local path).
+//! 3. Ask rusticdl to quit (or kill it) before files are overwritten.
 //! 4. Run the installer silently (`/S`, no `/R` — we own relaunch).
-//! 5. Start RusticDL again and exit.
+//! 5. Start RusticDL once the replace/install has finished, then exit.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

@@ -11,8 +11,8 @@
 //!    (channel switch is not a semver “newer” check). Toast stages:
 //!    Checking → You're up to date | Update available [Update].
 //! 3. On Update, flush app state, spawn **RusticDL Updater** with the setup
-//!    download URL, then quit. The updater shows progress, runs NSIS `/S`, and
-//!    relaunches this app.
+//!    download URL, then quit. The updater downloads, closes this app if it is
+//!    still running, runs NSIS `/S` (no `/R`), and relaunches once after replace.
 
 use std::path::PathBuf;
 use std::time::Duration;
