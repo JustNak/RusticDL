@@ -49,7 +49,8 @@ impl DownloadApp {
     /// Tear down leftover capture HUDs when hiding to tray (extra swapchains).
     ///
     /// Does not destroy the main window or its D3D swapchain. After hide,
-    /// `poll_browser_capture` may still open Confirm / needed Progress.
+    /// `poll_browser_capture` may still open Confirm / needed Progress
+    /// (IPC wake unparks the shell timer).
     pub(crate) fn close_capture_huds(&mut self, cx: &mut Context<Self>) {
         self.ipc.request_close_capture_windows();
         self.browser_watch_complete_ids.clear();
@@ -138,6 +139,8 @@ impl DownloadApp {
                 cx.notify();
             }
         }
+        // Resume the 80ms shell timer after restore (it parks while tray-hidden idle).
+        self.ipc.wake_ui();
     }
 
     /// Restore the main window using the cached HWND (no GPUI Window required).
