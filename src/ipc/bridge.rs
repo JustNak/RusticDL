@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::download::{EngineHandle, Job};
 use crate::extension_settings::ExtensionIntegrationSettings;
@@ -74,6 +74,8 @@ pub struct IpcBridge {
     pub(crate) inner: Arc<Mutex<IpcState>>,
     pub(crate) engine: EngineHandle,
     pub(crate) paths: AppPaths,
+    /// Wakes the GPUI shell loop so tray-idle parking does not miss IPC work.
+    ui_wake: Arc<Notify>,
 }
 
 pub(crate) struct IpcState {
@@ -121,14 +123,56 @@ impl IpcBridge {
             })),
             engine,
             paths,
+            ui_wake: Arc::new(Notify::new()),
         }
+    }
+
+    /// Clone the permit used to unpark the UI shell tick loop.
+    pub fn ui_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.ui_wake)
+    }
+
+    /// Store one wake permit for the shell loop (`Notify::notify_one`).
+    ///
+    /// Safe if no waiter is registered yet: the next `notified().await` completes
+    /// immediately. Extra wakes while the 80ms timer is running coalesce to one
+    /// leftover permit (one extra tick after idle).
+    pub fn wake_ui(&self) {
+        self.ui_wake.notify_one();
+    }
+
+    /// True when the shell must keep ticking (or unpark) to drain UI-side IPC work.
+    pub fn has_pending_ui_work(&self) -> bool {
+        let Ok(guard) = self.inner.lock() else {
+            return false;
+        };
+        if guard.show_window_requested {
+            return true;
+        }
+        if guard
+            .prompt_queue
+            .iter()
+            .any(|prompt| !guard.active_prompt_ids.contains(&prompt.id))
+        {
+            return true;
+        }
+        if !guard.pending_progress_watch_ids.is_empty() {
+            return true;
+        }
+        guard
+            .pending_progress_job_ids
+            .iter()
+            .any(|id| !guard.progress_hud_owned_jobs.contains(id))
     }
 
     /// Request that the main window be focused/restored (extension "Open app").
     pub fn request_show_window(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.show_window_requested = true;
-        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.show_window_requested = true;
+        drop(guard);
+        self.wake_ui();
     }
 
     /// Consume a pending show-window request. Returns true once per request.
@@ -239,6 +283,8 @@ impl IpcBridge {
             return Err(prompt.reply);
         }
         guard.prompt_queue.push_back(prompt);
+        drop(guard);
+        self.wake_ui();
         Ok(())
     }
 
@@ -274,18 +320,19 @@ impl IpcBridge {
             }
             guard.pending_progress_watch_ids.push_back(job_id.clone());
         }
-        if guard
+        if !guard
             .pending_progress_job_ids
             .iter()
             .any(|id| id == &job_id)
         {
-            return;
+            // Cap so a runaway extension cannot grow unbounded.
+            if guard.pending_progress_job_ids.len() >= 20 {
+                let _ = guard.pending_progress_job_ids.pop_front();
+            }
+            guard.pending_progress_job_ids.push_back(job_id);
         }
-        // Cap so a runaway extension cannot grow unbounded.
-        if guard.pending_progress_job_ids.len() >= 20 {
-            let _ = guard.pending_progress_job_ids.pop_front();
-        }
-        guard.pending_progress_job_ids.push_back(job_id);
+        drop(guard);
+        self.wake_ui();
     }
 
     /// Drain job ids that should be watched for Complete re-open.
@@ -618,5 +665,55 @@ mod tests {
             ipc.take_pending_progress_jobs_n(1),
             vec!["j-after".to_string()]
         );
+    }
+
+    #[test]
+    fn has_pending_ui_work_tracks_show_prompt_and_progress() {
+        let ipc = test_bridge();
+        assert!(!ipc.has_pending_ui_work());
+
+        ipc.request_show_window();
+        assert!(ipc.has_pending_ui_work());
+        assert!(ipc.take_show_window_request());
+        assert!(!ipc.has_pending_ui_work());
+
+        let (prompt, _rx) = test_prompt("p1", "https://example.com/p1");
+        ipc.enqueue_prompt(prompt).expect("enqueue");
+        assert!(ipc.has_pending_ui_work());
+        let _ = ipc.claim_next_prompt_for_ui();
+        assert!(
+            !ipc.has_pending_ui_work(),
+            "claimed prompts are already shown"
+        );
+
+        ipc.update_jobs(Arc::new(vec![test_job("j1", "https://example.com/1")]));
+        ipc.enqueue_progress_job("j1".into());
+        assert!(ipc.has_pending_ui_work());
+        let _ = ipc.take_progress_watch_jobs();
+        let _ = ipc.take_pending_progress_jobs_n(1);
+        assert!(!ipc.has_pending_ui_work());
+    }
+
+    #[tokio::test]
+    async fn ipc_mutations_store_a_wake_permit() {
+        let ipc = test_bridge();
+        let wake = ipc.ui_wake();
+        ipc.request_show_window();
+        tokio::time::timeout(std::time::Duration::from_millis(20), wake.notified())
+            .await
+            .expect("show_window must store a wake permit");
+
+        let wake = ipc.ui_wake();
+        let (prompt, _rx) = test_prompt("wake", "https://example.com/wake");
+        ipc.enqueue_prompt(prompt).expect("enqueue");
+        tokio::time::timeout(std::time::Duration::from_millis(20), wake.notified())
+            .await
+            .expect("enqueue_prompt must store a wake permit");
+
+        let wake = ipc.ui_wake();
+        ipc.enqueue_progress_job("job".into());
+        tokio::time::timeout(std::time::Duration::from_millis(20), wake.notified())
+            .await
+            .expect("enqueue_progress_job must store a wake permit");
     }
 }

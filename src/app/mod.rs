@@ -404,12 +404,16 @@ impl DownloadApp {
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
-                let result = this.update(cx, |app, cx| match event {
-                    EngineEvent::JobsChanged(jobs) => app.on_jobs_changed(jobs, cx),
-                    EngineEvent::Toast(message) => {
-                        app.pending_toast = Some(message);
-                        cx.notify();
+                let result = this.update(cx, |app, cx| {
+                    match event {
+                        EngineEvent::JobsChanged(jobs) => app.on_jobs_changed(jobs, cx),
+                        EngineEvent::Toast(message) => {
+                            app.pending_toast = Some(message);
+                            cx.notify();
+                        }
                     }
+                    // Unpark the shell timer (progress apply, Complete HUD watch).
+                    app.ipc.wake_ui();
                 });
                 if result.is_err() {
                     break;
@@ -418,40 +422,20 @@ impl DownloadApp {
         })
         .detach();
 
+        let shell_wake = ipc.ui_wake();
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(80))
-                    .await;
-                if this
-                    .update(cx, |app, cx| {
-                        // Hidden + empty/idle queue: skip apply/balloons/persist and
-                        // do not notify (PR 133 park). Capture HUDs still poll so
-                        // Confirm / Progress can appear while the main HWND is SW_HIDE.
-                        let skip_apply = app.should_skip_hidden_idle_tick();
-                        if !skip_apply {
-                            if let Some(jobs) = app.pending_jobs.take() {
-                                app.apply_jobs(jobs, cx);
-                            }
-                            // OS balloon burst deadline (Pipeline B).
-                            app.flush_os_notify_if_due(cx);
-                            // Flush a debounced window-layout write after the user stops resizing.
-                            app.flush_window_layout_if_due();
-                            app.flush_jobs_save_if_due();
-                        }
-                        // Dedicated prompt / progress / complete windows even if main UI is idle
-                        // or tray-hidden. Never open these from Render — GPUI crashes if
-                        // open_window re-enters draw. Tray-hide still closes leftover Complete
-                        // HUDs; this poll is how new Confirm / needed Progress appear.
-                        if browser_capture::should_poll_capture_huds(app.window_hidden_to_tray) {
-                            app.poll_browser_capture(cx);
-                        }
-                        // Second-instance / extension show_window while hidden to tray.
-                        app.poll_hidden_window_actions(cx);
-                    })
-                    .is_err()
-                {
-                    break;
+                let park = match this.update(cx, |app, cx| app.run_shell_tick(cx)) {
+                    Ok(park) => park,
+                    Err(_) => break,
+                };
+                if park {
+                    // Tray-hidden and idle: sleep until IPC / engine / tray wakes us.
+                    shell_wake.notified().await;
+                } else {
+                    cx.background_executor()
+                        .timer(jobs_ui::SHELL_TICK_INTERVAL)
+                        .await;
                 }
             }
         })

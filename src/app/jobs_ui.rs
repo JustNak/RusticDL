@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui::Context;
 
+use super::browser_capture;
 use super::DownloadApp;
 use crate::download::{Job, JobState};
 use crate::notifications::{
@@ -90,6 +91,41 @@ impl DownloadApp {
             self.pending_jobs.is_some(),
             !self.os_notify_buffer.pending.is_empty(),
         )
+    }
+
+    /// Stop the 80ms GPUI timer while tray-hidden with nothing to do.
+    ///
+    /// Capture / show_window stay event-driven via [`crate::ipc::IpcBridge::wake_ui`].
+    pub(crate) fn should_park_shell_tick(&self) -> bool {
+        should_park_shell_tick(
+            self.window_hidden_to_tray,
+            &self.jobs,
+            &self.latest_jobs,
+            self.pending_jobs.is_some(),
+            !self.os_notify_buffer.pending.is_empty(),
+            !self.browser_watch_complete_ids.is_empty(),
+            self.ipc.has_pending_ui_work(),
+        )
+    }
+
+    /// One shell timer tick: throttled apply (unless hidden-idle), then capture / show_window.
+    ///
+    /// Returns whether the 80ms timer can park until the next IPC / engine / tray wake.
+    pub(crate) fn run_shell_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let skip_apply = self.should_skip_hidden_idle_tick();
+        if !skip_apply {
+            if let Some(jobs) = self.pending_jobs.take() {
+                self.apply_jobs(jobs, cx);
+            }
+            self.flush_os_notify_if_due(cx);
+            self.flush_window_layout_if_due();
+            self.flush_jobs_save_if_due();
+        }
+        if browser_capture::should_poll_capture_huds(self.window_hidden_to_tray) {
+            self.poll_browser_capture(cx);
+        }
+        self.poll_hidden_window_actions(cx);
+        self.should_park_shell_tick()
     }
 
     pub(crate) fn flush_os_notify_if_due(&mut self, cx: &mut Context<Self>) {
@@ -187,7 +223,9 @@ impl DownloadApp {
     }
 }
 
-const JOBS_UI_THROTTLE: Duration = Duration::from_millis(80);
+/// GPUI shell timer while there is UI work (progress apply, persist, capture spacing).
+pub(crate) const SHELL_TICK_INTERVAL: Duration = Duration::from_millis(80);
+const JOBS_UI_THROTTLE: Duration = SHELL_TICK_INTERVAL;
 
 /// Queued / in-flight jobs still need the 80ms apply path even when hidden.
 fn job_needs_ui_tick(state: JobState) -> bool {
@@ -210,6 +248,26 @@ fn hidden_idle_tick_should_skip(
         && !has_pending_os_notify
         && !jobs.iter().any(|job| job_needs_ui_tick(job.state))
         && !latest_jobs.iter().any(|job| job_needs_ui_tick(job.state))
+}
+
+/// Park the 80ms timer only when hidden-idle *and* no capture / IPC work remains.
+fn should_park_shell_tick(
+    hidden: bool,
+    jobs: &[Job],
+    latest_jobs: &[Job],
+    has_pending_jobs: bool,
+    has_pending_os_notify: bool,
+    has_capture_watch: bool,
+    has_ipc_ui_work: bool,
+) -> bool {
+    hidden_idle_tick_should_skip(
+        hidden,
+        jobs,
+        latest_jobs,
+        has_pending_jobs,
+        has_pending_os_notify,
+    ) && !has_capture_watch
+        && !has_ipc_ui_work
 }
 
 /// Update `latest_jobs` on every event. Returns `Some` when render should apply.
@@ -257,7 +315,7 @@ fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
 mod tests {
     use super::{
         hidden_idle_tick_should_skip, jobs_need_immediate_persist, note_jobs_changed,
-        persist_source,
+        persist_source, should_park_shell_tick,
     };
     use crate::download::{Job, JobState};
     use std::path::PathBuf;
@@ -368,6 +426,43 @@ mod tests {
         ));
         assert!(!hidden_idle_tick_should_skip(
             true, &completed, &queued, false, false
+        ));
+    }
+
+    #[test]
+    fn shell_tick_parks_only_when_tray_hidden_and_capture_is_idle() {
+        let completed = vec![sample_job("a", JobState::Completed)];
+        let downloading = vec![sample_job("a", JobState::Downloading)];
+        assert!(should_park_shell_tick(
+            true, &completed, &completed, false, false, false, false
+        ));
+        assert!(should_park_shell_tick(
+            true,
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            false
+        ));
+        // Visible window keeps the 80ms timer (layout debounce, etc.).
+        assert!(!should_park_shell_tick(
+            false, &completed, &completed, false, false, false, false
+        ));
+        assert!(!should_park_shell_tick(
+            true,
+            &downloading,
+            &downloading,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!should_park_shell_tick(
+            true, &completed, &completed, false, false, true, false
+        ));
+        assert!(!should_park_shell_tick(
+            true, &completed, &completed, false, false, false, true
         ));
     }
 

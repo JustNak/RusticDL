@@ -19,8 +19,9 @@ use crate::prompt_window::{
 /// PR 133 parked the hidden idle apply/notify path and closed leftover
 /// Complete HUDs on tray hide. Gating this poll on `window_hidden_to_tray`
 /// also blocked Confirm (and needed Progress) while the main window is
-/// `SW_HIDE`. Idle park still skips clone+notify; this poll is a cheap
-/// queue check and may open a separate capture window.
+/// `SW_HIDE`. The 80ms shell timer itself now parks while tray-hidden idle;
+/// IPC enqueue / show_window stores a wake permit so this poll still runs
+/// when a handoff arrives. Do not gate on tray-hide.
 pub(crate) fn should_poll_capture_huds(_window_hidden_to_tray: bool) -> bool {
     true
 }
