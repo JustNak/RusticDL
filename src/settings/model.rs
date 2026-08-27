@@ -468,18 +468,9 @@ mod tests {
         let mut s = Settings::default();
         let dl = PathBuf::from("dl");
         s.download_directory = dl.clone();
-        assert_eq!(
-            s.resolve_save_directory("song.mp3", None),
-            dl.join("Audio")
-        );
-        assert_eq!(
-            s.resolve_save_directory("clip.mp4", None),
-            dl.join("Video")
-        );
-        assert_eq!(
-            s.resolve_save_directory("notes", None),
-            dl.join("Other")
-        );
+        assert_eq!(s.resolve_save_directory("song.mp3", None), dl.join("Audio"));
+        assert_eq!(s.resolve_save_directory("clip.mp4", None), dl.join("Video"));
+        assert_eq!(s.resolve_save_directory("notes", None), dl.join("Other"));
         assert_eq!(
             s.resolve_save_directory("pack.zip", Some(&dl)),
             dl.join("Compressed")
@@ -508,9 +499,6 @@ mod tests {
         assert_eq!(s.resolve_save_directory("song.mp3", None), dl);
         s.category_folders.audio.name = "Music".into();
         s.category_folders.audio.enabled = true;
-        assert_eq!(
-            s.resolve_save_directory("song.mp3", None),
-            dl.join("Music")
-        );
+        assert_eq!(s.resolve_save_directory("song.mp3", None), dl.join("Music"));
     }
 }
