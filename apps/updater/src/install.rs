@@ -23,6 +23,10 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
         return Err(format!("Installer missing: {}", path.display()));
     }
 
+    // Fail closed: Authenticode (WinVerifyTrust) before Command / ShellExecute.
+    // Soft download size is not this gate.
+    verify_installer_authenticode(path)?;
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -62,6 +66,93 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
             return Err(format!("Installer exited with code {:?}.", status.code()));
         }
         Ok(())
+    }
+}
+
+/// Reject the installer unless Authenticode trust succeeds.
+///
+/// Windows: `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`
+/// (embedded signature present, PE digest matches, cert chains to a trusted
+/// root, code-signing EKU). Not a content-length check and not a SHA-256
+/// from GitHub. Non-Windows: fail closed; this helper never executes there.
+fn verify_installer_authenticode(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_verify_trust_authenticode(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(
+            "Installer rejected: Authenticode verification failed (WinVerifyTrust). \
+The installer cannot be verified on this platform."
+                .into(),
+        )
+    }
+}
+
+#[cfg(windows)]
+fn win_verify_trust_authenticode(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::GUID;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+        WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
+        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: windows::core::PCWSTR(wide.as_ptr()),
+        ..Default::default()
+    };
+
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: std::ptr::from_mut(&mut file_info),
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+
+    let mut action: GUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let status = unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            std::ptr::from_mut(&mut action),
+            std::ptr::from_mut(&mut data).cast(),
+        )
+    };
+
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            std::ptr::from_mut(&mut action),
+            std::ptr::from_mut(&mut data).cast(),
+        );
+    }
+
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Installer rejected: Authenticode verification failed (WinVerifyTrust status 0x{:08X}). \
+The update is unsigned, tampered, or not trusted. Install manually from the release page.",
+            status as u32
+        ))
     }
 }
 
@@ -176,6 +267,14 @@ pub fn relaunch_app(app_exe: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::ProgressSink;
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {
+        fn set_status(&self, _text: String) {}
+        fn set_progress_percent(&self, _percent: u32) {}
+        fn set_progress_unknown(&self) {}
+    }
 
     #[test]
     fn silent_install_does_not_relaunch() {
@@ -184,6 +283,35 @@ mod tests {
         assert!(
             args.iter().all(|a| *a != "/R" && !a.contains("/R")),
             "updater owns relaunch; NSIS must not start rusticdl"
+        );
+    }
+
+    #[test]
+    fn refuses_execute_without_authenticode() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-updater-authenticode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("unsigned-setup.exe");
+        std::fs::write(&path, b"not-a-signed-pe\n").expect("unsigned payload");
+
+        let err = run_silent_installer(&path, &NoopProgress).expect_err(
+            "execute-without-Authenticode: unsigned installer must not reach Command / ShellExecute",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            err.contains("Authenticode") && err.contains("WinVerifyTrust"),
+            "execute-without-Authenticode: fail-closed gate must reject via Authenticode/WinVerifyTrust before Command / ShellExecute, got {err:?}"
+        );
+        assert!(
+            !err.contains("Could not start installer"),
+            "execute-without-Authenticode: must fail closed before Command / ShellExecute, got {err:?}"
         );
     }
 }
