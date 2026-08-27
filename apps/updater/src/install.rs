@@ -176,6 +176,14 @@ pub fn relaunch_app(app_exe: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::ProgressSink;
+
+    struct NoopProgress;
+    impl ProgressSink for NoopProgress {
+        fn set_status(&self, _text: String) {}
+        fn set_progress_percent(&self, _percent: u32) {}
+        fn set_progress_unknown(&self) {}
+    }
 
     #[test]
     fn silent_install_does_not_relaunch() {
@@ -184,6 +192,35 @@ mod tests {
         assert!(
             args.iter().all(|a| *a != "/R" && !a.contains("/R")),
             "updater owns relaunch; NSIS must not start rusticdl"
+        );
+    }
+
+    #[test]
+    fn refuses_execute_without_authenticode() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-updater-authenticode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("unsigned-setup.exe");
+        std::fs::write(&path, b"not-a-signed-pe\n").expect("unsigned payload");
+
+        let err = run_silent_installer(&path, &NoopProgress).expect_err(
+            "execute-without-Authenticode: unsigned installer must not reach Command / ShellExecute",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            err.contains("Authenticode") && err.contains("WinVerifyTrust"),
+            "execute-without-Authenticode: fail-closed gate must reject via Authenticode/WinVerifyTrust before Command / ShellExecute, got {err:?}"
+        );
+        assert!(
+            !err.contains("Could not start installer"),
+            "execute-without-Authenticode: must fail closed before Command / ShellExecute, got {err:?}"
         );
     }
 }
