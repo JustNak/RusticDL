@@ -197,6 +197,8 @@ jobs:
     needs: [decide, release-windows]
     if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true' && needs.release-windows.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      RUSTICDL_VERSION: ${{ needs.decide.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
