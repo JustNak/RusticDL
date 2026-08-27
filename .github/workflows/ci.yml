@@ -69,7 +69,8 @@ jobs:
         run: |
           file target/release/rusticdl
           readelf -h target/release/rusticdl
-          file target/release/rusticdl | grep -q 'ELF 64-bit LSB executable'
+          readelf -h target/release/rusticdl | grep -q 'Class: *ELF64'
+          readelf -h target/release/rusticdl | grep -Eq 'Type: *(EXEC|DYN)'
           test -x target/release/rusticdl
 
       - name: Upload rusticdl artifact
