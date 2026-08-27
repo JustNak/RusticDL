@@ -157,6 +157,7 @@ jobs:
             | **RusticDL-windows-x64-setup.exe** | **Recommended** — NSIS installer (app + native host + browser host registration) |
             | **RusticDL-windows-x64.zip** | Portable desktop app only |
             | **RusticDL-full-windows-x64.zip** | Portable app + native host + scripts + extensions |
+            | **RusticDL-linux-x64.tar.gz** | Linux ELF only, no updater, no native-host |
             | **extension-chromium.zip** | Chromium / Edge / Brave extension |
             | **extension-firefox.zip** | Firefox extension |
 
@@ -190,3 +191,44 @@ jobs:
             Write-Host "Deleting old nightly $($_.tagName)"
             gh release delete $_.tagName --yes --cleanup-tag
           }
+
+  release-linux:
+    name: Build & publish nightly (Linux)
+    needs: [decide, release-windows]
+    if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true' && needs.release-windows.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      RUSTICDL_VERSION: ${{ needs.decide.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libstdc++6 g++ libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: nightly
+
+      - name: Build rusticdl release
+        run: cargo build --release -p rusticdl
+
+      - name: Verify ELF
+        run: |
+          readelf -h target/release/rusticdl | grep -q 'Class: *ELF64'
+          readelf -h target/release/rusticdl | grep -Eq 'Type: *(EXEC|DYN)'
+          test -x target/release/rusticdl
+
+      - name: Package tarball
+        run: tar -czf RusticDL-linux-x64.tar.gz -C target/release rusticdl
+
+      - name: Upload Linux tarball
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ needs.decide.outputs.tag }} RusticDL-linux-x64.tar.gz
