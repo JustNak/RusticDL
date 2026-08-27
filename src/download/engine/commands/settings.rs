@@ -30,6 +30,7 @@ pub(super) async fn update_settings(
     limiter.0.set_limit(limiter.1).await;
 }
 
+#[cfg(test)]
 pub(super) async fn replace_jobs(inner: &Arc<Mutex<EngineInner>>, jobs: Vec<Job>) {
     let mut guard = inner.lock().await;
     guard.jobs = jobs;

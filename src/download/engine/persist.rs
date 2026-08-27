@@ -25,12 +25,13 @@ impl JobStore for FileJobStore {
 }
 
 /// Test double. Records snapshots; never touches disk.
+#[cfg(test)]
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct MemoryJobStore {
     pub snapshots: std::sync::Mutex<Vec<Vec<Job>>>,
 }
 
+#[cfg(test)]
 impl JobStore for MemoryJobStore {
     fn persist_jobs(&self, jobs: &[Job]) -> Result<(), String> {
         self.snapshots

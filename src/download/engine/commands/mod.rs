@@ -66,6 +66,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
         EngineCommand::UpdateSettings(config) => {
             settings::update_settings(inner, config).await;
         }
+        #[cfg(test)]
         EngineCommand::ReplaceJobs(jobs) => {
             settings::replace_jobs(inner, jobs).await;
         }

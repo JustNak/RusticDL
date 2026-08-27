@@ -22,8 +22,8 @@ mod launch;
 mod version;
 
 pub use github::{
-    check_for_update, download_installer, latest_release_api, latest_release_page,
-    open_release_page, open_url, releases_list_api, releases_page, UpdateCheck, UpdateInfo,
+    check_for_update, latest_release_api, latest_release_page, open_release_page, open_url,
+    releases_list_api, releases_page, UpdateCheck, UpdateInfo,
 };
-pub use launch::{launch_installer, launch_updater, updater_exe_path, LaunchUpdaterOpts};
+pub use launch::{launch_updater, updater_exe_path, LaunchUpdaterOpts};
 pub use version::{is_newer, is_nightly_version, normalize_version, should_offer_on_channel};
