@@ -2,42 +2,6 @@ use std::path::PathBuf;
 
 use crate::branding::{UPDATER_EXE_NAME, UPDATER_NAME};
 
-/// Launch a previously downloaded NSIS setup binary.
-///
-/// Prefer [`launch_updater`] for interactive updates so the user sees a progress
-/// window. This remains available for repair/fallback tooling.
-///
-/// When `silent_relaunch` is true, starts with `/S /R` (no wizard; app relaunches
-/// after success). Prefer flushing jobs/settings before calling this, then quit
-/// promptly so the installer can replace in-use files.
-#[allow(dead_code)]
-pub fn launch_installer(path: &std::path::Path, silent_relaunch: bool) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS so the installer outlives us when we quit for the update.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let mut cmd = std::process::Command::new(path);
-        // cargo-packager NSIS: /S = silent, /R = relaunch app after success.
-        if silent_relaunch {
-            cmd.args(["/S", "/R"]);
-        }
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
-            .map_err(|e| format!("Could not start installer: {e}"))?;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = silent_relaunch;
-        std::process::Command::new(path)
-            .spawn()
-            .map_err(|e| format!("Could not start installer: {e}"))?;
-        Ok(())
-    }
-}
-
 /// Arguments for spawning the dedicated **RusticDL Updater** process.
 #[derive(Debug, Clone)]
 pub struct LaunchUpdaterOpts {

@@ -262,8 +262,7 @@ impl IpcBridge {
         prompt.reply.send(decision).is_ok()
     }
 
-    /// Whether a prompt is still waiting (used to close stale dialogs after IPC timeout).
-    #[allow(dead_code)] // used by unit tests; HUD timeout close can consult this
+    #[cfg(test)]
     pub fn is_prompt_pending(&self, prompt_id: &str) -> bool {
         self.inner
             .lock()

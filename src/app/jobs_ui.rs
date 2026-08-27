@@ -219,7 +219,7 @@ impl DownloadApp {
         }
         self.jobs_dirty = false;
         self.last_jobs_save = Instant::now();
-        let _ = save_jobs(&self.paths, persist_source(&self.latest_jobs, &self.jobs));
+        let _ = save_jobs(&self.paths, persist_source(&self.latest_jobs));
     }
 }
 
@@ -286,7 +286,7 @@ fn note_jobs_changed(
 }
 
 /// Newest event snapshot. `rendered` is the last applied frame and may be older.
-fn persist_source<'a>(latest_jobs: &'a [Job], _rendered: &'a [Job]) -> &'a [Job] {
+fn persist_source<'a>(latest_jobs: &'a [Job]) -> &'a [Job] {
     latest_jobs
 }
 
@@ -378,7 +378,7 @@ mod tests {
         );
         assert!(pending.is_some());
 
-        let flushed = persist_source(&latest, &rendered);
+        let flushed = persist_source(&latest);
         assert_eq!(flushed[0].transfer_format_version, 1);
         assert_eq!(rendered[0].transfer_format_version, 0);
     }

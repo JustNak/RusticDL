@@ -1,10 +1,7 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
 
 use super::version::{is_nightly_version, normalize_version, should_offer_on_channel};
 use crate::branding::{APP_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO, SETUP_ASSET_NAME};
@@ -201,52 +198,6 @@ fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateC
         setup_download_url: asset.browser_download_url.clone(),
         setup_size: Some(asset.size),
     }))
-}
-
-/// Download the NSIS installer to a temp path (does not launch it).
-///
-/// Interactive updates now hand this off to **RusticDL Updater**. Kept for
-/// tooling / fallback paths that want an in-process download.
-#[allow(dead_code)]
-pub async fn download_installer(download_url: &str) -> Result<PathBuf, String> {
-    let client = github_client()?;
-    let response = client
-        .get(download_url)
-        .header(ACCEPT, "application/octet-stream")
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Download failed with HTTP {}.", response.status()));
-    }
-
-    let temp_dir = std::env::temp_dir().join("rusticdl-update");
-    tokio::fs::create_dir_all(&temp_dir)
-        .await
-        .map_err(|e| format!("Could not create temp folder: {e}"))?;
-
-    let installer_path = temp_dir.join(SETUP_ASSET_NAME);
-    // Replace any previous partial download.
-    let _ = tokio::fs::remove_file(&installer_path).await;
-
-    let mut file = tokio::fs::File::create(&installer_path)
-        .await
-        .map_err(|e| format!("Could not create installer file: {e}"))?;
-
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download interrupted: {e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Could not write installer: {e}"))?;
-    }
-    file.flush()
-        .await
-        .map_err(|e| format!("Could not finalize installer: {e}"))?;
-    drop(file);
-
-    Ok(installer_path)
 }
 
 /// Open the releases list in the default browser (includes nightly pre-releases).

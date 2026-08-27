@@ -139,12 +139,6 @@ pub fn partition(total_bytes: u64, n: u32) -> SegmentMap {
     }
 }
 
-/// Partition with the settings default of 8 segments.
-#[allow(dead_code)]
-pub fn partition_default(total_bytes: u64) -> SegmentMap {
-    partition(total_bytes, DEFAULT_SEGMENT_COUNT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +166,7 @@ mod tests {
     #[test]
     fn partition_default_is_eight() {
         let total = 8 * MIN_SEGMENT_SIZE;
-        let map = partition_default(total);
+        let map = partition(total, DEFAULT_SEGMENT_COUNT);
         assert_eq!(map.segment_count, DEFAULT_SEGMENT_COUNT);
         assert_eq!(map.segments.len(), 8);
         assert_contiguous(&map);

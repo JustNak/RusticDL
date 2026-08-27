@@ -20,7 +20,9 @@ mod persist;
 mod worker;
 
 pub(crate) use persist::EngineIdentity;
-pub use persist::{FileJobStore, JobStore, MemoryJobStore};
+#[cfg(test)]
+pub use persist::MemoryJobStore;
+pub use persist::{FileJobStore, JobStore};
 
 /// Live engine knobs (from Settings).
 #[derive(Debug, Clone)]
@@ -123,6 +125,7 @@ pub enum EngineCommand {
     ResumeAll,
     RetryAll,
     UpdateSettings(EngineRuntimeConfig),
+    #[cfg(test)]
     ReplaceJobs(Vec<Job>),
     Shutdown,
 }
