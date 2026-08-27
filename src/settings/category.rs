@@ -163,9 +163,13 @@ mod tests {
 
     #[test]
     fn sanitize_category_folder_rejects_traversal() {
+        let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(sanitize_category_folder_name("..", "Audio"), "Audio");
         assert_eq!(sanitize_category_folder_name("a/b", "Audio"), "b");
-        assert_eq!(sanitize_category_folder_name(r"x\y", "Audio"), "y");
+        assert_eq!(
+            sanitize_category_folder_name(&format!("x{sep}y"), "Audio"),
+            "y"
+        );
         assert_eq!(sanitize_category_folder_name("Music", "Audio"), "Music");
         assert_eq!(sanitize_category_folder_name("   ", "Audio"), "Audio");
     }
