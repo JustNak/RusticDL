@@ -14,6 +14,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License"></a>
   <a href="https://github.com/JustNak/RusticDL/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JustNak/RusticDL/ci.yml?branch=master&style=for-the-badge&label=CI" alt="CI status"></a>
   <img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/Platform-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/Rust-stable-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
 </p>
 
@@ -34,6 +35,8 @@ Get the latest Windows build from GitHub Releases:
 
 **[→ Download RusticDL for Windows](https://github.com/JustNak/RusticDL/releases/latest)**
 
+Linux builds are not on Stable yet. Grab **`RusticDL-linux-x64.tar.gz`** from a [Nightly pre-release](https://github.com/JustNak/RusticDL/releases) (ELF only — no updater, no native-host).
+
 Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
 
 | Asset | What it contains |
@@ -41,6 +44,7 @@ Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testi
 | **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app + native host + browser host registration) |
 | **`RusticDL-windows-x64.zip`** | Portable desktop app (`rusticdl.exe`) |
 | **`RusticDL-full-windows-x64.zip`** | Portable app + native host + register scripts + browser extension packages |
+| **`RusticDL-linux-x64.tar.gz`** | Linux desktop app (`rusticdl` ELF; Nightly only today) |
 | **`extension-chromium.zip`** | Chromium / Edge / Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 
@@ -55,6 +59,19 @@ The installer places files under `%LOCALAPPDATA%\RusticDL\`, creates a Start Men
 Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & Features (optionally remove app data).
 
 > **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see below). SmartScreen may warn on unsigned builds until code signing is added.
+
+### Install (Linux)
+
+1. Download **`RusticDL-linux-x64.tar.gz`** from a Nightly pre-release.
+2. Extract and run:
+
+```bash
+tar -xzf RusticDL-linux-x64.tar.gz
+chmod +x rusticdl
+./rusticdl
+```
+
+In-app updater and the Nightly update channel are Windows-only today.
 
 ### Portable install (ZIP)
 
@@ -213,8 +230,9 @@ Everything below is for people who want to compile RusticDL themselves, hack on 
 
 | Tool | Notes |
 | --- | --- |
-| **Rust stable** | Install via [rustup](https://rustup.rs/) |
+| **Rust stable** | Install via [rustup](https://rustup.rs/) (rustc 1.89+ on Linux) |
 | **Windows C++ build tools** | Visual Studio Build Tools with the “Desktop development with C++” workload (needed by GPUI / native graphics) |
+| **Linux link libs** | `libstdc++`, `libxcb`, `libxkbcommon`, `libxkbcommon-x11` |
 | **Node.js 20+** | Only if you build the browser extension |
 | **npm** | Comes with Node |
 
@@ -246,8 +264,8 @@ cargo build --release -p rusticdl
 
 Binary output:
 
-- Debug: `target/debug/rusticdl.exe`
-- Release: `target/release/rusticdl.exe`
+- Debug: `target/debug/rusticdl.exe` (Windows) or `target/debug/rusticdl` (Linux)
+- Release: `target/release/rusticdl.exe` (Windows) or `target/release/rusticdl` (Linux)
 
 ## Build the native messaging host
 
@@ -328,9 +346,8 @@ npm run build
 
 Settings and queue state are stored under:
 
-- Windows: `%APPDATA%\RusticDL\`
-  - `settings.json`
-  - `state.json`
+- Windows: `%APPDATA%\RusticDL\` — `settings.json`, `state.json`
+- Linux: `~/.local/share/RusticDL/` (XDG) — `settings.json`, `state.json`
 
 Partial downloads are written next to the destination as `filename.ext.part`. Multi-segment jobs also persist a segment map in `state.json` (`transfer_format_version = 1`).
 
@@ -366,7 +383,7 @@ GitHub Actions workflows live in `.github/workflows/`:
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
 | **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a **Stable** GitHub Release |
-| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Same assets as Release, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
+| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Windows release assets plus **`RusticDL-linux-x64.tar.gz`**, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. (`release.yml` remains Windows-only.) |
 
 To cut a new **stable** release from a clean tree:
 

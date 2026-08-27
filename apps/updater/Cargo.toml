@@ -1,6 +1,6 @@
 [package]
 name = "rusticdl-updater"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "RusticDL Updater — applies updates and relaunches the main app"
 license = "MIT"
