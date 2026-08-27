@@ -810,10 +810,14 @@ mod tests {
 
     #[test]
     fn shorten_folder_drops_filename() {
-        let path = PathBuf::from(r"C:\Users\Zeus\Downloads\show.s01e01.mkv");
+        let path = PathBuf::from("Users")
+            .join("Zeus")
+            .join("Downloads")
+            .join("show.s01e01.mkv");
         let folder = shorten_folder(&path);
-        assert!(!folder.to_lowercase().contains("show"));
-        assert!(folder.contains("Downloads") || folder.contains("Zeus"));
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(folder, format!("Zeus{sep}Downloads"));
+        assert!(!folder.contains("show.s01e01.mkv"));
     }
 
     #[test]

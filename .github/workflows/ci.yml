@@ -37,6 +37,31 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  rust-linux:
+    name: Rust (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libstdc++6 g++ libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: |
+          cargo test --workspace -- \
+            --skip v1_map_is_committed_before_set_len
+
   extension:
     name: Extension
     runs-on: ubuntu-latest
