@@ -62,6 +62,23 @@ jobs:
           cargo test --workspace -- \
             --skip v1_map_is_committed_before_set_len
 
+      - name: Build rusticdl release
+        run: cargo build --release -p rusticdl
+
+      - name: Verify ELF
+        run: |
+          file target/release/rusticdl
+          readelf -h target/release/rusticdl
+          readelf -h target/release/rusticdl | grep -q 'Class: *ELF64'
+          readelf -h target/release/rusticdl | grep -Eq 'Type: *(EXEC|DYN)'
+          test -x target/release/rusticdl
+
+      - name: Upload rusticdl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusticdl-linux-x64
+          path: target/release/rusticdl
+
   extension:
     name: Extension
     runs-on: ubuntu-latest
