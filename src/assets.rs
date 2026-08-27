@@ -159,9 +159,17 @@ mod tests {
 
     #[test]
     fn unused_assets_are_not_embedded() {
-        assert!(Assets::load_embedded("noise.png").is_none());
-        assert!(Assets::load_embedded("brand/masters/icon-master-1024.png").is_none());
-        assert!(Assets::load_embedded("brand/masters/icon-master-light-1024.png").is_none());
+        for path in [
+            "brand/icon.ico",
+            "brand/icon-256.png",
+            "brand/icon-1024.png",
+            "windows/app.manifest",
+        ] {
+            assert!(
+                Assets::load_embedded(path).is_none(),
+                "{path} is packager / install metadata only and must not be embedded"
+            );
+        }
     }
 
     #[test]
