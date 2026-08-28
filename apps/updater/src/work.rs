@@ -124,13 +124,11 @@ impl UpdateDriver for RealDriver {
     }
 
     fn relaunch(&mut self, app_exe: &Path) -> Result<(), String> {
-        // Brief pause so the progress text is readable and files settle.
         std::thread::sleep(Duration::from_millis(350));
         relaunch_app(app_exe)
     }
 }
 
-/// Run the full update sequence, reporting progress to `progress`.
 pub fn run_update(args: &UpdaterArgs, progress: &dyn ProgressSink) -> UpdateOutcome {
     run_update_with(args, progress, &mut RealDriver)
 }

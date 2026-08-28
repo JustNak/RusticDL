@@ -11,9 +11,7 @@ pub const DEFAULT_PIPE_PATH: &str = r"\\.\pipe\rusticdl.v1";
 const DEFAULT_APP_EXECUTABLE: &str = "rusticdl.exe";
 const CONNECT_ATTEMPTS: usize = 10;
 const CONNECT_DELAY: Duration = Duration::from_millis(300);
-/// Fast path for ping/status/open_app.
 const APP_FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
-/// Ask-mode prompts can wait up to 5 minutes for the user (plus a small buffer).
 const APP_PROMPT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5 * 60 + 30);
 const MAX_APP_RESPONSE_BYTES: usize = 256 * 1024;
 const PIPE_OPEN_RETRIES: usize = 20;
@@ -184,7 +182,6 @@ fn open_pipe(pipe_path: &str) -> std::io::Result<std::fs::File> {
         // FILE_FLAG_OVERLAPPED matches the Tokio server pipe mode.
         const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
-        // Give the server a moment if no instance is free yet.
         wait_named_pipe(pipe_path, 1_000);
 
         std::fs::OpenOptions::new()

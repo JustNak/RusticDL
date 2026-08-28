@@ -14,7 +14,6 @@ fn main() {
 
     let mut res = winresource::WindowsResource::new();
     res.set("ProductName", "RusticDL");
-    // Background / bridge process name (Startup lists, Task Manager overflow).
     res.set("FileDescription", "RusticDL Backend");
     res.set("CompanyName", "JustNak");
     res.set("LegalCopyright", "Copyright (c) JustNak");

@@ -13,7 +13,6 @@ const SETUP_ASSET_NAME: &str = "RusticDL-windows-x64-setup.exe";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Download `url` to a temp path, reporting progress when size is known.
 pub fn download_installer(
     url: &str,
     expected_size: Option<u64>,
@@ -81,7 +80,6 @@ pub fn download_installer(
     if let Some(total) = expected_size {
         if let Ok(meta) = std::fs::metadata(&installer_path) {
             if meta.len() != total {
-                // Soft warning only: GitHub size can differ if CDN recompresses (rare).
                 progress.set_status(format!(
                     "Downloaded {} (expected {})",
                     format_bytes(meta.len()),
@@ -95,7 +93,6 @@ pub fn download_installer(
     Ok(installer_path)
 }
 
-/// Ensure a local installer path exists.
 pub fn resolve_local_installer(path: &Path) -> Result<PathBuf, String> {
     if !path.is_file() {
         return Err(format!("Installer not found:\n{}", path.display()));

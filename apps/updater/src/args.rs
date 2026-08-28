@@ -1,27 +1,17 @@
-//! CLI argument parsing for the updater process.
-
 use std::path::PathBuf;
 
 /// Parsed command-line options passed by the main app (or a manual repair run).
 #[derive(Debug, Clone)]
 pub struct UpdaterArgs {
-    /// Download the setup from this URL (mutually exclusive with [`Self::installer_path`]).
     pub download_url: Option<String>,
-    /// Use a previously downloaded setup binary.
     pub installer_path: Option<PathBuf>,
-    /// Wait for this process id (main app) to exit before installing.
     pub wait_pid: Option<u32>,
-    /// Path to `rusticdl.exe` to relaunch after a successful install.
     pub app_exe: PathBuf,
-    /// Optional human version labels for UI / logging.
     #[allow(dead_code)] // reserved for richer UI copy / logs
     pub from_version: Option<String>,
     pub to_version: Option<String>,
-    /// Release page opened on failure.
     pub release_page: Option<String>,
-    /// Expected download size in bytes (progress bar).
     pub expected_size: Option<u64>,
-    /// How long to wait for the main process to exit.
     pub wait_timeout_secs: u64,
 }
 
