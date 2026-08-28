@@ -344,20 +344,36 @@ mod hyprland_title_bar_tests {
     const DRAG_TOKEN: &str = "WindowControlArea::Drag";
     const MOVE_TOKEN: &str = "start_window_move";
 
-    fn hyprland_branch_source() -> &'static str {
-        let start = SOURCE
+    fn normalized_source(raw: &str) -> String {
+        raw.replace("\r\n", "\n")
+    }
+
+    fn hyprland_branch_source(source: &str) -> &str {
+        let start = source
             .find("if on_hyprland")
             .expect("Hyprland title-bar branch");
         let end = start
-            + SOURCE[start..]
+            + source[start..]
                 .find(".into_any_element();")
                 .expect("Hyprland title-bar return");
-        &SOURCE[start..end]
+        &source[start..end]
+    }
+
+    fn hyprland_drag_helper_scope(source: &str) -> &str {
+        let helper_start = source
+            .find("fn hyprland_title_bar_drag_region")
+            .expect("hyprland title-bar drag helper");
+        let helper_scope = &source[helper_start..];
+        let helper_end = helper_scope
+            .find("\n}\n")
+            .expect("hyprland title-bar drag helper end");
+        &helper_scope[..helper_end]
     }
 
     #[test]
     fn hyprland_parent_title_bar_has_no_drag_or_move() {
-        let branch = hyprland_branch_source();
+        let source = normalized_source(SOURCE);
+        let branch = hyprland_branch_source(&source);
         let parent_start = branch
             .find(PARENT_ID)
             .expect("parent title-bar id in Hyprland branch");
@@ -379,14 +395,8 @@ mod hyprland_title_bar_tests {
 
     #[test]
     fn hyprland_title_bar_drag_owns_drag_and_move() {
-        let helper_start = SOURCE
-            .find("fn hyprland_title_bar_drag_region")
-            .expect("hyprland title-bar drag helper");
-        let helper_scope = &SOURCE[helper_start..];
-        let helper_end = helper_scope
-            .find("\n}\n")
-            .expect("hyprland title-bar drag helper end");
-        let helper_scope = &helper_scope[..helper_end];
+        let source = normalized_source(SOURCE);
+        let helper_scope = hyprland_drag_helper_scope(&source);
 
         assert!(
             helper_scope.contains(DRAG_ID),
@@ -401,7 +411,7 @@ mod hyprland_title_bar_tests {
             "title-bar-drag must call {MOVE_TOKEN}"
         );
 
-        let branch = hyprland_branch_source();
+        let branch = hyprland_branch_source(&source);
         assert!(
             branch.contains("hyprland_title_bar_drag_region()"),
             "Hyprland branch must mount title-bar-drag via hyprland_title_bar_drag_region"
@@ -409,22 +419,50 @@ mod hyprland_title_bar_tests {
     }
 
     #[test]
+    fn hyprland_drag_helper_end_scan_handles_crlf_line_endings() {
+        const CRLF_HELPER_END: &str = "\r\n}\r\n";
+        const CRLF_FIXTURE: &str = concat!(
+            "#[cfg(target_os = \"linux\")]\r\n",
+            "fn hyprland_title_bar_drag_region() {\r\n",
+            "    div()\r\n",
+            "        .id(\"title-bar-drag\")\r\n",
+            "        .window_control_area(WindowControlArea::Drag)\r\n",
+            "        .on_mouse_down(MouseButton::Left, |_, window, _| {\r\n",
+            "            window.start_window_move();\r\n",
+            "        })\r\n",
+            "}\r\n",
+        );
+
+        assert!(
+            CRLF_FIXTURE.contains(CRLF_HELPER_END),
+            "fixture must contain exact CRLF helper end token"
+        );
+
+        let source = normalized_source(CRLF_FIXTURE);
+        let helper_scope = hyprland_drag_helper_scope(&source);
+        assert!(helper_scope.contains(DRAG_ID));
+        assert!(helper_scope.contains(DRAG_TOKEN));
+        assert!(helper_scope.contains(MOVE_TOKEN));
+    }
+
+    #[test]
     fn hyprland_title_bar_drag_region_calls_are_linux_cfg_gated() {
         const CALL: &str = "hyprland_title_bar_drag_region()";
         const LINUX_CFG: &str = r#"#[cfg(target_os = "linux")]"#;
 
+        let source = normalized_source(SOURCE);
         let mut search_from = 0;
         let mut call_sites = 0;
-        while let Some(rel) = SOURCE[search_from..].find(CALL) {
+        while let Some(rel) = source[search_from..].find(CALL) {
             let at = search_from + rel;
-            let is_definition = at >= 3 && SOURCE.get(at - 3..at) == Some("fn ");
+            let is_definition = at >= 3 && source.get(at - 3..at) == Some("fn ");
             if !is_definition {
                 call_sites += 1;
-                let prefix = &SOURCE[..at];
+                let prefix = &source[..at];
                 let cfg_at = prefix
                     .rfind(LINUX_CFG)
                     .expect("linux cfg must gate hyprland_title_bar_drag_region call");
-                let cfg_gap = &SOURCE[cfg_at..at];
+                let cfg_gap = &source[cfg_at..at];
                 assert!(
                     !cfg_gap.contains(r#"#[cfg(not(target_os = "linux"))]"#),
                     "hyprland_title_bar_drag_region call must not be under not(linux) cfg"
