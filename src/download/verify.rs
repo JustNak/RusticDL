@@ -1,5 +1,3 @@
-//! Optional SHA-256 verify of `.part` before finalize rename.
-
 use std::io::Read;
 use std::path::Path;
 
@@ -15,13 +13,11 @@ pub const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934c
 #[cfg(test)]
 pub const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-/// Hex-encode SHA-256 of `data`.
 #[cfg(test)]
 pub fn sha256_hex(data: &[u8]) -> String {
     to_hex(&Sha256::digest(data))
 }
 
-/// Stream SHA-256 of a file (blocking). Used via `spawn_blocking` on the worker path.
 pub fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -36,8 +32,6 @@ pub fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
     Ok(to_hex(&hasher.finalize()))
 }
 
-/// Normalize a user-supplied SHA-256 hex string: trim + lowercase.
-/// Returns `None` unless the remainder is exactly 64 ASCII hex digits.
 pub fn normalize_sha256_hex(input: &str) -> Option<String> {
     let s = input.trim();
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -46,11 +40,6 @@ pub fn normalize_sha256_hex(input: &str) -> Option<String> {
     Some(s.to_ascii_lowercase())
 }
 
-/// After a successful transfer, hash `temp_path` when `expected` is `Some`.
-///
-/// - `None` → skip (Ok)
-/// - match → Ok
-/// - mismatch / invalid expected / unreadable file → Err (caller keeps `.part`)
 pub async fn verify_sha256_if_expected(
     temp_path: &Path,
     expected: Option<&str>,

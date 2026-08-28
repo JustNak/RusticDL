@@ -1,9 +1,3 @@
-//! Process-wide token-bucket bandwidth limiter shared by all transfer bodies.
-//!
-//! **Placement:** callers charge after a network read and before the disk write
-//! so concurrent jobs share one budget and TCP eventually back-pressures. Short
-//! bursts up to the bucket capacity (`max(2×rate, 64 KiB)`) are expected after
-//! idle; that is intentional shaping, not a failed limit.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -12,33 +6,26 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
 
-/// Shared global download bandwidth limiter.
 pub struct GlobalBandwidthLimiter {
     state: Mutex<LimiterState>,
     notify: Notify,
 }
 
 struct LimiterState {
-    /// Bytes per second. `None` means unlimited.
     rate: Option<u64>,
     tokens: f64,
     capacity: f64,
     last_refill: Instant,
 }
 
-/// Result of trying to take tokens under the lock.
 enum TryTake {
-    /// Unlimited or enough tokens charged.
     Done,
-    /// Need to wait this long (or until notified) before retrying.
     Wait(Duration),
 }
 
 impl GlobalBandwidthLimiter {
-    /// Max bytes a single wait loop iteration may charge (callers may pass larger `n`).
     pub const MAX_ACQUIRE_QUANTUM: usize = 64 * 1024;
 
-    /// While waiting with a control signal, re-check at least this often.
     const CONTROL_POLL: Duration = Duration::from_millis(50);
 
     pub fn new(bytes_per_second: Option<u64>) -> Arc<Self> {
@@ -55,11 +42,9 @@ impl GlobalBandwidthLimiter {
         })
     }
 
-    /// Hot-update the rate. Wakes all waiters so unlimited / higher limits apply promptly.
     pub async fn set_limit(&self, bytes_per_second: Option<u64>) {
         {
             let mut state = self.state.lock().await;
-            // Accrue under the old rate before changing capacity.
             refill(&mut state);
             let rate = normalize_rate(bytes_per_second);
             state.rate = rate;
@@ -71,10 +56,6 @@ impl GlobalBandwidthLimiter {
         self.notify.notify_waiters();
     }
 
-    /// Block until `n` bytes may proceed. Splits into ≤ [`MAX_ACQUIRE_QUANTUM`] chunks.
-    ///
-    /// When `control` is `Some` and becomes non-zero (pause/cancel), returns `false`
-    /// without charging remaining quanta. Unlimited / zero-rate is a fast path.
     pub async fn acquire(&self, n: usize, control: Option<&AtomicU8>) -> bool {
         if n == 0 {
             return true;
@@ -100,9 +81,7 @@ impl GlobalBandwidthLimiter {
                 return false;
             }
 
-            // Create + pin the wait future, then enable it *under the mutex* after
-            // re-checking the condition so notify_waiters cannot be lost between
-            // unlock and first poll (Notify does not store waiter permits).
+            // Notify lost-wakeup: enable the waiter under the mutex after re-checking tokens.
             let mut notified = std::pin::pin!(self.notify.notified());
             let wait_for = {
                 let mut state = self.state.lock().await;
@@ -112,7 +91,6 @@ impl GlobalBandwidthLimiter {
                         if control.is_some() {
                             wait_for = wait_for.min(Self::CONTROL_POLL);
                         }
-                        // Register as a waiter while still holding the lock.
                         notified.as_mut().enable();
                         wait_for
                     }
@@ -178,12 +156,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rate_under_n_acquirers() {
-        // 64 KiB/s shared across 4 concurrent acquirers.
-        // Capacity is max(2*rate, 64KiB) = 128 KiB, so transfer well above burst.
         let rate = 64 * 1024u64;
         let limiter = GlobalBandwidthLimiter::new(Some(rate));
         let total = Arc::new(AtomicU64::new(0));
-        // 4 × 64 KiB = 256 KiB total → ~2s after 128 KiB burst at 64 KiB/s.
         let per_task = 64 * 1024usize;
         let tasks = 4usize;
 
@@ -216,8 +191,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn set_limit_unblocks_waiters() {
-        // Capacity is max(2*rate, 64 KiB) = 64 KiB at 1 B/s — drain it first so
-        // the next acquire must wait (otherwise the burst returns immediately).
         let limiter = GlobalBandwidthLimiter::new(Some(1)); // 1 byte/s
         assert!(
             limiter
@@ -238,7 +211,6 @@ mod tests {
             .await
             .expect("acquire should unblock after set_limit(None)")
             .expect("task");
-        // Missed notify would sleep up to 2s; a correct wake is near-instant.
         assert!(
             t0.elapsed() < Duration::from_millis(500),
             "set_limit should wake promptly, elapsed {:?}",
@@ -248,8 +220,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acquire_aborts_on_control() {
-        // Capacity is max(2*rate, 64 KiB) = 64 KiB at 1 B/s — drain it first so
-        // the next acquire must wait (and can observe pause).
         let limiter = GlobalBandwidthLimiter::new(Some(1));
         assert!(limiter.acquire(64 * 1024, None).await);
 

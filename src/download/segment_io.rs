@@ -1,12 +1,3 @@
-//! Positioned concurrent writes into a single multi-segment `.part` file.
-//!
-//! Network work is parallel; disk writes are intentionally serialized under a
-//! short `std::sync::Mutex` around `seek_write` (Windows) / seek+write (other).
-//!
-//! # Async runtime
-//! All methods take a blocking mutex and perform disk IO. Call from a blocking
-//! context (`tokio::task::spawn_blocking` / dedicated pool), not on a tokio
-//! worker under multi-segment load.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,15 +9,11 @@ use std::io::{Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 
-/// Shared handle for multi-segment positioned writes into one `.part` file.
-///
-/// **Blocking:** see module docs — use `spawn_blocking` from async workers.
 pub struct SegmentFileWriter {
     file: Mutex<File>,
 }
 
 impl SegmentFileWriter {
-    /// Open (or create) `path` for read/write positioned IO.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -38,21 +25,12 @@ impl SegmentFileWriter {
         })
     }
 
-    /// Write `data` starting at `offset`, hard-capped so no byte past
-    /// `end_inclusive` is written.
-    ///
-    /// Returns the number of bytes written. A value less than `data.len()` means
-    /// the **end-cap truncated** the buffer — the returned prefix is fully
-    /// committed (short OS writes are retried inside the lock). Zero-length
-    /// `data` is a no-op. Writing with `offset` past the end-cap returns
-    /// `InvalidInput`.
     #[must_use = "short count means the end-cap truncated; credit only the returned length"]
     pub fn write_at(&self, offset: u64, data: &[u8], end_inclusive: u64) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
 
-        // Inclusive end → exclusive upper bound (checked add for u64::MAX).
         let end_exclusive = end_inclusive
             .checked_add(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "segment end overflow"))?;
@@ -64,7 +42,6 @@ impl SegmentFileWriter {
             ));
         }
 
-        // Portable: never cast a u64 span larger than usize to usize first.
         let max_len = (end_exclusive - offset).min(data.len() as u64) as usize;
         let to_write = &data[..max_len];
 
@@ -77,7 +54,6 @@ impl SegmentFileWriter {
         Ok(to_write.len())
     }
 
-    /// Flush OS buffers for this file (data only; metadata may lag).
     pub fn flush_sync_data(&self) -> io::Result<()> {
         let file = self
             .file
@@ -86,7 +62,6 @@ impl SegmentFileWriter {
         file.sync_data()
     }
 
-    /// Extend or truncate the file to `len` (used after free-space preallocate gate).
     pub fn set_len(&self, len: u64) -> io::Result<()> {
         let file = self
             .file
@@ -96,12 +71,10 @@ impl SegmentFileWriter {
     }
 }
 
-/// Loop until the entire slice is written (or hard-error). Mirrors `write_all`.
 #[cfg(windows)]
 fn write_all_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
     let mut done = 0usize;
     while done < data.len() {
-        // FileExt::seek_write takes &self.
         let n = file.seek_write(&data[done..], offset + done as u64)?;
         if n == 0 {
             return Err(io::Error::new(
@@ -120,11 +93,6 @@ fn write_all_at_locked(file: &mut File, offset: u64, data: &[u8]) -> io::Result<
     file.write_all(data)
 }
 
-/// Pure free-space decision for preallocate (unit-testable without disk API).
-///
-/// - `Err(())` → insufficient free space for remaining (Disk)
-/// - `Ok(false)` → skip preallocate (unknown free / below margin)
-/// - `Ok(true)` → proceed with `set_len`
 pub fn preallocate_decision(
     free: Option<u64>,
     remaining: u64,
@@ -146,14 +114,6 @@ pub fn preallocate_decision(
     }
 }
 
-/// Preallocate `path` to `total_bytes` only when free space is known and
-/// sufficient for `remaining_to_write` plus margin.
-///
-/// Returns:
-/// - `Ok(true)` — `set_len` applied
-/// - `Ok(false)` — free space unknown or below preallocate margin; caller may
-///   extend-on-write (`preallocated = false`)
-/// - `Err` — free space known and insufficient for remaining bytes (Disk)
 pub async fn try_preallocate(
     path: &Path,
     total_bytes: u64,
@@ -205,7 +165,6 @@ mod tests {
     fn write_at_end_cap_truncates() {
         let path = temp_part();
         let writer = SegmentFileWriter::open(&path).unwrap();
-        // Segment owns bytes 0..=9 (10 bytes).
         let n = writer.write_at(8, b"ABCDEF", 9).unwrap();
         assert_eq!(n, 2, "only bytes 8 and 9 may be written");
         writer.flush_sync_data().unwrap();
@@ -244,7 +203,6 @@ mod tests {
     fn two_threads_non_overlapping_writes() {
         let path = temp_part();
         let writer = Arc::new(SegmentFileWriter::open(&path).unwrap());
-        // 64 KiB file, two halves.
         let half = 32 * 1024usize;
         let end0 = (half as u64) - 1;
         let end1 = (2 * half as u64) - 1;

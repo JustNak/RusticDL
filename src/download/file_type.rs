@@ -1,6 +1,4 @@
-//! File-type taxonomy shared by save-path routing, the sidebar library, and queue icons.
 
-/// Download category inferred from the last filename extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileTypeKind {
     Video,

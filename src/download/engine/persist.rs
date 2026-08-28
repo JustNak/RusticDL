@@ -1,6 +1,3 @@
-//! Engine-owned job persist. `JobStore` is I/O only; the actor serializes writes
-//! by re-reading live `EngineInner.jobs` so a stale snapshot cannot win.
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,7 +21,6 @@ impl JobStore for FileJobStore {
     }
 }
 
-/// Test double. Records snapshots; never touches disk.
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemoryJobStore {
@@ -62,7 +58,6 @@ pub(super) async fn persist_actor(
     }
 }
 
-/// Queue one write of the current live queue. Never pass a caller-built Vec.
 pub(super) async fn persist_live_jobs(inner: &Arc<Mutex<EngineInner>>) -> Result<(), String> {
     let tx = {
         let guard = inner.lock().await;
@@ -76,7 +71,6 @@ pub(super) async fn persist_live_jobs(inner: &Arc<Mutex<EngineInner>>) -> Result
         .unwrap_or_else(|_| Err("persist worker dropped".into()))
 }
 
-/// In-memory apply plus disk persist via the engine actor.
 pub(crate) struct EngineIdentity {
     pub(super) inner: Arc<Mutex<EngineInner>>,
 }
@@ -90,7 +84,6 @@ impl IdentityCommit for EngineIdentity {
             let identity_wiped = guard.requeue_on_cancel.contains_key(&job.id)
                 || guard.pending_partial_deletes.contains_key(&job.id);
             if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
-                // Restart / cancel+delete already wiped identity; do not restore the worker's map.
                 if identity_wiped
                     && canonical.segment_map.is_none()
                     && canonical.transfer_format_version == 0
@@ -241,9 +234,6 @@ mod tests {
             guard.persist_tx.clone()
         };
 
-        // Persist is queued while the job lock is held. The actor blocks on that
-        // lock to clone live jobs; both identities are applied before it can write.
-        // A caller-built snapshot taken when the persist was queued would be v0/v0.
         let (ack_tx, ack_rx) = oneshot::channel();
         {
             let mut guard = inner.lock().await;

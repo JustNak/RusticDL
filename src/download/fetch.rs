@@ -1,5 +1,3 @@
-//! Shared transfer GET: Range / If-Range, H3 fallback, redirect follow, status classify.
-
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -16,7 +14,6 @@ use super::job::{
     WorkerControl,
 };
 
-/// Timeout for HEAD / Range 0-0 preflight probes.
 pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const MAX_REDIRECTS: u32 = 10;
 
@@ -41,7 +38,6 @@ pub fn store_control(control: &AtomicU8, value: WorkerControl) {
     control.store(raw, Ordering::Relaxed);
 }
 
-/// Open-ended (`bytes=N-`) or closed inclusive (`bytes=N-M`) transfer Range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeSpec {
     Open { start: u64 },
@@ -95,16 +91,11 @@ pub enum RangeStatus {
     },
 }
 
-/// Kind of transfer request sharing handoff / referer / identity headers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TransferRequestKind {
-    /// GET with optional open-ended Range resume (`bytes=N-`).
     Get { existing_bytes: u64 },
-    /// GET closed Range (`bytes={start}-{end}`, inclusive) for multi-segment.
     GetClosed { start: u64, end: u64 },
-    /// HEAD preflight probe.
     Head,
-    /// GET `Range: bytes=0-0` Accept-Ranges / size probe.
     RangeProbe,
 }
 
@@ -151,7 +142,6 @@ pub async fn fetch_range(req: FetchRequest<'_>) -> Result<FetchOutcome, Download
     })
 }
 
-/// Follow `Location` hops. `send_once` issues one request at `current` (caller sets timeout).
 pub async fn send_following_redirects<F, Fut>(
     start_url: &str,
     control: &AtomicU8,
@@ -210,8 +200,6 @@ where
     }
 }
 
-/// Build a transfer request (preflight HEAD/Range probe or download GET).
-/// Applies same-origin handoff, identity encoding, and browser-like Referer.
 pub(crate) fn build_transfer_request(
     client: &Client,
     kind: TransferRequestKind,
@@ -265,7 +253,6 @@ pub(crate) fn build_transfer_request(
     request
 }
 
-/// Build a GET for the download transfer (identity encoding, optional Range/If-Range, Referer).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_download_request(
     client: &Client,
@@ -288,7 +275,6 @@ pub(crate) fn build_download_request(
     )
 }
 
-/// Resolve a redirect Location against the current URL (absolute or relative).
 pub(crate) fn resolve_redirect_location(
     current: &str,
     location: &str,
@@ -361,7 +347,6 @@ pub(crate) fn content_range_size_mismatch(
     }
 }
 
-/// Full error chain for UI: top-level message + nested causes + optional filter hint.
 pub fn format_reqwest_error(error: &reqwest::Error) -> String {
     let chain = format_error_chain(error);
     if looks_like_tls_interference(&chain) {
@@ -557,7 +542,6 @@ fn connect_error_tcp(error: &reqwest::Error) -> DownloadError {
     )
 }
 
-/// User-visible Resume error when a segment GET gets a 200 for a non-zero Range.
 pub(crate) const RANGE_IGNORED_MESSAGE: &str =
     "Server ignored Range on a multi-segment resume. Use Restart.";
 

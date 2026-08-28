@@ -1,5 +1,3 @@
-//! Add / enqueue command handler.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,7 +21,6 @@ pub(super) async fn handle(
     conflict: FilenameConflictPolicy,
     reply: Option<oneshot::Sender<EnqueueOutcome>>,
 ) {
-    // Split newlines/spaces and glued pastes (…tokenhttps://other…).
     let mut urls = extract_http_urls(&url);
     if urls.is_empty() {
         let trimmed = url.trim().to_string();
@@ -37,11 +34,8 @@ pub(super) async fn handle(
     let mut added = 0u32;
     let mut skipped = 0u32;
     let mut last_error: Option<String> = None;
-    // Insert newest-first while preserving paste order (first URL ends up on top).
     let mut new_jobs = Vec::new();
-    // First successfully enqueued job in this Add (Queued reply when added > 0).
     let mut first_outcome: Option<EnqueueOutcome> = None;
-    // First active-duplicate identity (pure-dup reply/toast when added == 0).
     let mut first_dup: Option<(String, String)> = None;
 
     {
@@ -65,8 +59,6 @@ pub(super) async fn handle(
                 continue;
             }
 
-            // Active exact request-URL match: skip (Paused counts as active).
-            // Also check jobs created earlier in this batch.
             if let Some(existing) = find_active_duplicate(&guard.jobs, &url)
                 .or_else(|| find_active_duplicate(&new_jobs, &url))
             {
@@ -77,7 +69,6 @@ pub(super) async fn handle(
                 continue;
             }
 
-            // Suggested filename applies to the first successfully enqueued job only.
             let preferred = if first_outcome.is_none() {
                 filename
                     .as_ref()
@@ -89,7 +80,6 @@ pub(super) async fn handle(
                 derive_filename_from_url(&url).unwrap_or_else(|| "download.bin".into())
             };
 
-            // Overwrite applies to the first successfully enqueued job only.
             let policy = if first_outcome.is_none() {
                 conflict
             } else {
@@ -131,8 +121,6 @@ pub(super) async fn handle(
         if added == 0 {
             drop(guard);
             if skipped > 0 {
-                // Pure-dup path: always reply when oneshot present (never drop).
-                // first_dup is set on every skip that increments skipped.
                 if let Some((dup_id, dup_name)) = first_dup {
                     if let Some(reply) = reply {
                         let _ = reply.send(EnqueueOutcome {
@@ -148,7 +136,6 @@ pub(super) async fn handle(
                     };
                     emit_toast(inner, message).await;
                 } else {
-                    // Defensive: skipped > 0 without identity — treat like invalid.
                     emit_toast(
                         inner,
                         last_error.unwrap_or_else(|| "No valid download URLs found.".into()),
@@ -162,15 +149,11 @@ pub(super) async fn handle(
                 last_error.unwrap_or_else(|| "No valid download URLs found.".into()),
             )
             .await;
-            // Leave reply dropped: IPC already validates URLs; UI Add path has no reply.
             return;
         }
 
-        // Reverse so the first pasted URL is the first job in the list (insert 0 order).
         for job in new_jobs.into_iter().rev() {
             if let Some(auth) = handoff_auth.as_ref() {
-                // Attach browser session auth only to the first successfully
-                // enqueued job in this Add (matches first_outcome).
                 if first_outcome
                     .as_ref()
                     .is_some_and(|outcome| outcome.job_id == job.id)

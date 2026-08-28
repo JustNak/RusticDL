@@ -1,5 +1,3 @@
-//! Settings and job-list replacement commands.
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -16,7 +14,6 @@ pub(super) async fn update_settings(
     let limiter = {
         let mut guard = inner.lock().await;
         let limit = config.speed_limit_bytes_per_second();
-        // In-flight permits stay on the previous Arc and drain on drop.
         guard.conn_budget = ConnectionBudget::new(
             config.max_total_connections,
             config.max_connections_per_host,
@@ -26,7 +23,6 @@ pub(super) async fn update_settings(
         guard.wake.notify_one();
         (limiter, limit)
     };
-    // Hot-set outside the engine lock; wakes blocked acquires.
     limiter.0.set_limit(limiter.1).await;
 }
 

@@ -1,10 +1,3 @@
-//! Stable remaining-time estimates from noisy 400ms throughput windows.
-//!
-//! Instantaneous `remaining / window_speed` jumps whenever TCP, disk, or a
-//! multi-segment burst moves the last measurement. The UI should count down
-//! smoothly and only revise upward when the new estimate is clearly worse.
-
-/// Exponential moving average of throughput plus hysteresis on the shown ETA.
 #[derive(Debug, Clone)]
 pub struct EtaSmoother {
     ema_bps: Option<f64>,
@@ -18,11 +11,8 @@ impl Default for EtaSmoother {
 }
 
 impl EtaSmoother {
-    /// Blend toward each new 400ms sample. 0.22 ≈ 1.5s time constant.
     const ALPHA: f64 = 0.22;
-    /// Ease the displayed ETA toward the raw estimate (both directions).
     const DISPLAY_ALPHA: f64 = 0.28;
-    /// Only jump the shown ETA up when the raw estimate is this much worse.
     const RAISE_RATIO: f64 = 1.35;
     const RAISE_FLOOR_SECS: u64 = 8;
 
@@ -33,10 +23,6 @@ impl EtaSmoother {
         }
     }
 
-    /// Feed one measurement window.
-    ///
-    /// Returns `(smoothed_speed_bps, stable_eta_secs)`. Speed `0` and unknown
-    /// remaining (`remaining == 0` with no total) yield ETA `0` (UI "—").
     pub fn observe(&mut self, instant_bps: u64, remaining: u64) -> (u64, u64) {
         let speed = self.push_speed(instant_bps);
         if remaining == 0 || speed == 0 {
@@ -50,12 +36,10 @@ impl EtaSmoother {
         (speed, eta)
     }
 
-    /// Last EMA throughput, if any sample has been accepted.
     pub fn last_speed(&self) -> Option<u64> {
         self.ema_bps.map(|s| s.round() as u64)
     }
 
-    /// Last stabilized ETA, if any.
     pub fn last_eta(&self) -> Option<u64> {
         self.shown_eta
     }
@@ -148,7 +132,6 @@ mod tests {
         }
         let raw_low = raw_eta_secs(1_500_000, remaining);
         let raw_high = raw_eta_secs(12_000_000, remaining);
-        // Smoothed ETA must sit strictly between the worst and best raw spikes.
         assert!(
             last > raw_high && last < raw_low,
             "smoothed {last} should be between raw high {raw_high} and raw low {raw_low}"
@@ -160,8 +143,6 @@ mod tests {
         let mut s = EtaSmoother::new();
         let (_, first) = s.observe(10_000_000, 100_000_000);
         assert_eq!(first, 10);
-        // Instant 2_424_241 bps → EMA 8_333_333; 100_000_000 / 8_333_333 == 12.
-        // 12 > 10 but inside RAISE_FLOOR_SECS (8) and RAISE_RATIO (1.35).
         let (_, second) = s.observe(2_424_241, 100_000_000);
         assert_eq!(
             second, first,
@@ -173,7 +154,6 @@ mod tests {
     fn large_slowdown_does_raise_display() {
         let mut s = EtaSmoother::new();
         s.observe(10_000_000, 100_000_000); // 10s
-                                            // Several ticks at 2 MB/s so EMA and raise hysteresis both move.
         let mut eta = 0;
         for _ in 0..8 {
             eta = s.observe(2_000_000, 90_000_000).1;

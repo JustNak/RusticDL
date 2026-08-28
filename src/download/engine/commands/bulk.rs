@@ -1,5 +1,3 @@
-//! Bulk queue commands (pause all, resume all, retry all).
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

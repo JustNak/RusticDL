@@ -1,11 +1,4 @@
-//! HEAD + Range probes (size, real Range support, validators, URL pin).
-//!
-//! Shares the transfer request builder so browser handoff headers apply the same way
-//! as the download path. Best-effort: failures return `None` and never block enqueue.
-//!
-//! Multi-segment is allowed only after a GET `Range` returns 206 — HEAD
-//! `Accept-Ranges: bytes` is not enough (many hosts lie). A second GET at a
-//! non-zero offset confirms later segments can resume.
+//! HEAD `Accept-Ranges: bytes` is not enough (many hosts lie).
 
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED,
@@ -21,31 +14,21 @@ use super::fetch::{
 use super::filesystem::{parse_content_disposition_filename, parse_content_range};
 use super::handoff::HandoffAuth;
 
-/// Planner / transfer input from a successful preflight probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightInfo {
     pub total_bytes: Option<u64>,
     pub filename: Option<String>,
-    /// `None` = unknown (header absent and probe inconclusive).
     pub accept_ranges: Option<bool>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    /// Final URL after following redirects (pin for multi / reconnect).
     pub final_url: String,
 }
 
-/// How aggressively preflight should prove Range support.
-///
-/// Transfer entry skips body probes when a v1 map is missing/inconsistent
-/// (never invent Range / fetch a body) and skips confirmation when the
-/// planner cannot choose multi (legacy v0 partial, or size already below min).
+// v1 map missing/inconsistent: never invent Range / fetch a body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreflightPlan {
-    /// HEAD only — no GET (resume-required jobs).
     pub skip_range_probes: bool,
-    /// Confirm GET `0-0` / `1-1` when multi might still qualify.
     pub prove_ranges: bool,
-    /// Used to skip confirmation after HEAD already shows `size < min`.
     pub multi_min_bytes: u64,
 }
 
@@ -59,15 +42,6 @@ impl Default for PreflightPlan {
     }
 }
 
-/// Run HEAD (8s), then confirm Range with GET probes.
-///
-/// Uses the shared transfer request builder (handoff + referer + identity). Returns
-/// `None` on network/HTTP failure so the transfer can still start without preflight.
-///
-/// HEAD transport failure still attempts a Range probe from `start_url` (some CDNs
-/// mishandle HEAD while Range GET works). Filename is only from Content-Disposition
-/// when present — never URL-derived (GET path owns rename + path update).
-///
 /// `Accept-Ranges: none` skips Range confirmation. Otherwise GET `bytes=0-0`
 /// must be 206 to claim ranges; a 200 means the server ignored Range. When
 /// size is known, at or above `multi_min_bytes`, and greater than 1 byte,
@@ -114,13 +88,10 @@ pub async fn run_preflight_planned(
         return None;
     }
 
-    // Prefer Content-Length header: `Response::content_length()` is body size_hint
-    // (empty/unknown for HEAD), not the advertised entity length.
     let mut total_bytes = None;
     let mut accept_ranges = None;
     let mut etag = None;
     let mut last_modified = None;
-    // CD only — never URL-derive (would clobber uniquified / user-chosen names).
     let mut filename = None;
     let mut resolved = start_url.to_string();
     let mut head_ok = false;
@@ -128,7 +99,6 @@ pub async fn run_preflight_planned(
     if let Some((head_response, final_url)) = head_result {
         resolved = final_url;
         let status = head_response.status();
-        // Some CDNs reject HEAD; fall through to Range probe from the last URL.
         head_ok = status.is_success();
         if head_ok {
             total_bytes = content_length_header(head_response.headers());
@@ -143,16 +113,12 @@ pub async fn run_preflight_planned(
         }
         drop(head_response);
     }
-    // HEAD transport failure: still try Range 0-0 from start_url (resolved unchanged).
 
     if plan.skip_range_probes {
         if !head_ok {
             return None;
         }
     } else {
-        // Confirm Range unless HEAD already said `none`, the file is already
-        // below min, or the planner cannot choose multi. Size-only hosts still
-        // probe so we can read Content-Range / Content-Length.
         let below_min = total_bytes.is_some_and(|n| n < plan.multi_min_bytes);
         let need_zero_probe = total_bytes.is_none()
             || (plan.prove_ranges && !below_min && accept_ranges != Some(false));
@@ -179,15 +145,12 @@ pub async fn run_preflight_planned(
                 );
                 drop(probe_response);
             } else if !head_ok {
-                // Neither HEAD (success or transport) nor probe succeeded.
                 return None;
             }
         } else if !head_ok {
             return None;
         }
 
-        // Multi needs a non-zero Range (later segments never start at 0).
-        // Only a 200 (ignored Range) disables multi; 403/5xx is inconclusive.
         let below_min = total_bytes.is_some_and(|n| n < plan.multi_min_bytes);
         if plan.prove_ranges
             && !below_min
@@ -236,7 +199,6 @@ fn apply_zero_range_probe(
     if probe_status == StatusCode::PARTIAL_CONTENT {
         *accept_ranges = Some(true);
     } else if probe_status.is_success() {
-        // 200 = full entity; server ignored Range.
         *accept_ranges = Some(false);
     } else if accept_ranges.is_none() {
         if let Some(ar) = parse_accept_ranges(probe_response.headers()) {
@@ -276,7 +238,6 @@ fn apply_zero_range_probe(
     }
 }
 
-/// Parse `Accept-Ranges`: `bytes` → true, `none` → false, absent/other → unknown.
 pub fn parse_accept_ranges(headers: &reqwest::header::HeaderMap) -> Option<bool> {
     let value = headers.get(ACCEPT_RANGES)?.to_str().ok()?;
     let lower = value.to_ascii_lowercase();
@@ -312,8 +273,6 @@ fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
-/// Find the session gateway's Location without requesting the signed hop.
-///
 /// Canvas `/files/:id/download` 302s to a one-time Inst-FS / Drive URL. Following
 /// that hop here (HEAD or Range 0-0) consumes the token; the transfer GET then
 /// 401s. Callers pin the Location and let the first transfer request use it.
@@ -353,7 +312,6 @@ pub async fn discover_handoff_location(
             return None;
         }
         if status.is_success() {
-            // File is at the session URL itself — no one-time hop to protect.
             return None;
         }
     }
@@ -416,7 +374,6 @@ mod tests {
         assert_eq!(parse_accept_ranges(&headers), None);
     }
 
-    /// Minimal HTTP/1.1 mock: records request lines + headers, serves scripted replies.
     async fn spawn_scripted_server(
         replies: Vec<String>,
     ) -> (
@@ -436,7 +393,6 @@ mod tests {
                 };
                 let mut buf = vec![0u8; 8192];
                 let mut collected = Vec::new();
-                // Read until end of headers.
                 loop {
                     let n = match socket.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
@@ -632,7 +588,6 @@ ETag: \"v1\"\r\n\
 
     #[tokio::test]
     async fn preflight_strips_cookie_cross_origin() {
-        // Job URL is a different origin; request hits mock without Cookie.
         let head = "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
 Accept-Ranges: bytes\r\n\
@@ -642,7 +597,6 @@ Content-Length: 50\r\n\
         let (base, mut reqs, _handle) =
             spawn_scripted_server(vec![head, range_206(50, 0), range_206(50, 1)]).await;
         let request_url = format!("{base}/file.bin");
-        // Different host → cross-origin vs request_url.
         let job_url = "https://cdn.example.com/file.bin";
         let client = download_client().unwrap();
         let control = AtomicU8::new(0);
@@ -669,7 +623,6 @@ Content-Length: 50\r\n\
     #[tokio::test]
     async fn preflight_pins_final_url_after_redirect() {
         let (base, _reqs, _handle) = {
-            // Build replies after we know base — two-phase: bind first.
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let base = format!("http://{addr}");
@@ -735,7 +688,6 @@ ETag: \"final\"\r\n\
 
     #[tokio::test]
     async fn range_probe_sets_accept_ranges_when_head_unknown() {
-        // HEAD without Accept-Ranges / length → Range 0-0 206.
         let head = "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
 \r\n"
@@ -798,13 +750,11 @@ Content-Length: 10\r\n\
 
         assert_eq!(info.final_url, url);
         assert_eq!(info.total_bytes, Some(10));
-        // Pause control is respected as abort → None on next call after set.
         control.store(1, Ordering::Relaxed);
         let aborted = run_preflight(&client, &url, &url, None, &control).await;
         assert!(aborted.is_none());
     }
 
-    /// HEAD transport failure (peer closes without response) still tries Range 0-0.
     #[tokio::test]
     async fn head_transport_fail_still_tries_range_probe() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -813,7 +763,6 @@ Content-Length: 10\r\n\
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
         let _handle = tokio::spawn(async move {
-            // First connection: HEAD — close without writing (transport failure).
             if let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 8192];
                 let mut collected = Vec::new();
@@ -828,10 +777,8 @@ Content-Length: 10\r\n\
                     }
                 }
                 let _ = tx.send(String::from_utf8_lossy(&collected).to_string());
-                // Drop without response.
                 drop(socket);
             }
-            // Second connection: Range probe GET → 206.
             if let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 8192];
                 let mut collected = Vec::new();
@@ -855,7 +802,6 @@ Accept-Ranges: bytes\r\n\
                 let _ = socket.write_all(probe.as_bytes()).await;
                 let _ = socket.shutdown().await;
             }
-            // Third connection: non-zero Range confirm.
             if let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 8192];
                 let mut collected = Vec::new();
@@ -894,10 +840,8 @@ Accept-Ranges: bytes\r\n\
         assert!(get_req.to_ascii_lowercase().contains("range: bytes=0-0"));
     }
 
-    /// Full preflight soft-fail (nothing answers) returns None — caller must not hard-error.
     #[tokio::test]
     async fn preflight_transport_fail_returns_none() {
-        // Nothing listening — connection refused.
         let url = "http://127.0.0.1:1/nope.bin";
         let client = download_client().unwrap();
         let control = AtomicU8::new(0);
@@ -905,7 +849,6 @@ Accept-Ranges: bytes\r\n\
         assert!(info.is_none(), "preflight must soft-fail, not panic");
     }
 
-    /// Soft-fail path: preflight None, then transfer GET still completes.
     #[tokio::test]
     async fn preflight_soft_fail_does_not_abort_transfer() {
         use crate::download::bandwidth::GlobalBandwidthLimiter;
@@ -924,7 +867,6 @@ Accept-Ranges: bytes\r\n\
         let body = b"hello-soft-fail";
 
         let _handle = tokio::spawn(async move {
-            // Serve a few requests: preflight HEAD (drop), Range probe (drop), then GET body.
             for _ in 0..4 {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
@@ -943,16 +885,13 @@ Accept-Ranges: bytes\r\n\
                 }
                 let req = String::from_utf8_lossy(&collected).to_string();
                 if req.starts_with("HEAD ") {
-                    // Transport fail for HEAD.
                     drop(socket);
                     continue;
                 }
                 if req.to_ascii_lowercase().contains("range: bytes=0-0") {
-                    // Fail Range probe too → full preflight None.
                     drop(socket);
                     continue;
                 }
-                // Full download GET.
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
@@ -1002,7 +941,6 @@ Accept-Ranges: bytes\r\n\
         let data = std::fs::read(&target).expect("final file");
         assert_eq!(data, body);
 
-        // Preflight produced no patch (None); transfer still emitted progress.
         let seen = patches.lock().unwrap();
         assert!(
             !seen.is_empty(),
@@ -1056,7 +994,6 @@ Content-Length: 99\r\n\
         let info = run_preflight(&client, &ctx.job.url, &ctx.resolved_url, None, &ctx.control)
             .await
             .expect("preflight");
-        // Same assignment path as run_http_download_with_ctx.
         ctx.resolved_url = info.final_url.clone();
         assert_eq!(ctx.resolved_url, url);
         assert_eq!(info.total_bytes, Some(99));

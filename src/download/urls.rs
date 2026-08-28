@@ -1,5 +1,3 @@
-/// Pull HTTP(S) URLs from free-form paste: newlines, spaces, or glued schemes
-/// like `…token=abchttps://other.example/…`.
 pub fn extract_http_urls(raw: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let mut rest = raw.trim();
@@ -42,7 +40,6 @@ pub fn extract_http_urls(raw: &str) -> Vec<String> {
         if (candidate.starts_with("http://") || candidate.starts_with("https://"))
             && url::Url::parse(candidate).is_ok()
         {
-            // Avoid exact duplicates from messy paste.
             if urls.last().map(String::as_str) != Some(candidate) {
                 urls.push(candidate.to_string());
             }

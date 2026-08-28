@@ -1,5 +1,3 @@
-//! Transfer events (ticks / toasts) and in-memory identity commits.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -8,14 +6,12 @@ use async_trait::async_trait;
 use super::job::{ContentValidators, Job, JobState, TransferMode};
 use super::segment::SegmentMap;
 
-/// Tick or toast from a transfer worker.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
     Tick(ProgressTick),
     Toast(String),
 }
 
-/// Coalesced progress scalars.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressTick {
     pub downloaded_bytes: Option<u64>,
@@ -26,7 +22,6 @@ pub struct ProgressTick {
     pub state_hint: Option<ProgressHint>,
     pub active_connections: Option<u32>,
     pub reconnect_count: Option<u32>,
-    /// Index-aligned written counters; ignored when lengths differ.
     pub segment_written: Option<Vec<u64>>,
 }
 
@@ -43,7 +38,6 @@ impl ProgressTick {
         }
     }
 
-    /// Merge two ticks: `later` wins on `Some` (`later.or(self)`).
     pub fn merge(self, later: Self) -> Self {
         Self {
             downloaded_bytes: later.downloaded_bytes.or(self.downloaded_bytes),
@@ -94,18 +88,14 @@ pub type TransferEventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 
 #[async_trait]
 pub trait IdentityCommit: Send + Sync {
-    /// Apply `c` onto `job`. Engine impl patches the canonical job and returns
-    /// only after that write is durable.
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String>;
 }
 
-/// Records each committed job snapshot. Tests only.
 #[derive(Default)]
 pub struct MemoryIdentity {
     pub snapshots: Mutex<Vec<Job>>,
 }
 
-/// Apply onto the passed job only.
 pub struct NoopIdentity;
 
 #[async_trait]
@@ -128,7 +118,6 @@ impl IdentityCommit for NoopIdentity {
     }
 }
 
-/// Patch identity fields in any [`JobState`]. Ticks own Starting/Downloading.
 pub fn apply_commit_identity(job: &mut Job, c: &CommitIdentity) {
     if let Some(v) = c.downloaded_bytes {
         job.downloaded_bytes = v;
@@ -172,12 +161,6 @@ pub fn apply_commit_identity(job: &mut Job, c: &CommitIdentity) {
     }
 }
 
-/// Apply a coalesced tick. `None` fields leave the job value unchanged.
-/// Returns false if the job is not in an in-flight transfer state (no mutation).
-///
-/// Only `Starting` / `Downloading` accept ticks: rejects `Queued` (restart),
-/// `Paused`, and terminal states so deferred coalesce cannot resurrect progress
-/// after external lifecycle writes.
 pub fn apply_tick(job: &mut Job, tick: ProgressTick) -> bool {
     if !matches!(job.state, JobState::Starting | JobState::Downloading) {
         return false;
@@ -219,7 +202,6 @@ pub fn apply_tick(job: &mut Job, tick: ProgressTick) -> bool {
         if let Some(map) = job.segment_map.as_mut() {
             if written.len() == map.segments.len() {
                 for (segment, n) in map.segments.iter_mut().zip(written) {
-                    // Persist ticks may omit written; do not roll counters back after commit().
                     if n > segment.written {
                         segment.written = n;
                     }

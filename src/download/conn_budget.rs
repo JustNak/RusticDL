@@ -1,18 +1,3 @@
-//! Global + per-host connection budget for concurrent HTTP transfer bodies.
-//!
-//! Job scheduler still limits concurrent jobs; this limits simultaneous
-//! request bodies (single-stream job or multi-segment workers).
-//!
-//! # Acquire order
-//! Host permit first, then global. Waiters blocked on the global pool only hold a
-//! host slot (same-host backpressure), so one saturated host cannot exhaust the
-//! process-wide pool and starve other hosts. On `try_acquire`, a failed global
-//! attempt drops the host permit via RAII.
-//!
-//! # Host map growth
-//! Per-host semaphores are retained for the process lifetime (v0.2). Idle entries
-//! are small; pruning is deferred polish.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -23,7 +8,6 @@ use tokio::time::sleep;
 
 use super::job::DownloadOutcome;
 
-/// Process-wide connection budget: one global pool plus per-host caps.
 pub struct ConnectionBudget {
     global: Arc<Semaphore>,
     #[allow(dead_code)]
@@ -32,17 +16,14 @@ pub struct ConnectionBudget {
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
-/// While waiting with a control signal, re-check at least this often.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
 
-/// RAII permits for both global and per-host slots. Drop to release.
 #[must_use = "the permit is released when dropped"]
 pub struct ConnectionPermit {
     _host: OwnedSemaphorePermit,
     _global: OwnedSemaphorePermit,
 }
 
-/// Host key for the per-host map: hostname (plus port when non-default).
 pub fn host_key_for_budget(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => {
@@ -57,10 +38,6 @@ pub fn host_key_for_budget(url: &str) -> String {
 }
 
 impl ConnectionBudget {
-    /// Build a budget from runtime config caps.
-    ///
-    /// Clamps match [`crate::download::engine::EngineRuntimeConfig::sanitize`]:
-    /// total ∈ [1, 256], per-host ∈ [1, 64], per-host ≤ total.
     pub fn new(max_total: u32, max_per_host: u32) -> Arc<Self> {
         let max_total = max_total.clamp(1, 256) as usize;
         let max_per_host = max_per_host.clamp(1, 64).min(max_total as u32) as usize;
@@ -87,17 +64,10 @@ impl ConnectionBudget {
         self.global.available_permits()
     }
 
-    /// Normalize host for the per-host map (HTTP hostnames are case-insensitive).
-    ///
-    /// Lowercases the whole key. Port, if present (`host:port`), is preserved so
-    /// different ports stay independent pools.
     pub fn normalize_host(host: &str) -> String {
         host.trim().to_ascii_lowercase()
     }
 
-    /// Block until both a per-host and a global slot are held for `host`.
-    ///
-    /// Host is acquired first, then global (see module docs).
     #[must_use = "the permit is released when dropped"]
     pub async fn acquire(self: &Arc<Self>, host: &str) -> ConnectionPermit {
         let key = Self::normalize_host(host);
@@ -121,8 +91,6 @@ impl ConnectionBudget {
         }
     }
 
-    /// Block until both slots are held, or return pause/cancel without keeping a
-    /// partial permit. Host first, then global (same order as [`Self::acquire`]).
     #[must_use = "the permit is released when dropped"]
     pub async fn acquire_interruptible(
         self: &Arc<Self>,
@@ -144,10 +112,6 @@ impl ConnectionBudget {
         })
     }
 
-    /// Non-blocking attempt. Returns `None` if either pool is exhausted.
-    ///
-    /// Host first: if global is exhausted after host succeeds, the host permit
-    /// is dropped and released immediately.
     #[allow(dead_code)]
     #[must_use = "the permit is released when dropped"]
     pub async fn try_acquire(self: &Arc<Self>, host: &str) -> Option<ConnectionPermit> {
@@ -232,7 +196,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn host_fail_releases_does_not_leak_slots() {
-        // max_total=2, max_per_host=1: fill host a, fail second a, still allow b.
         let budget = ConnectionBudget::new(2, 1);
         let a1 = budget.try_acquire("a.com").await.expect("first a");
         assert_eq!(budget.available_global(), 1);
@@ -241,9 +204,6 @@ mod tests {
             budget.try_acquire("a.com").await.is_none(),
             "host a saturated"
         );
-        // Host-first: host miss never took global. Global-first bug would also
-        // release global on host miss; this tight total makes a leak visible if
-        // someone reintroduces global-first without release.
         assert_eq!(
             budget.available_global(),
             1,
@@ -262,9 +222,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn global_fail_releases_host_permit() {
-        // max_total=1, max_per_host=1: host-first takes b.com's only host slot, then
-        // global fails. If the host permit leaked, b.com would stay saturated forever
-        // and the post-drop try_acquire would still fail.
         let budget = ConnectionBudget::new(1, 1);
         let held = budget.try_acquire("a.com").await.expect("hold global");
         assert!(
@@ -361,8 +318,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acquire_interruptible_drops_partial_host_permit_on_cancel() {
-        // Global=1, per-host=1: A holds a.com + the only global. B takes b.com's
-        // only host slot then waits on global — that is the partial-permit window.
         let budget = ConnectionBudget::new(1, 1);
         let held = budget.acquire("a.com").await;
         let control = Arc::new(AtomicU8::new(0));
