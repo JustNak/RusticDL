@@ -1,4 +1,3 @@
-
 use gpui::{div, prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{h_flex, ActiveTheme};
 

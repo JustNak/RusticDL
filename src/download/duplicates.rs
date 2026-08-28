@@ -1,4 +1,3 @@
-
 use super::job::Job;
 
 pub fn find_active_duplicate<'a>(jobs: &'a [Job], url: &str) -> Option<&'a Job> {

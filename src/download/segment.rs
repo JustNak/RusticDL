@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_SEGMENT_COUNT: u32 = 8;

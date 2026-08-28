@@ -1,4 +1,3 @@
-
 use gpui::{div, px, Context, ParentElement, Styled, Window};
 use gpui_component::{
     button::{Button, ButtonVariants},

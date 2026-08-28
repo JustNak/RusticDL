@@ -1,4 +1,3 @@
-
 use gpui::{
     div, img, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
     ObjectFit, ParentElement, Styled, StyledImage,

@@ -1,4 +1,3 @@
-
 use gpui::{
     div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled,

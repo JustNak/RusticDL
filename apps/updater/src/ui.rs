@@ -378,9 +378,7 @@ mod windows_ui {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
-            WM_CLOSE => {
-                LRESULT(0)
-            }
+            WM_CLOSE => LRESULT(0),
             WM_DESTROY => {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
                 if ptr != 0 {

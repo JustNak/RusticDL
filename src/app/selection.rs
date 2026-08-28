@@ -1,4 +1,3 @@
-
 use super::DownloadApp;
 use crate::download::Job;
 

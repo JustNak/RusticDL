@@ -1,4 +1,3 @@
-
 use gpui::{Context, Window};
 
 use super::DownloadApp;

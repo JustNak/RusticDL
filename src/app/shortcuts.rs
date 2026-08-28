@@ -1,4 +1,3 @@
-
 use gpui::{App, Context, Focusable, KeyDownEvent, Window};
 use gpui_component::WindowExt;
 
