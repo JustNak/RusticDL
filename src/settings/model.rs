@@ -8,7 +8,7 @@ use super::appearance::{
 use super::category::CategoryFolders;
 use super::paths::{default_download_directory, same_dir};
 use super::sort::{SortColumn, SortDirection};
-use super::system::{OsNotifyMode, UpdateChannel};
+use super::system::{default_update_channel, OsNotifyMode, UpdateChannel};
 use super::window::WindowLayout;
 use crate::download::FileTypeKind;
 use crate::extension_settings::ExtensionIntegrationSettings;
@@ -84,7 +84,7 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub multi_connection_enabled: bool,
     /// Stable vs Nightly (`vX.Y.Z-nightly.*` pre-release) update stream.
-    #[serde(default)]
+    #[serde(default = "default_update_channel")]
     pub update_channel: UpdateChannel,
     pub theme: AppTheme,
     /// Accent palette; `Default` keeps the stock theme primary.
@@ -171,7 +171,7 @@ impl Default for Settings {
             max_total_connections: default_max_total_connections(),
             max_connections_per_host: default_max_connections_per_host(),
             multi_connection_enabled: true,
-            update_channel: UpdateChannel::Stable,
+            update_channel: default_update_channel(),
             theme: AppTheme::Light,
             accent_preset: AccentPreset::Default,
             accent_hue: default_accent_hue(),
@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(s.vignette_intensity, 0);
         assert_eq!(s.progress_style, ProgressStyle::Solid);
         assert_eq!(s.window_layout, WindowLayout::default());
-        assert_eq!(s.update_channel, UpdateChannel::Stable);
+        assert_eq!(s.update_channel, default_update_channel());
         assert!(s.close_to_tray);
         assert!(!s.launch_at_startup);
         assert!(!s.startup_minimized);
