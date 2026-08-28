@@ -9,8 +9,6 @@ fn in_app_for_kind(mode: OsNotifyMode, kind: TerminalKind) -> Option<InAppToastK
     }
 }
 
-/// Build immediate in-app toast messages for eligible edges (visible window only).
-///
 /// At most one toast per kind (aggregated when multiple edges share a kind).
 pub fn in_app_summary_messages(
     edges: &[TerminalEdge],

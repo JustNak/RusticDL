@@ -1,5 +1,3 @@
-//! Queue list, toolbar, and empty states extracted from `DownloadApp`.
-//!
 //! OS file drops (`ExternalPaths` / CF_HDROP) land on the queue list and empty
 //! state — freeform browser text/URL drag is not supported by GPUI on Windows.
 
@@ -32,14 +30,9 @@ use crate::download::{
 use crate::format::filter_jobs;
 use crate::settings::SortColumn;
 
-/// Cap how many distinct folders multi-reveal opens before toasting the rest.
 const BATCH_REVEAL_DIR_CAP: usize = 5;
 
 impl DownloadApp {
-    /// Handle OS file-path drops on the queue surface.
-    ///
-    /// Reads text-like / small files (cap 1 MiB), parses `.url` shortcuts, extracts
-    /// HTTP(S) URLs, and enqueues via the same Add path as the add dialog.
     pub(crate) fn handle_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
@@ -62,7 +55,6 @@ impl DownloadApp {
             }
             self.show_toast(msg, cx);
         } else if summary.skipped > 0 || summary.errors > 0 {
-            // Dropped only binaries / huge / unreadable files.
             let mut parts = Vec::new();
             if summary.skipped > 0 {
                 parts.push(format!(
@@ -103,7 +95,6 @@ impl DownloadApp {
         let cols = QueueColumns::from_main_width(main_w);
         let density = self.settings.ui_density;
         let progress_style = self.settings.progress_style;
-        // Cap detail so the list always keeps a usable share of the viewport.
         let detail_max_h = {
             let vh = viewport.height.to_f64() as f32;
             (vh * 0.36).clamp(DETAIL_MIN_CAP, DETAIL_MAX_H)
@@ -121,7 +112,6 @@ impl DownloadApp {
         v_flex()
             .size_full()
             .bg(theme.background)
-            // Search + overflow live in the title bar — no separate toolbar strip.
             .child(
                 h_flex()
                     .w_full()
@@ -133,7 +123,6 @@ impl DownloadApp {
                     .bg(theme.list_head)
                     .border_b_1()
                     .border_color(theme.border)
-                    // Match the file-type tile width in each row so metrics stay aligned.
                     .child(div().w(px(STATUS_DOT)).flex_shrink_0())
                     .child(sortable_header(
                         "Name",
@@ -196,13 +185,9 @@ impl DownloadApp {
                         &theme,
                         cx,
                     ))
-                    // Narrow overflow column — no header text (label would wrap).
                     .child(div().w(px(COL_ACTIONS_W)).flex_shrink_0()),
             )
             .child(
-                // File-path drops (CF_HDROP → ExternalPaths). Not freeform browser URL drag.
-                // `uniform_list` window-virtualizes fixed-height rows so offscreen
-                // jobs are not built; visible active/paused rows still re-render.
                 div()
                     .id("queue-scroll")
                     .flex_1()
@@ -214,7 +199,6 @@ impl DownloadApp {
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                         this.handle_external_paths_drop(paths, cx);
                     }))
-                    // Empty chrome / non-row background clears selection.
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.selected_ids.is_empty() {
                             this.clear_selection();
@@ -264,7 +248,6 @@ impl DownloadApp {
             .into_any_element()
     }
 
-    /// Batch action bar when more than one job is selected (replaces detail).
     pub(crate) fn render_batch_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let count = self.selected_ids.len();
@@ -425,7 +408,6 @@ impl DownloadApp {
         }
     }
 
-    /// Reveal unique parent folders for the selection; cap opens and toast if many.
     fn batch_reveal_selected(&mut self, cx: &mut Context<Self>) {
         let mut parents: BTreeSet<PathBuf> = BTreeSet::new();
         for job in self.selected_jobs() {
@@ -553,7 +535,6 @@ impl DownloadApp {
     pub(crate) fn render_empty(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
-        // Same ExternalPaths drop path as #queue-scroll; empty area must also accept drops.
         div()
             .id("queue-empty")
             .size_full()

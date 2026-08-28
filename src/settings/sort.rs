@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Which queue column drives sort order (persisted as a user preference).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SortColumn {

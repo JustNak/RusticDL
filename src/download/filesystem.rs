@@ -5,31 +5,18 @@ use tokio::fs;
 use super::job::Job;
 use super::resume::{resume_oracle, ResumeOracle};
 
-/// Safety margin beyond remaining download bytes before preallocate is allowed.
-/// `max(64 MiB, 1% of total)`.
 pub fn preallocate_margin(total_bytes: u64) -> u64 {
     (total_bytes / 100).max(64 * 1024 * 1024)
 }
 
-/// True when free space is enough to finish writing `remaining` bytes.
 pub fn free_space_allows_write(free: u64, remaining: u64) -> bool {
     free > remaining
 }
 
-/// True when free space covers remaining bytes **plus** preallocate margin.
-///
-/// Two-tier free-space policy (see `segment_io::preallocate_decision`):
-/// - `free <= remaining` → Disk error (cannot finish)
-/// - `remaining < free <= remaining + margin` → multi without `set_len`
-/// - `free > remaining + margin` → preallocate allowed
 pub fn free_space_allows_preallocate(free: u64, remaining: u64, total_bytes: u64) -> bool {
     free > remaining.saturating_add(preallocate_margin(total_bytes))
 }
 
-/// Free bytes available on the volume containing `path` (caller-available).
-///
-/// Returns `None` when the platform API is unavailable or the call fails
-/// (fail-open for preallocate: multi may extend-on-write).
 pub async fn free_space_bytes(path: &Path) -> Option<u64> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || free_space_bytes_sync(&path))
@@ -38,7 +25,6 @@ pub async fn free_space_bytes(path: &Path) -> Option<u64> {
         .flatten()
 }
 
-/// True when `path` is a UNC share root (`\\server\share` or `\\server\share\`).
 #[cfg(windows)]
 fn is_unc_share_root(path: &Path) -> bool {
     let raw = path.as_os_str().to_string_lossy().replace('/', "\\");
@@ -50,7 +36,6 @@ fn is_unc_share_root(path: &Path) -> bool {
     parts.len() == 2
 }
 
-/// `GetDiskFreeSpaceExW` needs a directory; UNC share roots need a trailing `\`.
 #[cfg(windows)]
 fn disk_free_query_path(path: &Path) -> PathBuf {
     let mut query = path.to_path_buf();
@@ -135,22 +120,14 @@ pub async fn metadata_len(path: &Path) -> Option<u64> {
     fs::metadata(path).await.ok().map(|metadata| metadata.len())
 }
 
-/// Result of aligning job progress with on-disk partial state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileResult {
-    /// Authoritative progress after reconcile (`job.downloaded_bytes`).
     pub downloaded_bytes: u64,
-    /// Observed `.part` length (v0) or tracked bytes (v1+ version gate).
     pub on_disk: u64,
-    /// True when `job.downloaded_bytes` / progress were updated.
     pub changed: bool,
-    /// True when single-stream `metadata_len` was applied.
     pub used_metadata_len: bool,
-    /// True when `transfer_format_version >= 1` skipped the metadata_len path.
     pub version_gated: bool,
-    /// True when `downloaded_bytes` was set from `sum(segment.written)`.
     pub used_map_sum: bool,
-    /// True when a present map passed `is_consistent`.
     pub map_consistent: bool,
     /// v1 + missing map, or present map that is inconsistent — do not invent Range.
     pub resume_required: bool,
@@ -165,17 +142,10 @@ pub(crate) fn apply_progress_from_sum(job: &mut Job, sum: u64) {
     }
 }
 
-/// Align `job.downloaded_bytes` (and progress) with a known on-disk length.
-///
-/// Split from the async I/O so callers can `metadata_len` without holding locks.
-/// Crash after `set_len` with no recorded progress: do not treat file length as
-/// contiguous bytes. `total == 0` is the first-start persist miss (Add snapshot).
 pub fn looks_like_preallocate_hole(downloaded: u64, on_disk: u64, total: u64) -> bool {
     downloaded == 0 && on_disk > 0 && (total == 0 || on_disk >= total)
 }
 
-/// v0, no map, no recorded progress, and on-disk length looks like a hole.
-/// v0 fixtures can still have a preallocate hole with no map.
 pub fn is_untracked_preallocate_hole(job: &Job, on_disk: u64) -> bool {
     job.downloaded_bytes == 0
         && job.transfer_format_version == 0
@@ -188,7 +158,6 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
     if changed {
         job.downloaded_bytes = on_disk;
     }
-    // Repair stale progress even when bytes already match (corrupt/partial state.json).
     if job.total_bytes > 0 {
         let expected = ((on_disk as f64 / job.total_bytes as f64) * 100.0).clamp(0.0, 100.0);
         if (job.progress - expected).abs() > 1e-9 {
@@ -208,10 +177,6 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
     }
 }
 
-/// Align `downloaded_bytes` from [`resume_oracle`].
-///
-/// `FreshSingle` / `LegacySingle` require `Some(on_disk)` — `None` would invent
-/// a resume offset without a `.part` length.
 pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileResult {
     let version_gated = job.transfer_format_version >= 1;
     match resume_oracle(job) {
@@ -260,12 +225,6 @@ pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileRe
     }
 }
 
-/// Align `job.downloaded_bytes` (and progress) with the contiguous `.part` length.
-///
-/// - Consistent `segment_map`: `downloaded_bytes = sum(written)`; **never** `metadata_len`.
-/// - Map present but inconsistent, or `version >= 1` with no map: leave bytes unchanged,
-///   set `resume_required` (Fail Resume — do not invent Range, do not use file len).
-/// - version 0 and no map: single-stream — set `downloaded_bytes` from `.part` length.
 pub async fn reconcile_partial_progress(job: &mut Job) -> ReconcileResult {
     let need_disk = matches!(
         resume_oracle(job),
@@ -298,9 +257,6 @@ pub async fn move_to_final_path(
     Ok(final_path)
 }
 
-/// Move `.part` into place without deleting the original first.
-///
-/// Original is renamed aside; if the final rename fails it is restored.
 async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), String> {
     if !target_path.exists() {
         fs::rename(temp_path, target_path)
@@ -465,29 +421,22 @@ pub fn temp_path_for(target: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// How to resolve a filename that already exists on disk or in the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilenameConflictPolicy {
-    /// `file (n).ext` — current default for Add / Auto handoff.
     #[default]
     Uniquify,
-    /// Keep the exact name. Active jobs still force uniquify.
     Overwrite,
 }
 
-/// A preferred name that is already taken in the save folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilenameCollision {
     pub filename: String,
     pub target_path: PathBuf,
     pub temp_path: PathBuf,
-    /// True when overwrite is unsafe (non-completed job or pending `.part` delete).
     pub blocks_overwrite: bool,
-    /// Next free `stem (n).ext` (or uuid fallback).
     pub suggested_unique_name: String,
 }
 
-/// Sanitize and join `preferred_name` under `directory`.
 pub fn preferred_download_paths(
     directory: &Path,
     preferred_name: &str,
@@ -519,14 +468,12 @@ fn job_owns_paths(job: &Job, target: &Path, temp: &Path) -> bool {
     job.target_path == target || job.temp_path == temp
 }
 
-/// Completed jobs may be overwritten; retryable / live jobs may not.
 fn job_blocks_overwrite(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
     jobs.iter().any(|job| {
         job.state != super::job::JobState::Completed && job_owns_paths(job, target, temp)
     })
 }
 
-/// A `.part` still being deleted after Remove is not safe to reuse.
 fn pending_temp_blocks_overwrite(
     temp: &Path,
     occupied_temps: &[PathBuf],
@@ -542,7 +489,6 @@ fn pending_temp_blocks_overwrite(
         .any(|job| job.temp_path == temp)
 }
 
-/// First collision for `preferred_name` against disk, leftover `.part`, and jobs.
 pub fn find_filename_collision(
     directory: &Path,
     preferred_name: &str,
@@ -581,10 +527,6 @@ fn find_filename_collision_occupied(
     })
 }
 
-/// Pick target paths, uniquifying or keeping the exact name per `policy`.
-///
-/// Overwrite still uniquifies when a non-completed job owns the preferred
-/// target / `.part`, or a pending partial delete still occupies the temp path.
 pub fn allocate_download_paths(
     directory: &Path,
     preferred_name: &str,
@@ -608,8 +550,6 @@ pub fn allocate_download_paths(
     (name, target, temp, false)
 }
 
-/// Pick a unique target filename within `directory`, avoiding collisions with
-/// existing jobs and on-disk final/partial files.
 pub fn allocate_unique_download_paths(
     directory: &Path,
     preferred_name: &str,
@@ -642,18 +582,12 @@ pub fn allocate_unique_download_paths(
         }
     }
 
-    // Extremely unlikely; fall back to a uuid-suffixed name.
     let name = format!("{stem}-{}.part-fallback{extension}", uuid::Uuid::new_v4());
     let target = directory.join(&name);
     let temp = temp_path_for(&target);
     (name, target, temp)
 }
 
-/// Parse `Content-Range: bytes START-END/TOTAL`.
-///
-/// Unit is matched case-insensitively (`bytes` / `Bytes`).
-/// `TOTAL` may be `*` (unknown length) → third field is `None`.
-/// Unsatisfied forms (`bytes */1234`) and non-`bytes` units return `None`.
 pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let value = value.trim();
     // RFC 9110: range unit is case-insensitive.
@@ -718,7 +652,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("file.bin");
         let temp = temp_path_for(&target);
-        // Sparse preallocated-style file would mislead metadata_len.
         std::fs::write(&temp, vec![0u8; 10_000]).unwrap();
 
         let mut job = Job::new(
@@ -817,7 +750,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("file.bin");
         let temp = temp_path_for(&target);
-        // Preallocated-style file: metadata_len would report full size.
         std::fs::write(&temp, vec![0u8; 10_000]).unwrap();
 
         let mut job = Job::new(
@@ -829,7 +761,6 @@ mod tests {
         job.transfer_format_version = 1;
         job.downloaded_bytes = 0;
         job.total_bytes = 10_000;
-        // Hand-built: partition would collapse this below 1 MiB into one segment.
         let map = crate::download::segment::SegmentMap {
             total_bytes: 10_000,
             segment_count: 2,
@@ -1003,7 +934,6 @@ mod tests {
 
     #[test]
     fn parses_content_range_star_total() {
-        // CDN probe / open-ended: `bytes 0-0/*`
         let (start, end, total) = parse_content_range("bytes 0-0/*").unwrap();
         assert_eq!((start, end, total), (0, 0, None));
 
@@ -1232,7 +1162,6 @@ mod tests {
             target,
             temp.clone(),
         );
-        // Stale UI/state counters (e.g. after crash while .part grew).
         job.downloaded_bytes = 100;
         job.total_bytes = 5000;
         job.progress = 2.0;
@@ -1244,12 +1173,10 @@ mod tests {
         let expected_progress = (on_disk_len as f64 / 5000.0) * 100.0;
         assert!((job.progress - expected_progress).abs() < 1e-9);
 
-        // Idempotent when already aligned.
         let again = reconcile_partial_progress(&mut job).await;
         assert_eq!(again.on_disk, on_disk_len);
         assert!(!again.changed);
 
-        // Missing .part → zero bytes.
         std::fs::remove_file(&temp).unwrap();
         let missing = reconcile_partial_progress(&mut job).await;
         assert_eq!(missing.on_disk, 0);
@@ -1282,7 +1209,6 @@ mod tests {
         job.progress = 12.5;
 
         let result = reconcile_partial_progress(&mut job).await;
-        // Unknown total + no recorded progress: do not promote file len (preallocate hole).
         assert!(!result.used_metadata_len);
         assert!(!result.changed);
         assert_eq!(job.downloaded_bytes, 0);
@@ -1293,7 +1219,6 @@ mod tests {
 
     #[tokio::test]
     async fn reconciles_downward_when_counters_ahead_of_disk() {
-        // Crash-relevant: progress tick / state.json ahead of durable .part length.
         let dir =
             std::env::temp_dir().join(format!("rusticdl-reconcile-down-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1376,7 +1301,6 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
-            // Non-Windows: API not implemented; fail-open returns None.
             let _ = free;
         }
     }

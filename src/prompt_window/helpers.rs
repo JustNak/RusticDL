@@ -1,5 +1,4 @@
 //! Shared display helpers for the capture HUD.
-//!
 //! Keep local `capture_progress_bar` and `shorten_path` (do not unify with
 //! queue `styled_progress` / widgets path helpers).
 
@@ -56,9 +55,6 @@ impl TrailMotion {
             if self.committed.len() >= cap {
                 self.committed.pop_front();
             }
-            // Commit the true bucket mean (same data). Snap the display tip to
-            // that mean so the next live column starts there — otherwise a flat
-            // series eases from a mid-ease leftover and dips at the right edge.
             self.committed.push_back(self.live_target);
             self.live_display = self.live_target;
             self.live_sum = 0;
@@ -454,7 +450,6 @@ fn paint_speed_graph(
     let step = inner_w / n;
     let peak = scale_max.max(1);
 
-    // Guides first so the series sits on top.
     paint_h_line(window, x0, base_y - 1.0, inner_w, muted.opacity(0.42));
     paint_h_line(
         window,
@@ -519,7 +514,6 @@ fn paint_speed_graph(
         window.paint_path(path, line_color);
     }
 
-    // Live tip — last sample.
     window.paint_quad(
         fill(
             Bounds {
@@ -626,7 +620,6 @@ mod tests {
     #[test]
     fn downsample_averages_even_buckets() {
         let samples: Vec<u64> = (1..=8).collect();
-        // Every sample is in exactly one bucket — no live-tip hole that drops 7.
         assert_eq!(downsample_avg(&samples, 4), vec![1, 3, 5, 7]);
     }
 
@@ -636,9 +629,6 @@ mod tests {
         let cols = downsample_avg(&samples, SPARK_COLUMNS);
         assert_eq!(cols.len(), SPARK_COLUMNS);
         let covered: u64 = {
-            // Reconstruct coverage by summing bucket * count is hard; instead
-            // check first/last and that no bucket is the raw last sample alone
-            // while skipping its neighbors (the old rubber-band hole).
             let last = *cols.last().unwrap();
             assert!(last < 90, "last bucket should average the tail, not pin 90");
             assert!(last >= 85);
@@ -728,7 +718,6 @@ mod tests {
         for speed in [10u64, 20, 30, 40, 50, 60] {
             trail.push_sample(speed, false);
         }
-        // 6 samples / bucket 2 → 3 committed, no live remainder.
         let first = trail.columns();
         let committed: Vec<f32> = first.iter().copied().flatten().collect();
         assert_eq!(committed.len(), 3);
@@ -739,7 +728,6 @@ mod tests {
         trail.push_sample(99, false);
         let second = trail.columns();
         let again: Vec<f32> = second.iter().copied().flatten().collect();
-        // First three committed values stay put; only a new live tip appears.
         assert_eq!(again.len(), 4);
         assert!((again[0] - 15.0).abs() < 0.01);
         assert!((again[1] - 35.0).abs() < 0.01);
@@ -795,7 +783,6 @@ mod tests {
         let xs = [0.0, 1.0, 2.0, 3.0];
         let ys = [0.0, 10.0, 0.0, 4.0];
         let m = monotone_tangents(&xs, &ys);
-        // Local peak at i=1 → tangent 0; samples along the segment stay in [0, 10].
         assert_eq!(m[1], 0.0);
         for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
             let y = hermite_y(ys[0], ys[1], m[0], m[1], 1.0, t);

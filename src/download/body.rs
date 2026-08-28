@@ -1,5 +1,3 @@
-//! Shared transfer body loop: control poll, limiter-then-write, stall, incomplete-at-end.
-
 use std::path::Path;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
@@ -18,8 +16,6 @@ use super::segment_io::SegmentFileWriter;
 
 pub(crate) const CONTROL_POLL: Duration = Duration::from_millis(200);
 
-/// No application data for this long is a retryable stall (reconnect / retry).
-///
 /// Shorter than the client `read_timeout` (120s) so a silent TCP/HTTP2 body
 /// does not sit at 98% with a stale live speed. Empty frames that reset
 /// reqwest's read timer do not reset this clock.
@@ -32,7 +28,6 @@ pub trait BodySink: Send {
     async fn write_chunk(&mut self, data: &[u8]) -> Result<usize, DownloadError>;
     async fn flush(&mut self) -> Result<(), DownloadError>;
     fn offset(&self) -> u64;
-    /// Known complete offset (`None` = unknown / no incomplete-at-end check).
     fn target_offset(&self) -> Option<u64> {
         None
     }
@@ -220,7 +215,6 @@ pub async fn stream_body(
     stream_body_with_stall(response, sink, control, limiter, STALL_TIMEOUT, on_chunk).await
 }
 
-/// Same as [`stream_body`] with an injectable stall budget (tests use a short one).
 pub(crate) async fn stream_body_with_stall(
     response: reqwest::Response,
     sink: &mut impl BodySink,
@@ -261,14 +255,12 @@ pub(crate) async fn stream_body_with_stall(
                     }
                 };
 
-                // Empty frames reset reqwest's read timeout but are not progress.
                 if chunk.is_empty() {
                     continue;
                 }
 
                 last_byte = Instant::now();
 
-                // Must write a delivered chunk — dropping it leaves a Range-resume hole.
                 let acquired = limiter.acquire(chunk.len(), Some(control)).await;
                 let n = sink.write_chunk(&chunk).await?;
                 if n > 0 {
@@ -290,7 +282,6 @@ pub(crate) async fn stream_body_with_stall(
                     sink.flush().await?;
                     return Err(stall_error(stall_timeout));
                 }
-                // Let callers emit speed=0 so the HUD/queue do not keep a stale live rate.
                 on_chunk(0);
             }
         }
@@ -517,7 +508,6 @@ mod tests {
         let url = format!("http://{addr}/file.bin");
         let response = get_response(&url).await;
 
-        // Empty the burst bucket so the next acquire must wait (1 B/s refill).
         let limiter = GlobalBandwidthLimiter::new(Some(1));
         assert!(
             limiter
@@ -545,8 +535,6 @@ mod tests {
         );
         let flipper = async {
             body_sent_rx.await.expect("body sent");
-            // Yield so stream_body can take the chunk and block in acquire
-            // (empty bucket at 1 B/s). CONTROL_POLL is 200 ms.
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }

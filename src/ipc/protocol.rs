@@ -219,7 +219,6 @@ pub(crate) fn parse_enqueue_payload(
             ));
         }
     }
-    // Source metadata is only logged conceptually; keep for future UI labels.
     let _ = (
         &parsed.source.page_url,
         &parsed.source.page_title,

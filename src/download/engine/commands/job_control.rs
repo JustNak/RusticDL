@@ -1,5 +1,3 @@
-//! Per-job control commands (pause, resume, cancel, retry, restart, remove).
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -93,7 +91,6 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             return;
         };
 
-        // Already terminal: optional leftover .part cleanup + identity wipe.
         let immediate = if job.state.is_terminal() {
             if delete_partial {
                 job.clear_partial_and_identity();
@@ -104,8 +101,6 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
                 None
             }
         } else {
-            // Queued / Paused: mark Canceled now. In-flight Starting/Downloading:
-            // worker finalizer sets Canceled after control flag is observed.
             if !matches!(job.state, JobState::Downloading | JobState::Starting) {
                 job.state = JobState::Canceled;
                 job.mark_finished();
@@ -114,12 +109,9 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             }
             job.active_connections = 0;
             if delete_partial {
-                // reconnect_count = 0, map/version/validators cleared.
                 job.clear_partial_and_identity();
             }
 
-            // Always drop handoff auth when canceling a non-running job.
-            // In-flight workers clear it in their finalizer.
             if !worker_running {
                 guard.handoff_auth.remove(&id);
             }
@@ -201,14 +193,12 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
         }
 
         let immediate = if worker_running {
-            // Finalizer keeps Queued and deletes .part after the worker drops its handle.
             guard.requeue_on_cancel.insert(id.clone(), ());
             if let Some(path) = temp_path {
                 guard.pending_partial_deletes.insert(id.clone(), path);
             }
             None
         } else {
-            // Scheduler 500ms poll would start this Queued job; block until delete returns.
             if let Some(path) = temp_path.clone() {
                 guard.pending_partial_deletes.insert(id.clone(), path);
             }
@@ -252,8 +242,6 @@ pub(super) async fn remove(
         guard.jobs.retain(|j| j.id != id);
         guard.handoff_auth.remove(&id);
         guard.requeue_on_cancel.remove(&id);
-        // Keep the active slot until the worker exits so concurrency stays accurate
-        // and the worker is not racing a deleted .part path.
         if !worker_still_running {
             guard.controls.remove(&id);
             guard.pending_partial_deletes.remove(&id);

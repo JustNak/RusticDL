@@ -209,7 +209,6 @@ impl Settings {
         self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
         self.max_total_connections = self.max_total_connections.clamp(1, 256);
         self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
-        // Per-host cannot exceed process-wide total.
         self.max_connections_per_host = self
             .max_connections_per_host
             .min(self.max_total_connections);
@@ -218,7 +217,6 @@ impl Settings {
     /// Clamp appearance fields to safe ranges (call after load / before save).
     pub fn sanitize_appearance(&mut self) {
         self.noise_intensity = self.noise_intensity.min(MAX_NOISE_INTENSITY);
-        // Slider is 0–100; the alpha floor is applied when painting, not here.
         self.window_transparency = self.window_transparency.min(MAX_WINDOW_TRANSPARENCY);
         self.vignette_intensity = self.vignette_intensity.min(MAX_VIGNETTE_INTENSITY);
         self.accent_hue = self.accent_hue.rem_euclid(360.0);
@@ -326,7 +324,6 @@ mod tests {
         assert_eq!(s.progress_style, ProgressStyle::Solid);
         assert_eq!(s.window_layout, WindowLayout::default());
         assert_eq!(s.update_channel, UpdateChannel::Stable);
-        // New system prefs: close-to-tray defaults on for download-manager UX.
         assert!(s.close_to_tray);
         assert!(!s.launch_at_startup);
         assert!(!s.startup_minimized);
@@ -337,7 +334,6 @@ mod tests {
         assert!(s.organize_by_file_type);
         assert!(s.sidebar_library_expanded);
         assert_eq!(s.category_folders.audio.name, "Audio");
-        // Multi limits default when legacy JSON omits those keys.
         assert_eq!(s.multi_max_segments, 8);
         assert_eq!(s.multi_min_bytes, 5 * 1024 * 1024);
         assert_eq!(s.max_total_connections, 32);
@@ -362,7 +358,6 @@ mod tests {
         assert_eq!(s.max_total_connections, 1);
         assert_eq!(s.max_connections_per_host, 1);
 
-        // Per-host is clamped to total.
         s.max_total_connections = 4;
         s.max_connections_per_host = 32;
         s.sanitize_download_limits();
@@ -392,7 +387,6 @@ mod tests {
         let mut s = Settings::default();
         s.download_directory = keep_dir.clone();
         s.window_layout = keep_layout.clone();
-        // Mutate fields that must return to defaults (including custom accent HSL).
         s.max_concurrent_downloads = 9;
         s.auto_retry_attempts = 1;
         s.speed_limit_kib_per_second = 512;
@@ -427,12 +421,10 @@ mod tests {
 
         s.reset_to_defaults_preserving_layout_and_dir();
 
-        // Expected = full Default with only preserve fields overlaid (catches new fields).
         let mut expected = Settings::default();
         expected.download_directory = keep_dir;
         expected.window_layout = keep_layout;
         assert_eq!(s, expected);
-        // Explicit HSL guards if someone later rewrites the helper field-by-field.
         let defaults = Settings::default();
         assert_eq!(s.accent_hue, defaults.accent_hue);
         assert_eq!(s.accent_saturation, defaults.accent_saturation);

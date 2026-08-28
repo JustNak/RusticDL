@@ -4,12 +4,10 @@ use crate::tray::NotifyLevel;
 
 /// Burst window after any OS flush; edges arriving inside it are held and merged.
 pub const OS_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-/// Flush immediately when the OS pending buffer reaches this size.
 pub const OS_HIGH_WATER: usize = 20;
 /// Retain balloon click contexts for late clicks.
 pub const BALLOON_CONTEXT_CAP: usize = 8;
 
-/// Kind of terminal transition we may notify on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalKind {
     Complete,

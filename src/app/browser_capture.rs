@@ -1,9 +1,5 @@
-//! Browser handoff capture pollers extracted from `DownloadApp`.
-//!
 //! Invoked from the shell 80ms timer (not from `Render`). Opening a native
 //! window during paint re-enters GPUI's draw path and crashes on Windows.
-//! At most one new capture window is created per tick so two HUDs never
-//! `open_window` in the same update.
 
 use gpui::{Context, WindowHandle};
 use gpui_component::Root;
@@ -27,11 +23,6 @@ pub(crate) fn should_poll_capture_huds(_window_hidden_to_tray: bool) -> bool {
 }
 
 impl DownloadApp {
-    /// Open the floating progress HUD for a queue job that is still downloading.
-    ///
-    /// No-ops when the job is missing or not in-flight. If a HUD already owns
-    /// this job (browser handoff or a previous open), tell the user instead of
-    /// stacking a second window.
     pub(crate) fn open_job_progress_popup(&mut self, job_id: &str, cx: &mut Context<Self>) {
         let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
             return;
@@ -63,10 +54,6 @@ impl DownloadApp {
         }
     }
 
-    /// Open at most one pending confirm / progress / complete HUD this tick.
-    ///
-    /// Must run while the main window is tray-hidden (`SW_HIDE`). Capture
-    /// still arrives over IPC; the user sees it through these windows.
     pub(crate) fn poll_browser_capture(&mut self, cx: &mut Context<Self>) {
         if self.open_next_browser_prompt(cx) {
             return;
@@ -77,9 +64,6 @@ impl DownloadApp {
         self.open_next_browser_complete(cx);
     }
 
-    /// Poll for browser ask-mode handoffs and open a dedicated prompt window.
-    ///
-    /// Returns true when a new window was created (caller should stop this tick).
     fn open_next_browser_prompt(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(prompt) = self.ipc.claim_next_prompt_for_ui() else {
             return false;
@@ -93,9 +77,7 @@ impl DownloadApp {
         ))
     }
 
-    /// Open one floating progress HUD for a browser handoff (auto mode + morph fallback).
     fn open_next_browser_progress(&mut self, cx: &mut Context<Self>) -> bool {
-        // Always adopt watch ids so Complete re-open works for Confirm morph too.
         for job_id in self.ipc.take_progress_watch_jobs() {
             if !self
                 .browser_watch_complete_ids
@@ -106,9 +88,7 @@ impl DownloadApp {
             }
         }
 
-        // Use committed bridge setting (same source as enqueue), not draft UI toggles.
         if !self.ipc.show_progress_after_handoff() {
-            // Drain open-queue so ids do not pile up while the setting is off.
             let _ = self.ipc.take_pending_progress_jobs();
             return false;
         }
@@ -125,9 +105,7 @@ impl DownloadApp {
         ))
     }
 
-    /// If Progress was closed early, re-open one Complete HUD when a watched job finishes.
     fn open_next_browser_complete(&mut self, cx: &mut Context<Self>) {
-        // Match enqueue / progress poll: committed bridge setting only.
         if !self.ipc.show_progress_after_handoff() {
             self.browser_watch_complete_ids.clear();
             return;
@@ -141,12 +119,10 @@ impl DownloadApp {
         let mut opened = false;
         for job_id in pending {
             let Some(job) = self.jobs.iter().find(|j| j.id == job_id).cloned() else {
-                // Job removed — stop watching.
                 continue;
             };
             match job.state {
                 JobState::Completed => {
-                    // Progress HUD still open will morph itself; avoid a second window.
                     if self.ipc.is_progress_hud_owned(&job_id) || opened {
                         still_watch.push(job_id);
                     } else {
@@ -157,7 +133,6 @@ impl DownloadApp {
                             &self.settings,
                             cx,
                         ));
-                        // Keep watching on open failure so Complete can retry.
                         if !handle_ok {
                             still_watch.push(job_id);
                         } else {
@@ -165,9 +140,7 @@ impl DownloadApp {
                         }
                     }
                 }
-                JobState::Failed | JobState::Canceled => {
-                    // Terminal non-success: do not show Complete.
-                }
+                JobState::Failed | JobState::Canceled => {}
                 _ => still_watch.push(job_id),
             }
         }
@@ -181,7 +154,6 @@ mod tests {
 
     #[test]
     fn capture_huds_are_polled_while_tray_hidden() {
-        // Regression: PR 133 gated poll_browser_capture on !window_hidden_to_tray.
         assert!(
             should_poll_capture_huds(true),
             "Confirm / Progress must open while the main window is SW_HIDE"

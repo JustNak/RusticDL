@@ -19,8 +19,6 @@ pub(crate) fn status_chip(text: String, color: Hsla) -> impl IntoElement {
     div().text_xs().font_medium().text_color(color).child(text)
 }
 
-/// Clickable queue column header with asc/desc indicator for the active sort.
-/// `center` centers the label (and sort chevron) in fixed-width metric columns.
 pub(crate) fn sortable_header(
     label: &'static str,
     column: SortColumn,
@@ -84,7 +82,6 @@ pub(crate) fn sortable_header(
         })
 }
 
-/// Fixed-width metric cell; content is centered under the column header.
 pub(crate) fn metric_cell(
     width: f32,
     text: impl Into<SharedString>,
@@ -121,7 +118,6 @@ pub(crate) fn status_color(tone: i32, theme: &gpui_component::Theme) -> Hsla {
 }
 
 pub(crate) fn status_tag(status: &'static str, tone: i32) -> Tag {
-    // Text badge kept for the detail panel only.
     match tone {
         1 => Tag::primary().small().child(status),
         2 => Tag::success().small().child(status),
@@ -131,8 +127,6 @@ pub(crate) fn status_tag(status: &'static str, tone: i32) -> Tag {
     }
 }
 
-/// Lowercase file extension for the detail File field (`mp3`, `mp4`).
-/// Compound names like `video.mkv.zip` report the last segment (`zip`).
 pub(crate) fn file_extension_label(filename: &str) -> String {
     std::path::Path::new(filename)
         .extension()
@@ -142,7 +136,6 @@ pub(crate) fn file_extension_label(filename: &str) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-/// File-type tile with a status badge overlaid at the bottom-right.
 pub(crate) fn file_type_status_tile(
     job_id: &str,
     filename: &str,
@@ -193,9 +186,7 @@ pub(crate) fn file_type_status_tile(
         )
 }
 
-/// Approximate how many characters fit in the Name column (text-sm / semibold).
 pub(crate) fn name_char_budget(main_w: f32, cols: QueueColumns) -> usize {
-    // Row chrome always present: padding + file icon tile + size + actions + gaps.
     let mut used = 32.0 + FILE_ICON_W + COL_SIZE_W + COL_ACTIONS_W + 12.0 * 5.0;
     if cols.date {
         used += COL_DATE_W + 12.0;
@@ -207,19 +198,15 @@ pub(crate) fn name_char_budget(main_w: f32, cols: QueueColumns) -> usize {
         used += COL_ETA_W + 12.0;
     }
     let name_px = (main_w - used).max(96.0);
-    // ~8px average advance for semibold text-sm on Windows.
     ((name_px / 8.0) as usize).clamp(16, 200)
 }
 
-/// How many characters fit the detail-panel filename (header minus badge + close).
 pub(crate) fn detail_name_char_budget(main_w: f32) -> usize {
-    // Horizontal chrome: panel padding, status icon, Completed tag, close, gaps.
     let used = 40.0 + 16.0 + 96.0 + 28.0 + 24.0;
     let name_px = (main_w - used).max(200.0);
     ((name_px / 8.0) as usize).clamp(40, 280)
 }
 
-/// Force a visible "..." when the label is longer than the name column can show.
 /// (GPUI's text-overflow ellipsis is unreliable for this flex layout.)
 pub(crate) fn ellipsize_name(name: &str, max_chars: usize) -> SharedString {
     let count = name.chars().count();

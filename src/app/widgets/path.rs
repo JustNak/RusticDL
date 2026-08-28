@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use super::super::DownloadApp;
 
-/// Compact path for secondary UI hints (e.g. Advanced row preview).
 pub(crate) fn shorten_path_display(path: &str) -> String {
     let path = path.trim();
     if path.is_empty() {
@@ -26,8 +25,6 @@ pub(crate) fn shorten_path_display(path: &str) -> String {
     }
 }
 
-/// Open the platform folder picker and write the chosen path into `input`.
-///
 /// Uses GPUI's native path prompt (with a proper parent HWND on Windows) instead
 /// of `rfd`, which often fails silently or opens behind the app window.
 pub(crate) fn browse_directory(

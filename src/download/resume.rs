@@ -1,8 +1,3 @@
-//! Single resume classifier for planner, single-stream, multi-start, and reconcile.
-//!
-//! Classification uses job identity only (`segment_map`, `transfer_format_version`,
-//! `downloaded_bytes`). On-disk length is never a classifier.
-
 use super::job::Job;
 use super::segment::SegmentMap;
 
@@ -10,20 +5,14 @@ pub(crate) const FALLBACK_LEGACY_PARTIAL: &str = "legacy_contiguous_partial";
 pub(crate) const FALLBACK_MAP_MISSING: &str = "map_missing";
 pub(crate) const FALLBACK_MAP_INCONSISTENT: &str = "map_inconsistent";
 
-/// How an existing job may be resumed. One function; every caller matches this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeOracle {
-    /// v0, no map, no durable partial. Single-stream from offset 0.
     FreshSingle,
-    /// v0 contiguous `.part` (`downloaded_bytes > 0`). Stay single until Restart.
     LegacySingle,
-    /// Present consistent map (any segment count, including 1). Multi only.
     Multi { map: SegmentMap },
-    /// v1 + missing map, or present map that fails `is_consistent`.
     RestartRequired,
 }
 
-/// Classify resume from job identity. Never looks at on-disk length.
 pub fn resume_oracle(job: &Job) -> ResumeOracle {
     match job.segment_map.as_ref() {
         Some(map) if !map.is_consistent() => ResumeOracle::RestartRequired,
@@ -216,7 +205,6 @@ mod tests {
 
     #[test]
     fn resume_oracle_ignores_on_disk_for_fresh() {
-        // leftover hole file is still FreshSingle; caller must not promote it.
         let job = sample_job();
         assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(resume_oracle(&job), ResumeOracle::FreshSingle);

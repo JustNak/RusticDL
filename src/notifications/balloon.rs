@@ -95,7 +95,6 @@ pub fn compose_balloon(pending: &[PendingOsTerminal]) -> Option<BalloonPayload> 
             None,
         )
     } else {
-        // Mixed completes + fails → single combined balloon.
         (
             "Downloads finished".to_string(),
             format!("{c} finished, {f} failed"),

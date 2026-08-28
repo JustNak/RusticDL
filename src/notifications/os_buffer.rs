@@ -30,12 +30,10 @@ impl OsNotifyBuffer {
 
         let burst_open = self.is_burst_open(now);
 
-        // Solitary edge outside a burst window → immediate OS notify.
         if self.pending.len() == 1 && !burst_open {
             return true;
         }
 
-        // Multi-edge and/or open burst: hold until deadline (or high-water).
         if self.coalesce_deadline.is_none() {
             self.coalesce_deadline = Some(if burst_open {
                 self.burst_open_until
@@ -69,7 +67,6 @@ impl OsNotifyBuffer {
         std::mem::take(&mut self.pending)
     }
 
-    /// Open the post-flush burst window. Call only after a balloon was shown.
     pub fn after_flush(&mut self, now: Instant) {
         self.coalesce_deadline = None;
         self.burst_open_until = Some(now + OS_BURST_WINDOW);
@@ -185,7 +182,6 @@ mod tests {
 
     #[test]
     fn take_pending_without_after_flush_does_not_arm_burst() {
-        // Simulates hard-eligibility drop: drain pending but skip after_flush.
         let mut buf = OsNotifyBuffer::default();
         let now = Instant::now();
         let edge = PendingOsTerminal {
@@ -197,7 +193,6 @@ mod tests {
         };
         assert!(buf.enqueue(vec![edge], now));
         let _ = buf.take_pending();
-        // No after_flush → burst stays closed; next solitary flushes immediately.
         assert!(!buf.is_burst_open(now + Duration::from_millis(50)));
         let next = PendingOsTerminal {
             kind: TerminalKind::Complete,

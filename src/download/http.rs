@@ -31,7 +31,6 @@ use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
-/// Nested mid-transfer reconnect before worker-level `RETRY_DELAYS`.
 pub(crate) const RECONNECT_MAX: u32 = 5;
 pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
 pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(2);
@@ -67,7 +66,6 @@ pub async fn run_http_download(
     run_http_download_with_ctx(&mut ctx).await
 }
 
-/// Single-stream transfer using an attempt-local [`TransferContext`] (URL pin + handoff).
 pub async fn run_http_download_with_ctx(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
@@ -77,14 +75,12 @@ pub async fn run_http_download_with_ctx(
 
     let client = download_client()?;
 
-    // Best-effort preflight: skipped when `run_transfer` already probed this attempt.
     apply_preflight(ctx).await;
 
     if let Some(outcome) = control_outcome(&ctx.control) {
         return Ok(outcome);
     }
 
-    // Planner must not send Multi / RestartRequired here. 1-segment maps are Multi.
     let mut existing_bytes = match resume_oracle(&ctx.job) {
         ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
             metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
@@ -117,20 +113,15 @@ pub async fn run_http_download_with_ctx(
     };
 
     let job_url = ctx.job.url.clone();
-    // Pinned resolved URL (updated after redirects); handoff still keyed off job_url.
     let mut current_url = ctx.resolved_url.clone();
     let mut validators = ctx.job.validators.clone();
     let mut target_path = ctx.job.target_path.clone();
     let mut temp_path = ctx.job.temp_path.clone();
     let mut filename = ctx.job.filename.clone();
-    // Mutated on full-replace so the reconnect oracle matches the committed
-    // identity (v1+ → contiguous v0).
     let mut transfer_format_version = ctx.job.transfer_format_version;
     let mut total_bytes: u64;
     let mut resume_supported = ctx.job.resume_supported;
 
-    // Short reconnect budget resets each `run_http_download_with_ctx` call (worker
-    // long-retry does not share the budget). Cumulative job counter is preserved.
     let mut short_reconnects: u32 = 0;
     let mut cumulative_reconnects = ctx.job.reconnect_count;
     let reconnect_baseline = ctx.job.reconnect_count;
@@ -345,7 +336,6 @@ pub async fn run_http_download_with_ctx(
         }
 
         // Capture validators for this response; keep local copy for reconnect If-Range.
-        // Full replace: snapshot replaces identity; else field-wise merge.
         let validators_patch = if full_replace {
             let snap = content_validators_from_headers(response.headers(), total_bytes);
             validators = snap.clone();
@@ -358,8 +348,6 @@ pub async fn run_http_download_with_ctx(
             patch
         };
 
-        // Filename / path discovery (first response or when still generic).
-        // Overwrite confirmed a specific path — never let CD / redirect rename it.
         if !ctx.job.replace_existing {
             if let Some(header_name) = response
                 .headers()
@@ -398,7 +386,6 @@ pub async fn run_http_download_with_ctx(
         }
 
         if full_replace {
-            // Keep local oracle in sync with the committed identity (v1+ → contiguous v0).
             transfer_format_version = 0;
         }
         committer
@@ -573,14 +560,12 @@ pub async fn run_http_download_with_ctx(
     }
 }
 
-/// Outcome of a mid-transfer reconnect decision.
 enum ReconnectAction {
     Retry { offset: u64 },
     Control(DownloadOutcome),
     GiveUp,
 }
 
-/// Decide whether to short-reconnect, sleep (control-polled), and refresh offset.
 async fn prepare_reconnect(
     error: &DownloadError,
     is_fetch_phase: bool,
@@ -620,13 +605,11 @@ async fn prepare_reconnect(
         return ReconnectAction::Control(outcome);
     }
 
-    // Refresh offset from progress oracle after durable flush.
     let offset = refresh_reconnect_offset(transfer_format_version, existing_bytes, temp_path).await;
 
     ReconnectAction::Retry { offset }
 }
 
-/// Nested reconnect eligibility (before worker `RETRY_DELAYS`).
 fn can_mid_transfer_reconnect(
     error: &DownloadError,
     is_fetch_phase: bool,
@@ -640,12 +623,9 @@ fn can_mid_transfer_reconnect(
     if !is_reconnectable_error(error) {
         return false;
     }
-    // Initial connect/GET failures bubble to worker retry; only reconnect-GET connect
-    // errors use the short budget (`short_reconnects > 0`).
     if is_fetch_phase && short_reconnects == 0 {
         return false;
     }
-    // Ranges usable: from zero always; partial needs known resume support.
     ranges_usable_for_reconnect(existing_bytes, resume_supported)
 }
 
@@ -661,14 +641,12 @@ fn ranges_usable_for_reconnect(existing_bytes: u64, resume_supported: bool) -> b
     existing_bytes == 0 || resume_supported
 }
 
-/// Short backoff: base 200ms, doubles per attempt, cap 2s.
 pub(crate) fn reconnect_backoff(attempt_1_based: u32) -> Duration {
     let shift = attempt_1_based.saturating_sub(1).min(16);
     let ms = (RECONNECT_BASE.as_millis() as u64).saturating_mul(1u64 << shift);
     Duration::from_millis(ms.min(RECONNECT_CAP.as_millis() as u64))
 }
 
-/// Sleep `total` while polling control every `CONTROL_POLL` (pause/cancel aborts).
 pub(crate) async fn sleep_interruptible(
     control: &AtomicU8,
     total: Duration,
@@ -687,7 +665,6 @@ pub(crate) async fn sleep_interruptible(
     }
 }
 
-/// Progress oracle after reconnect: v1+ keeps tracked bytes; v0 uses `.part` length.
 async fn refresh_reconnect_offset(
     transfer_format_version: u32,
     tracked_downloaded: u64,
@@ -717,8 +694,6 @@ or a temporary gateway issue. Confirm the full URL is a single link (not two pas
     download_error(FailureCategory::Http, message, retryable)
 }
 
-/// Best-effort preflight: pin `resolved_url` and publish an early progress patch.
-/// No-op (returns `None`) when this attempt already probed.
 pub(crate) async fn apply_preflight(
     ctx: &mut TransferContext,
 ) -> Option<super::preflight::PreflightInfo> {
@@ -727,9 +702,7 @@ pub(crate) async fn apply_preflight(
     }
     ctx.preflight_done = true;
     let client = download_client().ok()?;
-    // Browser captures mint a one-time Inst-FS / Drive Location. Discover that
-    // hop without fetching it — a preflight GET/HEAD on the signed URL burns
-    // the token and the transfer GET then 401s.
+    // Browser captures mint a one-time Inst-FS / Drive Location; discover it without consuming the hop.
     if ctx.handoff_auth.is_some() {
         if let Some(location) = super::preflight::discover_handoff_location(
             &client,
@@ -762,8 +735,7 @@ pub(crate) async fn apply_preflight(
     .await?;
     ctx.resolved_url = info.final_url.clone();
     let identity = preflight_commit_identity(&ctx.job, &info);
-    // Do not merge preflight ETag/LM onto the transfer-local job: If-Range
-    // must keep the validators that match bytes already on disk.
+    // Do not merge preflight ETag/LM onto the transfer-local job: If-Range on the GET owns identity.
     let _ = ctx.committer.commit(&mut ctx.job, identity).await;
     (ctx.on_progress)(TransferEvent::Tick(ProgressTick {
         total_bytes: info.total_bytes.filter(|&n| n > 0),
@@ -773,10 +745,6 @@ pub(crate) async fn apply_preflight(
     Some(info)
 }
 
-/// Early identity from preflight (size / validators / resume hint).
-///
-/// Sparse only: never forces `progress` (would zero a resume job) or overwrites a
-/// user/uniquified `filename` — GET start commit owns rename + path updates.
 pub(crate) fn preflight_commit_identity(
     job: &Job,
     info: &super::preflight::PreflightInfo,
@@ -796,8 +764,6 @@ pub(crate) fn preflight_commit_identity(
     } else {
         None
     };
-    // Filename only from Content-Disposition, and only when the job still has a
-    // generic fallback name (matches GET CD rename caution). Never URL-derive here.
     let filename = info.filename.as_ref().and_then(|cd_name| {
         let generic = job.filename.is_empty()
             || job.filename == "download.bin"
@@ -822,8 +788,6 @@ pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     }
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
-/// Both sides present and differ. Missing 206 headers are not a mismatch
-/// (CDN 206 without identity still continues).
 fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
     if let (Some(a), Some(b)) = (stored.etag.as_deref(), incoming.etag.as_deref()) {
         if a.trim() != b.trim() {
@@ -841,7 +805,6 @@ fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValida
     false
 }
 
-/// Capture ETag / Last-Modified / expected size from a successful download response.
 fn content_validators_from_headers(
     headers: &reqwest::header::HeaderMap,
     total_bytes: u64,
@@ -863,7 +826,6 @@ fn content_validators_from_headers(
     }
 }
 
-/// Progress patch value: `None` when capture is empty so apply does not replace stored identity.
 fn content_validators_patch(
     headers: &reqwest::header::HeaderMap,
     total_bytes: u64,
@@ -876,7 +838,6 @@ fn content_validators_patch(
     }
 }
 
-/// `sync_data` only on pause — cancel/complete skip fsync.
 fn should_sync_data_on_exit(outcome: DownloadOutcome) -> bool {
     matches!(outcome, DownloadOutcome::Paused)
 }
@@ -1135,7 +1096,6 @@ mod tests {
             "uniquified name must not be overwritten"
         );
 
-        // Generic fallback still allows CD rename hint.
         job.filename = "download.bin".into();
         let patch = preflight_commit_identity(&job, &info);
         assert_eq!(patch.filename.as_deref(), Some("server-name.zip"));
@@ -1164,12 +1124,10 @@ mod tests {
             true,
         );
         let stalled = crate::download::body::stall_error(std::time::Duration::from_secs(30));
-        // Mid-body with resume support.
         assert!(can_mid_transfer_reconnect(&body_err, false, 0, 100, true));
         assert!(can_mid_transfer_reconnect(&incomplete, false, 0, 100, true));
         assert!(can_mid_transfer_reconnect(&stalled, false, 0, 100, true));
         assert!(!can_mid_transfer_reconnect(&stalled, false, 0, 100, false));
-        // Exhausted short budget.
         assert!(!can_mid_transfer_reconnect(
             &body_err,
             false,
@@ -1177,9 +1135,7 @@ mod tests {
             100,
             true
         ));
-        // Partial without range support — not seamless reconnect.
         assert!(!can_mid_transfer_reconnect(&body_err, false, 0, 100, false));
-        // From zero always ranges-usable.
         assert!(can_mid_transfer_reconnect(&body_err, false, 0, 0, false));
     }
 
@@ -1190,9 +1146,7 @@ mod tests {
             "Could not connect: timed out".into(),
             true,
         );
-        // First attempt connect → worker RETRY_DELAYS.
         assert!(!can_mid_transfer_reconnect(&connect, true, 0, 50, true));
-        // Reconnect GET connect error → short budget.
         assert!(can_mid_transfer_reconnect(&connect, true, 1, 50, true));
     }
 
@@ -1225,7 +1179,6 @@ mod tests {
         let sleeper = tokio::spawn(async move {
             sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
         });
-        // Flip cancel shortly after start.
         sleep(Duration::from_millis(20)).await;
         control.store(CONTROL_CANCELED, Ordering::Relaxed);
         let outcome = sleeper.await.expect("join");
@@ -1275,9 +1228,7 @@ mod tests {
         let part = dir.join("f.bin.part");
         tokio::fs::write(&part, vec![0u8; 77]).await.unwrap();
 
-        // v0: disk length wins.
         assert_eq!(refresh_reconnect_offset(0, 10, &part).await, 77);
-        // v1+: tracked downloaded (map-authoritative), ignore sparse length.
         assert_eq!(refresh_reconnect_offset(1, 42, &part).await, 42);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

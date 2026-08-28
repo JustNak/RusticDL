@@ -1,29 +1,18 @@
-//! Extract HTTP(S) URLs from OS file drops (`ExternalPaths` / CF_HDROP).
-//!
-//! GPUI Windows only accepts file-path drops — freeform text/URL drag is not available.
-//! Callers should read dropped paths here, then enqueue via `EngineCommand::Add`.
-
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::urls::extract_http_urls;
 
-/// Cap for reading dropped files (1 MiB). Larger files are skipped.
 pub const MAX_DROP_FILE_BYTES: u64 = 1_048_576;
 
-/// Outcome of scanning one or more dropped paths for HTTP(S) URLs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DropFilesSummary {
-    /// Deduped URLs in first-seen order (exact-string dedupe across files).
     pub urls: Vec<String>,
-    /// Files skipped as binary, oversized, directories, or unreadable as text.
     pub skipped: usize,
-    /// Paths that failed to open/read (permission, IO).
     pub errors: usize,
 }
 
-/// Collect HTTP(S) URLs from Explorer / shell file drops.
 pub fn extract_urls_from_dropped_paths(paths: &[PathBuf]) -> DropFilesSummary {
     let mut summary = DropFilesSummary::default();
     for path in paths {
@@ -62,8 +51,6 @@ fn urls_from_dropped_path(path: &Path) -> Result<Vec<String>, DropPathError> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
 
-    // Known text-like extensions always attempt a read (within size cap).
-    // Unknown extensions only if the file looks like UTF-8 text without NULs.
     let text_like = matches!(
         ext.as_deref(),
         Some("txt" | "csv" | "url" | "webloc" | "md" | "log" | "html" | "htm" | "json")
@@ -89,26 +76,17 @@ fn urls_from_dropped_path(path: &Path) -> Result<Vec<String>, DropPathError> {
         if let Some(url) = parse_windows_url_shortcut(&contents) {
             return Ok(vec![url]);
         }
-        // Fall through: some .url files may still contain bare URLs.
     }
 
     Ok(extract_http_urls(&contents))
 }
 
-/// Parse a Windows Internet Shortcut (`.url`) `URL=` line.
-///
-/// Example:
-/// ```ini
-/// [InternetShortcut]
-/// URL=https://example.com/file.zip
-/// ```
 pub fn parse_windows_url_shortcut(contents: &str) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim();
         if line.len() < 5 {
             continue;
         }
-        // Case-insensitive "URL="
         if line
             .as_bytes()
             .get(..4)
@@ -118,12 +96,10 @@ pub fn parse_windows_url_shortcut(contents: &str) -> Option<String> {
             if value.is_empty() {
                 continue;
             }
-            // Prefer validated HTTP(S); also accept any parseable http(s) via extractor.
             let urls = extract_http_urls(value);
             if let Some(u) = urls.into_iter().next() {
                 return Some(u);
             }
-            // Bare non-http schemes are ignored for this product.
         }
     }
     None
@@ -133,11 +109,9 @@ fn looks_binary(buf: &[u8]) -> bool {
     if buf.is_empty() {
         return false;
     }
-    // NUL in the sample ⇒ almost certainly binary.
     if buf.iter().any(|&b| b == 0) {
         return true;
     }
-    // High ratio of non-text control bytes (excluding common whitespace).
     let sample = &buf[..buf.len().min(512)];
     let non_text = sample
         .iter()
@@ -218,8 +192,6 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let huge = dir.join("huge.txt");
-        // Don't write a full MiB+1 of zeros to disk if avoidable — write a stub and
-        // rely on metadata... actually we need real size. Write sparse-ish content.
         {
             let mut f = fs::File::create(&huge).unwrap();
             let chunk = vec![b'a'; 64 * 1024];

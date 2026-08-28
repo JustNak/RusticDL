@@ -1,5 +1,3 @@
-//! Browser session headers for extension handoff (memory-only).
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,7 +6,6 @@ pub struct HandoffAuthHeader {
     pub value: String,
 }
 
-/// Cookie / Authorization captured for one origin (Canvas vs Drive after redirect).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OriginHandoffAuth {
     pub origin: String,
@@ -19,8 +16,6 @@ pub struct OriginHandoffAuth {
 pub struct HandoffAuth {
     #[serde(default)]
     pub headers: Vec<HandoffAuthHeader>,
-    /// Per-origin secrets so a Canvas → Google Drive hop keeps Drive cookies
-    /// without sending the Canvas session to a different site.
     #[serde(default, rename = "originAuth")]
     pub origin_auth: Vec<OriginHandoffAuth>,
 }
@@ -47,7 +42,6 @@ impl EnqueueStatus {
     }
 }
 
-/// Headers the desktop app will apply from a browser capture (case-insensitive names).
 const ALLOWED_HANDOFF_HEADERS: &[&str] = &[
     "cookie",
     "authorization",
@@ -78,9 +72,6 @@ fn is_secret_handoff_header(name: &str) -> bool {
     lower == "cookie" || lower == "authorization"
 }
 
-/// Headers to send on this hop: identity headers stay job-origin-only;
-/// Cookie / Authorization come from matching `origin_auth`, else the legacy
-/// job-origin Cookie header.
 pub fn handoff_headers_for_request<'a>(
     job_url: &str,
     request_url: &str,
@@ -122,15 +113,11 @@ pub fn handoff_headers_for_request<'a>(
     out
 }
 
-/// Preflight must not pin a hop it already fetched when a browser session
-/// minted that Location. Inst-FS / Drive tokens are one-use; the real GET
-/// then 401s with the "fresh token" message.
+// Inst-FS / Drive tokens are one-use; the real GET then 401s with the "fresh token" message.
 pub fn should_pin_preflight_url(handoff_auth: Option<&HandoffAuth>) -> bool {
     handoff_auth.is_none()
 }
 
-/// After 401/403 on a redirected hop, replay the original session URL once
-/// so Canvas can mint a new Location. Same URL cannot remint itself.
 pub fn session_url_after_auth_denied<'a>(
     job_url: &'a str,
     current_url: &'a str,
@@ -146,9 +133,6 @@ pub fn session_url_after_auth_denied<'a>(
     Some(job_url)
 }
 
-/// Apply handoff headers only when the request URL is same-origin as the job URL.
-///
-/// Prefer [`handoff_headers_for_request`] when origin-scoped cookies are present.
 pub fn handoff_auth_for_request_url<'a>(
     job_url: &str,
     request_url: &str,

@@ -1,8 +1,5 @@
-//! Apply the RusticDL brand icon to a native window (Windows).
-
 use std::path::PathBuf;
 
-/// Best-effort: load `assets/brand/icon.ico` and set it as the window icon.
 pub fn apply_app_icon(window: &gpui::Window) {
     #[cfg(windows)]
     {
@@ -15,7 +12,6 @@ pub fn apply_app_icon(window: &gpui::Window) {
             LR_LOADFROMFILE, WM_SETICON,
         };
 
-        // Prefer the raw-window-handle trait method (not gpui's AnyWindowHandle helper).
         let Ok(handle) = HasWindowHandle::window_handle(window) else {
             return;
         };

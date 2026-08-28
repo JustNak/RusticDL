@@ -1,5 +1,3 @@
-//! Conflict phase: same-name file already exists — rename, overwrite, or cancel.
-
 use std::path::PathBuf;
 
 use gpui::{

@@ -1,10 +1,6 @@
-//! Multi-segment map types and even-split partition (orchestrator lands in PR 11).
-
 use serde::{Deserialize, Serialize};
 
-/// Settings default when `multi_max_segments` is not specified.
 pub const DEFAULT_SEGMENT_COUNT: u32 = 8;
-/// Partition floor: never emit a segment smaller than 1 MiB unless the file itself is.
 pub const MIN_SEGMENT_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -21,11 +17,8 @@ pub enum SegmentState {
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub index: u32,
-    /// Inclusive byte offset.
     pub start: u64,
-    /// Inclusive byte offset.
     pub end: u64,
-    /// Bytes successfully written inside `[start, end]`.
     #[serde(default)]
     pub written: u64,
     #[serde(default)]
@@ -37,7 +30,6 @@ impl Segment {
         self.end.saturating_sub(self.start).saturating_add(1)
     }
 
-    /// Next Range start for this segment (`start + written`).
     pub fn remaining_start(&self) -> u64 {
         self.start.saturating_add(self.written)
     }
@@ -49,7 +41,6 @@ pub struct SegmentMap {
     pub total_bytes: u64,
     pub segment_count: u32,
     pub segments: Vec<Segment>,
-    /// True after a successful `set_len(total)` preallocate (progress must ignore file len).
     #[serde(default)]
     pub preallocated: bool,
 }
@@ -59,7 +50,6 @@ impl SegmentMap {
         self.segments.iter().map(|segment| segment.written).sum()
     }
 
-    /// Bounds / segment `state` / `preallocated` — ignores `written` (§2.8 accepted lag).
     pub fn structure_eq(&self, other: &Self) -> bool {
         self.total_bytes == other.total_bytes
             && self.segment_count == other.segment_count
@@ -70,7 +60,6 @@ impl SegmentMap {
             })
     }
 
-    /// Contiguous coverage of `total_bytes`, no gaps/overlaps, written within bounds.
     pub fn is_consistent(&self) -> bool {
         if self.segment_count as usize != self.segments.len() {
             return false;
@@ -95,10 +84,6 @@ impl SegmentMap {
     }
 }
 
-/// Even-split `total_bytes` into at most `n` segments (default 8).
-///
-/// Lengths differ by at most 1 byte; no gaps or overlaps. Files smaller than
-/// `n * MIN_SEGMENT_SIZE` get fewer segments so each is ≥ 1 MiB (or the whole file).
 pub fn partition(total_bytes: u64, n: u32) -> SegmentMap {
     if total_bytes == 0 {
         return SegmentMap {
@@ -181,7 +166,6 @@ mod tests {
         let map = partition(total, 8);
         assert_eq!(map.segment_count, 8);
         assert_contiguous(&map);
-        // First 3 get the extra byte.
         assert_eq!(map.segments[0].length(), MIN_SEGMENT_SIZE + 1);
         assert_eq!(map.segments[2].length(), MIN_SEGMENT_SIZE + 1);
         assert_eq!(map.segments[3].length(), MIN_SEGMENT_SIZE);

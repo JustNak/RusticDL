@@ -1,5 +1,3 @@
-//! Tray lifecycle, close-to-tray, and balloon-click handlers for `DownloadApp`.
-
 use gpui::{Context, Window};
 
 use super::DownloadApp;
@@ -13,7 +11,6 @@ use crate::tray::{
 };
 
 impl DownloadApp {
-    /// Intercept main-window close: hide to tray when the preference is on.
     pub(crate) fn handle_window_should_close(
         &mut self,
         window: &mut Window,
@@ -25,7 +22,6 @@ impl DownloadApp {
             return true;
         }
 
-        // Need a tray icon to restore; without one, quit instead of orphaning.
         self.ensure_tray(cx);
         if self.system_tray.is_none() {
             self.flush_window_layout_now();
@@ -46,11 +42,6 @@ impl DownloadApp {
         false
     }
 
-    /// Tear down leftover capture HUDs when hiding to tray (extra swapchains).
-    ///
-    /// Does not destroy the main window or its D3D swapchain. After hide,
-    /// `poll_browser_capture` may still open Confirm / needed Progress
-    /// (IPC wake unparks the shell timer).
     pub(crate) fn close_capture_huds(&mut self, cx: &mut Context<Self>) {
         self.ipc.request_close_capture_windows();
         self.browser_watch_complete_ids.clear();
@@ -83,10 +74,6 @@ impl DownloadApp {
         self.system_tray = None;
     }
 
-    /// Drop the tray icon without joining its message thread on the UI thread.
-    ///
-    /// Exit is often delivered while the tray thread is still nested in
-    /// `TrackPopupMenu`; a synchronous join there can stall quit.
     fn stop_tray_nonblocking(&mut self) {
         if let Some(tray) = self.system_tray.take() {
             let _ = std::thread::Builder::new()
@@ -107,7 +94,6 @@ impl DownloadApp {
         cx.quit();
     }
 
-    /// Keep tray alive when close-to-tray, currently hidden, or OS notify is enabled.
     pub(crate) fn sync_tray_lifetime(&mut self, cx: &mut Context<Self>) {
         let needed = self.settings.close_to_tray
             || self.window_hidden_to_tray
@@ -122,24 +108,20 @@ impl DownloadApp {
     pub(crate) fn handle_tray_event(&mut self, event: TrayEvent, cx: &mut Context<Self>) {
         match event {
             TrayEvent::ShowWindow => {
-                // Show HWND immediately — hidden windows may not paint until visible again.
                 self.restore_main_window_now();
                 self.pending_tray_show = true;
                 cx.notify();
             }
             TrayEvent::Exit => {
-                // Quit immediately (same reason Show restores HWND without render).
                 self.force_quit_app(cx);
             }
             TrayEvent::BalloonUserClick { context_id } => {
-                // Always restore/focus the main window; open-file resolved on render.
                 self.restore_main_window_now();
                 self.pending_tray_show = true;
                 self.pending_balloon_click = Some(context_id);
                 cx.notify();
             }
         }
-        // Resume the 80ms shell timer after restore (it parks while tray-hidden idle).
         self.ipc.wake_ui();
     }
 
@@ -151,7 +133,6 @@ impl DownloadApp {
         }
     }
 
-    /// Poll IPC show_window while the main window may be hidden (no render).
     pub(crate) fn poll_hidden_window_actions(&mut self, cx: &mut Context<Self>) {
         if self.ipc.take_show_window_request() {
             self.restore_main_window_now();
@@ -165,7 +146,6 @@ impl DownloadApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Keep HWND fresh whenever we have a Window (handles recreate edge cases).
         let hwnd = main_window_hwnd(window);
         if hwnd != 0 {
             self.main_hwnd = hwnd;
@@ -180,7 +160,6 @@ impl DownloadApp {
         }
     }
 
-    /// Balloon click policy: show window already applied; open file for SingleComplete.
     fn handle_balloon_click(&mut self, context_id: u64, cx: &mut Context<Self>) {
         let Some(ctx) = self.balloon_contexts.lookup(context_id).cloned() else {
             return;

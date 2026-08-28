@@ -1,5 +1,3 @@
-//! Process wait, quit/kill, and single-instance helpers.
-
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -7,7 +5,6 @@ use crate::ui::ProgressSink;
 
 const MUTEX_NAME: &str = "Local\\RusticDL.Updater";
 
-/// Returns true if this process owns the single-instance mutex.
 pub fn try_acquire_single_instance() -> bool {
     #[cfg(windows)]
     {
@@ -19,7 +16,6 @@ pub fn try_acquire_single_instance() -> bool {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        // Intentionally leaked: held for process lifetime.
         let result = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) };
         match result {
             Ok(_handle) => {
@@ -35,7 +31,6 @@ pub fn try_acquire_single_instance() -> bool {
     }
 }
 
-/// Wait until `pid` exits, or until `timeout`.
 pub fn wait_for_process_exit(
     pid: u32,
     timeout: Duration,
@@ -55,7 +50,6 @@ pub fn wait_for_process_exit(
         let handle = match handle {
             Ok(h) if !h.is_invalid() => h,
             _ => {
-                // Process already gone (or access denied treated as gone for update purposes).
                 return Ok(());
             }
         };
@@ -70,21 +64,18 @@ pub fn wait_for_process_exit(
                 return Err(WaitError::Timeout);
             }
             let ms = remaining.as_millis().min(u32::MAX as u128) as u32;
-            // Poll in chunks so the UI can keep marquee animation via posted messages.
             let slice = ms.min(250);
             let wait = unsafe { WaitForSingleObject(handle, slice) };
             if wait == WAIT_OBJECT_0 {
                 unsafe {
                     let _ = CloseHandle(handle);
                 }
-                // Brief settle so file handles are fully released before overwrite.
                 std::thread::sleep(Duration::from_millis(400));
                 return Ok(());
             }
             if wait == WAIT_TIMEOUT {
                 continue;
             }
-            // Unexpected wait result — treat as exited to avoid stuck updater.
             unsafe {
                 let _ = CloseHandle(handle);
             }
@@ -119,7 +110,6 @@ pub fn close_app_for_replace(
     if let Some(pid) = wait_pid {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            // Best-effort wait for the handoff pid; stragglers are quit/killed next.
             let _ = wait_for_process_exit(pid, remaining, progress);
         }
     }
@@ -257,7 +247,6 @@ mod win {
 
     fn image_path_matches(pid: u32, app_exe: &Path) -> bool {
         let Some(image) = process_image_path(pid) else {
-            // Name already matched rusticdl.exe (not the updater). Include it.
             return true;
         };
         paths_equal_ignore_case(Path::new(&image), app_exe)

@@ -1,5 +1,3 @@
-//! Sidebar navigation extracted from `DownloadApp`.
-
 use gpui::{
     div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled,
@@ -113,7 +111,6 @@ impl DownloadApp {
             )
     }
 
-    /// Left rail while Settings is open: Back + category list (replaces queue filters).
     pub(crate) fn render_settings_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let sidebar_w = self.settings.ui_density.sidebar_w();

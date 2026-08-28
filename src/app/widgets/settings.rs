@@ -13,8 +13,6 @@ use gpui_component::{
 use super::super::DownloadApp;
 use crate::settings::AccentPreset;
 
-/// Field title — stronger than hints so forms scan as Label → control → help.
-/// Used by add dialog and other compact forms (`text_xs`).
 pub(crate) fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
@@ -24,7 +22,6 @@ pub(crate) fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement 
         .child(text)
 }
 
-/// Supporting description under a field. Kept smaller/softer than `field_label`.
 pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
@@ -34,9 +31,6 @@ pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl In
         .child(text.into())
 }
 
-// ── Settings layout helpers (settings panels only; leave add-dialog labels alone) ──
-
-/// Settings field label: `text_sm` semibold so hierarchy beats muted hints.
 pub(crate) fn settings_field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
@@ -46,7 +40,6 @@ pub(crate) fn settings_field_label(text: &'static str, cx: &mut App) -> impl Int
         .child(text)
 }
 
-/// Settings text field with an in-field ↺ reset when the draft diverges from factory default.
 pub(crate) fn settings_input_with_reset(
     id: impl Into<SharedString>,
     input: &Entity<InputState>,
@@ -80,7 +73,6 @@ pub(crate) fn settings_input_with_reset(
                             input_entity.update(cx, |state, cx| {
                                 state.set_value(default_owned.clone(), window, cx);
                             });
-                            // Re-render settings so the suffix can hide when clean.
                             let _ = app.update(cx, |_, cx| cx.notify());
                         }
                     }),
@@ -88,7 +80,6 @@ pub(crate) fn settings_input_with_reset(
         })
 }
 
-/// Sub-group eyebrow (e.g. NOTIFICATIONS). Optional top hairline divider.
 pub(crate) fn settings_subgroup(
     title: &'static str,
     with_divider: bool,
@@ -111,10 +102,6 @@ pub(crate) fn settings_subgroup(
         )
 }
 
-/// Horizontal toggle/choice row: label (+ optional hint) left, control cluster right.
-///
-/// Label is width-capped so multi-button control clusters (theme, density, handoff)
-/// keep a single horizontal row instead of wrapping and bleeding into the next field.
 pub(crate) fn settings_choice_row(
     label: &'static str,
     hint: Option<&'static str>,
@@ -135,12 +122,9 @@ pub(crate) fn settings_choice_row(
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
         )
-        // Size to the control cluster; do not cap width so Off/On/Auto groups
-        // stay on one line inside the expanded settings content column.
         .child(div().flex_shrink_0().child(control))
 }
 
-/// Equal-size circular preset swatch (solid fill + selection ring).
 pub(crate) fn accent_preset_swatch(
     preset: AccentPreset,
     selected: bool,
@@ -154,8 +138,6 @@ pub(crate) fn accent_preset_swatch(
     } else {
         label.to_string().into()
     };
-    // Light fills (stock dark primary is often near-white) need a stronger edge
-    // so they don't dissolve into the selection ring or the panel.
     let light_fill = swatch.l > 0.72;
     let fill_border = if selected {
         if light_fill {
@@ -178,7 +160,6 @@ pub(crate) fn accent_preset_swatch(
         .cursor_pointer()
         .border_2()
         .border_color(if selected {
-            // Darker ring when the fill itself is light so selection stays obvious.
             if light_fill {
                 theme.muted_foreground.opacity(0.95)
             } else {
@@ -207,7 +188,6 @@ pub(crate) fn accent_preset_swatch(
         )
 }
 
-/// Custom mixer entry: white disc + paintbrush — clearly not a solid preset.
 pub(crate) fn accent_custom_swatch(
     selected: bool,
     _custom_color: Hsla,
@@ -215,7 +195,6 @@ pub(crate) fn accent_custom_swatch(
     cx: &mut Context<DownloadApp>,
 ) -> impl IntoElement {
     let tip: SharedString = "Custom — mix your own accent".into();
-    // White plate always; brush in dark ink so it stays readable on light/dark UI.
     let plate = hsla(0.0, 0.0, 0.98, 1.0);
     let brush = hsla(0.0, 0.0, 0.22, 1.0);
 

@@ -7,7 +7,6 @@ fn default_true() -> bool {
     true
 }
 
-/// One type-folder under the main download directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryFolder {
@@ -30,7 +29,6 @@ impl CategoryFolder {
     }
 }
 
-/// Per-type subfolder names (and optional disable) for organize-by-type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryFolders {

@@ -24,13 +24,11 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
     }
 
     // Fail closed: Authenticode (WinVerifyTrust) before Command / ShellExecute.
-    // Soft download size is not this gate.
     verify_installer_authenticode(path)?;
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // Keep the console hidden; do not detach — we need to wait for completion.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const ERROR_ELEVATION_REQUIRED: i32 = 740;
 
@@ -42,7 +40,6 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
             Ok(status) => status,
             Err(e) if e.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) => {
                 // Per-machine setups (or Installer Detection) need elevation.
-                // ShellExecuteEx with "runas" shows UAC and can wait for exit.
                 return run_installer_elevated(path, progress);
             }
             Err(e) => return Err(format!("Could not start installer: {e}")),
@@ -156,7 +153,6 @@ The update is unsigned, tampered, or not trusted. Install manually from the rele
     }
 }
 
-/// Run the NSIS setup elevated (UAC prompt) and wait for it to finish.
 #[cfg(windows)]
 fn run_installer_elevated(path: &Path, progress: &dyn ProgressSink) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -225,10 +221,8 @@ Accept the Windows security prompt, or install the update manually from the rele
     Ok(())
 }
 
-/// Launch the main application after a successful update.
 pub fn relaunch_app(app_exe: &Path) -> Result<(), String> {
     if !app_exe.is_file() {
-        // Fresh install path might still be settling; brief retry.
         for _ in 0..10 {
             std::thread::sleep(Duration::from_millis(200));
             if app_exe.is_file() {

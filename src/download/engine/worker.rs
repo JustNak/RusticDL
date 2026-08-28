@@ -1,5 +1,3 @@
-//! Per-job worker: spawn, retry loop, reconcile, finalize.
-
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +19,6 @@ use super::{
     spawn_progress_pump, EngineIdentity, EngineInner,
 };
 
-/// Backoff schedule for auto-retry (indexed by attempt number - 1).
-/// Longer delays help with flaky TLS / filter / CDN blips that browsers also hit.
 const RETRY_DELAYS: [Duration; 8] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
@@ -78,12 +74,9 @@ async fn run_attempts(
     let mut attempt_job = job_snapshot;
     let mut retry_attempts = attempt_job.retry_attempts;
 
-    // Per-attempt progress pump: drain (flush pending) after each attempt so
-    // restart/retry state writes cannot race a deferred coalesce window.
     loop {
         reconcile_for_attempt(&inner, &job_id, &mut attempt_job).await;
 
-        // Reset control to continue for each attempt unless user paused/canceled.
         if control.load(Ordering::Relaxed) == 0 {
             store_control(&control, WorkerControl::Continue);
         }
@@ -97,9 +90,6 @@ async fn run_attempts(
             inner: inner.clone(),
         });
 
-        // Re-read live knobs so UpdateSettings applies to the next attempt.
-        // Mid-transfer reconnect (short backoff, max 5) is nested inside
-        // `run_http_download_with_ctx`; worker `RETRY_DELAYS` only run after that budget is spent.
         let (config, conn_budget) = {
             let guard = inner.lock().await;
             (guard.config.clone(), guard.conn_budget.clone())
@@ -116,21 +106,18 @@ async fn run_attempts(
         );
         let attempt_result = run_transfer(ctx).await;
 
-        // Flush remaining patches before any post-attempt state mutation.
         drop(on_progress);
         let _ = progress_pump.await;
 
         match attempt_result {
             Ok(outcome) => break Ok(outcome),
             Err(error) => {
-                // Restart requested mid-flight: stop retrying and exit as canceled.
                 {
                     let guard = inner.lock().await;
                     if guard.requeue_on_cancel.contains_key(&job_id) {
                         break Ok(DownloadOutcome::Canceled);
                     }
                 }
-                // Re-read live auto_retry so UpdateSettings applies to the next failure.
                 let max_retry = {
                     let guard = inner.lock().await;
                     guard.config.auto_retry
@@ -171,7 +158,6 @@ async fn run_attempts(
     }
 }
 
-/// Snapshot under the lock, then await metadata without holding it.
 /// Multi / Restart skip metadata_len so a sparse `.part` cannot lie.
 async fn reconcile_for_attempt(
     inner: &Arc<Mutex<EngineInner>>,
@@ -224,7 +210,6 @@ pub(super) async fn finalize_worker(
         let mut guard = inner.lock().await;
         let requeue = guard.requeue_on_cancel.contains_key(job_id);
         let has_partial = guard.pending_partial_deletes.contains_key(job_id);
-        // Restart leaves a startable Queued job; wait until the leftover .part is gone.
         let defer_start = requeue && has_partial;
 
         guard.active.remove(job_id);
@@ -238,7 +223,6 @@ pub(super) async fn finalize_worker(
         };
 
         if requeue {
-            // Restart already reset the job to Queued; do not overwrite with Canceled.
             if let Some(job) = find_job_mut(&mut guard.jobs, job_id) {
                 if !matches!(job.state, JobState::Queued) {
                     job.state = JobState::Queued;
@@ -252,7 +236,6 @@ pub(super) async fn finalize_worker(
                         job.state = JobState::Completed;
                         job.progress = 100.0;
                         job.error = None;
-                        // Slim state.json: drop map, version 0; keep validators.
                         job.on_completed();
                         clear_live_metrics(job);
                     }
@@ -278,7 +261,6 @@ pub(super) async fn finalize_worker(
                 Err(error) => {
                     let clear_auth = !matches!(control.load(Ordering::Relaxed), 1);
                     if let Some(job) = find_job_mut(&mut guard.jobs, job_id) {
-                        // If user paused/canceled during retry wait, prefer that.
                         match control.load(Ordering::Relaxed) {
                             1 => {
                                 job.state = JobState::Paused;

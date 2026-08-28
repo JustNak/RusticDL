@@ -1,7 +1,5 @@
 //! Shared chrome for fixed-size browser capture popups.
-//!
 //! `gpui-component::TitleBar` always draws min/max/close on Windows. These
-//! popups are non-resizable, so we use a close-only bar with a drag region.
 
 use std::rc::Rc;
 

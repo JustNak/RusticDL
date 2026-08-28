@@ -1,13 +1,4 @@
-//! Transfer entry + planner decision tree.
-//!
-//! When multi qualifies (known size ≥ `multi_min_bytes`, ranges supported)
-//! the planner chooses [`TransferMode::Multi`].
-//!
-//! - Convert multi→single only when every segment `written == 0`.
-//! - Range unusable after any `written > 0` is a Resume error (retain map).
-//! - Legacy v0 `.part` stays single until Restart.
-//! - v1 map missing/inconsistent → Resume error (never invent Range offsets).
-//! - Surface `fallback_reason` whenever the planner stays on single-stream.
+//! v1 map missing/inconsistent → Resume error (never invent Range offsets).
 
 use super::context::TransferContext;
 use super::http::{apply_preflight, control_outcome, run_http_download_with_ctx};
@@ -19,26 +10,21 @@ use super::preflight::PreflightInfo;
 use super::progress::{CommitIdentity, ProgressTick, TransferEvent};
 use super::resume::{resume_oracle, ResumeOracle};
 
-/// Why the planner chose single-stream, or that multi qualified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPlanReason {
     SizeUnknown,
     RangesUnknown,
     RangesUnsupported,
     BelowMinSize,
-    /// v0 contiguous `.part` — stay single until Restart.
     LegacyContiguousPartial,
     /// `version >= 1` and no map — Resume error, do not invent ranges.
     MapMissing,
     /// Map present but inconsistent — Resume error, do not invent ranges.
     MapInconsistent,
-    /// Multi qualifies — orchestrator should run.
     MultiQualified,
-    /// Settings kill switch; a live consistent map still forces Multi.
     MultiDisabled,
 }
 
-/// One-shot toast when a large file cannot use multi (ranges unknown/unsupported).
 pub const LARGE_FILE_MULTI_UNAVAILABLE_TOAST: &str =
     "Multi-connection unavailable for this large file; using a single connection.";
 
@@ -66,14 +52,12 @@ impl TransferPlanReason {
     }
 }
 
-/// Planner result. `chosen` is Multi when [`TransferPlanReason::MultiQualified`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferPlan {
     pub chosen: TransferMode,
     pub reason: TransferPlanReason,
 }
 
-/// Planner Tick plus an optional one-shot toast.
 #[derive(Debug, Clone)]
 pub struct VisibilityUpdate {
     pub tick: ProgressTick,
@@ -89,7 +73,6 @@ impl TransferPlan {
         }
     }
 
-    /// Resume-required jobs keep their multi identity; do not claim a conversion.
     fn published_mode(self) -> Option<TransferMode> {
         if self.reason.is_resume_required() {
             None
@@ -98,7 +81,6 @@ impl TransferPlan {
         }
     }
 
-    /// Last why we stayed single (or why Resume is required).
     pub fn fallback_reason(self) -> Option<&'static str> {
         match self.reason {
             TransferPlanReason::MultiQualified => None,
@@ -106,13 +88,6 @@ impl TransferPlan {
         }
     }
 
-    /// Connections tick plus a one-shot toast for large files.
-    ///
-    /// Toast only when ranges are unknown/unsupported on a file at or above
-    /// `multi_min_bytes`.
-    ///
-    /// `existing_reason` is the job's last `fallback_reason`. A matching key
-    /// (retry / resume) keeps the reason but skips the toast.
     pub fn to_visibility_update(
         self,
         size: Option<u64>,
@@ -137,9 +112,6 @@ impl TransferPlan {
     }
 }
 
-/// Decide transfer mode. Multi when size known, ranges supported, and size ≥ min.
-/// A present consistent `segment_map` always forces Multi so resume reuses bounds/`written`.
-/// Legacy v0 partials stay single; v1 map missing/inconsistent is Resume-required.
 pub fn plan_transfer(
     job: &Job,
     preflight: Option<&PreflightInfo>,
@@ -224,7 +196,6 @@ fn range_support(job: &Job, preflight: Option<&PreflightInfo>) -> RangeSupport {
     }
 }
 
-/// Engine transfer entry: preflight → plan → multi orchestrator or single-stream.
 pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, DownloadError> {
     let preflight = apply_preflight(&mut ctx).await;
 
@@ -406,7 +377,6 @@ mod tests {
 
     #[test]
     fn planner_handoff_does_not_block_multi_qualification() {
-        // Decision tree allows multi with handoff; planner does not inspect auth.
         let mut job = sample_job();
         job.total_bytes = 20 * 1024 * 1024;
         job.resume_supported = true;
@@ -432,7 +402,6 @@ mod tests {
         job.transfer_format_version = 1;
         job.total_bytes = 2 * 1024 * 1024;
         job.segment_map = Some(crate::download::segment::partition(2 * 1024 * 1024, 2));
-        // Flaky preflight: unknown size / ranges, and min-size raised above total.
         let pf = preflight(None, None);
         let plan = plan_transfer(&job, Some(&pf), 50 * 1024 * 1024, true);
         assert_eq!(plan.chosen, TransferMode::Multi);
@@ -717,8 +686,6 @@ Accept-Ranges: bytes\r\n\
     #[tokio::test]
     async fn run_transfer_large_file_without_ranges_toasts_once() {
         let body = vec![b'x'; 64];
-        // Explicit none so preflight does not fire a Range probe (which would
-        // consume the scripted GET). Planner still sees ranges_unsupported.
         let head = format!(
             "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
@@ -909,7 +876,6 @@ Content-Length: {}\r\n\
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
-        // Contiguous bytes on disk must not be used as a Range start.
         std::fs::write(&temp, &body[..16]).unwrap();
 
         let url = format!("{base}/file.bin");
@@ -968,7 +934,6 @@ Content-Length: {}\r\n\
 \r\n",
             body.len()
         );
-        // Single-stream resume: 206 from offset 16.
         let get = format!(
             "HTTP/1.1 206 Partial Content\r\n\
 Connection: close\r\n\

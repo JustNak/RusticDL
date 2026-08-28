@@ -86,8 +86,6 @@ fn main() {
         .with_assets(Assets::new())
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            // Theme / accent / opacity are applied when the window opens
-            // (DownloadApp::new → appearance::apply_appearance).
 
             let (window_bounds, needs_center) =
                 window_bounds_from_layout(&initial_settings.window_layout, cx);
@@ -103,9 +101,6 @@ fn main() {
                     .open_window(
                         WindowOptions {
                             window_bounds: Some(window_bounds),
-                            // Client-drawn chrome: gpui-component TitleBar supplies
-                            // drag region + window controls. Keep a title string for
-                            // taskbar / Alt-Tab while drawing our own bar.
                             titlebar: Some({
                                 let mut opts = TitleBar::title_bar_options();
                                 opts.title = Some(SharedString::from(APP_NAME));
@@ -116,7 +111,6 @@ fn main() {
                                 px(MIN_WINDOW_WIDTH),
                                 px(MIN_WINDOW_HEIGHT),
                             )),
-                            // `--minimized` (startup-minimized) keeps the shell hidden until tray show.
                             show: !start_hidden,
                             ..Default::default()
                         },
@@ -172,7 +166,6 @@ fn window_bounds_from_layout(layout: &WindowLayout, cx: &App) -> (WindowBounds, 
     };
 
     let window_bounds = if layout.maximized {
-        // Maximized restore already fills the monitor; no post-open center needed.
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)

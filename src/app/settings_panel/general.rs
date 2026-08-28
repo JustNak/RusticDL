@@ -1,5 +1,3 @@
-//! General settings category panel.
-
 use std::path::PathBuf;
 
 use gpui::{

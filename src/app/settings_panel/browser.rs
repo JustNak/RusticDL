@@ -1,5 +1,3 @@
-//! Browser extension settings category panel.
-
 use gpui::{prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{
     button::{Button, ButtonVariants},

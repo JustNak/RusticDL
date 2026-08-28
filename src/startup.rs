@@ -1,5 +1,3 @@
-//! Launch-at-login registration (Windows Run key).
-
 use crate::branding::APP_NAME;
 
 /// Command-line flag written into the startup entry when "start minimized" is on.
@@ -51,7 +49,6 @@ mod windows_impl {
         let exe =
             std::env::current_exe().map_err(|e| format!("Could not resolve exe path: {e}"))?;
         let exe_str = exe.to_string_lossy();
-        // Quote the path so spaces are safe; append --minimized when requested.
         let command = if start_minimized {
             format!("\"{exe_str}\" {MINIMIZED_ARG}")
         } else {
@@ -111,10 +108,8 @@ mod windows_impl {
                 &mut hkey,
             );
             if status != ERROR_SUCCESS {
-                // Key missing is fine when disabling.
                 return Ok(());
             }
-            // Missing value is fine (already disabled).
             let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr()));
             let _ = RegCloseKey(hkey);
         }

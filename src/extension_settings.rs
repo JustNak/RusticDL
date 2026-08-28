@@ -170,9 +170,7 @@ fn normalize_host_pattern(value: &str) -> String {
         pattern = host.to_string();
     }
     if let Some((host, _)) = pattern.rsplit_once(':') {
-        if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            // keep as-is for IPv4:port edge — strip only trailing :port when host has no colons of ipv6
-        }
+        if host.chars().all(|c| c.is_ascii_digit() || c == '.') {}
         if !host.contains(':')
             && pattern[host.len() + 1..]
                 .chars()

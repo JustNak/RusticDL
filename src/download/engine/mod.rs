@@ -24,7 +24,6 @@ pub(crate) use persist::EngineIdentity;
 pub use persist::MemoryJobStore;
 pub use persist::{FileJobStore, JobStore};
 
-/// Live engine knobs (from Settings).
 #[derive(Debug, Clone)]
 pub struct EngineRuntimeConfig {
     pub max_concurrent: u32,
@@ -56,12 +55,10 @@ impl EngineRuntimeConfig {
     pub fn sanitize(&mut self) {
         self.max_concurrent = self.max_concurrent.clamp(1, 64);
         self.auto_retry = self.auto_retry.min(100);
-        // 0 = unlimited; no upper clamp needed for practical UI values.
         self.multi_max_segments = self.multi_max_segments.clamp(1, 16);
         self.multi_min_bytes = self.multi_min_bytes.clamp(1024 * 1024, 1024 * 1024 * 1024);
         self.max_total_connections = self.max_total_connections.clamp(1, 256);
         self.max_connections_per_host = self.max_connections_per_host.clamp(1, 64);
-        // Per-host cannot exceed process-wide total (multi orchestrator will rely on this).
         self.max_connections_per_host = self
             .max_connections_per_host
             .min(self.max_total_connections);
@@ -82,7 +79,6 @@ impl Default for EngineRuntimeConfig {
     }
 }
 
-/// Progress patches are applied at most this often.
 const PROGRESS_COALESCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
@@ -98,24 +94,18 @@ pub enum EngineCommand {
         url: String,
         filename: Option<String>,
         directory: PathBuf,
-        /// Browser session headers (memory-only; never persisted).
         handoff_auth: Option<HandoffAuth>,
-        /// Same-name file policy (Ask-mode overwrite vs default uniquify).
         conflict: FilenameConflictPolicy,
         reply: Option<oneshot::Sender<EnqueueOutcome>>,
     },
     Pause(String),
     Resume(String),
-    /// Stop a job. When `delete_partial` is true, remove the `.part` file after
-    /// the worker exits (or immediately if no worker is running).
     Cancel {
         id: String,
         delete_partial: bool,
     },
     Retry(String),
     Restart(String),
-    /// Drop a job from the queue. `delete_partial` removes leftover `.part`
-    /// files; `delete_file` also deletes the completed download on disk.
     Remove {
         id: String,
         delete_partial: bool,
@@ -152,12 +142,8 @@ pub(super) struct EngineInner {
     jobs: Vec<Job>,
     controls: HashMap<String, Arc<AtomicU8>>,
     active: HashMap<String, ()>,
-    /// In-memory browser session headers keyed by job id (never written to disk).
     handoff_auth: HashMap<String, HandoffAuth>,
-    /// When a worker exits with Canceled, re-queue instead of marking Canceled.
-    /// Used by Restart so an in-flight cancel does not stick the job in Canceled.
     requeue_on_cancel: HashMap<String, ()>,
-    /// Partial paths to delete after a still-running worker exits (Cancel/Restart/Remove).
     pending_partial_deletes: HashMap<String, PathBuf>,
     pub(super) config: EngineRuntimeConfig,
     pub(super) limiter: Arc<GlobalBandwidthLimiter>,
@@ -188,7 +174,6 @@ pub fn spawn_engine(
 
     let mut jobs = initial_jobs;
     for job in &mut jobs {
-        // Recover in-flight states after restart.
         if matches!(job.state, JobState::Starting | JobState::Downloading) {
             job.state = JobState::Queued;
             clear_live_metrics(job);
@@ -231,17 +216,12 @@ async fn command_loop(
             EngineCommand::Shutdown => break,
             other => {
                 commands::handle_command(&inner, other).await;
-                // Parked scheduler must resume as soon as any command lands.
                 wake.notify_one();
             }
         }
     }
 }
 
-/// True when the scheduler can sleep until a command or worker wake.
-///
-/// Queued / Starting / Downloading need a tick. Paused and terminal jobs do
-/// not. Restart/cancel bookkeeping also keeps the loop polling.
 fn scheduler_should_park(guard: &EngineInner) -> bool {
     guard.active.is_empty()
         && guard.requeue_on_cancel.is_empty()
@@ -306,7 +286,6 @@ async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
     }
 }
 
-/// Coalesce ticks then apply at most every `PROGRESS_COALESCE`. Toasts flush now.
 fn spawn_progress_pump(
     inner: Arc<Mutex<EngineInner>>,
     job_id: String,
@@ -364,7 +343,6 @@ fn spawn_progress_pump(
     })
 }
 
-/// Merge `tick` into the coalesce buffer (later wins on Some).
 fn coalesce_push(pending: &mut Option<ProgressTick>, tick: ProgressTick) {
     *pending = Some(match pending.take() {
         Some(prev) => prev.merge(tick),
@@ -381,8 +359,6 @@ async fn apply_tick_event(inner: &Arc<Mutex<EngineInner>>, id: &str, tick: Progr
     }
 }
 
-/// Restart holds `requeue_on_cancel` / `pending_partial_deletes` until the old
-/// `.part` is gone so a replacement worker cannot open it.
 pub(super) fn job_is_startable(guard: &EngineInner, id: &str) -> bool {
     guard.jobs.iter().any(|job| {
         job.id == id
@@ -393,14 +369,12 @@ pub(super) fn job_is_startable(guard: &EngineInner, id: &str) -> bool {
     })
 }
 
-/// Zero live transfer metrics when a worker leaves the job (every finalizer path).
 fn clear_live_metrics(job: &mut Job) {
     job.speed = 0;
     job.eta_secs = 0;
     job.active_connections = 0;
 }
 
-/// Failed multi: retain map + version for resume reuse. Do not call `on_completed`.
 fn apply_failed_lifecycle(job: &mut Job, error: super::job::DownloadError) {
     job.state = JobState::Failed;
     job.error = Some(error.message);
@@ -586,7 +560,6 @@ mod tests {
         assert_eq!(job.state, JobState::Completed);
     }
 
-    /// Restart zeros job to Queued; deferred coalesce must not resurrect progress.
     #[test]
     fn apply_tick_skips_queued_jobs() {
         let mut job = sample_job(JobState::Queued);
@@ -746,7 +719,6 @@ mod tests {
         }
     }
 
-    /// Multiple ticks merge into one pending; take drains once.
     #[test]
     fn coalesce_push_merges_then_take_flushes_once() {
         let mut pending: Option<ProgressTick> = None;
@@ -781,7 +753,6 @@ mod tests {
         assert_eq!(flushed.state_hint, Some(ProgressHint::Downloading));
     }
 
-    /// Pump applies pending when the channel closes, then stops (terminal flush).
     #[tokio::test]
     async fn progress_pump_flushes_pending_on_channel_close() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -794,7 +765,6 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let pump = spawn_progress_pump(inner.clone(), job_id.clone(), rx);
 
-        // Buffer two patches then close: merge + flush-on-close (no wait for deadline).
         tx.send(TransferEvent::Tick(ProgressTick::downloading(
             10, 100, 1, 90, 10.0,
         )))
@@ -809,14 +779,12 @@ mod tests {
 
         let guard = inner.lock().await;
         let job = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
-        // Final values from merged pending (later tick wins scalars).
         assert_eq!(job.downloaded_bytes, 40);
         assert_eq!(job.speed, 4);
         assert_eq!(job.progress, 40.0);
         assert_eq!(job.state, JobState::Downloading);
         drop(guard);
 
-        // At least one JobsChanged from the flush path.
         let mut emits = 0;
         while event_rx.try_recv().is_ok() {
             emits += 1;
@@ -824,7 +792,6 @@ mod tests {
         assert!(emits >= 1, "expected flush emit(s), got {emits}");
     }
 
-    /// Deferred patch after restart zeroed the job must not clobber Queued.
     #[tokio::test]
     async fn progress_pump_does_not_apply_when_job_queued() {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();

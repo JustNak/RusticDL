@@ -61,16 +61,13 @@ use widgets::render_vignette_overlay;
 
 pub struct DownloadApp {
     jobs: Arc<Vec<Job>>,
-    /// Newest JobsChanged snapshot, including events still waiting on the render throttle.
     latest_jobs: Arc<Vec<Job>>,
     settings: Settings,
     paths: AppPaths,
     engine: EngineHandle,
     ipc: IpcBridge,
     filter: FilterKind,
-    /// Selected job ids; primary is `last()` (detail only when len == 1).
     selected_ids: Vec<String>,
-    /// Anchor for future Shift+range multi-select (PR-07).
     selection_anchor_id: Option<String>,
     last_ui_update: Instant,
     pending_jobs: Option<Arc<Vec<Job>>>,
@@ -83,23 +80,15 @@ pub struct DownloadApp {
     retry_input: Entity<InputState>,
     speed_input: Entity<InputState>,
     multi_max_segments_input: Entity<InputState>,
-    /// Draft for multi min size in MiB (settings store bytes).
     multi_min_mib_input: Entity<InputState>,
     max_total_connections_input: Entity<InputState>,
     max_connections_per_host_input: Entity<InputState>,
-    /// Save-gated draft for Engine → Connections "Multi-connection".
     draft_multi_connection_enabled: bool,
-    /// Draft textarea for `settings.extension.excluded_hosts` (one host per line).
     excluded_hosts_input: Entity<InputState>,
-    /// Draft field for `settings.extension.captured_file_extensions` (comma-separated).
     captured_extensions_input: Entity<InputState>,
-    /// Draft folder names aligned with [`FileTypeKind::ALL`].
     category_folder_inputs: [Entity<InputState>; FileTypeKind::COUNT],
-    /// Unsaved Browser capture toggles/enums (preview) not yet flushed via Save settings.
     extension_settings_dirty: bool,
-    /// Last extension snapshot written to disk / IPC (or accepted from the bridge).
     extension_committed: ExtensionIntegrationSettings,
-    /// When true, rewrite host/extension text drafts on the next frame that has a Window.
     extension_text_inputs_stale: bool,
     noise_slider: Entity<SliderState>,
     opacity_slider: Entity<SliderState>,
@@ -107,54 +96,28 @@ pub struct DownloadApp {
     sat_slider: Entity<SliderState>,
     light_slider: Entity<SliderState>,
     vignette_slider: Entity<SliderState>,
-    /// Last transparency value pushed to the platform (avoids re-setting layered style every frame).
     applied_window_transparency: Option<u8>,
-    /// In-memory window geometry changed since last disk write.
     window_layout_dirty: bool,
-    /// Throttle how often we rewrite settings.json while the user drags a resize edge.
     last_window_layout_save: Instant,
-    /// Browser-handoff job ids that should re-open Complete if Progress was closed early.
     browser_watch_complete_ids: Vec<String>,
-    /// Queue snapshot differs from last successful disk write.
     jobs_dirty: bool,
-    /// Throttle progress-only state.json writes.
     last_jobs_save: Instant,
-    /// True while a GitHub update check or updater handoff is running.
     update_busy: bool,
-    /// Bumped when a check starts or is invalidated (e.g. channel switch).
-    /// Completions whose generation no longer matches are dropped.
     update_check_gen: u64,
-    /// Cached latest release when an update is available (menu label + toast actions).
     available_update: Option<UpdateInfo>,
-    /// Id of the staged update-flow toast so check → result replaces instead of stacking.
     update_toast_id: Option<u64>,
-    /// Post-update changelog snapshot (from `pending_whats_new.json` after relaunch).
     pending_whats_new: Option<PendingWhatsNew>,
-    /// Open the What’s new dialog once a Window is free (no stacking over About/etc.).
     pending_show_whats_new: bool,
-    /// System tray icon (Windows). Present when close-to-tray, hidden-to-tray,
-    /// or OS notify mode is enabled (`sync_tray_lifetime`).
     system_tray: Option<SystemTray>,
-    /// When true, the next close request actually quits (tray Exit / updates).
     force_quit: bool,
-    /// Main window is currently hidden to the tray.
     window_hidden_to_tray: bool,
-    /// Win32 HWND of the main window (0 if unknown). Used to restore without render.
     main_hwnd: isize,
-    /// Tray "Show" was requested; applied on the next render (has Window).
     pending_tray_show: bool,
-    /// Balloon click context id to resolve after showing the main window.
     pending_balloon_click: Option<u64>,
-    /// OS balloon burst-coalesce buffer (Pipeline B).
     os_notify_buffer: OsNotifyBuffer,
-    /// Last-N balloon click contexts for open-file / show policy.
     balloon_contexts: BalloonContextMap,
-    /// Debounce key for the last clipboard URL set offered on focus (PR-10).
     last_clipboard_urls_key: Option<u64>,
-    /// Active Settings mini-nav category (does not discard draft when switched).
     settings_category: SettingsCategory,
-    /// Queue filter to restore when leaving Settings (Back / Esc / mouse-back).
-    /// Never `FilterKind::Settings`.
     settings_return_filter: FilterKind,
     /// Confirm / Progress / Complete HUD windows. Tray hide closes leftovers;
     /// new Confirm / Progress may still open while the main window is SW_HIDE.
@@ -275,7 +238,6 @@ impl DownloadApp {
         })
         .detach();
 
-        // Re-render settings so per-field reset icons appear when drafts diverge.
         for input in [
             &concurrent_input,
             &retry_input,
@@ -387,13 +349,11 @@ impl DownloadApp {
         })
         .detach();
 
-        // Persist size / position / maximized across launches.
         cx.observe_window_bounds(window, |this, window, _cx| {
             this.capture_window_layout(window);
         })
         .detach();
 
-        // Opt-in clipboard URL watch on main-window focus gain (never auto-downloads).
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 return;
@@ -412,7 +372,6 @@ impl DownloadApp {
                             cx.notify();
                         }
                     }
-                    // Unpark the shell timer (progress apply, Complete HUD watch).
                     app.ipc.wake_ui();
                 });
                 if result.is_err() {
@@ -423,20 +382,17 @@ impl DownloadApp {
         .detach();
 
         let shell_wake = ipc.ui_wake();
-        cx.spawn(async move |this, cx| {
-            loop {
-                let park = match this.update(cx, |app, cx| app.run_shell_tick(cx)) {
-                    Ok(park) => park,
-                    Err(_) => break,
-                };
-                if park {
-                    // Tray-hidden and idle: sleep until IPC / engine / tray wakes us.
-                    shell_wake.notified().await;
-                } else {
-                    cx.background_executor()
-                        .timer(jobs_ui::SHELL_TICK_INTERVAL)
-                        .await;
-                }
+        cx.spawn(async move |this, cx| loop {
+            let park = match this.update(cx, |app, cx| app.run_shell_tick(cx)) {
+                Ok(park) => park,
+                Err(_) => break,
+            };
+            if park {
+                shell_wake.notified().await;
+            } else {
+                cx.background_executor()
+                    .timer(jobs_ui::SHELL_TICK_INTERVAL)
+                    .await;
             }
         })
         .detach();
@@ -446,7 +402,6 @@ impl DownloadApp {
         ipc.update_jobs(Arc::clone(&jobs));
 
         let started_minimized = launched_minimized();
-        // Tray is needed for close-to-tray, startup-minimized, and OS balloons.
         let need_tray = settings.close_to_tray
             || started_minimized
             || settings.os_notify_mode != OsNotifyMode::Off;
@@ -513,7 +468,6 @@ impl DownloadApp {
             vignette_slider,
             applied_window_transparency: None,
             window_layout_dirty: false,
-            // Allow an immediate first save after the first real bounds change.
             last_window_layout_save: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
@@ -542,17 +496,13 @@ impl DownloadApp {
             capture_windows: Vec::new(),
         };
 
-        // Post-update What’s new: snapshot written before handoff, shown once after relaunch.
         if let Some(pending) = load_pending_whats_new(&app.paths) {
             app.pending_whats_new = Some(pending);
             app.pending_show_whats_new = true;
         }
 
-        // Quiet startup check against GitHub Releases (toast only if an update exists).
-        // Route through begin_update_check so update_busy serializes with interactive checks.
         app.begin_update_check(false, cx);
 
-        // Close (X) → tray when enabled; tray Exit / force_quit still destroy the window.
         let entity = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
             entity.update(cx, |app, cx| app.handle_window_should_close(window, cx))
@@ -575,7 +525,6 @@ impl DownloadApp {
     pub(crate) fn reset_settings_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.reset_to_defaults_preserving_layout_and_dir();
 
-        // Text inputs bound to General / Browser panels.
         let dir = self
             .settings
             .download_directory
@@ -610,7 +559,6 @@ impl DownloadApp {
         self.refresh_extension_text_inputs(window, cx);
         self.refresh_category_folder_inputs(window, cx);
 
-        // Appearance sliders (same rebind as reset_appearance_draft).
         let noise = self.settings.noise_intensity as f32;
         let transparency = self.settings.window_transparency as f32;
         let hue = self.settings.accent_hue;
@@ -630,28 +578,21 @@ impl DownloadApp {
         self.vignette_slider
             .update(cx, |s, cx| s.set_value(vignette, window, cx));
 
-        // Browser capture draft may now differ from last committed snapshot.
         self.extension_settings_dirty = self.settings.extension != self.extension_committed;
         if !self.settings.clipboard_watch_enabled {
             self.last_clipboard_urls_key = None;
         }
-        // Match live System toggle side-effects for tray lifetime.
         self.sync_tray_lifetime(cx);
         apply_appearance(&self.settings, Some(window), cx);
         cx.notify();
     }
 
     fn select_filter(&mut self, filter: FilterKind, window: &mut Window, cx: &mut Context<Self>) {
-        // Remember the queue filter we came from so Back/Esc/mouse-back restore it.
         if filter == FilterKind::Settings && self.filter != FilterKind::Settings {
             self.settings_return_filter = self.filter;
         }
         self.filter = filter;
         if filter == FilterKind::Settings {
-            // When the user has no local Browser capture preview, adopt any
-            // bridge updates made while Settings was closed. Dirty previews
-            // survive reopen (same idea as System toggles keeping in-memory
-            // values until Save).
             self.sync_extension_settings_from_bridge(true);
             let dir = self
                 .settings
@@ -693,7 +634,6 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Leave Settings via Back / Esc / mouse-back / `/` search. Draft prefs are preserved.
     pub(crate) fn leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter != FilterKind::Settings {
             return;
@@ -706,7 +646,6 @@ impl DownloadApp {
     }
 
     /// Escape owner (keystroke interceptor): dialogs → leave Settings → clear selection.
-    /// Returns true when the keystroke was handled (caller stops propagation).
     ///
     /// Runs before Input/dialog keybindings so Settings Esc matches mouse-back.
     /// Leaves search-field `clean_on_escape` alone when not in Settings.
@@ -723,7 +662,6 @@ impl DownloadApp {
             self.leave_settings(window, cx);
             return true;
         }
-        // Queue search clears on Escape via InputState::clean_on_escape.
         if self.search_input.focus_handle(cx).is_focused(window) {
             return false;
         }
@@ -738,8 +676,6 @@ impl DownloadApp {
 
 impl Drop for DownloadApp {
     fn drop(&mut self) {
-        // Ensure the last resize/move before close is written even if the
-        // debounced timer never got another tick.
         self.flush_window_layout_now();
         self.flush_jobs_save_now();
     }
@@ -749,14 +685,11 @@ impl Render for DownloadApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_toast(cx);
         self.apply_pending_tray_actions(window, cx);
-        // Post-update changelog after relaunch (once a Window is free).
         self.apply_pending_whats_new(window, cx);
         if self.ipc.take_show_window_request() {
             self.window_hidden_to_tray = false;
             show_main_window(window);
         }
-        // Bridge-adopted extension settings (while Settings is open) need a
-        // Window to rewrite text drafts; apply_jobs only sets the stale flag.
         if self.extension_text_inputs_stale && self.filter == FilterKind::Settings {
             self.refresh_extension_text_inputs(window, cx);
         }
@@ -787,8 +720,6 @@ impl Render for DownloadApp {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
-            // Mouse back (XButton1): close dialog first, else leave Settings
-            // (same destination as the sidebar Back row / Esc).
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 if !matches!(
                     event.button,
@@ -833,7 +764,6 @@ impl Render for DownloadApp {
                         ),
                 ),
             )
-            // Film grain: 1:1 tiled paint. Strength is in the texture alpha
             // (GPUI canvas `.opacity()` does not affect paint_image).
             .when(noise_on, |this| {
                 let grain = grain.expect("noise_on implies grain texture");
@@ -879,7 +809,6 @@ impl Render for DownloadApp {
                     .size_full(),
                 )
             })
-            // Soft edge vignette (above grain, below modals).
             .when(vignette_on, |this| {
                 this.child(render_vignette_overlay(vignette_a, is_dark))
             })

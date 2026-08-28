@@ -28,7 +28,6 @@ pub fn releases_page() -> String {
 }
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
-/// Max release-body characters retained for update UI / post-update What’s new.
 const NOTES_MAX_CHARS: usize = 4_000;
 
 /// Result of comparing the running build to GitHub's latest release.
@@ -138,7 +137,6 @@ async fn fetch_nightly_release(client: &reqwest::Client) -> Result<GhRelease, St
         .await
         .map_err(|e| format!("Could not parse GitHub releases list: {e}"))?;
 
-    // GitHub returns newest first; take the first published nightly with a setup asset.
     releases
         .into_iter()
         .find(is_published_nightly)
@@ -177,8 +175,6 @@ fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateC
             )
         })?;
 
-    // Keep enough body for the post-update What’s new dialog; the pre-install
-    // consent dialog applies its own shorter truncation when rendering.
     let notes = release
         .body
         .as_ref()
@@ -205,7 +201,6 @@ pub fn open_release_page() -> Result<(), String> {
     open_url(&releases_page())
 }
 
-/// Open a URL (release page or similar) in the default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
     open::that(url).map_err(|e| format!("Could not open browser: {e}"))
 }

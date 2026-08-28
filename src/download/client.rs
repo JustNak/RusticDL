@@ -9,7 +9,6 @@ use super::job::{download_error, DownloadError, FailureCategory};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Browser-like UA so hosts that fingerprint clients treat us like a normal download.
 pub const BROWSER_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
     "AppleWebKit/537.36 (KHTML, like Gecko) ",
@@ -28,8 +27,6 @@ pub fn download_client() -> Result<Client, DownloadError> {
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
 
-    // HTTP/2 is always enabled via the reqwest `http2` feature.
-    // HTTP/3 (QUIC) is available via the `http3` feature; individual requests opt in with
     // Version::HTTP_3. Do NOT call http3_prior_knowledge() — that forces H3-only and breaks
     // hosts that only speak TCP HTTP/1.1 or HTTP/2.
     let client = Client::builder()
@@ -67,7 +64,6 @@ pub fn download_client() -> Result<Client, DownloadError> {
     })
 }
 
-/// Origin-style Referer (`https://host/`) derived from the request URL.
 pub fn referer_for_url(raw_url: &str) -> Option<String> {
     let parsed = url::Url::parse(raw_url).ok()?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {

@@ -1,11 +1,3 @@
-//! Resolution-aware native window placement helpers.
-//!
-//! GPUI's `Bounds::centered` + Windows `SetWindowPlacement` path can leave
-//! newly created windows (especially `WindowKind::PopUp`) at the cascade /
-//! corner position chosen by `CreateWindowEx(CW_USEDEFAULT)`. These helpers
-//! re-center using the monitor work area in physical screen coordinates, which
-//! is correct across DPI scales and multi-monitor layouts.
-
 use gpui::Window;
 
 /// Pixel step used to stagger stacked capture HUDs so the Nth window is visible.

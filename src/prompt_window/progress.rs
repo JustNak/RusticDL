@@ -1,5 +1,3 @@
-//! Progress phase: construct, engine controls, sync, and render.
-
 use std::collections::VecDeque;
 
 use gpui::{div, prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled, Window};
@@ -43,7 +41,6 @@ impl BrowserPromptWindow {
         let job = ipc.job_by_id(&job_id);
         let url = job.as_ref().map(|j| j.url.clone()).unwrap_or_default();
 
-        // Promote to Complete immediately if already finished.
         let phase = if let Some(j) = job.as_ref() {
             if j.state == JobState::Completed {
                 let _ = ipc.try_claim_complete_hud(&job_id);
@@ -140,7 +137,6 @@ impl BrowserPromptWindow {
         } = &self.phase
         {
             self.canceling = true;
-            // Match main-queue cancel: keep .part so resume/retry remains possible.
             self.engine.send(EngineCommand::Cancel {
                 id: id.clone(),
                 delete_partial: false,
@@ -162,14 +158,11 @@ impl BrowserPromptWindow {
         }
     }
 
-    /// Refresh job snapshot; bind id; morph to Complete when done.
     pub(super) fn sync_from_bridge(&mut self, cx: &mut Context<Self>) {
         match &self.phase {
             CapturePhase::Progress { job_id, url } => {
                 let mut bound_id = job_id.clone();
                 if bound_id.is_none() {
-                    // Bind only active jobs; prefer newest so same-URL re-downloads
-                    // do not attach to an older Completed/Failed row.
                     let snapshot = self.ipc.jobs_snapshot();
                     if let Some(j) = newest_active_job_for_url(&snapshot, url) {
                         if self.ipc.try_own_progress_job(&j.id) {
@@ -187,7 +180,6 @@ impl BrowserPromptWindow {
                         if matches!(j.state, JobState::Downloading | JobState::Starting) {
                             self.push_speed_sample(j.speed);
                         } else if j.state == JobState::Paused {
-                            // Freeze chart — do not push new samples while paused.
                         }
                         if j.state == JobState::Completed {
                             let _ = self.ipc.try_claim_complete_hud(&id);
@@ -202,7 +194,6 @@ impl BrowserPromptWindow {
                             return;
                         }
                         self.job = Some(j);
-                        // Canceled/Failed: keep HUD open so Retry stays available.
                     }
                 }
 
@@ -216,7 +207,6 @@ impl BrowserPromptWindow {
                 cx.notify();
             }
             CapturePhase::Complete { job_id, .. } => {
-                // Keep snapshot fresh for path existence checks.
                 if let Some(j) = self.ipc.job_by_id(job_id) {
                     self.job = Some(j);
                 }
@@ -349,7 +339,6 @@ impl BrowserPromptWindow {
                         .child(msg),
                 )
             })
-            // Live speed sparkline fills the empty band under the progress row.
             .child(speed_sparkline(
                 &samples,
                 &self.trail.columns(),

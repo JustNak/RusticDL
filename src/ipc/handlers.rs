@@ -1,5 +1,3 @@
-//! Request handlers for extension bridge messages.
-
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
@@ -165,7 +163,6 @@ async fn enqueue_download(
         );
     }
 
-    // Active duplicate: same URL still in queue / downloading / paused.
     if let Some(existing) = find_active_duplicate(&jobs, &payload.url) {
         return HostResponse::enqueue_result(
             request_id,
@@ -207,7 +204,6 @@ async fn prompt_download(
         );
     }
 
-    // Still short-circuit exact active duplicates without bothering the user.
     if let Some(existing) = find_active_duplicate(&jobs, &payload.url) {
         return HostResponse::enqueue_result(
             request_id,
@@ -246,7 +242,6 @@ async fn prompt_download(
         Ok(Ok(decision)) => decision,
         Ok(Err(_)) => PromptDecision::Dismiss,
         Err(_) => {
-            // Timed out waiting for the user — remove from queue so the dialog can close.
             let _ = bridge.resolve_prompt(&prompt_id, PromptDecision::Dismiss);
             PromptDecision::Dismiss
         }
@@ -313,7 +308,6 @@ async fn engine_enqueue(
 
     match tokio::time::timeout(ENQUEUE_REPLY_TIMEOUT, reply_rx).await {
         Ok(Ok(outcome)) => {
-            // Open floating progress HUD for newly queued browser handoffs.
             if outcome.status == EnqueueStatus::Queued {
                 let show_progress = bridge
                     .inner

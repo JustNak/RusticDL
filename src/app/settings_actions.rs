@@ -1,5 +1,3 @@
-//! Settings disk helpers, draft setters, and appearance draft actions for `DownloadApp`.
-
 use std::path::PathBuf;
 
 use gpui::{Context, Window};
@@ -37,7 +35,6 @@ impl DownloadApp {
             return;
         };
         if self.extension_settings_dirty {
-            // Keep preview; only track latest external/disk truth for incidental saves.
             if self.extension_committed != extension {
                 self.extension_committed = extension;
             }
@@ -48,8 +45,6 @@ impl DownloadApp {
         }
         self.settings.extension = extension.clone();
         self.extension_committed = extension;
-        // When Settings is open, text drafts must follow the adopted snapshot
-        // (Issue 5); refresh on the next render frame that has a Window.
         if force_text_refresh || self.filter == super::FilterKind::Settings {
             self.extension_text_inputs_stale = true;
         }
@@ -126,7 +121,6 @@ impl DownloadApp {
         self.settings.max_connections_per_host = max_connections_per_host;
         self.settings.multi_connection_enabled = self.draft_multi_connection_enabled;
 
-        // Browser capture text lists — drafts until Save; sanitize via extension.sanitize().
         let excluded_hosts = self
             .excluded_hosts_input
             .read(cx)
@@ -154,7 +148,6 @@ impl DownloadApp {
         }
 
         self.settings.sanitize_appearance();
-        // Reflect clamped multi limits back into text drafts.
         let multi_segs = self.settings.multi_max_segments.to_string();
         let multi_mib = (self.settings.multi_min_bytes / (1024 * 1024))
             .max(1)
@@ -178,13 +171,11 @@ impl DownloadApp {
 
         self.extension_settings_dirty = false;
         self.extension_committed = self.settings.extension.clone();
-        // Show sanitized hosts/extensions in the drafts after Save.
         self.refresh_extension_text_inputs(window, cx);
         self.refresh_category_folder_inputs(window, cx);
         let _ = save_settings(&self.paths, &self.settings);
         self.ipc.update_settings(&self.settings);
 
-        // Keep Windows Run-key entry in sync with launch preferences.
         if let Err(msg) = apply_launch_at_startup(
             self.settings.launch_at_startup,
             self.settings.startup_minimized,
@@ -192,7 +183,6 @@ impl DownloadApp {
             self.show_toast(format!("Startup setting: {msg}"), cx);
         }
 
-        // Tray lifetime: close-to-tray, hidden-to-tray, or OS notify != Off.
         self.sync_tray_lifetime(cx);
 
         apply_appearance(&self.settings, Some(window), cx);
@@ -266,7 +256,6 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// Draft update channel; clears cached results and invalidates in-flight checks.
     pub(crate) fn set_update_channel(
         &mut self,
         channel: crate::settings::UpdateChannel,
@@ -278,17 +267,12 @@ impl DownloadApp {
         }
         self.settings.update_channel = channel;
         self.available_update = None;
-        // Drop any in-flight check for the previous channel (late result is ignored).
         self.update_check_gen = self.update_check_gen.wrapping_add(1);
         self.update_busy = false;
         self.clear_update_toast(cx);
         cx.notify();
     }
 
-    /// Mutate extension settings draft, mark dirty, and notify.
-    ///
-    /// Browser capture toggles preview immediately; disk + IPC flush is "Save settings".
-    /// Shared by the near-identical `set_*` extension draft setters below.
     fn update_extension_settings_draft(
         &mut self,
         f: impl FnOnce(&mut ExtensionIntegrationSettings),
@@ -384,7 +368,6 @@ impl DownloadApp {
     ) {
         self.settings.os_notify_mode = mode;
         self.sync_tray_lifetime(cx);
-        // Drop pending + burst window when turning Off so re-enable is clean.
         if mode == OsNotifyMode::Off {
             self.os_notify_buffer.clear();
         }
@@ -418,7 +401,6 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         self.settings.clipboard_watch_enabled = on;
-        // Fresh enable should re-offer current clipboard on next focus.
         if !on {
             self.last_clipboard_urls_key = None;
         }
@@ -452,7 +434,6 @@ impl DownloadApp {
         if self.last_clipboard_urls_key == Some(key) {
             return;
         }
-        // Record before open so Cancel / focus flap does not re-prompt the same set.
         self.last_clipboard_urls_key = Some(key);
         self.confirm_add_clipboard_urls(urls, window, cx);
     }
@@ -504,8 +485,6 @@ impl DownloadApp {
     }
 
     pub(crate) fn sync_window_chrome(&mut self, window: &mut Window) {
-        // Re-apply when either transparency or blur preference changes.
-        // Encode as transparency in high bits-ish: just re-apply always when blur differs.
         let pct = self.settings.window_transparency;
         let key = pct.saturating_add(if self.settings.backdrop_blur { 128 } else { 0 });
         if self.applied_window_transparency == Some(key) {

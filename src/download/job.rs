@@ -29,7 +29,6 @@ impl JobState {
         }
     }
 
-    /// 0 muted, 1 primary, 2 success, 3 warning, 4 destructive
     pub fn tone(self) -> i32 {
         match self {
             Self::Queued | Self::Canceled => 0,
@@ -51,14 +50,10 @@ impl JobState {
         matches!(self, Self::Completed | Self::Failed | Self::Canceled)
     }
 
-    /// Queued items that can leave the list (finished or paused). Active
-    /// transfers must be canceled first.
     pub fn is_removable(self) -> bool {
         self.is_terminal() || self == Self::Paused
     }
 
-    /// Queue/detail can open the floating progress HUD only while bytes are
-    /// still moving (not queued, paused, or terminal).
     pub fn can_show_progress_popup(self) -> bool {
         matches!(self, Self::Starting | Self::Downloading)
     }
@@ -109,7 +104,6 @@ pub fn download_error(
     }
 }
 
-/// HTTP content validators captured from response headers for resume identity checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentValidators {
@@ -122,13 +116,10 @@ pub struct ContentValidators {
 }
 
 impl ContentValidators {
-    /// True when no ETag / Last-Modified / expected_size is stored.
     pub fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none() && self.expected_size.is_none()
     }
 
-    /// Field-wise merge: only overwrite fields present as `Some` in `incoming`.
-    /// Never clears an existing field via a sparse capture (lifecycle clears only).
     pub fn merge_present(&mut self, incoming: ContentValidators) {
         if let Some(etag) = incoming.etag {
             self.etag = Some(etag);
@@ -142,7 +133,6 @@ impl ContentValidators {
     }
 }
 
-/// Transfer strategy hint for UI / multi-connection planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferMode {
@@ -159,7 +149,6 @@ impl TransferMode {
     }
 }
 
-/// Human label for planner / multi-fallback reason keys (detail panel).
 pub fn fallback_reason_label(reason: &str) -> &str {
     match reason {
         "multi_disabled" => "Multi-connection disabled",
@@ -189,7 +178,6 @@ pub struct Job {
     pub filename: String,
     pub state: JobState,
     pub created_at: u64,
-    /// Unix seconds when the job last became Completed, Failed, or Canceled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<u64>,
     pub progress: f64,
@@ -203,31 +191,22 @@ pub struct Job {
     pub temp_path: PathBuf,
     pub resume_supported: bool,
     pub retry_attempts: u32,
-    /// ETag / Last-Modified / size from successful responses.
     #[serde(default)]
     pub validators: ContentValidators,
-    /// 0 = single-stream contiguous `.part`; 1 = multi-segment map-authoritative.
     #[serde(default)]
     pub transfer_format_version: u32,
-    /// Multi-segment resume map. Authoritative for progress when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_map: Option<SegmentMap>,
-    /// Live connection count (UI / metrics placeholder).
     #[serde(default)]
     pub active_connections: u32,
-    /// Cumulative short reconnects for this job until Restart.
     #[serde(default)]
     pub reconnect_count: u32,
-    /// Single vs multi transfer mode when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_mode: Option<TransferMode>,
-    /// Last multi→single or planner failure reason (UI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
-    /// Optional SHA-256 hex; verified after transfer, before finalize rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
-    /// Replace the on-disk file with this name at finalize (Ask-mode overwrite).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replace_existing: bool,
 }
@@ -264,7 +243,6 @@ impl Job {
         }
     }
 
-    /// Clear validators, map, transfer format, and metrics (Restart / Cancel+delete).
     pub fn clear_transfer_identity(&mut self) {
         self.validators = ContentValidators::default();
         self.transfer_format_version = 0;
@@ -275,24 +253,20 @@ impl Job {
         self.fallback_reason = None;
     }
 
-    /// Cancel+delete: drop map/identity and zero downloaded progress.
     pub fn clear_partial_and_identity(&mut self) {
         self.downloaded_bytes = 0;
         self.progress = 0.0;
         self.clear_transfer_identity();
     }
 
-    /// True when the job can leave the queue (terminal or paused).
     pub fn is_removable(&self) -> bool {
         self.state.is_removable()
     }
 
-    /// True when a completed (or leftover) file exists and the job can be removed.
     pub fn has_deletable_file(&self) -> bool {
         self.is_removable() && self.target_path.is_file()
     }
 
-    /// Completed: slim state.json — drop map, version 0, mode; keep validators / reconnects.
     pub fn on_completed(&mut self) {
         self.segment_map = None;
         self.transfer_format_version = 0;
@@ -301,17 +275,14 @@ impl Job {
         self.mark_finished();
     }
 
-    /// Stamp the last terminal transition (Completed / Failed / Canceled).
     pub fn mark_finished(&mut self) {
         self.completed_at = Some(now_unix_secs());
     }
 
-    /// Drop finished time when the job re-enters the queue (retry / restart / resume).
     pub fn clear_finished(&mut self) {
         self.completed_at = None;
     }
 
-    /// Date for the detail panel: last finish when terminal, otherwise added time.
     pub fn display_date(&self) -> u64 {
         if self.state.is_terminal() {
             self.completed_at.unwrap_or(self.created_at)
@@ -320,7 +291,6 @@ impl Job {
         }
     }
 
-    /// Seconds from add to finish. Terminal jobs stay frozen at `completed_at`.
     pub fn elapsed_secs(&self) -> u64 {
         let end = if self.state.is_terminal() {
             self.completed_at.unwrap_or_else(now_unix_secs)
@@ -338,7 +308,6 @@ mod tests {
 
     #[test]
     fn job_serde_defaults_legacy_payload() {
-        // Older state.json without validators / version fields must deserialize cleanly.
         let json = r#"{
             "id":"abc",
             "url":"https://example.com/f.bin",
@@ -513,7 +482,6 @@ mod tests {
             Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
 
         let json = serde_json::to_string(&job).expect("serialize");
-        // camelCase keys for new fields
         assert!(json.contains("\"transferFormatVersion\":1"));
         assert!(json.contains("\"segmentMap\""));
         assert!(json.contains("\"preallocated\""));

@@ -1,15 +1,5 @@
-//! Active-URL duplicate policy for enqueue (IPC + engine Add).
-//!
-//! Dedupes on the **original request URL** stored in `Job::url` only (exact string).
-//! Redirect final URLs are not compared — see test names documenting that contract.
-
 use super::job::Job;
 
-/// First active job with the exact same request URL, if any.
-///
-/// Active ≡ [`JobState::is_active`](super::job::JobState::is_active)
-/// (Queued / Starting / Downloading / Paused). Terminal jobs (Completed /
-/// Failed / Canceled) do not block re-download of the same URL.
 pub fn find_active_duplicate<'a>(jobs: &'a [Job], url: &str) -> Option<&'a Job> {
     jobs.iter()
         .find(|job| job.url == url && job.state.is_active())
@@ -80,8 +70,6 @@ mod tests {
 
     #[test]
     fn request_url_only_redirect_final_url_is_not_compared() {
-        // job.url stays the original request URL; redirect target is not stored on Job.
-        // Two different request URLs that would redirect to the same file are not dups.
         let jobs = vec![job_with("https://short.example/abc", JobState::Downloading)];
         assert!(
             find_active_duplicate(&jobs, "https://cdn.example/real/file.bin").is_none(),

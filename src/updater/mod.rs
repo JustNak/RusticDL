@@ -1,10 +1,8 @@
 //! Auto-updater backed by GitHub Releases.
-//!
 //! Channel selection (`UpdateChannel`):
 //! - **Stable** — `GET …/releases/latest` (GitHub’s latest non-prerelease).
 //! - **Nightly** — list releases and pick the newest published `vX.Y.Z-nightly.*`
 //!   pre-release that includes the setup installer.
-//!
 //! Staged flow (main app UI in `update_flow`):
 //! 1. Query the GitHub Releases API for the latest tag + assets on the chosen channel.
 //! 2. Offer that channel’s current build when this install is not already it

@@ -1,11 +1,8 @@
 //! RusticDL Updater — dedicated process that applies an update and relaunches the app.
-//!
 //! Invoked by the main app after the user clicks Update:
 //! 1. Show a small progress window.
 //! 2. Download the NSIS setup (or use a local path).
-//! 3. Ask rusticdl to quit (or kill it) before files are overwritten.
 //! 4. Run the installer silently (`/S`, no `/R` — we own relaunch).
-//! 5. Start RusticDL once the replace/install has finished, then exit.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -70,9 +67,6 @@ fn main() {
         {
             let release = args.release_page.as_deref();
             ui::show_error_message("RusticDL Updater", &message, release);
-            // Best-effort: leave the user with a running app when the main
-            // process already exited for the update. Skip WaitTimeout — the
-            // original app is still alive in that case.
             if matches!(
                 outcome,
                 UpdateOutcome::DownloadFailed(_)

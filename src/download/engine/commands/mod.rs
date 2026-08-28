@@ -1,5 +1,3 @@
-//! Engine command handlers (Add, Pause, Remove, settings, …).
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -255,7 +253,6 @@ mod tests {
         let dir = temp_dir();
         let a = sample_job("https://example.com/a.zip", JobState::Paused, &dir);
         let b = sample_job("https://example.com/b.zip", JobState::Queued, &dir);
-        // Queued becomes Starting via scheduler — still active. Use Paused for both to avoid network.
         let mut b = b;
         b.state = JobState::Paused;
         let first_id = a.id.clone();
@@ -398,7 +395,6 @@ mod tests {
 
     #[tokio::test]
     async fn same_batch_non_adjacent_duplicate_skips_second_a() {
-        // extract_http_urls only collapses consecutive exact dups, so A\nB\nA reaches the engine.
         let dir = temp_dir();
         let (engine, mut events) = spawn_test_engine(vec![]);
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -438,7 +434,6 @@ mod tests {
 
     #[tokio::test]
     async fn suggested_filename_applies_to_first_successfully_enqueued_job() {
-        // First paste URL is an active dup; suggested name should land on the first *new* job.
         let dir = temp_dir();
         let existing = sample_job("https://example.com/old.zip", JobState::Paused, &dir);
         let (engine, mut events) = spawn_test_engine(vec![existing]);
@@ -470,7 +465,6 @@ mod tests {
 
     #[tokio::test]
     async fn request_url_only_different_original_not_treated_as_dup_of_active() {
-        // Redirect finals are never on Job::url; distinct request strings always enqueue.
         let dir = temp_dir();
         let existing = sample_job("https://short.example/abc", JobState::Paused, &dir);
 
@@ -499,7 +493,6 @@ mod tests {
     async fn cancel_queued_with_delete_partial_removes_part_file() {
         let dir = temp_dir();
         let mut job = sample_job("https://example.com/partial.bin", JobState::Paused, &dir);
-        // Simulate a leftover partial.
         std::fs::write(&job.temp_path, b"partial-bytes").expect("write part");
         assert!(job.temp_path.exists());
         let id = job.id.clone();
@@ -507,7 +500,6 @@ mod tests {
         job.state = JobState::Queued;
 
         let (engine, mut events) = spawn_test_engine(vec![job]);
-        // Consume initial JobsChanged from spawn if any; then cancel.
         engine.send(EngineCommand::Cancel {
             id: id.clone(),
             delete_partial: true,
@@ -516,7 +508,6 @@ mod tests {
         let jobs = next_jobs(&mut events).await;
         let canceled = jobs.iter().find(|j| j.id == id).expect("job remains");
         assert_eq!(canceled.state, JobState::Canceled);
-        // Give async remove_partial a moment.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!part.exists(), ".part must be deleted on cancel cleanup");
 
@@ -570,7 +561,6 @@ mod tests {
             id: id.clone(),
             delete_partial: true,
         });
-        // Should not panic; job stays Canceled.
         let jobs = tokio::time::timeout(Duration::from_millis(200), next_jobs(&mut events))
             .await
             .unwrap_or_default();
@@ -677,7 +667,6 @@ mod tests {
             persist_rx,
         ));
 
-        // SegmentFileWriter would hold this open; DeleteFile must wait until it drops.
         let held = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -694,7 +683,6 @@ mod tests {
             );
             assert!(guard.requeue_on_cancel.contains_key(&id));
             assert!(!super::super::job_is_startable(&guard, &id));
-            // Dummy active is not the only block: restart marks must hold after it drops.
             guard.active.remove(&id);
             assert!(
                 !super::super::job_is_startable(&guard, &id),
@@ -1064,7 +1052,6 @@ mod tests {
     async fn overwrite_add_falls_back_when_active_job_owns_name() {
         let dir = temp_dir();
         let existing = sample_job("https://example.com/owner.bin", JobState::Paused, &dir);
-        // sample_job always uses file.bin — keep that name for the collision.
         let existing_name = existing.filename.clone();
 
         let (engine, mut events) = spawn_test_engine(vec![existing]);

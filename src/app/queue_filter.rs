@@ -1,5 +1,3 @@
-//! Queue visibility: search, sidebar filter, sort, and single-selection detail.
-
 use gpui::{App, Context};
 
 use super::DownloadApp;
@@ -32,24 +30,20 @@ impl DownloadApp {
         self.visible_jobs_in(&self.jobs, cx)
     }
 
-    /// Toggle or switch queue sort; persists the preference immediately.
     pub(crate) fn set_sort_column(&mut self, column: SortColumn, cx: &mut Context<Self>) {
         if self.settings.sort_column == column {
             self.settings.sort_direction = self.settings.sort_direction.toggle();
         } else {
             self.settings.sort_column = column;
-            // Name reads naturally A→Z; metrics usually want largest/newest first.
             self.settings.sort_direction = match column {
                 SortColumn::Name => SortDirection::Asc,
                 _ => SortDirection::Desc,
             };
         }
-        // Sort prefs only — do not flush unsaved Browser capture previews.
         let _ = save_settings(&self.paths, &self.settings_for_disk());
         cx.notify();
     }
 
-    /// Detail panel job: only when exactly one id is selected.
     pub(crate) fn selected_job(&self) -> Option<&Job> {
         if self.selected_ids.len() != 1 {
             return None;

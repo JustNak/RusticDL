@@ -1,12 +1,3 @@
-//! Multi-segment download orchestrator.
-//!
-//! Parallel Range workers write into one `.part` via [`SegmentFileWriter`].
-//! Progress is **map-authoritative** (`sum(written)`); never `metadata_len`
-//! after a map exists (preallocate would report the full file size).
-//!
-//! Convert multi→single only when every segment `written == 0`. After any
-//! `written > 0`, an unusable Range is a Resume error and the map is kept.
-
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,18 +36,14 @@ use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
-/// User-visible Resume error when a v1 map is missing or inconsistent.
 pub(crate) const RESUME_RESTART_MESSAGE: &str = "Multi-part incomplete; Restart required.";
 
-/// Outcome of the multi-start map step (reuse vs fresh partition).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreparedMap {
     Reuse(SegmentMap),
     Fresh(SegmentMap),
 }
 
-/// Choose an existing consistent map or partition a new one. Never repartitions
-/// a present map and never resets `written`.
 pub(crate) fn prepare_segment_map(
     job: &super::job::Job,
     total_bytes: u64,
@@ -99,13 +86,10 @@ pub(crate) fn all_written_zero(map: &SegmentMap) -> bool {
     map.segments.iter().all(|segment| segment.written == 0)
 }
 
-/// Convert multi→single when every segment still has `written == 0`.
 pub(crate) fn may_convert_multi_to_single(map: &SegmentMap) -> bool {
     all_written_zero(map)
 }
 
-/// Run multi-segment transfer. Converts to single-stream only when every
-/// segment still has `written == 0`.
 pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
@@ -113,7 +97,6 @@ pub async fn run_multi_segment_download(
         return fallback_to_single(ctx, FALLBACK_LEGACY_PARTIAL).await;
     }
 
-    // Disk check only for v0 / no-map (single-stream semantics).
     if ctx.job.segment_map.is_none() && ctx.job.transfer_format_version == 0 {
         let on_disk = metadata_len(&ctx.job.temp_path).await.unwrap_or(0);
         if is_untracked_preallocate_hole(&ctx.job, on_disk) {
@@ -186,7 +169,6 @@ pub async fn run_multi_segment_download(
         Err((error, map)) => {
             persist_map_exit(ctx, &map, 0).await?;
             if may_convert_multi_to_single(&map) {
-                // Writer handle blocks DeleteFile on Windows.
                 drop(writer);
                 remove_unwritten_partial(ctx).await?;
                 fallback_to_single(ctx, fallback_reason_for(&error)).await
@@ -219,7 +201,6 @@ fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
     ))
 }
 
-/// Persist v1+map before `preallocate` / `set_len` so a crash cannot leave an untracked hole.
 async fn multi_start_checklist<F, Fut>(
     ctx: &mut TransferContext,
     persist: &dyn IdentityCommit,
@@ -381,12 +362,8 @@ async fn persist_map_exit(
     Ok(())
 }
 
-/// One-shot toast when multi actually converts to single-stream.
 const MULTI_FALLBACK_TOAST: &str = "Fell back to a single connection.";
 
-/// Roll back v1 map. `continue_as_single` publishes live `active_connections=1`
-/// and a convert toast (skipped when this reason was already recorded).
-/// Hard-fail (`false`) stays at 0 connections and never toasts.
 async fn rollback_multi_identity(
     ctx: &mut TransferContext,
     reason: &str,
@@ -429,7 +406,6 @@ async fn fail_start(
 ) -> DownloadError {
     if !reused {
         if did_preallocate {
-            // Delete a set_len'd file only when this process created it.
             let _ = tokio::fs::remove_file(&ctx.job.temp_path).await;
         }
         rollback_multi_identity(ctx, "multi_start_failed", false).await;
@@ -454,7 +430,6 @@ async fn fallback_to_single(
     run_http_download_with_ctx(ctx).await
 }
 
-/// Drop a zero-written preallocate hole so single-stream does not resume from `metadata_len`.
 async fn remove_unwritten_partial(ctx: &TransferContext) -> Result<(), DownloadError> {
     if ctx.job.temp_path.exists() {
         tokio::fs::remove_file(&ctx.job.temp_path)
@@ -507,8 +482,6 @@ fn record_window_bytes(shared: &SharedMulti, n: u64) {
     window.bytes = window.bytes.saturating_add(n);
 }
 
-/// Sample the shared 400ms window and feed the smoother. `None` if another
-/// worker already reset this window (elapsed still below the interval).
 fn take_due_sample(shared: &SharedMulti, remaining: u64) -> Option<(u64, u64)> {
     let mut window = shared
         .window
@@ -777,7 +750,6 @@ async fn run_segment_loop(
     }
 }
 
-/// `Ok(true)` retry, `Ok(false)` pause/cancel, `Err` after marking Failed.
 async fn fail_or_reconnect(
     task: &SegmentTask,
     error: DownloadError,
@@ -798,7 +770,6 @@ async fn fail_or_reconnect(
     Err(error)
 }
 
-/// `true` when the segment is complete; `false` on pause/cancel.
 async fn stream_segment(
     response: reqwest::Response,
     task: &SegmentTask,
@@ -849,7 +820,6 @@ async fn stream_segment(
     }
 }
 
-/// Returns `true` when the caller should retry the segment GET.
 async fn try_segment_reconnect(
     task: &SegmentTask,
     error: &DownloadError,
@@ -953,7 +923,6 @@ async fn finalize_completed(
     if let Err(error) =
         verify_sha256_if_expected(&ctx.job.temp_path, ctx.job.expected_sha256.as_deref()).await
     {
-        // Hash fail is a Failed transfer: keep .part and retain the completed map.
         persist_map_exit(ctx, map, 0).await?;
         return Err(error);
     }
@@ -1117,7 +1086,6 @@ mod tests {
 
     #[test]
     fn prepare_failed_resume_preserves_bounds_like_fresh_start() {
-        // Failed mid-map → Resume uses the same helper and must not re-partition.
         let mut failed = sample_job();
         let map = two_seg_map(4096, 0);
         failed.segment_map = Some(map.clone());
@@ -1169,7 +1137,6 @@ mod tests {
         assert!(may_convert_multi_to_single(&two_seg_map(0, 0)));
         assert!(!all_written_zero(&two_seg_map(1, 0)));
         assert!(!may_convert_multi_to_single(&two_seg_map(1, 0)));
-        // Prefix-complete (first segment full, rest empty) is not a zero-write convert.
         assert!(!may_convert_multi_to_single(&two_seg_map(
             MIN_SEGMENT_SIZE,
             0
@@ -1221,7 +1188,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("file.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
-        // Preallocated-style: file len == total.
         std::fs::write(&temp, vec![0u8; 10_000]).unwrap();
 
         let mut job = Job::new(
@@ -1357,7 +1323,6 @@ mod tests {
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
 
-        // Simulate Failed mid-map: first segment fully written on disk.
         let mut part = vec![0u8; total];
         part[..MIN_SEGMENT_SIZE as usize].copy_from_slice(&body[..MIN_SEGMENT_SIZE as usize]);
         std::fs::write(&temp, &part).unwrap();
@@ -1389,7 +1354,6 @@ mod tests {
             })
             .cloned()
             .collect();
-        // Must not re-fetch the completed first half (start 0 .. 1MiB-1).
         for req in &body_ranges {
             let lower = req.to_ascii_lowercase();
             assert!(
@@ -1457,7 +1421,6 @@ mod tests {
         assert!(looks_like_preallocate_hole(0, 10_000, 10_000));
         assert!(!looks_like_preallocate_hole(100, 10_000, 10_000));
         assert!(!looks_like_preallocate_hole(0, 50, 10_000));
-        // First-start crash: Add snapshot still has total=0.
         assert!(looks_like_preallocate_hole(0, 10_000, 0));
         assert!(!looks_like_preallocate_hole(0, 0, 0));
     }
@@ -1472,7 +1435,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
-        // First-start crash: set_len already applied, state.json still total=0 / downloaded=0 / v0.
         std::fs::write(&temp, vec![0u8; body.len()]).unwrap();
 
         let url = format!("{base}/file.bin");
@@ -1582,8 +1544,6 @@ mod tests {
         assert_eq!(std::fs::read(&target).expect("final file"), body);
 
         let snaps = progress.snapshots();
-        // Mid-probe GET bytes=1-1 sees the ignored Range (200) and stays single
-        // before workers start — do not enter multi then convert.
         assert!(snaps.iter().any(|job| {
             job.fallback_reason.as_deref() == Some("ranges_unsupported")
                 && job.transfer_mode == Some(TransferMode::Single)
@@ -1976,7 +1936,6 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("rusticdl-multi-ff-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Parent is a file so ensure_parent_directory fails after map attach.
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, b"x").unwrap();
         let target = blocker.join("out.bin");
@@ -2011,8 +1970,6 @@ mod tests {
 
     #[tokio::test]
     async fn non_prefix_failure_keeps_map() {
-        // First segment already written (prefix complete). Remaining segment fails.
-        // Must retain the map — no multi→single conversion, no invented Range.
         let total = 2 * MIN_SEGMENT_SIZE as usize;
         let body: Vec<u8> = (0..total).map(|i| (i % 173) as u8).collect();
         let (base, _seen, _handle) =
@@ -2082,11 +2039,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RangeServeMode {
         Honest,
-        /// 200 + full entity when Range start > 0 (ignored Range / If-Range mismatch).
         FullBodyOnNonzeroRange,
-        /// Body GETs return 403 (convert-to-single path).
         ForbiddenBody,
-        /// Fail Range requests that start at/after the first segment (prefix already done).
         FailNonPrefix,
     }
 
