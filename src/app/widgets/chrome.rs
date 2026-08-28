@@ -4,7 +4,6 @@ use gpui::{
 };
 use gpui_component::{tooltip::Tooltip, Icon, IconName, Sizable, StyledExt};
 
-/// Soft edge vignette using four linear-gradient strips.
 pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl IntoElement {
     let a = edge_alpha.clamp(0.0, 0.5);
     let edge = if is_dark {
@@ -19,7 +18,6 @@ pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl In
         .absolute()
         .inset_0()
         .size_full()
-        // Top
         .child(
             div()
                 .absolute()
@@ -33,7 +31,6 @@ pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl In
                     linear_color_stop(clear, 1.0),
                 )),
         )
-        // Bottom
         .child(
             div()
                 .absolute()
@@ -47,7 +44,6 @@ pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl In
                     linear_color_stop(clear, 1.0),
                 )),
         )
-        // Left
         .child(
             div()
                 .absolute()
@@ -61,7 +57,6 @@ pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl In
                     linear_color_stop(clear, 1.0),
                 )),
         )
-        // Right
         .child(
             div()
                 .absolute()
@@ -77,7 +72,6 @@ pub(crate) fn render_vignette_overlay(edge_alpha: f32, is_dark: bool) -> impl In
         )
 }
 
-/// Decorative icon badge for empty / search-empty states.
 pub(crate) fn empty_state_badge(
     icon: IconName,
     icon_color: Hsla,
@@ -109,7 +103,6 @@ pub(crate) fn empty_state_badge(
         )
 }
 
-/// Smaller, muted tooltip used for status dots and full filenames.
 pub(crate) fn soft_tooltip(
     text: SharedString,
     tip_color: Hsla,

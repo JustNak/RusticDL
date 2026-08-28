@@ -1,4 +1,3 @@
-//! About dialog extracted from `DownloadApp`.
 
 use gpui::{div, px, Context, ParentElement, Styled, Window};
 use gpui_component::{
@@ -22,7 +21,6 @@ impl DownloadApp {
             let muted = theme.muted_foreground;
             let app_view_check = app_view.clone();
 
-            // Match Add download: viewport-center so the card sits mid-window, not top-biased.
             let est_h = 320.0;
             let view_h = window.viewport_size().height.to_f64() as f32;
             let max_top = (view_h - est_h - 20.0).max(24.0);
@@ -31,7 +29,6 @@ impl DownloadApp {
             dialog
                 .title(format!("About {APP_NAME}"))
                 .alert()
-                // alert() disables outside-click; re-enable for light dismiss UX.
                 .overlay_closable(true)
                 .keyboard(true)
                 .w(px(420.))

@@ -1,15 +1,11 @@
-//! GitHub release-note cleanup for the post-update What’s new dialog.
-
 use gpui::rems;
 use gpui_component::{highlighter::HighlightTheme, text::TextViewStyle, Theme};
 
-/// Max height for the scrollable post-update changelog body.
 /// `TextView::scrollable(true)` requires a definite parent height (not only max_h).
 const WHATS_NEW_NOTES_MAX_H: f32 = 168.0;
 const WHATS_NEW_NOTES_MIN_H: f32 = 64.0;
 const WHATS_NEW_NOTES_LINE_H: f32 = 20.0;
 
-/// Compact Markdown style that follows the desktop theme (density, dark/light).
 pub(super) fn changelog_text_style(theme: &Theme) -> TextViewStyle {
     let mut style = TextViewStyle::default();
     style.paragraph_gap = rems(0.28);
@@ -27,7 +23,6 @@ pub(super) fn changelog_text_style(theme: &Theme) -> TextViewStyle {
     style
 }
 
-/// Fit the notes pane to the extracted changelog; cap so the first paint stays short.
 pub(super) fn changelog_notes_height(markdown: &str) -> f32 {
     let lines = markdown
         .lines()
@@ -44,14 +39,12 @@ pub(super) fn changelog_notes_height(markdown: &str) -> f32 {
     (lines * WHATS_NEW_NOTES_LINE_H + 12.0).clamp(WHATS_NEW_NOTES_MIN_H, WHATS_NEW_NOTES_MAX_H)
 }
 
-/// Prepare GitHub release Markdown for the What’s New dialog: changelog only.
 pub(super) fn format_changelog_notes(notes: &str) -> String {
     let stripped = strip_html_comments(notes);
     let extracted = extract_changelog_body(&stripped);
     collapse_blank_lines(&extracted)
 }
 
-/// Keep the “What’s Changed” / Changelog section; drop release boilerplate.
 fn extract_changelog_body(src: &str) -> String {
     let lines: Vec<&str> = src.lines().collect();
     if let Some(start) = lines.iter().position(|l| is_changelog_heading(l)) {
@@ -74,7 +67,6 @@ fn clean_changelog_lines(lines: &[&str]) -> String {
         .join("\n")
 }
 
-/// Drop Downloads / Quick start / License / product-title blocks when no changelog heading exists.
 fn strip_release_boilerplate<'a>(lines: &[&'a str]) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut skipping = false;
@@ -170,7 +162,6 @@ fn is_license_line(line: &str) -> bool {
     lower.starts_with("**license:**") || lower.starts_with("license:")
 }
 
-/// Drop GitHub’s auto `by @user in <url|#n>` suffix from a change line.
 fn strip_github_attribution(line: &str) -> &str {
     let mut search_from = 0;
     let mut last_start = None;

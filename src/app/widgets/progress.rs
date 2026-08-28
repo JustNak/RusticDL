@@ -3,8 +3,6 @@ use gpui_component::{h_flex, progress::Progress};
 
 use crate::settings::ProgressStyle;
 
-/// Progress bar variants for queue rows and settings preview.
-/// `value` is 0..100.
 pub(crate) fn styled_progress(value: f32, color: Hsla, style: ProgressStyle) -> impl IntoElement {
     let value = value.clamp(0.0, 100.0);
     match style {

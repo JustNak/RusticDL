@@ -1,5 +1,3 @@
-//! Add-download dialog extracted from `DownloadApp` for maintainability.
-//! Behavior is unchanged — pure move of `open_add_dialog` plus small pure helpers.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -24,7 +22,6 @@ use crate::download::{
 };
 use crate::settings::{same_dir, Settings};
 
-/// Estimated dialog content height so the footer stays on-screen.
 fn estimated_dialog_height(is_advanced: bool, is_multi: bool) -> f32 {
     match (is_advanced, is_multi) {
         (true, true) => 560.0,
@@ -34,13 +31,11 @@ fn estimated_dialog_height(is_advanced: bool, is_multi: bool) -> f32 {
     }
 }
 
-/// Vertical margin that centers compact dialogs and biases tall ones upward.
 fn dialog_margin_top(view_h: f32, est_h: f32) -> f32 {
     let max_top = (view_h - est_h - 20.0).max(24.0);
     ((view_h - est_h) * 0.5).clamp(24.0, max_top)
 }
 
-/// Preferred filename used to pick a type folder (matches engine Add).
 fn preferred_filename(url: &str, override_name: Option<&str>) -> String {
     override_name
         .map(str::trim)
@@ -51,11 +46,6 @@ fn preferred_filename(url: &str, override_name: Option<&str>) -> String {
         .unwrap_or_else(|| "download.bin".into())
 }
 
-/// Enqueue HTTP(S) URLs via the same `EngineCommand::Add` path used by IPC / drop.
-///
-/// Duplicate policy is applied inside the engine. Returns how many URLs were sent.
-/// `filename_for_first` only applies when a single URL is enqueued (add-dialog Advanced).
-/// `explicit_directory` skips type-folder routing when it is not the configured download dir.
 pub(crate) fn enqueue_urls(
     urls: impl IntoIterator<Item = String>,
     settings: &Settings,
@@ -89,7 +79,6 @@ pub(crate) fn enqueue_urls(
     count
 }
 
-/// Parse free-form text and enqueue; shared by add dialog (and drop path for text bodies).
 pub(crate) fn enqueue_urls_from_text(
     raw: &str,
     settings: &Settings,
@@ -97,7 +86,6 @@ pub(crate) fn enqueue_urls_from_text(
     filename_for_first: Option<String>,
     engine: &crate::download::EngineHandle,
 ) -> usize {
-    // Engine also splits glued schemes; do it here so filename applies to first only.
     let urls = crate::download::extract_http_urls(raw);
     enqueue_urls(
         urls,
@@ -108,7 +96,6 @@ pub(crate) fn enqueue_urls_from_text(
     )
 }
 
-/// Enqueue one or more URLs from the add dialog; returns whether the dialog should close.
 fn submit_add_download(
     raw: &str,
     filename: String,
@@ -118,7 +105,6 @@ fn submit_add_download(
     app_view: &Entity<DownloadApp>,
     cx: &mut App,
 ) -> bool {
-    // Pre-check so we can toast before enqueue; engine also splits defensively.
     let urls = crate::download::extract_http_urls(raw);
     if urls.is_empty() {
         app_view.update(cx, |app, cx| {
@@ -138,7 +124,6 @@ fn submit_add_download(
         Some(typed_directory.as_path())
     };
 
-    // Shared path with file-drop enqueue (filename only for single-URL Advanced).
     let _ = enqueue_urls_from_text(raw, settings, explicit, single_name, engine);
     true
 }
@@ -150,8 +135,6 @@ impl DownloadApp {
         let engine = self.engine.clone();
         let app_view = cx.entity().clone();
 
-        // Single-line by default; multi-line is opt-in via a toggle (InputState mode
-        // is fixed at construction, so we keep two states and swap which is shown).
         let url_single =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/file.zip"));
         let url_multi = cx.new(|cx| {
@@ -172,7 +155,6 @@ impl DownloadApp {
         let name_for_ok = name_input.clone();
         let dir_for_ok = dir_input.clone();
         let dir_for_browse = dir_input.clone();
-        // Dialog builder re-runs each paint; Cells keep toggle state across rebuilds.
         let advanced_open = Rc::new(Cell::new(false));
         let multi_urls = Rc::new(Cell::new(false));
 
@@ -231,8 +213,6 @@ impl DownloadApp {
                     settings_preview.resolve_save_directory(&preview_name, preview_explicit);
                 let save_preview = shorten_path_display(&save_dest.to_string_lossy());
 
-                // Center when compact; when Advanced / multi-URL is open, bias upward
-                // so the footer (Cancel / Start download) never clips the window bottom.
                 let est_h = estimated_dialog_height(is_advanced, is_multi);
                 let view_h = window.viewport_size().height.to_f64() as f32;
                 let margin_top = dialog_margin_top(view_h, est_h);
@@ -243,7 +223,6 @@ impl DownloadApp {
                     .margin_top(px(margin_top))
                     .border_color(theme.border.opacity(0.32))
                     .confirm()
-                    // confirm() disables outside-click; re-enable for light dismiss UX.
                     .overlay_closable(true)
                     .keyboard(true)
                     .button_props(DialogButtonProps::default().ok_text("Start download"))
@@ -251,7 +230,6 @@ impl DownloadApp {
                         v_flex()
                             .gap_4()
                             .w_full()
-                            // Keep last fields clear of the footer row.
                             .pb_2()
                             .child(
                                 v_flex()
@@ -264,9 +242,6 @@ impl DownloadApp {
                                             .gap_3()
                                             .child(field_label("URL", cx))
                                             .child(
-                                                // Lightweight toggle (not Switch): Switch's
-                                                // internal keyed state + dialog rebuild was
-                                                // panicking on click inside open_dialog.
                                                 h_flex()
                                                     .id("add-multi-urls-toggle")
                                                     .items_center()
@@ -361,8 +336,6 @@ impl DownloadApp {
                                         el.child(Input::new(&url_single).w_full())
                                     })
                                     .when(is_multi, |el| {
-                                        // Explicit height: multi-line Input defaults to h_auto
-                                        // and collapses when empty without a fixed size.
                                         el.child(Input::new(&url_multi).w_full().h(px(104.)))
                                     }),
                             )

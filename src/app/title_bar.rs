@@ -1,4 +1,3 @@
-//! Title bar chrome extracted from `DownloadApp`.
 
 use gpui::{
     div, img, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
@@ -32,7 +31,6 @@ impl DownloadApp {
             .map(|info| info.html_url.clone());
         let view = cx.entity();
         let total_speed = total_download_speed(&self.jobs);
-        // Only show live throughput — filter count lives in the sidebar badge.
         let speed_label = if total_speed > 0 {
             Some(format!("↓ {}", format_speed(total_speed)))
         } else {
@@ -112,7 +110,6 @@ impl DownloadApp {
                                 let view = view.clone();
                                 move |_, _, cx| {
                                     view.update(cx, |app, cx| {
-                                        // Full quit (close-to-tray must not intercept).
                                         app.force_quit_app(cx);
                                     });
                                 }
@@ -129,7 +126,6 @@ impl DownloadApp {
                 .items_center()
                 .gap_2()
                 .pr_1()
-                // Brand column matches sidebar width so search starts on the divider.
                 .child(
                     h_flex()
                         .id("title-bar-brand")
@@ -139,7 +135,6 @@ impl DownloadApp {
                         .items_center()
                         .overflow_hidden()
                         .gap_2()
-                        // Brand mark + name share one overflow menu (logo is clickable too).
                         .child(
                             Button::new("app-brand-menu")
                                 .ghost()
@@ -217,7 +212,6 @@ impl DownloadApp {
         )
     }
 
-    /// Shared builder for the queue ⋮ overflow (title bar).
     fn queue_overflow_menu_builder(
         view: gpui::Entity<Self>,
     ) -> impl Fn(

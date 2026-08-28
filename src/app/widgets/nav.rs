@@ -9,7 +9,6 @@ use super::super::settings_category::SettingsCategory;
 use super::super::DownloadApp;
 use crate::download::FileTypeKind;
 
-/// Format a sidebar nav count for display. Caps at 999 (`999+` beyond that).
 pub(crate) fn format_nav_count(count: i32) -> SharedString {
     if count > 999 {
         "999+".into()
@@ -26,7 +25,6 @@ pub(crate) fn nav_item(
     cx: &mut Context<DownloadApp>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    // Selected filter: subtle grey highlight. Unselected: plain (white/default surface).
     let bg = if active {
         theme
             .secondary
@@ -44,7 +42,6 @@ pub(crate) fn nav_item(
     } else {
         theme.muted_foreground
     };
-    // Count text: muted grey when selected, brighter when not.
     let count_color = if active {
         theme.muted_foreground
     } else {
@@ -100,7 +97,6 @@ pub(crate) fn nav_item(
         })
 }
 
-/// Parent "All downloads" row with a chevron that expands the type tree.
 pub(crate) fn library_parent_nav(
     count: i32,
     active: bool,
@@ -210,7 +206,6 @@ pub(crate) fn library_parent_nav(
         )
 }
 
-/// Indented type row under All downloads.
 pub(crate) fn type_nav_item(
     kind: FileTypeKind,
     count: i32,
@@ -291,8 +286,6 @@ pub(crate) fn type_nav_item(
         )
 }
 
-/// Settings mini-nav row: icon + label, active styling aligned with [`nav_item`].
-/// No badge counts (categories are not queue filters).
 pub(crate) fn settings_nav_item(
     category: SettingsCategory,
     active: bool,

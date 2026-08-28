@@ -1,6 +1,3 @@
-//! Settings panel UI extracted from `DownloadApp` for maintainability.
-//! Category list lives in the left rail (`sidebar::render_settings_sidebar`);
-//! this module renders the active category panel + sticky footer.
 
 mod appearance;
 mod browser;
@@ -26,8 +23,6 @@ impl DownloadApp {
         let settings_pad = self.settings.ui_density.settings_pad();
         let category = self.settings_category;
 
-        // Categories live in the main left rail (`render_settings_sidebar`).
-        // This pane is content + sticky footer only.
         v_flex()
             .id("settings-view")
             .size_full()
@@ -35,7 +30,6 @@ impl DownloadApp {
             .child(
                 div()
                     // Key id by category so GPUI does not reuse scroll offset
-                    // when switching from a tall panel (Appearance) to a short one.
                     .id(SharedString::from(format!(
                         "settings-content-scroll-{}",
                         category.label()
@@ -49,11 +43,7 @@ impl DownloadApp {
                     .child(
                         v_flex()
                             .gap_5()
-                            // Wide enough for label + multi-segment control clusters
-                            // (handoff / density / radius) without crushing the control column.
                             .max_w(px(880.))
-                            // Single page title — GroupBox cards are title-less so the
-                            // category name is not printed twice.
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -90,7 +80,6 @@ impl DownloadApp {
                             }),
                     ),
             )
-            // Sticky footer (flex shell, not CSS position:sticky): always visible.
             .child(
                 h_flex()
                     .id("settings-footer")

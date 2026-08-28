@@ -1,5 +1,3 @@
-//! Download Engine settings category panel.
-
 use gpui::{prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -16,7 +14,6 @@ use crate::settings::Settings;
 
 impl DownloadApp {
     pub(super) fn render_settings_engine(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Derive from live drafts (same parse fallbacks as Save), not last-committed only.
         let budget_hint = {
             let concurrent = self
                 .concurrent_input

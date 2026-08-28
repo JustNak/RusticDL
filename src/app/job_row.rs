@@ -41,7 +41,6 @@ pub(crate) fn render_job_row(
         job.state,
         JobState::Starting | JobState::Downloading | JobState::Paused
     );
-    // Action availability is resolved when the row overflow menu opens.
 
     let speed = if matches!(job.state, JobState::Downloading | JobState::Starting) {
         format_speed(job.speed)
@@ -73,10 +72,6 @@ pub(crate) fn render_job_row(
         theme.list
     };
 
-    // Fixed-height table row: never grows with wrapped text or flex stretch.
-    // Horizontal padding matches the header so metric columns share the same grid.
-    // `w_full` is required so the flex-1 name column gets a real width; without
-    // it the row shrink-wraps to metrics and the label is clipped to nothing.
     h_flex()
         .id(SharedString::from(format!("job-row-{}", id)))
         .w_full()
@@ -99,9 +94,6 @@ pub(crate) fn render_job_row(
         })
         .cursor_pointer()
         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-            // Modifier-click multi-select (PR-07): Ctrl/Cmd = toggle, Shift = range.
-            // Plain click: select only (no toggle-off). Stop bubble so empty
-            // queue chrome can clear selection on background click.
             let m = event.modifiers();
             if m.secondary() {
                 this.toggle_select(id_for_select.clone());
@@ -115,7 +107,6 @@ pub(crate) fn render_job_row(
             cx.notify();
             cx.stop_propagation();
         }))
-        // File-type tile with status badge, then the filename (+ progress under name).
         .child(file_type_status_tile(
             &id,
             &job.filename,
@@ -124,9 +115,6 @@ pub(crate) fn render_job_row(
             &theme,
         ))
         .child(
-            // Name takes remaining width; metrics stay fixed so every row shares
-            // the same name column width (no per-filename width stretch).
-            // Inner h_flex gives the label a horizontal measure. Do not use
             // GPUI `text_ellipsis` here — it can paint zero glyphs in this
             // nested flex; `ellipsize_name` supplies the visible "...".
             v_flex()
@@ -135,7 +123,6 @@ pub(crate) fn render_job_row(
                 .gap_1()
                 .justify_center()
                 .child(h_flex().w_full().min_w_0().items_center().child({
-                    // Explicit "..." when too long; hover shows the full name.
                     let tip_color = theme.muted_foreground;
                     div()
                         .id(SharedString::from(format!("job-name-{id}")))
@@ -404,17 +391,14 @@ pub(crate) fn render_job_row(
         )
 }
 
-/// Circular arrow — reads as “start over”, unlike redo’s curved arrow.
 pub(crate) fn restart_icon() -> Icon {
     Icon::empty().path("icons/rotate-cw.svg")
 }
 
-/// Spinner — marks the in-flight progress HUD action.
 pub(crate) fn progress_popup_icon() -> Icon {
     Icon::empty().path("icons/loader-circle.svg")
 }
 
-/// Destructive queue action (Remove / Delete) — red label and icon.
 fn danger_popup_item(
     label: impl Into<SharedString>,
     icon: IconName,

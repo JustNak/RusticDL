@@ -1,5 +1,3 @@
-//! Persist main-window size / position / maximized across launches.
-
 use std::time::{Duration, Instant};
 
 use gpui::{Window, WindowBounds};
@@ -9,7 +7,6 @@ use crate::persistence::save_settings;
 use crate::settings::WindowLayout;
 
 impl DownloadApp {
-    /// Snapshot restore-size + maximized from the platform window into settings.
     pub(crate) fn capture_window_layout(&mut self, window: &Window) {
         let layout = window_layout_from_window(window);
         if self.settings.window_layout == layout {
@@ -17,7 +14,6 @@ impl DownloadApp {
         }
         self.settings.window_layout = layout;
         self.window_layout_dirty = true;
-        // Write promptly when quiet; during an active drag, throttle via the timer loop.
         self.flush_window_layout_if_due();
     }
 
@@ -30,7 +26,6 @@ impl DownloadApp {
         }
         self.window_layout_dirty = false;
         self.last_window_layout_save = Instant::now();
-        // Do not flush unsaved Browser capture previews via incidental layout writes.
         let _ = save_settings(&self.paths, &self.settings_for_disk());
     }
 
@@ -44,7 +39,6 @@ impl DownloadApp {
     }
 }
 
-/// Capture restore bounds from the platform window (not the maximized full-screen rect).
 fn window_layout_from_window(window: &Window) -> WindowLayout {
     let wb = window.window_bounds();
     let bounds = wb.get_bounds();

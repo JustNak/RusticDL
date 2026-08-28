@@ -1,19 +1,3 @@
-//! Staged self-update flow extracted from `DownloadApp`.
-//!
-//! Toast stages (interactive + silent when an update exists):
-//! 1. **Checking for update…**
-//! 2a. **You're up to date** — or —
-//! 2b. **Update available vX.Y.Z** `[Update]`
-//! 3. On Update: flush state, snapshot What’s new, spawn **RusticDL Updater**, quit.
-//! 4. Updater downloads, closes rusticdl if still running, runs NSIS `/S`,
-//!    then relaunches the main app once.
-//! 5. **What’s new** — post-relaunch dialog with the release changelog.
-//!
-//! Channel (`UpdateChannel`) selects Stable (`/releases/latest`) vs Nightly
-//! (`vX.Y.Z-nightly.*` pre-releases). Switching channels offers that stream’s
-//! current build even when its version number is lower.
-//! In-flight checks are invalidated when the channel changes.
-
 mod changelog;
 
 use std::time::Duration;
@@ -40,7 +24,6 @@ use crate::updater::{
 use changelog::{changelog_notes_height, changelog_text_style, format_changelog_notes};
 
 impl DownloadApp {
-    /// Label for the single update action (check or advance cached release).
     pub(crate) fn update_action_label(&self) -> String {
         if let Some(info) = &self.available_update {
             format!("Update available v{}", info.latest_version)
@@ -49,7 +32,6 @@ impl DownloadApp {
         }
     }
 
-    /// Brand menu / About: check when unknown, else re-show the Update toast.
     pub(crate) fn begin_update_action(
         &mut self,
         _window: &mut gpui::Window,
@@ -66,7 +48,6 @@ impl DownloadApp {
         self.begin_update_check(true, cx);
     }
 
-    /// Manual or silent GitHub Releases update check (never installs).
     pub(crate) fn begin_update_check(&mut self, interactive: bool, cx: &mut Context<Self>) {
         if self.update_busy {
             if interactive {
@@ -92,7 +73,6 @@ impl DownloadApp {
         result: Result<UpdateCheck, String>,
         cx: &mut Context<Self>,
     ) {
-        // Channel switch (or a newer check / apply) invalidates this completion.
         if check_gen != self.update_check_gen {
             return;
         }
@@ -103,15 +83,12 @@ impl DownloadApp {
                 if interactive {
                     self.replace_update_toast("You're up to date", ToastKind::Info, None, cx);
                 } else {
-                    // Drop the checking toast if a silent check somehow set one.
                     self.clear_update_toast(cx);
                 }
             }
             Ok(UpdateCheck::Available(info)) => {
                 self.available_update = Some(info.clone());
                 self.update_busy = false;
-                // Interactive and silent: toast with [Update] so the user can continue
-                // without hunting the brand menu.
                 self.show_update_available_toast(&info, cx);
             }
             Err(message) => {
@@ -126,7 +103,6 @@ impl DownloadApp {
         cx.notify();
     }
 
-    /// “Update available vX.Y.Z” with an Update action button.
     pub(crate) fn show_update_available_toast(
         &mut self,
         info: &UpdateInfo,
@@ -140,7 +116,6 @@ impl DownloadApp {
         );
     }
 
-    /// Handle primary actions from update toasts.
     pub(crate) fn on_update_toast_action(&mut self, kind: ToastActionKind, cx: &mut Context<Self>) {
         match kind {
             ToastActionKind::ApplyUpdate => {
@@ -153,7 +128,6 @@ impl DownloadApp {
         }
     }
 
-    /// Open the post-update changelog once a `Window` is free.
     pub(crate) fn apply_pending_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.pending_show_whats_new {
             return;
@@ -169,14 +143,12 @@ impl DownloadApp {
         self.open_whats_new_dialog(pending, window, cx);
     }
 
-    /// Tasteful post-update changelog (Esc / mouse-back / outside / Close).
     pub(crate) fn open_whats_new_dialog(
         &mut self,
         pending: PendingWhatsNew,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Ack on open so Esc / mouse-back via `close_dialog` (no on_close) cannot re-show.
         self.ack_whats_new(cx);
 
         let to = pending.to_version.clone();
@@ -257,7 +229,6 @@ impl DownloadApp {
             dialog
                 .title(title)
                 .alert()
-                // alert() disables outside-click; re-enable for light dismiss UX.
                 .overlay_closable(true)
                 .keyboard(true)
                 .w(px(460.))
@@ -268,7 +239,6 @@ impl DownloadApp {
         });
     }
 
-    /// Drop the on-disk snapshot so the dialog does not reappear next launch.
     pub(crate) fn ack_whats_new(&mut self, _cx: &mut Context<Self>) {
         self.pending_whats_new = None;
         self.pending_show_whats_new = false;
@@ -280,13 +250,11 @@ impl DownloadApp {
             self.show_toast("An update is already in progress…", cx);
             return;
         }
-        // Invalidate any in-flight check so a late result cannot clear busy mid-handoff.
         self.update_check_gen = self.update_check_gen.wrapping_add(1);
         self.update_busy = true;
         self.begin_apply_update_inner(info, cx);
     }
 
-    /// Persist state, snapshot What’s new, spawn RusticDL Updater, then quit.
     pub(crate) fn begin_apply_update_inner(&mut self, info: UpdateInfo, cx: &mut Context<Self>) {
         self.replace_update_toast(
             format!("Handing off to {UPDATER_NAME}…"),
@@ -296,7 +264,6 @@ impl DownloadApp {
         );
         cx.notify();
 
-        // Persist before spawn/quit so a kill during install cannot race a dirty save.
         self.flush_jobs_save_now();
         self.flush_window_layout_now();
 
@@ -306,7 +273,6 @@ impl DownloadApp {
             info.current_version.clone()
         };
 
-        // Snapshot notes now so the relaunched binary can show them without GitHub.
         let pending = PendingWhatsNew {
             from_version: from_version.clone(),
             to_version: info.latest_version.clone(),
@@ -325,8 +291,6 @@ impl DownloadApp {
         };
 
         if let Err(message) = launch_updater(&opts) {
-            // Handoff failed — discard the snapshot so a normal start does not
-            // claim an update that never applied.
             let _ = clear_pending_whats_new(&self.paths);
             self.update_busy = false;
             self.replace_update_toast(message, ToastKind::Error, None, cx);
@@ -334,12 +298,10 @@ impl DownloadApp {
             return;
         }
 
-        // Bypass close-to-tray / hidden-window paint so quit actually tears down.
         self.force_quit_app(cx);
     }
 }
 
-/// Run a GitHub Releases update check on a background thread and deliver the result to the UI.
 pub(crate) fn spawn_update_check(
     interactive: bool,
     channel: UpdateChannel,

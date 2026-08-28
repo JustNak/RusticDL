@@ -1,4 +1,3 @@
-//! Jobs list apply path, debounced persist, and OS notify flush wiring for `DownloadApp`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +15,6 @@ use crate::notifications::{
 use crate::persistence::save_jobs;
 use crate::settings::OsNotifyMode;
 
-/// Debounce progress-driven `state.json` writes; terminal transitions flush immediately.
 const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl DownloadApp {
@@ -32,7 +30,6 @@ impl DownloadApp {
     }
 
     pub(crate) fn apply_jobs(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
-        // Edge-detect BEFORE overwrite (Completed / Failed only — never Canceled).
         let edges = terminal_edges(&self.jobs, &jobs);
         let notify_edges = filter_notify_edges(
             &edges,
@@ -40,7 +37,6 @@ impl DownloadApp {
             self.settings.notify_on_fail,
         );
 
-        // Pipeline A — in-app toasts (immediate when window is visible).
         if !self.window_hidden_to_tray && !notify_edges.is_empty() {
             for (kind, message) in
                 in_app_summary_messages(&notify_edges, self.settings.os_notify_mode)
@@ -52,7 +48,6 @@ impl DownloadApp {
             }
         }
 
-        // Pipeline B — OS balloons (burst coalesce; hard eligibility at flush).
         if soft_os_eligible(self.settings.os_notify_mode) && !notify_edges.is_empty() {
             let pending: Vec<PendingOsTerminal> = notify_edges
                 .iter()
@@ -75,13 +70,10 @@ impl DownloadApp {
             self.flush_jobs_save_if_due();
         }
         self.ipc.update_jobs(Arc::clone(&self.jobs));
-        // Adopt bridge extension settings only when the user has no local preview
-        // (unsaved toggles). Never clobber while extension_settings_dirty.
         self.sync_extension_settings_from_bridge(false);
         cx.notify();
     }
 
-    /// Hidden + no downloads + no pending tick work: skip apply/balloons/persist.
     /// Capture HUD poll is separate — Confirm / Progress must still open while SW_HIDE.
     pub(crate) fn should_skip_hidden_idle_tick(&self) -> bool {
         hidden_idle_tick_should_skip(
@@ -93,9 +85,6 @@ impl DownloadApp {
         )
     }
 
-    /// Stop the 80ms GPUI timer while tray-hidden with nothing to do.
-    ///
-    /// Capture / show_window stay event-driven via [`crate::ipc::IpcBridge::wake_ui`].
     pub(crate) fn should_park_shell_tick(&self) -> bool {
         should_park_shell_tick(
             self.window_hidden_to_tray,
@@ -108,9 +97,6 @@ impl DownloadApp {
         )
     }
 
-    /// One shell timer tick: throttled apply (unless hidden-idle), then capture / show_window.
-    ///
-    /// Returns whether the 80ms timer can park until the next IPC / engine / tray wake.
     pub(crate) fn run_shell_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let skip_apply = self.should_skip_hidden_idle_tick();
         if !skip_apply {
@@ -134,10 +120,6 @@ impl DownloadApp {
         }
     }
 
-    /// Flush OS coalesce buffer: re-check hard eligibility, compose one balloon, show.
-    ///
-    /// Arms the 2s burst window only after a balloon is actually shown. Hard-drops
-    /// (e.g. WhenHiddenToTray while visible) do not delay the next solitary balloon.
     pub(crate) fn flush_os_notify(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let pending = self.os_notify_buffer.take_pending();
@@ -145,9 +127,6 @@ impl DownloadApp {
             return;
         }
 
-        // Hard eligibility with *current* mode / visibility / toggles.
-        // Do not arm burst on drop — visible completes under WhenHiddenToTray must
-        // not tax the first real OS balloon after the user hides to tray.
         if !hard_os_eligible(self.settings.os_notify_mode, self.window_hidden_to_tray) {
             return;
         }
@@ -165,24 +144,19 @@ impl DownloadApp {
             return;
         };
 
-        // Tray required for balloons; ensure lifetime when notify is on.
         self.sync_tray_lifetime(cx);
         if let Some(tray) = self.system_tray.as_ref() {
-            // Allocate context only when we can actually show a balloon.
             let context_id = self.balloon_contexts.allocate(&payload);
             tray.show_notification(&payload.title, &payload.body, payload.level, context_id);
             self.os_notify_buffer.after_flush(now);
         } else {
             eprintln!("rusticdl: OS notification skipped (tray unavailable)");
-            // Always mode skips success in-app because "OS covers success". If the
-            // tray is missing, fall back so visible completes are not silent.
             if self.settings.os_notify_mode == OsNotifyMode::Always && !self.window_hidden_to_tray {
                 self.fallback_in_app_for_missed_os_complete(&pending, cx);
             }
         }
     }
 
-    /// In-app Info for complete edges when Always OS path could not show a balloon.
     fn fallback_in_app_for_missed_os_complete(
         &mut self,
         pending: &[PendingOsTerminal],
@@ -223,11 +197,9 @@ impl DownloadApp {
     }
 }
 
-/// GPUI shell timer while there is UI work (progress apply, persist, capture spacing).
 pub(crate) const SHELL_TICK_INTERVAL: Duration = Duration::from_millis(80);
 const JOBS_UI_THROTTLE: Duration = SHELL_TICK_INTERVAL;
 
-/// Queued / in-flight jobs still need the 80ms apply path even when hidden.
 fn job_needs_ui_tick(state: JobState) -> bool {
     matches!(
         state,
@@ -235,7 +207,6 @@ fn job_needs_ui_tick(state: JobState) -> bool {
     )
 }
 
-/// When the main window is in the tray and nothing needs a tick, skip the hot path.
 fn hidden_idle_tick_should_skip(
     hidden: bool,
     jobs: &[Job],
@@ -250,7 +221,6 @@ fn hidden_idle_tick_should_skip(
         && !latest_jobs.iter().any(|job| job_needs_ui_tick(job.state))
 }
 
-/// Park the 80ms timer only when hidden-idle *and* no capture / IPC work remains.
 fn should_park_shell_tick(
     hidden: bool,
     jobs: &[Job],
@@ -270,7 +240,6 @@ fn should_park_shell_tick(
         && !has_ipc_ui_work
 }
 
-/// Update `latest_jobs` on every event. Returns `Some` when render should apply.
 fn note_jobs_changed(
     latest_jobs: &mut Arc<Vec<Job>>,
     pending_jobs: &mut Option<Arc<Vec<Job>>>,
@@ -285,12 +254,10 @@ fn note_jobs_changed(
     Some(jobs)
 }
 
-/// Newest event snapshot. `rendered` is the last applied frame and may be older.
 fn persist_source<'a>(latest_jobs: &'a [Job]) -> &'a [Job] {
     latest_jobs
 }
 
-/// Persist immediately on membership or JobState changes. Scalar ticks stay debounced.
 fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
     if previous.len() != next.len() {
         return true;
@@ -394,7 +361,6 @@ mod tests {
             true, &paused, &paused, false, false
         ));
         assert!(hidden_idle_tick_should_skip(true, &[], &[], false, false));
-        // Park is apply/notify/persist only. Capture poll stays armed while SW_HIDE.
         assert!(super::super::browser_capture::should_poll_capture_huds(
             true
         ));
@@ -445,7 +411,6 @@ mod tests {
             false,
             false
         ));
-        // Visible window keeps the 80ms timer (layout debounce, etc.).
         assert!(!should_park_shell_tick(
             false, &completed, &completed, false, false, false, false
         ));

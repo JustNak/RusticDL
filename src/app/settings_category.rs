@@ -1,8 +1,5 @@
-//! Settings mini-nav category enum (shared by shell state and nav widgets).
-
 use gpui_component::IconName;
 
-/// Settings mini-nav categories. Switching does not discard the draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SettingsCategory {
     #[default]
@@ -42,7 +39,6 @@ impl SettingsCategory {
         }
     }
 
-    /// GroupBox title (Browser keeps the longer “Browser capture” name).
     pub(crate) fn panel_title(self) -> &'static str {
         match self {
             Self::Browser => "Browser capture",

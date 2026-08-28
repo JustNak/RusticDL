@@ -1,5 +1,3 @@
-//! System settings category panel.
-
 use gpui::{prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -106,8 +104,6 @@ impl DownloadApp {
                 .child(settings_choice_row(
                     "OS notifications",
                     Some("Uses the tray icon even if Close to tray is Off."),
-                    // Keep Off / When hidden / Always on one row — flex_wrap stacks
-                    // segments and paints them over Notify on complete / fail below.
                     h_flex()
                         .gap_2()
                         .child(

@@ -17,7 +17,6 @@ use super::DownloadApp;
 use crate::download::{fallback_reason_label, open_path, EngineCommand, Job, JobState};
 use crate::format::{format_date, format_eta, format_size, format_speed};
 
-/// Inline “Label value” pair used in the detail meta row (no card chrome).
 pub(crate) fn detail_pair(
     label: &'static str,
     value: impl Into<SharedString>,
@@ -50,7 +49,6 @@ pub(crate) fn detail_pair(
         )
 }
 
-/// Thin vertical rule between meta pairs — same language as the status bar separators.
 pub(crate) fn detail_meta_sep(theme: &Theme) -> impl IntoElement {
     div()
         .w(px(1.))
@@ -125,16 +123,11 @@ pub(crate) fn render_detail(
     );
     let can_resume = job.state == JobState::Paused;
     let can_retry = matches!(job.state, JobState::Failed | JobState::Canceled);
-    // Restart wipes partial progress and starts from zero — only useful after a
-    // failed or canceled transfer, not on completed jobs.
     let can_restart = matches!(job.state, JobState::Failed | JobState::Canceled);
     let can_cancel = !job.state.is_terminal() && job.state != JobState::Paused;
-    // Open / folder / remove / delete live on the row overflow menu.
     let show_actions =
         can_show_progress || can_pause || can_resume || can_retry || can_restart || can_cancel;
 
-    // Height-capped inspector: scrolls internally so the job list keeps space.
-    // Flat surfaces only — hierarchy comes from type and a single top border, not nested cards.
     v_flex()
         .id("job-detail")
         .flex_shrink_0()
@@ -155,7 +148,6 @@ pub(crate) fn render_detail(
                 .child(
                     v_flex()
                         .gap_3()
-                        // ── Header ──
                         .child(
                             h_flex()
                                 .w_full()
@@ -183,7 +175,6 @@ pub(crate) fn render_detail(
                                         .overflow_hidden()
                                         .child(
                                             // Soft character clamp — GPUI text-overflow is unreliable
-                                            // in nested flex, same approach as the queue Name column.
                                             div()
                                                 .id(SharedString::from(format!(
                                                     "detail-name-{}",
@@ -266,7 +257,6 @@ pub(crate) fn render_detail(
                                         })),
                                 ),
                         )
-                        // ── Meta row: terminal jobs keep Size / Date / Type / File ──
                         .child(if terminal {
                             let row = h_flex()
                                 .w_full()
@@ -338,7 +328,6 @@ pub(crate) fn render_detail(
                                     ),
                             )
                         })
-                        // ── Path ──
                         .child(
                             h_flex()
                                 .w_full()
@@ -376,7 +365,6 @@ pub(crate) fn render_detail(
                                 ),
                         )
                         .when_some(error, |el, err| {
-                            // Error keeps a light tint — semantic, not decorative card chrome.
                             el.child(
                                 h_flex()
                                     .gap_2()

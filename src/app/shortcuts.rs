@@ -1,8 +1,3 @@
-//! Global keyboard shortcuts for queue productivity.
-//!
-//! Active when no modal dialog is open and no owned text input is focused.
-//! Escape is owned by the keystroke interceptor in `DownloadApp::new` (must run
-//! before Input keybindings); see `handle_escape_keystroke`.
 
 use gpui::{App, Context, Focusable, KeyDownEvent, Window};
 use gpui_component::WindowExt;
@@ -23,7 +18,6 @@ impl DownloadApp {
         let key = event.keystroke.key.as_str();
         let modifiers = &event.keystroke.modifiers;
 
-        // Remaining shortcuts require an idle chrome (no modal, no text focus).
         if window.has_active_dialog(cx) || self.any_text_input_focused(window, cx) {
             return;
         }
@@ -43,8 +37,6 @@ impl DownloadApp {
             return;
         }
 
-        // Queue-only ops: no-op on Settings (queue is not rendered; visible_jobs
-        // would otherwise treat Settings as "all" via filter_jobs fallthrough).
         if secondary_only && key == "a" {
             if self.queue_shortcuts_active() {
                 self.shortcut_select_all_visible(cx);
@@ -83,12 +75,10 @@ impl DownloadApp {
         }
     }
 
-    /// Queue list is shown (not Settings). Select-all / Delete / Space apply only here.
     fn queue_shortcuts_active(&self) -> bool {
         self.filter != FilterKind::Settings
     }
 
-    /// True when any app-owned text input (search, settings fields) has focus.
     fn any_text_input_focused(&self, window: &Window, cx: &App) -> bool {
         [
             &self.search_input,
@@ -111,8 +101,6 @@ impl DownloadApp {
                 .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
-    /// Ctrl/Cmd+A — select every job currently visible (filter + search + sort).
-    /// Caller must ensure `queue_shortcuts_active()` (Settings has no visible list).
     fn shortcut_select_all_visible(&mut self, cx: &mut Context<Self>) {
         if !self.queue_shortcuts_active() {
             return;
@@ -123,12 +111,10 @@ impl DownloadApp {
         }
         let ids: Vec<String> = visible.iter().map(|j| j.id.clone()).collect();
         self.selected_ids = ids;
-        // Keep a stable Shift-range anchor at the first visible row; primary = last.
         self.selection_anchor_id = self.selected_ids.first().cloned();
         cx.notify();
     }
 
-    /// Delete — confirm remove for primary (N=1) or all selected removable ids.
     fn shortcut_confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
             return;
@@ -147,7 +133,6 @@ impl DownloadApp {
         }
     }
 
-    /// Shift+Delete — confirm delete-from-disk for selected jobs with files.
     fn shortcut_confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
             return;
@@ -168,7 +153,6 @@ impl DownloadApp {
         }
     }
 
-    /// Space — pause any pausable selected jobs; else resume paused ones.
     fn shortcut_toggle_pause_resume(&mut self) {
         if !self.queue_shortcuts_active() || self.selected_ids.is_empty() {
             return;
@@ -186,10 +170,8 @@ impl DownloadApp {
         }
     }
 
-    /// `/` — focus the queue search field (leave Settings so it is visible).
     fn shortcut_focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter == FilterKind::Settings {
-            // Same restore path as Back / Esc / mouse-back.
             self.leave_settings(window, cx);
         }
         self.search_input

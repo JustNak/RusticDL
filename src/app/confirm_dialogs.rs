@@ -1,4 +1,3 @@
-//! Queue confirm dialogs extracted from `DownloadApp`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -12,7 +11,6 @@ use super::add_dialog::enqueue_urls;
 use super::DownloadApp;
 use crate::download::EngineCommand;
 
-/// Stable key for a clipboard URL set so focus flapping does not re-prompt.
 pub(crate) fn clipboard_urls_key(urls: &[String]) -> u64 {
     let mut sorted: Vec<&str> = urls.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -113,8 +111,6 @@ impl DownloadApp {
         });
     }
 
-    /// Multi-select remove: one confirm listing count; only removable jobs
-    /// (terminal or paused) leave the queue. Active jobs are left alone.
     pub(crate) fn confirm_remove_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .jobs
@@ -166,8 +162,6 @@ impl DownloadApp {
         });
     }
 
-    /// Multi-select delete: remove selected jobs whose files exist on disk.
-    /// Active downloads are left alone.
     pub(crate) fn confirm_delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .jobs
@@ -220,7 +214,6 @@ impl DownloadApp {
         });
     }
 
-    /// Remove finished jobs (completed, failed, canceled) from the queue.
     pub(crate) fn confirm_clear_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .jobs
@@ -257,7 +250,6 @@ impl DownloadApp {
                 .child(div().text_sm().child(body))
                 .on_ok(move |_, _, _| {
                     for id in &ids {
-                        // Keep on-disk files (including leftover .part for failed jobs).
                         engine.send(EngineCommand::Remove {
                             id: id.clone(),
                             delete_partial: false,
@@ -269,7 +261,6 @@ impl DownloadApp {
         });
     }
 
-    /// Confirm before draft-resetting Settings prefs to defaults (Save still required).
     pub(crate) fn confirm_reset_settings_defaults(
         &mut self,
         window: &mut Window,
@@ -315,7 +306,6 @@ impl DownloadApp {
         });
     }
 
-    /// Confirm before enqueueing URLs found on the clipboard (never auto-downloads).
     pub(crate) fn confirm_add_clipboard_urls(
         &mut self,
         urls: Vec<String>,
@@ -337,7 +327,6 @@ impl DownloadApp {
             .iter()
             .take(5)
             .map(|u| {
-                // Char-boundary safe: URLs can contain non-ASCII after extraction.
                 let mut iter = u.chars();
                 let prefix: String = iter.by_ref().take(69).collect();
                 if iter.next().is_some() {

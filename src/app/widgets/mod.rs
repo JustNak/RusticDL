@@ -1,6 +1,3 @@
-//! Shared UI widget helpers, split by domain.
-//!
-//! Call sites continue to import via `super::widgets::{…}` / `widgets::…`.
 
 mod chrome;
 mod nav;
@@ -9,9 +6,8 @@ mod progress;
 mod queue;
 mod settings;
 
-pub(crate) use chrome::{empty_state_badge, render_vignette_overlay, soft_tooltip};
-// format_nav_count is re-exported for path stability (was pub(crate) on the monolith).
 pub(crate) use crate::download::FileTypeKind;
+pub(crate) use chrome::{empty_state_badge, render_vignette_overlay, soft_tooltip};
 #[allow(unused_imports)]
 pub(crate) use nav::{
     format_nav_count, library_parent_nav, nav_item, settings_nav_item, type_nav_item,
