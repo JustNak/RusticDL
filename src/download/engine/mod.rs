@@ -399,7 +399,14 @@ pub(super) async fn emit_toast(inner: &Arc<Mutex<EngineInner>>, message: String)
 }
 
 pub fn open_path(path: &Path) -> Result<(), String> {
-    open::that(path).map_err(|e| format!("Could not open path: {e}"))
+    #[cfg(target_os = "windows")]
+    {
+        open::that(path).map_err(|e| format!("Could not open path: {e}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open::that_detached(path).map_err(|e| format!("Could not open path: {e}"))
+    }
 }
 
 pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
@@ -1142,5 +1149,48 @@ mod tests {
             "queued job must start without waiting out a 500ms poll"
         );
         handle.send(EngineCommand::Shutdown);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn reveal_in_folder_missing_path_opens_parent_via_that_detached() {
+        let parent = std::env::temp_dir().join("rusticdl_reveal_parent_that_detached");
+        std::fs::create_dir_all(&parent).unwrap();
+        let missing = parent.join("rusticdl-missing-download.bin");
+        assert!(!missing.exists());
+        assert!(parent.is_dir());
+
+        let result = reveal_in_folder(&missing);
+        assert!(
+            result.is_ok(),
+            "missing file {:?} should open parent {:?} via open_path/that_detached",
+            missing,
+            parent
+        );
+
+        let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn open_path_non_windows_uses_that_detached_not_blocking_that() {
+        let src = include_str!("mod.rs");
+        let non_windows_start = src
+            .find("#[cfg(not(target_os = \"windows\"))]")
+            .expect("non-Windows open_path branch must exist in mod.rs");
+        let non_windows_body = &src[non_windows_start..];
+        let next_cfg = non_windows_body[1..]
+            .find("#[cfg(")
+            .unwrap_or(non_windows_body.len() - 1);
+        let open_path_non_windows = &non_windows_body[..next_cfg];
+
+        assert!(
+            open_path_non_windows.contains("that_detached"),
+            "open_path on Linux must call open::that_detached"
+        );
+        assert!(
+            !open_path_non_windows.contains("open::that("),
+            "open_path on Linux must not call blocking open::that"
+        );
     }
 }
