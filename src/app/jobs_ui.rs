@@ -8,8 +8,8 @@ use super::DownloadApp;
 use crate::download::{Job, JobState};
 use crate::notifications::{
     compose_balloon, filter_notify_edges, filter_pending_by_toggles, hard_os_eligible,
-    in_app_summary_messages, soft_os_eligible, terminal_edges, InAppToastKind, PendingOsTerminal,
-    TerminalKind,
+    in_app_summary_messages, linux_session_notify_at_flush, soft_os_eligible, spawn_session_notify,
+    terminal_edges, InAppToastKind, PendingOsTerminal, TerminalKind,
 };
 use crate::persistence::save_jobs;
 use crate::settings::OsNotifyMode;
@@ -147,6 +147,12 @@ impl DownloadApp {
         if let Some(tray) = self.system_tray.as_ref() {
             let context_id = self.balloon_contexts.allocate(&payload);
             tray.show_notification(&payload.title, &payload.body, payload.level, context_id);
+            self.os_notify_buffer.after_flush(now);
+        } else if linux_session_notify_at_flush(
+            self.settings.os_notify_mode,
+            self.window_hidden_to_tray,
+        ) {
+            spawn_session_notify(&payload.title, &payload.body);
             self.os_notify_buffer.after_flush(now);
         } else {
             eprintln!("rusticdl: OS notification skipped (tray unavailable)");

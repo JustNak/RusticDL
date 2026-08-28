@@ -10,6 +10,7 @@ mod edges;
 mod in_app;
 mod os_buffer;
 mod policy;
+mod session_notify;
 mod types;
 
 pub use balloon::{compose_balloon, BalloonContextMap};
@@ -18,6 +19,9 @@ pub use in_app::in_app_summary_messages;
 pub use os_buffer::OsNotifyBuffer;
 pub use policy::{
     filter_notify_edges, filter_pending_by_toggles, hard_os_eligible, soft_os_eligible,
+};
+pub use session_notify::{
+    linux_session_notify_at_flush, spawn_session_notify, NotifySendInvocation, NOTIFY_SEND_PROGRAM,
 };
 pub use types::{
     BalloonClickContext, BalloonOutcome, BalloonPayload, InAppToastKind, PendingOsTerminal,
