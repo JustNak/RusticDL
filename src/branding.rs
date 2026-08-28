@@ -1,8 +1,6 @@
 //! Product branding constants for RusticDL.
-//!
 //! User-facing names (what Windows, the UI, and installers should show):
 //! - [`APP_NAME`] — main desktop app (window title, Start Menu, About, taskbar)
-//!
 //! Technical identifiers (crate names, pipe path, registry keys) stay lowercase
 //! `rusticdl` and must not be used as display names.
 

@@ -37,7 +37,6 @@ pub fn terminal_edges(previous: &[Job], next: &[Job]) -> Vec<TerminalEdge> {
                 error: job.error.clone(),
                 target_path: job.target_path.clone(),
             }),
-            // Canceled: never notify.
             _ => {}
         }
     }

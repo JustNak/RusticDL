@@ -132,7 +132,6 @@ fn parse_semverish(s: &str) -> Option<Semverish> {
     if s.is_empty() {
         return None;
     }
-    // Build metadata (`+…`) is ignored for precedence.
     let s = s.split_once('+').map(|(core, _)| core).unwrap_or(s);
     let (core, pre) = match s.split_once('-') {
         Some((core, rest)) if !rest.is_empty() => (core, Some(rest)),
@@ -195,13 +194,11 @@ mod tests {
 
     #[test]
     fn channel_switch_offers_that_stream_regardless_of_semver() {
-        // Stable → Nightly: take nightly even when its core version is lower.
         assert!(should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.2",
             UpdateChannel::Nightly
         ));
-        // Nightly → Stable: take stable even when the nightly is “ahead”.
         assert!(should_offer_on_channel(
             "0.3.1",
             "0.3.2-nightly.20260813155600",
@@ -212,7 +209,6 @@ mod tests {
             "0.3.2-nightly.20260813155600",
             UpdateChannel::Stable
         ));
-        // Same-core Nightly over the matching Stable (toggle to Nightly).
         assert!(should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.1",
@@ -224,7 +220,6 @@ mod tests {
             "0.3.1",
             UpdateChannel::Stable
         ));
-        // Already on that exact nightly.
         assert!(!should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.1-nightly.20260813155600",
@@ -249,7 +244,6 @@ mod tests {
             "0.3.2",
             UpdateChannel::Stable
         ));
-        // Newer local/dev Stable is not downgraded while staying on Stable.
         assert!(!should_offer_on_channel(
             "0.3.2",
             "0.3.3",
@@ -260,13 +254,11 @@ mod tests {
             "0.3.1-nightly.20260812000000",
             UpdateChannel::Nightly
         ));
-        // Already on a newer nightly: do not roll back while staying on Nightly.
         assert!(!should_offer_on_channel(
             "0.3.1-nightly.20260813155600",
             "0.3.2-nightly.20260813155600",
             UpdateChannel::Nightly
         ));
-        // Stable must not be offered as a Nightly target.
         assert!(!should_offer_on_channel(
             "0.3.2",
             "0.3.1-nightly.20260813155600",

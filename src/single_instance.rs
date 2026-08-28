@@ -1,5 +1,3 @@
-//! Single-instance guard for the main desktop app (Windows).
-//!
 //! A second launch activates the existing window via the named-pipe
 //! `show_window` request and exits instead of opening a duplicate UI.
 
@@ -21,8 +19,6 @@ pub enum InstanceRole {
     Secondary,
 }
 
-/// Try to become the sole running instance.
-///
 /// On Windows, if another instance holds the mutex, send `show_window` over the
 /// IPC pipe (best-effort) and return [`InstanceRole::Secondary`].
 pub fn claim_instance() -> InstanceRole {
@@ -62,7 +58,6 @@ fn try_acquire_mutex() -> bool {
             let err = unsafe { GetLastError() };
             err != ERROR_ALREADY_EXISTS
         }
-        // If mutex APIs fail, allow startup rather than blocking the app.
         Err(_) => true,
     }
 }
@@ -112,10 +107,7 @@ fn send_show_window_once(request_json: &str) -> bool {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     match reader.read_line(&mut line) {
-        Ok(n) if n > 0 => {
-            // Require a successful envelope; `"ok":false` must not count as success.
-            line.contains("\"ok\":true") || line.contains("\"ok\": true")
-        }
+        Ok(n) if n > 0 => line.contains("\"ok\":true") || line.contains("\"ok\": true"),
         _ => false,
     }
 }

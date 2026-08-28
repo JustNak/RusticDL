@@ -1,7 +1,6 @@
 use super::types::{PendingOsTerminal, TerminalEdge, TerminalKind};
 use crate::settings::OsNotifyMode;
 
-/// Filter edges by user notify toggles (applies to both pipelines).
 pub fn filter_notify_edges(
     edges: &[TerminalEdge],
     notify_on_complete: bool,

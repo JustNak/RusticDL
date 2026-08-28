@@ -1,5 +1,3 @@
-//! Windows named-pipe server for the extension native-messaging host.
-
 use std::time::Duration;
 
 use super::bridge::IpcBridge;
@@ -73,7 +71,6 @@ impl LocalPipeDacl {
     }
 }
 
-/// Start the Windows named-pipe listener (no-op on other platforms).
 pub fn start_ipc_server(bridge: IpcBridge) {
     #[cfg(windows)]
     {
@@ -281,7 +278,6 @@ impl PipeSecurity {
     }
 
     fn attributes_ptr(&mut self) -> *mut std::ffi::c_void {
-        // Keep descriptor alive while attributes point at it.
         self.attributes.lpSecurityDescriptor = (&raw mut self.descriptor) as *mut std::ffi::c_void;
         (&raw mut self.attributes) as *mut std::ffi::c_void
     }
@@ -295,8 +291,6 @@ async fn accept_single_connection(
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    // Create the pipe with a same-user local DACL, then drop security state
-    // before any .await so the async future stays Send.
     let server = {
         let mut security = PipeSecurity::new_allow_local()?;
         let security_ptr = security.attributes_ptr();

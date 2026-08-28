@@ -1,5 +1,3 @@
-//! Confirm phase: construct, accept/dismiss, browse, and render.
-
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -181,7 +179,6 @@ impl BrowserPromptWindow {
         );
 
         if self.ipc.show_progress_after_handoff() {
-            // Morph Confirm → Progress; bind job by URL when enqueue completes.
             self.ipc.note_progress_waiting_url(&prompt.url);
             self.waiting_url_noted = true;
             self.phase = CapturePhase::Progress {

@@ -60,7 +60,6 @@ impl WindowLayout {
                 self.y = None;
             }
         }
-        // Position is all-or-nothing so restore never anchors only one axis.
         if self.x.is_none() || self.y.is_none() {
             self.x = None;
             self.y = None;

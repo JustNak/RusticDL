@@ -1,5 +1,3 @@
-//! Complete phase: construct, open/reveal actions, and render.
-
 use std::collections::VecDeque;
 
 use gpui::{

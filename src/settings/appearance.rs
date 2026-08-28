@@ -9,7 +9,6 @@ pub enum AppTheme {
     System,
 }
 
-/// Preset accent colors for the Appearance section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccentPreset {
@@ -57,7 +56,6 @@ impl AccentPreset {
     }
 }
 
-/// UI spacing / row height density (Phase C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiDensity {
@@ -105,7 +103,6 @@ impl UiDensity {
     }
 }
 
-/// Corner radius scale applied to theme tokens (Phase C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CornerRadiusScale {
@@ -140,7 +137,6 @@ impl CornerRadiusScale {
     }
 }
 
-/// Progress bar visual style (Phase D).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressStyle {

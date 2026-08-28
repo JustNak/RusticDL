@@ -43,7 +43,6 @@ pub fn app_paths() -> AppPaths {
     }
 }
 
-/// Release notes snapshot for the post-update “What’s new” dialog.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingWhatsNew {
@@ -64,8 +63,6 @@ impl PendingWhatsNew {
     }
 }
 
-/// Load a pending What’s new snapshot if present and valid for this build.
-///
 /// Corrupt or stale files (wrong `toVersion`) are deleted so they cannot reappear later.
 pub fn load_pending_whats_new(paths: &AppPaths) -> Option<PendingWhatsNew> {
     let bytes = fs::read(&paths.pending_whats_new).ok()?;
@@ -95,7 +92,6 @@ pub fn save_pending_whats_new(paths: &AppPaths, pending: &PendingWhatsNew) -> Re
     atomic_write(&paths.pending_whats_new, &json)
 }
 
-/// Remove the pending snapshot (ack after showing, or discard stale).
 pub fn clear_pending_whats_new(paths: &AppPaths) -> Result<(), String> {
     let _guard = write_lock()
         .lock()
@@ -160,8 +156,6 @@ fn load_jobs_with_history_cap(paths: &AppPaths, max_completed: usize) -> Vec<Job
     match cap_completed_history(&jobs, max_completed) {
         Cow::Borrowed(_) => jobs,
         Cow::Owned(trimmed) => {
-            // Shrink oversized files on read so old unbounded state.json files
-            // do not stay large until the next progress-driven save.
             let _ = save_jobs_with_history_cap(paths, &trimmed, max_completed);
             trimmed
         }
@@ -212,7 +206,6 @@ fn cap_completed_history(jobs: &[Job], max_completed: usize) -> Cow<'_, [Job]> {
     )
 }
 
-/// Write via temp file + rename so readers never see a partial JSON document.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -387,7 +380,6 @@ mod tests {
             sample_job("newer", JobState::Completed, 20, None),
             sample_job("newest", JobState::Completed, 30, Some(5)),
         ];
-        // newest has an earlier completed_at than the others' created_at fallback.
         let trimmed = cap_completed_history(&jobs, 2);
         assert_eq!(ids(&trimmed), ["older", "newer"]);
     }

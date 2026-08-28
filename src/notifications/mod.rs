@@ -1,6 +1,5 @@
 //! Terminal-job notification policy: edge detect, dual pipelines (in-app + OS),
 //! OS burst coalesce, and balloon click context mapping.
-//!
 //! See design plan A1 (Windows completion notifications).
 
 // Re-exports preserve the former `notifications.rs` public surface.

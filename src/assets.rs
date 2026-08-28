@@ -24,8 +24,6 @@ pub struct Assets {
 
 impl Assets {
     pub fn new() -> Self {
-        // Prefer assets next to the executable (release installs), fall back to
-        // the crate-local assets/ used during development.
         let exe_side = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("assets")));
@@ -119,7 +117,6 @@ mod tests {
 
     #[test]
     fn embedded_icons_include_nav_and_empty_state_svgs() {
-        // These are the icons the empty-state / sidebar render on first launch.
         for path in [
             "icons/inbox.svg",
             "icons/arrow-down.svg",
@@ -152,7 +149,6 @@ mod tests {
                 !bytes.is_empty(),
                 "embedded asset {path} should not be empty"
             );
-            // PNG magic
             assert_eq!(&bytes[..4], b"\x89PNG", "{path} should be a PNG");
         }
     }
@@ -174,7 +170,6 @@ mod tests {
 
     #[test]
     fn asset_source_load_falls_back_to_embedded() {
-        // Point base at a path that does not exist so disk load fails.
         let assets = Assets {
             base: PathBuf::from("__no_such_assets_dir__"),
         };

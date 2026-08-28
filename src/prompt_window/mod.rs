@@ -1,7 +1,4 @@
 //! Floating browser capture HUD: Confirm → Progress → Complete.
-//!
-//! Lives independent of the main queue window so handoff still works when the
-//! main UI is minimized or hidden.
 
 mod complete;
 mod confirm;
@@ -53,7 +50,6 @@ enum CapturePhase {
     Progress {
         /// Bound job id once known.
         job_id: Option<String>,
-        /// URL used to match the new job after Accept.
         url: String,
     },
     /// Successful terminal surface.
@@ -105,7 +101,6 @@ impl BrowserPromptWindow {
             self.peak_speed = speed;
         }
         if self.reduce_motion {
-            // Keep a short flat trail so the chart still has shape without churn.
             if self.speed_samples.len() >= 12 {
                 self.speed_samples.pop_front();
             }
@@ -136,7 +131,6 @@ impl BrowserPromptWindow {
                 self.dismiss_confirm(window, cx);
             }
             CapturePhase::Progress { .. } | CapturePhase::Complete { .. } => {
-                // Release so Complete can re-open if Progress closed mid-download.
                 self.release_ownership();
                 window.remove_window();
                 cx.notify();
@@ -169,7 +163,6 @@ impl BrowserPromptWindow {
         if fitted_size_matches(self.fitted_size, width, height) {
             return;
         }
-        // Record first so a synchronous resize→re-render does not loop.
         self.fitted_size = Some((width, height));
         window.resize(gpui::size(gpui::px(width), gpui::px(height)));
         crate::window_placement::cascade_window(window, self.cascade_index);
@@ -228,7 +221,6 @@ fn start_sync_timer(cx: &mut Context<BrowserPromptWindow>) {
 
 impl Render for BrowserPromptWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Live name/folder edits can collide after Confirm opened on a free name.
         if matches!(self.phase, CapturePhase::Confirm)
             && !self.resolved
             && self.current_collision(cx).is_some()
@@ -278,8 +270,6 @@ mod tests {
 
     #[test]
     fn sync_timer_stays_alive_until_complete() {
-        // Confirm starts the poller; if it exits here the Progress HUD stays
-        // stuck on "Starting…" after Accept (job never binds).
         assert!(capture_sync_timer_should_continue(&CapturePhase::Confirm));
         assert!(capture_sync_timer_should_continue(&CapturePhase::Conflict));
         assert!(capture_sync_timer_should_continue(&progress_phase()));
@@ -295,7 +285,6 @@ mod tests {
 
     #[test]
     fn conflict_window_is_larger_than_confirm() {
-        // Four actions + rejection row must not share Confirm's 480×320 box.
         assert!(CAPTURE_CONFLICT_W > CAPTURE_WINDOW_W);
         assert!(CAPTURE_CONFLICT_H > CAPTURE_WINDOW_H);
         assert!(CAPTURE_CONFLICT_H - CAPTURE_WINDOW_H >= 48.0);

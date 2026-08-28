@@ -101,8 +101,6 @@ pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
 fn spawn_detached_windows(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
-    // DETACHED_PROCESS: outlive the parent when it quits for the update.
-    // CREATE_NEW_PROCESS_GROUP: independent console/signal group.
     // CREATE_BREAKAWAY_FROM_JOB: leave the parent's job so KILL_ON_JOB_CLOSE
     // does not tear the updater down when the main app exits (best-effort; the
     // job must allow breakaway).
@@ -151,7 +149,6 @@ fn spawn_detached_windows(exe: &std::path::Path, args: &[String]) -> Result<(), 
     }
 }
 
-/// Launch via ShellExecuteEx so Windows can prompt for elevation when required.
 #[cfg(windows)]
 fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -173,7 +170,6 @@ fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), 
             if i > 0 {
                 joined.push(' ');
             }
-            // Quote args with spaces; updater paths/URLs are already simple.
             if arg.chars().any(|c| c.is_whitespace()) {
                 joined.push('"');
                 joined.push_str(&arg.replace('"', "\\\""));
@@ -185,7 +181,6 @@ fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), 
         wide(std::ffi::OsStr::new(&joined))
     };
 
-    // Verb left null → "open". If the PE still requires elevation, Windows shows UAC.
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -203,7 +198,6 @@ fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), 
         ));
     }
 
-    // Detach immediately — do not wait for the update to finish.
     if !info.hProcess.is_invalid() {
         unsafe {
             let _ = CloseHandle(info.hProcess);

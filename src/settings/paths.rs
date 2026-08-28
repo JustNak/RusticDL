@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-/// Compare download directories ignoring slash style, trailing separators, and ASCII case.
 pub fn same_dir(a: &Path, b: &Path) -> bool {
     fn key(p: &Path) -> String {
         let s = p.to_string_lossy().replace('/', "\\");

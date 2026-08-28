@@ -1,7 +1,5 @@
 //! Persisted user preferences and related value types.
-//!
 //! Callers keep importing from `crate::settings::{…}`; this module is a facade
-//! over window, appearance, sort, system, category, and the Settings aggregate.
 
 // Re-exports preserve the former `settings.rs` public surface; some names are
 // only used from tests or other modules, not from this facade file.

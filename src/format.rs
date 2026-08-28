@@ -50,7 +50,6 @@ pub fn format_eta(secs: u64) -> String {
     if hours > 0 {
         format!("{hours}h {minutes:02}m")
     } else if minutes >= 2 {
-        // Drop seconds once the estimate is minutes-scale — they only jitter.
         format!("{minutes}m")
     } else if minutes > 0 {
         format!("{minutes}m {seconds:02}s")
@@ -114,8 +113,6 @@ pub fn format_size(job: &Job) -> String {
     }
 }
 
-/// Format a job's created-at timestamp for the queue Date column.
-///
 /// - Under 24 hours: relative (`Just now`, `12m ago`, `5h ago`)
 /// - 24 hours or older: absolute calendar date using the OS short-date format
 ///   (falls back to `mm/dd/yyyy` when the system formatter is unavailable)
@@ -149,7 +146,6 @@ fn format_absolute_date(unix_secs: u64) -> String {
 
 /// Best-effort UTC calendar date as `mm/dd/yyyy` when locale formatting fails.
 fn format_absolute_date_fallback(unix_secs: u64) -> String {
-    // Civil date from Unix days (UTC). Good enough as a portable last resort.
     // Algorithm from Howard Hinnant's civil_from_days (public domain).
     let z = (unix_secs / 86_400) as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -171,8 +167,6 @@ fn format_absolute_date_windows(unix_secs: u64) -> Option<String> {
     use windows::Win32::Globalization::{GetDateFormatEx, DATE_SHORTDATE};
     use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
-    // FILETIME: 100ns ticks since 1601-01-01 UTC.
-    // Unix epoch is 11644473600 seconds after that.
     const UNIX_TO_FILETIME_SECS: u64 = 11_644_473_600;
     let ticks = unix_secs
         .checked_add(UNIX_TO_FILETIME_SECS)?
@@ -189,7 +183,6 @@ fn format_absolute_date_windows(unix_secs: u64) -> Option<String> {
         let mut local = SYSTEMTIME::default();
         SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
 
-        // First call: required buffer length (chars, including null).
         let needed = GetDateFormatEx(
             PCWSTR::null(),
             DATE_SHORTDATE,
@@ -361,11 +354,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        // ~3 days ago — must not be relative "Xd ago".
         let s = format_date(now - 3 * 86_400);
         assert!(!s.contains("ago"), "expected absolute date, got {s}");
         assert!(!s.is_empty());
-        // System short date always includes the year for multi-day-old stamps.
         assert!(
             s.chars().any(|c| c.is_ascii_digit()),
             "expected digits in absolute date, got {s}"
@@ -374,7 +365,6 @@ mod tests {
 
     #[test]
     fn fallback_mm_dd_yyyy_shape() {
-        // 2020-01-15 00:00:00 UTC
         let s = format_absolute_date_fallback(1_579_046_400);
         assert_eq!(s, "01/15/2020");
     }

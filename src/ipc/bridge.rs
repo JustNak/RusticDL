@@ -1,5 +1,3 @@
-//! Shared IPC bridge state between the UI and the named-pipe server.
-
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -127,7 +125,6 @@ impl IpcBridge {
         }
     }
 
-    /// Clone the permit used to unpark the UI shell tick loop.
     pub fn ui_wake(&self) -> Arc<Notify> {
         Arc::clone(&self.ui_wake)
     }
@@ -216,7 +213,6 @@ impl IpcBridge {
     /// the queue until resolved and are skipped here.
     pub fn claim_next_prompt_for_ui(&self) -> Option<BrowserPromptView> {
         let mut guard = self.inner.lock().ok()?;
-        // Drop timed-out prompts still sitting in the queue.
         let now = Instant::now();
         while let Some(front) = guard.prompt_queue.front() {
             if now.duration_since(front.created_at) > DOWNLOAD_PROMPT_TIMEOUT {
@@ -249,7 +245,6 @@ impl IpcBridge {
         Some(view)
     }
 
-    /// Resolve a claimed or queued prompt with the user's decision.
     pub fn resolve_prompt(&self, prompt_id: &str, decision: PromptDecision) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
             return false;
@@ -277,7 +272,6 @@ impl IpcBridge {
         let Ok(mut guard) = self.inner.lock() else {
             return Err(prompt.reply);
         };
-        // Cap queue depth so a runaway extension cannot OOM the app.
         if guard.prompt_queue.len() >= 20 {
             return Err(prompt.reply);
         }
@@ -324,7 +318,6 @@ impl IpcBridge {
             .iter()
             .any(|id| id == &job_id)
         {
-            // Cap so a runaway extension cannot grow unbounded.
             if guard.pending_progress_job_ids.len() >= 20 {
                 let _ = guard.pending_progress_job_ids.pop_front();
             }
@@ -365,14 +358,11 @@ impl IpcBridge {
             if guard.progress_hud_owned_jobs.contains(&id) {
                 continue;
             }
-            // Job not in snapshot yet (JobsChanged lag): retry next poll so we do not
-            // open a Progress HUD while Confirm morph still waits with job_id: None.
             let Some(job) = guard.jobs.iter().find(|j| j.id == id) else {
                 keep.push_back(id);
                 continue;
             };
             if guard.progress_hud_waiting_urls.contains(&job.url) {
-                // Confirm morph will bind; leave id for a later claim if morph abandons.
                 keep.push_back(id);
                 continue;
             }
@@ -424,7 +414,6 @@ impl IpcBridge {
             return false;
         }
         guard.progress_hud_owned_jobs.insert(job_id.to_string());
-        // Drop from pending queue if present.
         guard.pending_progress_job_ids.retain(|id| id != job_id);
         true
     }
@@ -442,7 +431,6 @@ impl IpcBridge {
             .is_some_and(|g| g.progress_hud_owned_jobs.contains(job_id))
     }
 
-    /// Open capture HUDs (confirm + progress/complete) currently tracked.
     ///
     /// Used to cascade newly opened windows so they do not stack on one pixel.
     pub fn capture_window_count(&self) -> usize {
@@ -451,7 +439,6 @@ impl IpcBridge {
         })
     }
 
-    /// Returns true the first time Complete should be shown for this job.
     pub fn try_claim_complete_hud(&self, job_id: &str) -> bool {
         let Ok(mut guard) = self.inner.lock() else {
             return false;
@@ -459,7 +446,6 @@ impl IpcBridge {
         if guard.complete_hud_shown.contains(job_id) {
             return false;
         }
-        // Cap memory for long-running sessions.
         if guard.complete_hud_shown.len() >= 200 {
             guard.complete_hud_shown.clear();
         }
@@ -474,7 +460,6 @@ impl IpcBridge {
         }
     }
 
-    /// Close leftover Confirm/Progress HUDs when the main window hides to tray.
     ///
     /// Dismisses open confirm prompts, releases Progress ownership, and bumps
     /// the close epoch. Leaves `complete_hud_shown` (and its cap) intact so a
@@ -641,8 +626,6 @@ mod tests {
 
     #[test]
     fn request_close_does_not_block_confirm_or_progress_after_hide() {
-        // Tray-hide close tears down leftover HUDs. A later handoff must still
-        // be claimable so Confirm / Progress can pop while the main window is SW_HIDE.
         let ipc = test_bridge();
         ipc.request_close_capture_windows();
 

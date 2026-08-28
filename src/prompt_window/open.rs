@@ -1,5 +1,3 @@
-//! Public window open APIs and shared capture window scaffolding.
-
 use gpui::{
     px, size, App, AppContext, Bounds, Context, Pixels, SharedString, Size, Window, WindowBounds,
     WindowDecorations, WindowHandle, WindowKind, WindowOptions,
@@ -16,14 +14,12 @@ use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
 use crate::window_placement::cascade_window;
 
-/// Close a capture HUD without touching the main window.
 pub fn close_capture_window(handle: &WindowHandle<Root>, cx: &mut App) {
     let _ = handle.update(cx, |_root, window, _cx| {
         window.remove_window();
     });
 }
 
-/// Open the ask-mode browser confirm window (may morph into progress/complete).
 pub fn open_browser_prompt_window(
     prompt: BrowserPromptView,
     ipc: IpcBridge,
@@ -65,7 +61,6 @@ pub fn open_browser_prompt_window(
     )
 }
 
-/// Open a progress (or complete) HUD for a browser-handoff job.
 pub fn open_browser_progress_window(
     job_id: String,
     ipc: IpcBridge,
@@ -167,8 +162,6 @@ where
             }),
             window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(size(px(360.0), px(160.0))),
-            // Normal (not PopUp/tool-window): survives focus switches; only X closes.
-            // Closing Progress/Complete releases HUD ownership — download keeps running.
             kind: WindowKind::Normal,
             focus: true,
             show: true,
@@ -193,7 +186,6 @@ where
 
     match result {
         Ok(handle) => {
-            // Count includes this HUD (already claimed/owned). Index 0 stays centered.
             let cascade_index = ipc_fallback.capture_window_count().saturating_sub(1);
             cx.activate(true);
             let _ = handle.update(cx, |_root, window, _cx| {
@@ -204,7 +196,6 @@ where
         }
         Err(error) => {
             eprintln!("[capture] could not open browser capture window: {error:#}");
-            // Best-effort dismiss if this was still a confirm prompt id.
             let _ = ipc_fallback.resolve_prompt(&fallback_id, PromptDecision::Dismiss);
             ipc_fallback.release_progress_job(&fallback_id);
             None
