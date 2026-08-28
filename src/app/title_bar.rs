@@ -1,6 +1,6 @@
 use gpui::{
     div, img, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
-    ObjectFit, ParentElement, Styled, StyledImage,
+    MouseButton, ObjectFit, ParentElement, Styled, StyledImage, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -16,10 +16,12 @@ use crate::branding::{APP_LOGO_DARK, APP_LOGO_LIGHT, APP_NAME, APP_VERSION};
 use crate::download::{EngineCommand, JobState};
 use crate::format::format_speed;
 use crate::format::total_download_speed;
+#[cfg(target_os = "linux")]
+use crate::hyprland;
 use crate::updater::{open_release_page, open_url};
 
 impl DownloadApp {
-    pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let show_queue_chrome = self.filter != FilterKind::Settings;
         let update_busy = self.update_busy;
@@ -117,98 +119,118 @@ impl DownloadApp {
             }
         };
 
-        TitleBar::new().h(px(48.)).child(
-            h_flex()
-                .id("title-bar-content")
-                .w_full()
-                .h_full()
-                .items_center()
-                .gap_2()
-                .pr_1()
-                .child(
-                    h_flex()
-                        .id("title-bar-brand")
-                        .w(px(brand_col_w))
-                        .h_full()
-                        .flex_shrink_0()
-                        .items_center()
-                        .overflow_hidden()
-                        .gap_2()
-                        .child(
-                            Button::new("app-brand-menu")
-                                .ghost()
-                                .compact()
-                                .tooltip("App menu")
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .w(px(32.))
-                                                .h(px(32.))
-                                                .rounded(theme.radius)
-                                                .overflow_hidden()
-                                                .flex_shrink_0()
-                                                .child(
-                                                    img(logo)
-                                                        .w(px(32.))
-                                                        .h(px(32.))
-                                                        .object_fit(ObjectFit::Cover),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_semibold()
-                                                .text_color(theme.foreground)
-                                                .child(APP_NAME),
-                                        ),
-                                )
-                                .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
-                        )
-                        .when_some(speed_label, |el, label| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .flex_shrink_0()
-                                    .child(label),
-                            )
-                        }),
-                )
-                .when(show_queue_chrome, |el| {
-                    el.child(
-                        div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
-                            Input::new(&self.search_input).w_full().prefix(
-                                Icon::new(IconName::Search)
-                                    .with_size(px(14.))
-                                    .text_color(theme.muted_foreground),
-                            ),
-                        ),
-                    )
+        let content = h_flex()
+            .id("title-bar-content")
+            .w_full()
+            .h_full()
+            .items_center()
+            .gap_2()
+            .pr_1()
+            .child(
+                h_flex()
+                    .id("title-bar-brand")
+                    .w(px(brand_col_w))
+                    .h_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .overflow_hidden()
+                    .gap_2()
                     .child(
-                        Button::new("queue-overflow")
+                        Button::new("app-brand-menu")
                             .ghost()
-                            .icon(IconName::EllipsisVertical)
-                            .tooltip("More actions")
-                            .dropdown_menu_with_anchor(
-                                Corner::BottomRight,
-                                Self::queue_overflow_menu_builder(view.clone()),
-                            ),
+                            .compact()
+                            .tooltip("App menu")
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(32.))
+                                            .h(px(32.))
+                                            .rounded(theme.radius)
+                                            .overflow_hidden()
+                                            .flex_shrink_0()
+                                            .child(
+                                                img(logo)
+                                                    .w(px(32.))
+                                                    .h(px(32.))
+                                                    .object_fit(ObjectFit::Cover),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .child(APP_NAME),
+                                    ),
+                            )
+                            .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
                     )
-                    .child(
-                        Button::new("add-download")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("Add download")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_add_dialog(window, cx);
-                            })),
-                    )
+                    .when_some(speed_label, |el, label| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .flex_shrink_0()
+                                .child(label),
+                        )
+                    }),
+            )
+            .when(show_queue_chrome, |el| {
+                el.child(
+                    div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
+                        Input::new(&self.search_input).w_full().prefix(
+                            Icon::new(IconName::Search)
+                                .with_size(px(14.))
+                                .text_color(theme.muted_foreground),
+                        ),
+                    ),
+                )
+                .child(
+                    Button::new("queue-overflow")
+                        .ghost()
+                        .icon(IconName::EllipsisVertical)
+                        .tooltip("More actions")
+                        .dropdown_menu_with_anchor(
+                            Corner::BottomRight,
+                            Self::queue_overflow_menu_builder(view.clone()),
+                        ),
+                )
+                .child(
+                    Button::new("add-download")
+                        .primary()
+                        .icon(IconName::Plus)
+                        .label("Add download")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_add_dialog(window, cx);
+                        })),
+                )
+            })
+            .when(!show_queue_chrome, |el| el.child(div().flex_1()));
+
+        #[cfg(target_os = "linux")]
+        if hyprland::is_hyprland() {
+            return h_flex()
+                .id("title-bar")
+                .w_full()
+                .h(px(48.))
+                .flex_shrink_0()
+                .items_center()
+                .pl(px(TITLE_BAR_LEFT_PAD))
+                .border_b_1()
+                .border_color(theme.title_bar_border)
+                .bg(theme.title_bar)
+                .window_control_area(WindowControlArea::Drag)
+                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                    window.start_window_move();
                 })
-                .when(!show_queue_chrome, |el| el.child(div().flex_1())),
-        )
+                .child(content)
+                .into_any_element();
+        }
+
+        TitleBar::new().h(px(48.)).child(content).into_any_element()
     }
 
     fn queue_overflow_menu_builder(

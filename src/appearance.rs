@@ -9,6 +9,7 @@ use gpui_component::{ColorName, Colorize, Theme, ThemeMode};
 use image::{Frame, Rgba, RgbaImage};
 use smallvec::SmallVec;
 
+use crate::hyprland;
 use crate::settings::{
     AccentPreset, AppTheme, Settings, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY,
     MAX_WINDOW_TRANSPARENCY, MIN_WINDOW_OPACITY,
@@ -165,6 +166,9 @@ fn apply_accent(theme: &mut Theme, settings: &Settings) {
 /// Soften large surface tokens for per-pixel translucency (non-Windows / composition path).
 #[cfg(not(windows))]
 fn apply_surface_opacity(theme: &mut Theme, alpha: f32) {
+    if hyprland::is_hyprland() {
+        return;
+    }
     if (alpha - 1.0).abs() < 0.001 {
         return;
     }
@@ -244,13 +248,30 @@ pub fn apply_window_opacity(window: &Window, transparency_pct: u8, backdrop_blur
 
 #[cfg(not(windows))]
 pub fn apply_window_opacity(window: &Window, transparency_pct: u8, backdrop_blur: bool) {
+    window.set_background_appearance(resolve_window_background_appearance(
+        transparency_pct,
+        backdrop_blur,
+        hyprland::is_hyprland(),
+    ));
+}
+
+/// Non-Windows window background for the transparency slider (unit-testable).
+#[cfg(not(windows))]
+fn resolve_window_background_appearance(
+    transparency_pct: u8,
+    backdrop_blur: bool,
+    on_hyprland: bool,
+) -> WindowBackgroundAppearance {
+    if on_hyprland {
+        return WindowBackgroundAppearance::Opaque;
+    }
     let alpha = effective_window_opacity_alpha(transparency_pct);
     if alpha >= 0.999 {
-        window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+        WindowBackgroundAppearance::Opaque
     } else if backdrop_blur {
-        window.set_background_appearance(WindowBackgroundAppearance::Blurred);
+        WindowBackgroundAppearance::Blurred
     } else {
-        window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+        WindowBackgroundAppearance::Transparent
     }
 }
 
@@ -474,6 +495,18 @@ mod tests {
         assert!(s5 < s50 && s50 < s100, "s5={s5} s50={s50} s100={s100}");
         let old_25 = (0.25f32).powf(0.85) * 0.78;
         assert!((s100 - old_25).abs() < 0.02, "s100={s100} old_25={old_25}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn hyprland_window_background_is_opaque() {
+        use gpui::WindowBackgroundAppearance;
+
+        let opaque = resolve_window_background_appearance(50, true, true);
+        assert!(matches!(opaque, WindowBackgroundAppearance::Opaque));
+
+        let glassy = resolve_window_background_appearance(50, false, false);
+        assert!(matches!(glassy, WindowBackgroundAppearance::Transparent));
     }
 
     #[test]
