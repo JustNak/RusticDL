@@ -12,7 +12,7 @@ repository = "https://github.com/JustNak/RusticDL"
 homepage = "https://github.com/JustNak/RusticDL"
 readme = "README.md"
 authors = ["JustNak"]
-keywords = ["download-manager", "http", "gpui", "windows"]
+keywords = ["download-manager", "http", "gpui", "windows", "linux"]
 categories = ["network-programming", "gui"]
 
 [package.metadata.winresource]
