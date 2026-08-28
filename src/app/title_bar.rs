@@ -20,6 +20,17 @@ use crate::format::total_download_speed;
 use crate::hyprland;
 use crate::updater::{open_release_page, open_url};
 
+#[cfg(target_os = "linux")]
+fn hyprland_title_bar_drag_region() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("title-bar-drag")
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+}
+
 impl DownloadApp {
     pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
@@ -51,6 +62,10 @@ impl DownloadApp {
         #[cfg(not(target_os = "macos"))]
         const TITLE_BAR_LEFT_PAD: f32 = 12.0;
         let brand_col_w = (self.settings.ui_density.sidebar_w() - TITLE_BAR_LEFT_PAD).max(80.0);
+        #[cfg(target_os = "linux")]
+        let on_hyprland = hyprland::is_hyprland();
+        #[cfg(not(target_os = "linux"))]
+        let on_hyprland = false;
         let brand_menu = {
             let view = view.clone();
             move |menu: gpui_component::menu::PopupMenu,
@@ -208,23 +223,30 @@ impl DownloadApp {
                         })),
                 )
             })
-            .when(!show_queue_chrome, |el| el.child(div().flex_1()));
+            .when(!show_queue_chrome && !on_hyprland, |el| {
+                el.child(div().flex_1())
+            })
+            .when(!show_queue_chrome && on_hyprland, |el| {
+                el.child(hyprland_title_bar_drag_region().flex_1())
+            });
 
         #[cfg(target_os = "linux")]
-        if hyprland::is_hyprland() {
+        if on_hyprland {
             return h_flex()
                 .id("title-bar")
                 .w_full()
                 .h(px(48.))
                 .flex_shrink_0()
                 .items_center()
-                .pl(px(TITLE_BAR_LEFT_PAD))
                 .border_b_1()
                 .border_color(theme.title_bar_border)
                 .bg(theme.title_bar)
-                .window_control_area(WindowControlArea::Drag)
-                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                    window.start_window_move();
+                .when(show_queue_chrome, |bar| {
+                    bar.child(
+                        hyprland_title_bar_drag_region()
+                            .w(px(TITLE_BAR_LEFT_PAD))
+                            .flex_shrink_0(),
+                    )
                 })
                 .child(content)
                 .into_any_element();
@@ -307,5 +329,78 @@ impl DownloadApp {
                         }),
                 )
         }
+    }
+}
+
+#[cfg(test)]
+mod hyprland_title_bar_tests {
+    const SOURCE: &str = include_str!("title_bar.rs");
+    const PARENT_ID: &str = r#".id("title-bar")"#;
+    const DRAG_ID: &str = r#".id("title-bar-drag")"#;
+    const DRAG_TOKEN: &str = "WindowControlArea::Drag";
+    const MOVE_TOKEN: &str = "start_window_move";
+
+    fn hyprland_branch_source() -> &'static str {
+        let start = SOURCE
+            .find("if on_hyprland")
+            .expect("Hyprland title-bar branch");
+        let end = start
+            + SOURCE[start..]
+                .find(".into_any_element();")
+                .expect("Hyprland title-bar return");
+        &SOURCE[start..end]
+    }
+
+    #[test]
+    fn hyprland_parent_title_bar_has_no_drag_or_move() {
+        let branch = hyprland_branch_source();
+        let parent_start = branch
+            .find(PARENT_ID)
+            .expect("parent title-bar id in Hyprland branch");
+        let parent_scope = &branch[parent_start..];
+        let child_offset = parent_scope
+            .find(".child(")
+            .expect("title-bar child in Hyprland branch");
+        let parent_scope = &parent_scope[..child_offset];
+
+        assert!(
+            !parent_scope.contains(DRAG_TOKEN),
+            "parent title-bar must not use {DRAG_TOKEN}"
+        );
+        assert!(
+            !parent_scope.contains(MOVE_TOKEN),
+            "parent title-bar must not call {MOVE_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn hyprland_title_bar_drag_owns_drag_and_move() {
+        let helper_start = SOURCE
+            .find("fn hyprland_title_bar_drag_region")
+            .expect("hyprland title-bar drag helper");
+        let helper_scope = &SOURCE[helper_start..];
+        let helper_end = helper_scope
+            .find("\n}\n")
+            .expect("hyprland title-bar drag helper end");
+        let helper_scope = &helper_scope[..helper_end];
+
+        assert!(
+            helper_scope.contains(DRAG_ID),
+            "title-bar-drag id must live on the drag helper"
+        );
+        assert!(
+            helper_scope.contains(DRAG_TOKEN),
+            "title-bar-drag must use {DRAG_TOKEN}"
+        );
+        assert!(
+            helper_scope.contains(MOVE_TOKEN),
+            "title-bar-drag must call {MOVE_TOKEN}"
+        );
+
+        let branch = hyprland_branch_source();
+        assert!(
+            branch.contains("hyprland_title_bar_drag_region()"),
+            "Hyprland branch must mount title-bar-drag via hyprland_title_bar_drag_region"
+        );
     }
 }
