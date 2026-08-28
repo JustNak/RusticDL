@@ -1,6 +1,6 @@
 use gpui::{
     div, img, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
-    ObjectFit, ParentElement, Styled, StyledImage,
+    MouseButton, ObjectFit, ParentElement, Styled, StyledImage, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -16,10 +16,23 @@ use crate::branding::{APP_LOGO_DARK, APP_LOGO_LIGHT, APP_NAME, APP_VERSION};
 use crate::download::{EngineCommand, JobState};
 use crate::format::format_speed;
 use crate::format::total_download_speed;
+#[cfg(target_os = "linux")]
+use crate::hyprland;
 use crate::updater::{open_release_page, open_url};
 
+#[cfg(target_os = "linux")]
+fn hyprland_title_bar_drag_region() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("title-bar-drag")
+        .h_full()
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+}
+
 impl DownloadApp {
-    pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let show_queue_chrome = self.filter != FilterKind::Settings;
         let update_busy = self.update_busy;
@@ -49,6 +62,8 @@ impl DownloadApp {
         #[cfg(not(target_os = "macos"))]
         const TITLE_BAR_LEFT_PAD: f32 = 12.0;
         let brand_col_w = (self.settings.ui_density.sidebar_w() - TITLE_BAR_LEFT_PAD).max(80.0);
+        #[cfg(target_os = "linux")]
+        let on_hyprland = hyprland::is_hyprland();
         let brand_menu = {
             let view = view.clone();
             move |menu: gpui_component::menu::PopupMenu,
@@ -117,98 +132,131 @@ impl DownloadApp {
             }
         };
 
-        TitleBar::new().h(px(48.)).child(
-            h_flex()
-                .id("title-bar-content")
-                .w_full()
-                .h_full()
-                .items_center()
-                .gap_2()
-                .pr_1()
-                .child(
-                    h_flex()
-                        .id("title-bar-brand")
-                        .w(px(brand_col_w))
-                        .h_full()
-                        .flex_shrink_0()
-                        .items_center()
-                        .overflow_hidden()
-                        .gap_2()
-                        .child(
-                            Button::new("app-brand-menu")
-                                .ghost()
-                                .compact()
-                                .tooltip("App menu")
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .w(px(32.))
-                                                .h(px(32.))
-                                                .rounded(theme.radius)
-                                                .overflow_hidden()
-                                                .flex_shrink_0()
-                                                .child(
-                                                    img(logo)
-                                                        .w(px(32.))
-                                                        .h(px(32.))
-                                                        .object_fit(ObjectFit::Cover),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_semibold()
-                                                .text_color(theme.foreground)
-                                                .child(APP_NAME),
-                                        ),
-                                )
-                                .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
-                        )
-                        .when_some(speed_label, |el, label| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .flex_shrink_0()
-                                    .child(label),
-                            )
-                        }),
-                )
-                .when(show_queue_chrome, |el| {
-                    el.child(
-                        div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
-                            Input::new(&self.search_input).w_full().prefix(
-                                Icon::new(IconName::Search)
-                                    .with_size(px(14.))
-                                    .text_color(theme.muted_foreground),
-                            ),
-                        ),
-                    )
+        let content = h_flex()
+            .id("title-bar-content")
+            .w_full()
+            .h_full()
+            .items_center()
+            .gap_2()
+            .pr_1()
+            .child(
+                h_flex()
+                    .id("title-bar-brand")
+                    .w(px(brand_col_w))
+                    .h_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .overflow_hidden()
+                    .gap_2()
                     .child(
-                        Button::new("queue-overflow")
+                        Button::new("app-brand-menu")
                             .ghost()
-                            .icon(IconName::EllipsisVertical)
-                            .tooltip("More actions")
-                            .dropdown_menu_with_anchor(
-                                Corner::BottomRight,
-                                Self::queue_overflow_menu_builder(view.clone()),
-                            ),
+                            .compact()
+                            .tooltip("App menu")
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(32.))
+                                            .h(px(32.))
+                                            .rounded(theme.radius)
+                                            .overflow_hidden()
+                                            .flex_shrink_0()
+                                            .child(
+                                                img(logo)
+                                                    .w(px(32.))
+                                                    .h(px(32.))
+                                                    .object_fit(ObjectFit::Cover),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .child(APP_NAME),
+                                    ),
+                            )
+                            .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
                     )
-                    .child(
-                        Button::new("add-download")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("Add download")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_add_dialog(window, cx);
-                            })),
+                    .when_some(speed_label, |el, label| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .flex_shrink_0()
+                                .child(label),
+                        )
+                    }),
+            )
+            .when(show_queue_chrome, |el| {
+                el.child(
+                    div().flex_1().min_w(px(180.)).max_w(px(420.)).child(
+                        Input::new(&self.search_input).w_full().prefix(
+                            Icon::new(IconName::Search)
+                                .with_size(px(14.))
+                                .text_color(theme.muted_foreground),
+                        ),
+                    ),
+                )
+                .child(
+                    Button::new("queue-overflow")
+                        .ghost()
+                        .icon(IconName::EllipsisVertical)
+                        .tooltip("More actions")
+                        .dropdown_menu_with_anchor(
+                            Corner::BottomRight,
+                            Self::queue_overflow_menu_builder(view.clone()),
+                        ),
+                )
+                .child(
+                    Button::new("add-download")
+                        .primary()
+                        .icon(IconName::Plus)
+                        .label("Add download")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_add_dialog(window, cx);
+                        })),
+                )
+            });
+
+        #[cfg(target_os = "linux")]
+        let content = content
+            .when(!show_queue_chrome && !on_hyprland, |el| {
+                el.child(div().flex_1())
+            })
+            .when(!show_queue_chrome && on_hyprland, |el| {
+                el.child(hyprland_title_bar_drag_region().flex_1())
+            });
+
+        #[cfg(not(target_os = "linux"))]
+        let content = content.when(!show_queue_chrome, |el| el.child(div().flex_1()));
+
+        #[cfg(target_os = "linux")]
+        if on_hyprland {
+            return h_flex()
+                .id("title-bar")
+                .w_full()
+                .h(px(48.))
+                .flex_shrink_0()
+                .items_center()
+                .border_b_1()
+                .border_color(theme.title_bar_border)
+                .bg(theme.title_bar)
+                .when(show_queue_chrome, |bar| {
+                    bar.child(
+                        hyprland_title_bar_drag_region()
+                            .w(px(TITLE_BAR_LEFT_PAD))
+                            .flex_shrink_0(),
                     )
                 })
-                .when(!show_queue_chrome, |el| el.child(div().flex_1())),
-        )
+                .child(content)
+                .into_any_element();
+        }
+
+        TitleBar::new().h(px(48.)).child(content).into_any_element()
     }
 
     fn queue_overflow_menu_builder(
@@ -285,5 +333,147 @@ impl DownloadApp {
                         }),
                 )
         }
+    }
+}
+
+#[cfg(test)]
+mod hyprland_title_bar_tests {
+    const SOURCE: &str = include_str!("title_bar.rs");
+    const PARENT_ID: &str = r#".id("title-bar")"#;
+    const DRAG_ID: &str = r#".id("title-bar-drag")"#;
+    const DRAG_TOKEN: &str = "WindowControlArea::Drag";
+    const MOVE_TOKEN: &str = "start_window_move";
+
+    fn normalized_source(raw: &str) -> String {
+        raw.replace("\r\n", "\n")
+    }
+
+    fn hyprland_branch_source(source: &str) -> &str {
+        let start = source
+            .find("if on_hyprland")
+            .expect("Hyprland title-bar branch");
+        let end = start
+            + source[start..]
+                .find(".into_any_element();")
+                .expect("Hyprland title-bar return");
+        &source[start..end]
+    }
+
+    fn hyprland_drag_helper_scope(source: &str) -> &str {
+        let helper_start = source
+            .find("fn hyprland_title_bar_drag_region")
+            .expect("hyprland title-bar drag helper");
+        let helper_scope = &source[helper_start..];
+        let helper_end = helper_scope
+            .find("\n}\n")
+            .expect("hyprland title-bar drag helper end");
+        &helper_scope[..helper_end]
+    }
+
+    #[test]
+    fn hyprland_parent_title_bar_has_no_drag_or_move() {
+        let source = normalized_source(SOURCE);
+        let branch = hyprland_branch_source(&source);
+        let parent_start = branch
+            .find(PARENT_ID)
+            .expect("parent title-bar id in Hyprland branch");
+        let parent_scope = &branch[parent_start..];
+        let child_offset = parent_scope
+            .find(".child(")
+            .expect("title-bar child in Hyprland branch");
+        let parent_scope = &parent_scope[..child_offset];
+
+        assert!(
+            !parent_scope.contains(DRAG_TOKEN),
+            "parent title-bar must not use {DRAG_TOKEN}"
+        );
+        assert!(
+            !parent_scope.contains(MOVE_TOKEN),
+            "parent title-bar must not call {MOVE_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn hyprland_title_bar_drag_owns_drag_and_move() {
+        let source = normalized_source(SOURCE);
+        let helper_scope = hyprland_drag_helper_scope(&source);
+
+        assert!(
+            helper_scope.contains(DRAG_ID),
+            "title-bar-drag id must live on the drag helper"
+        );
+        assert!(
+            helper_scope.contains(DRAG_TOKEN),
+            "title-bar-drag must use {DRAG_TOKEN}"
+        );
+        assert!(
+            helper_scope.contains(MOVE_TOKEN),
+            "title-bar-drag must call {MOVE_TOKEN}"
+        );
+
+        let branch = hyprland_branch_source(&source);
+        assert!(
+            branch.contains("hyprland_title_bar_drag_region()"),
+            "Hyprland branch must mount title-bar-drag via hyprland_title_bar_drag_region"
+        );
+    }
+
+    #[test]
+    fn hyprland_drag_helper_end_scan_handles_crlf_line_endings() {
+        const CRLF_HELPER_END: &str = "\r\n}\r\n";
+        const CRLF_FIXTURE: &str = concat!(
+            "#[cfg(target_os = \"linux\")]\r\n",
+            "fn hyprland_title_bar_drag_region() {\r\n",
+            "    div()\r\n",
+            "        .id(\"title-bar-drag\")\r\n",
+            "        .window_control_area(WindowControlArea::Drag)\r\n",
+            "        .on_mouse_down(MouseButton::Left, |_, window, _| {\r\n",
+            "            window.start_window_move();\r\n",
+            "        })\r\n",
+            "}\r\n",
+        );
+
+        assert!(
+            CRLF_FIXTURE.contains(CRLF_HELPER_END),
+            "fixture must contain exact CRLF helper end token"
+        );
+
+        let source = normalized_source(CRLF_FIXTURE);
+        let helper_scope = hyprland_drag_helper_scope(&source);
+        assert!(helper_scope.contains(DRAG_ID));
+        assert!(helper_scope.contains(DRAG_TOKEN));
+        assert!(helper_scope.contains(MOVE_TOKEN));
+    }
+
+    #[test]
+    fn hyprland_title_bar_drag_region_calls_are_linux_cfg_gated() {
+        const CALL: &str = "hyprland_title_bar_drag_region()";
+        const LINUX_CFG: &str = r#"#[cfg(target_os = "linux")]"#;
+
+        let source = normalized_source(SOURCE);
+        let mut search_from = 0;
+        let mut call_sites = 0;
+        while let Some(rel) = source[search_from..].find(CALL) {
+            let at = search_from + rel;
+            let is_definition = at >= 3 && source.get(at - 3..at) == Some("fn ");
+            if !is_definition {
+                call_sites += 1;
+                let prefix = &source[..at];
+                let cfg_at = prefix
+                    .rfind(LINUX_CFG)
+                    .expect("linux cfg must gate hyprland_title_bar_drag_region call");
+                let cfg_gap = &source[cfg_at..at];
+                assert!(
+                    !cfg_gap.contains(r#"#[cfg(not(target_os = "linux"))]"#),
+                    "hyprland_title_bar_drag_region call must not be under not(linux) cfg"
+                );
+            }
+            search_from = at + CALL.len();
+        }
+
+        assert!(
+            call_sites >= 1,
+            "expected at least one linux-gated hyprland_title_bar_drag_region call"
+        );
     }
 }

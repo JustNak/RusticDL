@@ -10,6 +10,7 @@ use super::{
 };
 use crate::branding::APP_NAME;
 use crate::download::{EngineHandle, Job, JobState};
+use crate::hyprland;
 use crate::ipc::{BrowserPromptView, IpcBridge, PromptDecision};
 use crate::settings::Settings;
 use crate::window_placement::cascade_window;
@@ -157,7 +158,7 @@ where
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some(SharedString::from(title)),
-                appears_transparent: true,
+                appears_transparent: !hyprland::is_hyprland(),
                 traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
             }),
             window_decorations: Some(WindowDecorations::Client),

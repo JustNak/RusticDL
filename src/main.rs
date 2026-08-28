@@ -8,6 +8,7 @@ mod browser_popup_chrome;
 mod download;
 mod extension_settings;
 mod format;
+mod hyprland;
 mod ipc;
 mod notifications;
 mod persistence;
