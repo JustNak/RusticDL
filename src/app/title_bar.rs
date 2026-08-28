@@ -64,8 +64,6 @@ impl DownloadApp {
         let brand_col_w = (self.settings.ui_density.sidebar_w() - TITLE_BAR_LEFT_PAD).max(80.0);
         #[cfg(target_os = "linux")]
         let on_hyprland = hyprland::is_hyprland();
-        #[cfg(not(target_os = "linux"))]
-        let on_hyprland = false;
         let brand_menu = {
             let view = view.clone();
             move |menu: gpui_component::menu::PopupMenu,
@@ -222,13 +220,19 @@ impl DownloadApp {
                             this.open_add_dialog(window, cx);
                         })),
                 )
-            })
+            });
+
+        #[cfg(target_os = "linux")]
+        let content = content
             .when(!show_queue_chrome && !on_hyprland, |el| {
                 el.child(div().flex_1())
             })
             .when(!show_queue_chrome && on_hyprland, |el| {
                 el.child(hyprland_title_bar_drag_region().flex_1())
             });
+
+        #[cfg(not(target_os = "linux"))]
+        let content = content.when(!show_queue_chrome, |el| el.child(div().flex_1()));
 
         #[cfg(target_os = "linux")]
         if on_hyprland {
@@ -401,6 +405,37 @@ mod hyprland_title_bar_tests {
         assert!(
             branch.contains("hyprland_title_bar_drag_region()"),
             "Hyprland branch must mount title-bar-drag via hyprland_title_bar_drag_region"
+        );
+    }
+
+    #[test]
+    fn hyprland_title_bar_drag_region_calls_are_linux_cfg_gated() {
+        const CALL: &str = "hyprland_title_bar_drag_region()";
+        const LINUX_CFG: &str = r#"#[cfg(target_os = "linux")]"#;
+
+        let mut search_from = 0;
+        let mut call_sites = 0;
+        while let Some(rel) = SOURCE[search_from..].find(CALL) {
+            let at = search_from + rel;
+            let is_definition = at >= 3 && SOURCE.get(at - 3..at) == Some("fn ");
+            if !is_definition {
+                call_sites += 1;
+                let prefix = &SOURCE[..at];
+                let cfg_at = prefix
+                    .rfind(LINUX_CFG)
+                    .expect("linux cfg must gate hyprland_title_bar_drag_region call");
+                let cfg_gap = &SOURCE[cfg_at..at];
+                assert!(
+                    !cfg_gap.contains(r#"#[cfg(not(target_os = "linux"))]"#),
+                    "hyprland_title_bar_drag_region call must not be under not(linux) cfg"
+                );
+            }
+            search_from = at + CALL.len();
+        }
+
+        assert!(
+            call_sites >= 1,
+            "expected at least one linux-gated hyprland_title_bar_drag_region call"
         );
     }
 }
