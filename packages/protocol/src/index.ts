@@ -4,7 +4,7 @@ export const PIPE_NAME = '\\\\.\\pipe\\rusticdl.v1';
 export const MAX_URL_LENGTH = 2048;
 export const MAX_METADATA_LENGTH = 512;
 export const ALLOWED_URL_PROTOCOLS = ['http:', 'https:'] as const;
-export const DEFAULT_EXTENSION_EXCLUDED_HOSTS = ['web.telegram.org'] as const;
+export const DEFAULT_EXTENSION_EXCLUDED_HOSTS = [] as const;
 export const DEFAULT_CAPTURED_FILE_EXTENSIONS = [
   '7z', 'apk', 'bz2', 'cab', 'deb', 'dmg', 'doc', 'docx', 'exe', 'gz', 'iso', 'jar',
   'msi', 'pdf', 'ppt', 'pptx', 'rar', 'rpm', 'tar', 'tgz', 'txz', 'xls', 'xlsx', 'xz', 'zip', 'zst',
@@ -233,7 +233,10 @@ export function normalizeExcludedHostPattern(value: string): string {
   return pattern;
 }
 
-export function isHostnameExcludedByPatterns(hostname: string, patterns: string[]): boolean {
+export function isHostnameExcludedByPatterns(
+  hostname: string,
+  patterns: readonly string[],
+): boolean {
   const normalizedHostname = normalizeExcludedHostPattern(hostname);
   if (!normalizedHostname) return false;
   return patterns.some((pattern) => {
@@ -250,7 +253,7 @@ export function isHostnameExcludedByPatterns(hostname: string, patterns: string[
   });
 }
 
-export function isUrlHostExcludedByPatterns(url: string, patterns: string[]): boolean {
+export function isUrlHostExcludedByPatterns(url: string, patterns: readonly string[]): boolean {
   try {
     return isHostnameExcludedByPatterns(new URL(url).hostname, patterns);
   } catch {

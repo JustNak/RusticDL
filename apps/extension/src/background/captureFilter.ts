@@ -190,6 +190,15 @@ export function shouldCaptureDownloadItem(
   const url = item.finalUrl || item.url;
   if (!url || !(url.startsWith('http://') || url.startsWith('https://'))) return false;
   if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) return false;
+  if (
+    shouldSkipAppOwnedDownloadOrigin({
+      url: item.url,
+      finalUrl: item.finalUrl,
+      referrer: item.referrer,
+    })
+  ) {
+    return false;
+  }
   if (item.byExtensionId) return false;
   if (url.startsWith('blob:') || url.startsWith('data:')) return false;
 
@@ -474,6 +483,40 @@ export function lookupRedirectSessionUrl(url: string | undefined): string | unde
   if (!url) return undefined;
   pruneDownloadRedirects();
   return redirectSessionByUrl.get(normalizeCaptureUrl(url))?.sessionUrl;
+}
+
+/** Product rule, not settings.excludedHosts: putting Drive there would drop LMS remint. */
+const APP_OWNED_DOWNLOAD_ORIGINS: readonly string[] = [
+  'drive.google.com',
+  'googleusercontent.com',
+  'dropbox.com',
+  'dropboxusercontent.com',
+  'onedrive.live.com',
+  '1drv.ms',
+  'sharepoint.com',
+  'box.com',
+  'boxcloud.com',
+  'mega.nz',
+  'mega.co.nz',
+  'web.telegram.org',
+];
+
+export function shouldSkipAppOwnedDownloadOrigin(args: {
+  url?: string;
+  finalUrl?: string;
+  pageUrl?: string;
+  referrer?: string;
+}): boolean {
+  const urls = [args.url, args.finalUrl, args.pageUrl, args.referrer];
+  if (urls.some((value) => isSessionGatewayUrl(value))) {
+    return false;
+  }
+  const remembered =
+    lookupRedirectSessionUrl(args.url) ?? lookupRedirectSessionUrl(args.finalUrl);
+  if (isSessionGatewayUrl(remembered)) {
+    return false;
+  }
+  return urls.some((value) => Boolean(value && isUrlHostExcludedByPatterns(value, APP_OWNED_DOWNLOAD_ORIGINS)));
 }
 
 export function handoffUrlForCapturedDownload(item: {
