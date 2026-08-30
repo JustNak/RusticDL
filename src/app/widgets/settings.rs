@@ -166,27 +166,13 @@ impl RenderOnce for SettingsBay {
 
         div()
             .id(bay_id)
-            .relative()
             .w_full()
-            .overflow_hidden()
             .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border.opacity(0.7))
             .bg(bay_fill(&theme))
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(3.))
-                    .bg(theme.primary.opacity(0.48)),
-            )
             .child(
                 v_flex()
                     .w_full()
-                    .pl(px(19.))
-                    .pr(px(16.))
+                    .px(px(16.))
                     .py(px(14.))
                     .gap_3()
                     .child(
