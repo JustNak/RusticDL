@@ -1,19 +1,28 @@
+use std::rc::Rc;
+
 use gpui::{
-    div, hsla, prelude::FluentBuilder, px, App, Context, Entity, Hsla, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    div, hsla, prelude::FluentBuilder, px, AnyElement, App, Context, Div, ElementId, Entity, Hsla,
+    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState},
+    switch::Switch,
     tooltip::Tooltip,
-    v_flex, ActiveTheme, Icon, Sizable, StyledExt, Theme,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, Theme,
 };
 
 use super::super::DownloadApp;
+use crate::download::FileTypeKind;
 use crate::settings::AccentPreset;
 
-pub(crate) fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
+pub(crate) fn settings_bays() -> Div {
+    v_flex().w_full().gap_4()
+}
+
+pub(crate) fn field_label(text: &'static str, cx: &App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
         .text_xs()
@@ -22,7 +31,7 @@ pub(crate) fn field_label(text: &'static str, cx: &mut App) -> impl IntoElement 
         .child(text)
 }
 
-pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl IntoElement {
+pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
         .text_xs()
@@ -31,13 +40,13 @@ pub(crate) fn field_hint(text: impl Into<SharedString>, cx: &mut App) -> impl In
         .child(text.into())
 }
 
-pub(crate) fn settings_field_label(text: &'static str, cx: &mut App) -> impl IntoElement {
+pub(crate) fn settings_field_label(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let theme = cx.theme().clone();
     div()
         .text_sm()
         .font_semibold()
         .text_color(theme.foreground)
-        .child(text)
+        .child(text.into())
 }
 
 pub(crate) fn settings_input_with_reset(
@@ -80,33 +89,20 @@ pub(crate) fn settings_input_with_reset(
         })
 }
 
-pub(crate) fn settings_subgroup(
-    title: &'static str,
-    with_divider: bool,
-    cx: &mut App,
-) -> impl IntoElement {
-    let theme = cx.theme().clone();
-    let eyebrow: SharedString = title.to_ascii_uppercase().into();
-    v_flex()
-        .w_full()
-        .gap_2()
-        .when(with_divider, |el| {
-            el.child(div().w_full().h(px(1.)).bg(theme.border.opacity(0.55)))
-        })
-        .child(
-            div()
-                .text_xs()
-                .font_semibold()
-                .text_color(theme.muted_foreground)
-                .child(eyebrow),
-        )
-}
-
-pub(crate) fn settings_choice_row(
-    label: &'static str,
-    hint: Option<&'static str>,
+pub(crate) fn settings_control_row(
+    label: impl Into<SharedString>,
+    hint: Option<SharedString>,
     control: impl IntoElement,
     cx: &mut App,
+) -> impl IntoElement {
+    row_shell(label.into(), hint, control, cx)
+}
+
+fn row_shell(
+    label: SharedString,
+    hint: Option<SharedString>,
+    control: impl IntoElement,
+    cx: &App,
 ) -> impl IntoElement {
     h_flex()
         .w_full()
@@ -117,12 +113,389 @@ pub(crate) fn settings_choice_row(
             v_flex()
                 .flex_1()
                 .min_w(px(140.))
-                .max_w(px(320.))
+                .max_w(px(360.))
                 .gap_0p5()
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
         )
         .child(div().flex_shrink_0().child(control))
+}
+
+fn bay_fill(theme: &Theme) -> Hsla {
+    if theme.is_dark() {
+        theme.secondary.opacity(0.38)
+    } else {
+        theme.group_box.opacity(0.92)
+    }
+}
+
+#[derive(IntoElement)]
+pub(crate) struct SettingsBay {
+    title: SharedString,
+    children: Vec<AnyElement>,
+}
+
+impl SettingsBay {
+    pub(crate) fn new(title: impl Into<SharedString>) -> Self {
+        Self {
+            title: title.into(),
+            children: Vec::new(),
+        }
+    }
+
+    pub(crate) fn child(mut self, child: impl IntoElement) -> Self {
+        self.children.push(child.into_any_element());
+        self
+    }
+
+    pub(crate) fn children<I>(mut self, children: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: IntoElement,
+    {
+        self.children
+            .extend(children.into_iter().map(|c| c.into_any_element()));
+        self
+    }
+}
+
+impl RenderOnce for SettingsBay {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let bay_id: SharedString = format!("settings-bay-{}", self.title).into();
+
+        div()
+            .id(bay_id)
+            .relative()
+            .w_full()
+            .overflow_hidden()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border.opacity(0.7))
+            .bg(bay_fill(&theme))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(theme.primary.opacity(0.48)),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .pl(px(19.))
+                    .pr(px(16.))
+                    .py(px(14.))
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(theme.foreground)
+                            .child(self.title),
+                    )
+                    .children(self.children),
+            )
+    }
+}
+
+type ToggleHandler = Rc<dyn Fn(bool, &mut Window, &mut App) + 'static>;
+
+#[derive(IntoElement)]
+pub(crate) struct SettingsToggleRow {
+    id: ElementId,
+    label: SharedString,
+    hint: Option<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_toggle: ToggleHandler,
+}
+
+impl SettingsToggleRow {
+    pub(crate) fn new<F>(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        checked: bool,
+        on_toggle: F,
+    ) -> Self
+    where
+        F: Fn(bool, &mut Window, &mut App) + 'static,
+    {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            hint: None,
+            checked,
+            disabled: false,
+            on_toggle: Rc::new(on_toggle),
+        }
+    }
+
+    pub(crate) fn hint(mut self, text: impl Into<SharedString>) -> Self {
+        self.hint = Some(text.into());
+        self
+    }
+
+    pub(crate) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+impl RenderOnce for SettingsToggleRow {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let on_toggle = self.on_toggle.clone();
+        let switch = Switch::new(self.id)
+            .checked(self.checked)
+            .disabled(self.disabled)
+            .on_click(move |next, window, cx| on_toggle(*next, window, cx));
+        row_shell(self.label, self.hint, switch, cx)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ExclusiveOpt<V: Copy> {
+    pub value: V,
+    pub id: SharedString,
+    pub label: SharedString,
+    pub icon: Option<IconName>,
+}
+
+impl<V: Copy> ExclusiveOpt<V> {
+    pub(crate) fn new(
+        value: V,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            value,
+            id: id.into(),
+            label: label.into(),
+            icon: None,
+        }
+    }
+
+    pub(crate) fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+}
+
+type ExclusiveHandler<V> = Rc<dyn Fn(V, &mut Window, &mut App) + 'static>;
+
+#[derive(IntoElement)]
+pub(crate) struct SettingsExclusiveRow<V: Copy + PartialEq + 'static> {
+    bar_id: SharedString,
+    label: SharedString,
+    hint: Option<SharedString>,
+    selected: V,
+    options: Vec<ExclusiveOpt<V>>,
+    disabled: bool,
+    on_select: ExclusiveHandler<V>,
+}
+
+impl<V: Copy + PartialEq + 'static> SettingsExclusiveRow<V> {
+    pub(crate) fn new<F>(
+        bar_id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        selected: V,
+        options: impl IntoIterator<Item = ExclusiveOpt<V>>,
+        on_select: F,
+    ) -> Self
+    where
+        F: Fn(V, &mut Window, &mut App) + 'static,
+    {
+        Self {
+            bar_id: bar_id.into(),
+            label: label.into(),
+            hint: None,
+            selected,
+            options: options.into_iter().collect(),
+            disabled: false,
+            on_select: Rc::new(on_select),
+        }
+    }
+
+    pub(crate) fn hint(mut self, text: impl Into<SharedString>) -> Self {
+        self.hint = Some(text.into());
+        self
+    }
+
+    pub(crate) fn hint_dynamic(mut self, text: Option<impl Into<SharedString>>) -> Self {
+        self.hint = text.map(Into::into);
+        self
+    }
+
+    pub(crate) fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
+impl<V: Copy + PartialEq + 'static> RenderOnce for SettingsExclusiveRow<V> {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let selected = self.selected;
+        let disabled = self.disabled;
+        let on_select = self.on_select.clone();
+        let track = h_flex()
+            .id(self.bar_id)
+            .flex_shrink_0()
+            .flex_wrap()
+            .gap_1()
+            .p(px(3.))
+            .rounded(theme.radius)
+            .bg(theme.tab_bar_segmented)
+            .border_1()
+            .border_color(theme.border.opacity(0.45))
+            .opacity(if disabled { 0.55 } else { 1.0 })
+            .children(self.options.into_iter().map(|opt| {
+                let is_on = opt.value == selected;
+                let value = opt.value;
+                let on_select = on_select.clone();
+                let fg = if is_on {
+                    theme.primary_foreground
+                } else {
+                    theme.muted_foreground
+                };
+                div()
+                    .id(opt.id)
+                    .px_2()
+                    .py(px(5.))
+                    .rounded(theme.radius)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .bg(if is_on {
+                        theme.primary
+                    } else {
+                        theme.transparent
+                    })
+                    .text_color(fg)
+                    .text_xs()
+                    .font_medium()
+                    .when(!disabled && !is_on, |el| {
+                        el.cursor_pointer().hover(|s| {
+                            s.bg(theme.secondary.opacity(0.8))
+                                .text_color(theme.foreground)
+                        })
+                    })
+                    .when(!disabled && is_on, |el| el.cursor_pointer())
+                    .when(!disabled, |el| {
+                        el.on_click(move |_, window, cx| on_select(value, window, cx))
+                    })
+                    .when_some(opt.icon, |el, icon| {
+                        el.child(
+                            Icon::new(icon)
+                                .with_size(px(12.))
+                                .text_color(fg),
+                        )
+                    })
+                    .child(opt.label)
+            }));
+        row_shell(self.label, self.hint, track, cx)
+    }
+}
+
+#[derive(IntoElement)]
+pub(crate) struct TypeFolderStrip {
+    kind: FileTypeKind,
+    folder_input: Entity<InputState>,
+    current_folder: String,
+    enabled: bool,
+    organize_master: bool,
+    app: Entity<DownloadApp>,
+    on_enabled: ToggleHandler,
+}
+
+impl TypeFolderStrip {
+    pub(crate) fn new<F>(
+        kind: FileTypeKind,
+        folder_input: &Entity<InputState>,
+        current_folder: &str,
+        enabled: bool,
+        organize_master: bool,
+        app: Entity<DownloadApp>,
+        on_enabled: F,
+    ) -> Self
+    where
+        F: Fn(bool, &mut Window, &mut App) + 'static,
+    {
+        Self {
+            kind,
+            folder_input: folder_input.clone(),
+            current_folder: current_folder.to_string(),
+            enabled,
+            organize_master,
+            app,
+            on_enabled: Rc::new(on_enabled),
+        }
+    }
+}
+
+impl RenderOnce for TypeFolderStrip {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let kind = self.kind;
+        let label = kind.label();
+        let default_name = kind.default_folder_name();
+        let locked = !self.organize_master;
+        let on_enabled = self.on_enabled.clone();
+        let switch_id: SharedString = format!("category-enabled-{label}").into();
+
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .opacity(if locked { 0.55 } else { 1.0 })
+            .child(
+                div()
+                    .size(px(28.))
+                    .flex_shrink_0()
+                    .rounded(theme.radius)
+                    .bg(theme.secondary.opacity(if theme.is_dark() { 0.7 } else { 0.9 }))
+                    .border_1()
+                    .border_color(theme.border.opacity(0.5))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::empty()
+                            .path(kind.icon_path())
+                            .with_size(px(14.))
+                            .text_color(theme.muted_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(96.))
+                    .flex_shrink_0()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                settings_input_with_reset(
+                    format!("category-folder-reset-{label}"),
+                    &self.folder_input,
+                    &self.current_folder,
+                    default_name,
+                    default_name,
+                    self.app,
+                    locked,
+                )
+                .flex_1(),
+            )
+            .child(
+                Switch::new(switch_id)
+                    .small()
+                    .checked(self.enabled)
+                    .disabled(locked)
+                    .on_click(move |next, window, cx| on_enabled(*next, window, cx)),
+            )
+    }
 }
 
 pub(crate) fn accent_preset_swatch(
@@ -134,7 +507,7 @@ pub(crate) fn accent_preset_swatch(
 ) -> impl IntoElement {
     let label = preset.label();
     let tip: SharedString = if preset == AccentPreset::Default {
-        "Default — stock theme color".into()
+        "Default, stock theme color".into()
     } else {
         label.to_string().into()
     };
@@ -194,7 +567,7 @@ pub(crate) fn accent_custom_swatch(
     theme: &Theme,
     cx: &mut Context<DownloadApp>,
 ) -> impl IntoElement {
-    let tip: SharedString = "Custom — mix your own accent".into();
+    let tip: SharedString = "Custom, mix your own accent".into();
     let plate = hsla(0.0, 0.0, 0.98, 1.0);
     let brush = hsla(0.0, 0.0, 0.22, 1.0);
 
