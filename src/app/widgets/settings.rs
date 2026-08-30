@@ -1,17 +1,18 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, hsla, prelude::FluentBuilder, px, AnyElement, App, Context, Div, ElementId, Entity, Hsla,
-    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
+    div, hsla, prelude::FluentBuilder, px, AnyElement, App, Context, Corner, Div, ElementId,
+    Entity, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
     tooltip::Tooltip,
-    v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, Theme,
+    v_flex, ActiveTheme, Disableable, Icon, IconName, Side, Sizable, StyledExt, Theme,
 };
 
 use super::super::DownloadApp;
@@ -112,8 +113,7 @@ fn row_shell(
         .child(
             v_flex()
                 .flex_1()
-                .min_w(px(140.))
-                .max_w(px(360.))
+                .min_w_0()
                 .gap_0p5()
                 .child(settings_field_label(label, cx))
                 .when_some(hint, |el, text| el.child(field_hint(text, cx))),
@@ -258,6 +258,7 @@ impl RenderOnce for SettingsToggleRow {
 #[derive(Clone)]
 pub(crate) struct ExclusiveOpt<V: Copy> {
     pub value: V,
+    #[allow(dead_code)]
     pub id: SharedString,
     pub label: SharedString,
     pub icon: Option<IconName>,
@@ -336,66 +337,56 @@ impl<V: Copy + PartialEq + 'static> SettingsExclusiveRow<V> {
 
 impl<V: Copy + PartialEq + 'static> RenderOnce for SettingsExclusiveRow<V> {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let selected = self.selected;
+        let selected_value = self.selected;
+        let current = self
+            .options
+            .iter()
+            .find(|opt| opt.value == selected_value);
+        let current_label = current
+            .map(|opt| opt.label.clone())
+            .unwrap_or_else(|| "Choose".into());
+        let current_icon = current.and_then(|opt| opt.icon.clone());
         let disabled = self.disabled;
-        let on_select = self.on_select.clone();
-        let track = h_flex()
-            .id(self.bar_id)
-            .flex_shrink_0()
-            .flex_wrap()
-            .gap_1()
-            .p(px(3.))
-            .rounded(theme.radius)
-            .bg(theme.tab_bar_segmented)
-            .border_1()
-            .border_color(theme.border.opacity(0.45))
-            .opacity(if disabled { 0.55 } else { 1.0 })
-            .children(self.options.into_iter().map(|opt| {
-                let is_on = opt.value == selected;
-                let value = opt.value;
-                let on_select = on_select.clone();
-                let fg = if is_on {
-                    theme.primary_foreground
-                } else {
-                    theme.muted_foreground
-                };
-                div()
-                    .id(opt.id)
-                    .px_2()
-                    .py(px(5.))
-                    .rounded(theme.radius)
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .bg(if is_on {
-                        theme.primary
-                    } else {
-                        theme.transparent
-                    })
-                    .text_color(fg)
-                    .text_xs()
-                    .font_medium()
-                    .when(!disabled && !is_on, |el| {
-                        el.cursor_pointer().hover(|s| {
-                            s.bg(theme.secondary.opacity(0.8))
-                                .text_color(theme.foreground)
-                        })
-                    })
-                    .when(!disabled && is_on, |el| el.cursor_pointer())
-                    .when(!disabled, |el| {
-                        el.on_click(move |_, window, cx| on_select(value, window, cx))
-                    })
-                    .when_some(opt.icon, |el, icon| {
-                        el.child(
-                            Icon::new(icon)
-                                .with_size(px(12.))
-                                .text_color(fg),
-                        )
-                    })
-                    .child(opt.label)
-            }));
-        row_shell(self.label, self.hint, track, cx)
+        let options = self.options;
+        let on_select = self.on_select;
+
+        let trigger = Button::new(self.bar_id)
+            .outline()
+            .small()
+            .min_w(px(132.))
+            .label(current_label)
+            .dropdown_caret(true)
+            .disabled(disabled)
+            .when_some(current_icon, |btn, icon| btn.icon(icon));
+
+        let control = if disabled {
+            trigger.into_any_element()
+        } else {
+            trigger
+                .dropdown_menu_with_anchor(Corner::TopRight, {
+                    let options = options.clone();
+                    let on_select = on_select.clone();
+                    move |menu, _, _| {
+                        let mut menu = menu.min_w(px(168.)).check_side(Side::Right);
+                        for opt in options.iter().cloned() {
+                            let value = opt.value;
+                            let on_select = on_select.clone();
+                            let mut item =
+                                PopupMenuItem::new(opt.label).checked(value == selected_value);
+                            if let Some(icon) = opt.icon {
+                                item = item.icon(icon);
+                            }
+                            menu = menu.item(item.on_click(move |_, window, cx| {
+                                on_select(value, window, cx);
+                            }));
+                        }
+                        menu
+                    }
+                })
+                .into_any_element()
+        };
+
+        row_shell(self.label, self.hint, control, cx)
     }
 }
 
