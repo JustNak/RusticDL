@@ -1,20 +1,15 @@
 use std::path::PathBuf;
 
-use gpui::{
-    div, Context, IntoElement, ParentElement, SharedString, Styled,
-};
+use gpui::{div, Context, IntoElement, ParentElement, SharedString, Styled};
 use gpui_component::{
-    button::Button,
-    clipboard::Clipboard,
-    h_flex,
-    input::Input,
-    v_flex, ActiveTheme, Disableable, IconName, Sizable,
+    button::Button, clipboard::Clipboard, h_flex, input::Input, v_flex, ActiveTheme, Disableable,
+    IconName, Sizable,
 };
 
 use super::super::widgets::{
     browse_directory, field_hint, settings_bays, settings_control_row, settings_field_label,
-    ExclusiveOpt, SettingsBay, SettingsExclusiveRow, SettingsToggleRow, TypeFolderStrip,
-    shorten_path_display,
+    shorten_path_display, ExclusiveOpt, SettingsBay, SettingsExclusiveRow, SettingsToggleRow,
+    TypeFolderStrip,
 };
 use super::super::DownloadApp;
 use crate::download::{reveal_in_folder, FileTypeKind};

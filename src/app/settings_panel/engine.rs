@@ -51,10 +51,20 @@ impl DownloadApp {
         let speed_def = defaults.speed_limit_kib_per_second.to_string();
         let segs_val = self.multi_max_segments_input.read(cx).value().to_string();
         let mib_val = self.multi_min_mib_input.read(cx).value().to_string();
-        let total_val = self.max_total_connections_input.read(cx).value().to_string();
-        let host_val = self.max_connections_per_host_input.read(cx).value().to_string();
+        let total_val = self
+            .max_total_connections_input
+            .read(cx)
+            .value()
+            .to_string();
+        let host_val = self
+            .max_connections_per_host_input
+            .read(cx)
+            .value()
+            .to_string();
         let segs_def = defaults.multi_max_segments.to_string();
-        let mib_def = (defaults.multi_min_bytes / (1024 * 1024)).max(1).to_string();
+        let mib_def = (defaults.multi_min_bytes / (1024 * 1024))
+            .max(1)
+            .to_string();
         let total_def = defaults.max_total_connections.to_string();
         let host_def = defaults.max_connections_per_host.to_string();
 

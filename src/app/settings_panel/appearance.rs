@@ -1,6 +1,4 @@
-use gpui::{
-    div, prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled,
-};
+use gpui::{div, prelude::FluentBuilder, px, Context, IntoElement, ParentElement, Styled};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
@@ -372,27 +370,30 @@ impl DownloadApp {
                     ),
             )
             .child(
-                SettingsBay::new("Progress")
-                    .child(SettingsExclusiveRow::new(
-                        "progress",
-                        "Progress style",
-                        progress_style,
-                        ProgressStyle::ALL.map(|style| {
-                            ExclusiveOpt::new(
-                                style,
-                                format!("progress-{}", style.label()),
-                                style.label(),
-                            )
-                        }),
-                        {
-                            let app = app.clone();
-                            move |style, window, cx| {
-                                app.update(cx, |this, cx| {
-                                    this.set_progress_style(style, window, cx);
-                                });
-                            }
-                        },
-                    ))
+                SettingsBay::new("Progress").child(SettingsExclusiveRow::new(
+                    "progress",
+                    "Progress style",
+                    progress_style,
+                    ProgressStyle::ALL.map(|style| {
+                        ExclusiveOpt::new(
+                            style,
+                            format!("progress-{}", style.label()),
+                            style.label(),
+                        )
+                    }),
+                    {
+                        let app = app.clone();
+                        move |style, window, cx| {
+                            app.update(cx, |this, cx| {
+                                this.set_progress_style(style, window, cx);
+                            });
+                        }
+                    },
+                )),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
                     .child(
                         h_flex().child(
                             Button::new("reset-appearance")

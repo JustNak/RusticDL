@@ -324,10 +324,7 @@ impl<V: Copy + PartialEq + 'static> SettingsExclusiveRow<V> {
 impl<V: Copy + PartialEq + 'static> RenderOnce for SettingsExclusiveRow<V> {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let selected_value = self.selected;
-        let current = self
-            .options
-            .iter()
-            .find(|opt| opt.value == selected_value);
+        let current = self.options.iter().find(|opt| opt.value == selected_value);
         let current_label = current
             .map(|opt| opt.label.clone())
             .unwrap_or_else(|| "Choose".into());
@@ -432,7 +429,9 @@ impl RenderOnce for TypeFolderStrip {
                     .size(px(28.))
                     .flex_shrink_0()
                     .rounded(theme.radius)
-                    .bg(theme.secondary.opacity(if theme.is_dark() { 0.7 } else { 0.9 }))
+                    .bg(theme
+                        .secondary
+                        .opacity(if theme.is_dark() { 0.7 } else { 0.9 }))
                     .border_1()
                     .border_color(theme.border.opacity(0.5))
                     .flex()

@@ -1,7 +1,7 @@
 use gpui::{Context, IntoElement, ParentElement};
 
 use super::super::widgets::{
-    ExclusiveOpt, SettingsBay, SettingsExclusiveRow, SettingsToggleRow, settings_bays,
+    settings_bays, ExclusiveOpt, SettingsBay, SettingsExclusiveRow, SettingsToggleRow,
 };
 use super::super::DownloadApp;
 use crate::settings::OsNotifyMode;
@@ -21,19 +21,14 @@ impl DownloadApp {
             .child(
                 SettingsBay::new("Window & startup")
                     .child(
-                        SettingsToggleRow::new(
-                            "close-tray",
-                            "Close to tray",
-                            close_to_tray,
-                            {
-                                let app = app.clone();
-                                move |on, window, cx| {
-                                    app.update(cx, |this, cx| {
-                                        this.set_close_to_tray(on, window, cx);
-                                    });
-                                }
-                            },
-                        )
+                        SettingsToggleRow::new("close-tray", "Close to tray", close_to_tray, {
+                            let app = app.clone();
+                            move |on, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.set_close_to_tray(on, window, cx);
+                                });
+                            }
+                        })
                         .hint("Hides to the tray instead of quitting."),
                     )
                     .child(SettingsToggleRow::new(
