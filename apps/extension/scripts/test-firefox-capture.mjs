@@ -97,7 +97,7 @@ const defaultSettings = {
   contextMenuEnabled: true,
   showProgressAfterHandoff: true,
   showBadgeStatus: true,
-  excludedHosts: ['web.telegram.org'],
+  excludedHosts: [],
   ignoredFileExtensions: [],
   capturedFileExtensions: [
     '7z', 'apk', 'bz2', 'cab', 'csv', 'deb', 'dmg', 'doc', 'docx', 'exe', 'gz',
@@ -1145,6 +1145,129 @@ assert(
       url: 'https://inst-fs-iad-prod.inscloudgate.net/files/abc?token=1',
       finalUrl: 'https://drive.google.com/uc?export=download&id=abc',
     }) === 'https://school.instructure.com/files/99/download?download_frd=1',
+);
+resetDownloadRedirectsForTests();
+
+const driveUc = 'https://drive.google.com/uc?export=download&id=abc';
+const canvasSessionUrl = 'https://school.instructure.com/files/99/download?download_frd=1';
+const driveAttachmentHeaders = [
+  { name: 'content-type', value: 'application/zip' },
+  { name: 'content-disposition', value: 'attachment; filename="file.zip"' },
+  { name: 'content-length', value: '12000000' },
+];
+
+assert(
+  'skips native Drive /uc?export=download onCreated even with docx + octet-stream + large size',
+  shouldCaptureDownloadItem(
+    {
+      url: driveUc,
+      filename: 'report.docx',
+      mime: 'application/octet-stream',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'skips googleusercontent hop onCreated without a remembered session',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://doc-00-00-docs.googleusercontent.com/docs/securesc/file.docx',
+      filename: 'file.docx',
+      mime: 'application/octet-stream',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'skips Telegram web.telegram.org /k/d download onCreated',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://web.telegram.org/k/d/123',
+      filename: 'notes.pdf',
+      mime: 'application/pdf',
+      totalBytes: 250_000,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'skips Dropboxusercontent file.zip onCreated',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://dl.dropboxusercontent.com/s/x/file.zip',
+      filename: 'file.zip',
+      mime: 'application/zip',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'user excludedHosts still skips a listed random host',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://files.randomhost.example/a.zip',
+      filename: 'a.zip',
+      mime: 'application/zip',
+      totalBytes: 5_000_000,
+    },
+    { ...defaultSettings, excludedHosts: ['randomhost.example'] },
+  ) === false,
+);
+
+assert(
+  'firefoxWebRequestDownloadCandidate skips Drive main_frame zip with attachment',
+  candidate({
+    url: driveUc,
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: driveAttachmentHeaders,
+  }) === null,
+);
+
+assert(
+  'firefoxWebRequestDownloadCandidate keeps Canvas page Drive hops without a remembered redirect',
+  candidate({
+    url: driveUc,
+    type: 'main_frame',
+    statusCode: 200,
+    originUrl: canvasSessionUrl,
+    documentUrl: canvasSessionUrl,
+    responseHeaders: driveAttachmentHeaders,
+  }) !== null,
+);
+
+resetDownloadRedirectsForTests();
+rememberDownloadRedirect(canvasSessionUrl, driveUc);
+assert(
+  'captures Canvas→Drive onCreated after rememberDownloadRedirect',
+  shouldCaptureDownloadItem(
+    {
+      url: canvasSessionUrl,
+      finalUrl: driveUc,
+      filename: 'report.docx',
+      mime: 'application/octet-stream',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === true,
+);
+assert(
+  'firefoxWebRequestDownloadCandidate still captures Canvas→Drive after rememberDownloadRedirect',
+  candidate({
+    url: driveUc,
+    type: 'main_frame',
+    statusCode: 200,
+    originUrl: canvasSessionUrl,
+    documentUrl: canvasSessionUrl,
+    responseHeaders: driveAttachmentHeaders,
+  }) !== null,
 );
 resetDownloadRedirectsForTests();
 

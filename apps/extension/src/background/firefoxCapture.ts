@@ -17,6 +17,7 @@ import {
   filenameFromContentDisposition,
   isPageOrApiMime,
   isWeakCaptureExtension,
+  shouldSkipAppOwnedDownloadOrigin,
 } from './captureFilter';
 import browser from './browser';
 
@@ -73,6 +74,7 @@ export {
   preferredSuggestedFilename,
   shouldCaptureDownloadItem,
   shouldPauseDownloadItem,
+  shouldSkipAppOwnedDownloadOrigin,
   shouldWaitForDownloadSize,
   urlIsClaimed,
 } from './captureFilter';
@@ -232,6 +234,15 @@ export function firefoxWebRequestDownloadCandidate(
     return null;
   }
   if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) {
+    return null;
+  }
+  if (
+    shouldSkipAppOwnedDownloadOrigin({
+      url,
+      pageUrl: details.documentUrl,
+      referrer: details.originUrl,
+    })
+  ) {
     return null;
   }
   if (looksLikeNonDownloadUrl(url)) {

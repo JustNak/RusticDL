@@ -7,7 +7,7 @@ pub const DEFAULT_CAPTURED_FILE_EXTENSIONS: &[&str] = &[
     "pdf", "ppt", "pptx", "rar", "rpm", "tar", "tgz", "txz", "xls", "xlsx", "xz", "zip", "zst",
 ];
 
-pub const DEFAULT_EXCLUDED_HOSTS: &[&str] = &["web.telegram.org"];
+pub const DEFAULT_EXCLUDED_HOSTS: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
