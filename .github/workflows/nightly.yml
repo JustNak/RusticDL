@@ -7,6 +7,8 @@ on:
         description: Publish even if this commit already has a nightly
         type: boolean
         default: false
+  repository_dispatch:
+    types: [publish-nightly]
 
 permissions:
   contents: write
