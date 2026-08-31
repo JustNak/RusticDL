@@ -156,7 +156,6 @@ fn http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("Could not create HTTP client: {e}"))
 }
 
-#[cfg(test)]
 fn format_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
