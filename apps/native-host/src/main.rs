@@ -196,7 +196,7 @@ fn map_forwarder_error(request_id: String, error: ForwarderError) -> HostRespons
             request_id,
             "app_unreachable",
             "APP_UNREACHABLE",
-            "RusticDL did not respond on the named pipe.",
+            "RusticDL did not respond on the app transport.",
         ),
         ForwarderError::Serialization(message) | ForwarderError::Transport(message) => {
             HostResponseEnvelope::rejected(request_id, "rejected", "INTERNAL_ERROR", message)

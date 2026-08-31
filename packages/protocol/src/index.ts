@@ -390,7 +390,7 @@ export function isErrorResponse(response: HostToExtensionResponse): response is 
 export function toUserFacingMessage(code: ErrorCode, fallback?: string): string {
   switch (code) {
     case 'HOST_REGISTRATION_MISSING':
-      return 'RusticDL Backend is not registered. Run scripts/register-native-host.ps1, then reload the extension.';
+      return 'RusticDL Backend is not registered. Run scripts/register-native-host.sh (Linux) or scripts/register-native-host.ps1 (Windows), then reload the extension.';
     case 'APP_NOT_INSTALLED':
       return 'RusticDL was not found.';
     case 'APP_UNREACHABLE':

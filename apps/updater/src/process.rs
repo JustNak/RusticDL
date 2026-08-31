@@ -25,7 +25,32 @@ pub fn try_acquire_single_instance() -> bool {
             Err(_) => true, // if mutex APIs fail, don't block updates
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::AsRawFd;
+        use std::sync::OnceLock;
+
+        static LOCK: OnceLock<std::fs::File> = OnceLock::new();
+        let path = std::env::temp_dir().join("rusticdl-updater.lock");
+        let file = match OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(_) => return true,
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            let _ = LOCK.set(file);
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         true
     }
@@ -83,10 +108,38 @@ pub fn wait_for_process_exit(
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        wait_for_unix_pid(pid, timeout)
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = (pid, timeout, progress);
         Err(WaitError::Timeout)
+    }
+}
+
+#[cfg(unix)]
+fn unix_pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn wait_for_unix_pid(pid: u32, timeout: Duration) -> Result<(), WaitError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !unix_pid_alive(pid) {
+            std::thread::sleep(Duration::from_millis(400));
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(WaitError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -125,7 +178,29 @@ pub fn close_app_for_replace(
         return Err(WaitError::Timeout);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        let _ = app_exe;
+        if let Some(pid) = wait_pid {
+            if unix_pid_alive(pid) {
+                unsafe {
+                    let _ = libc::kill(pid as i32, libc::SIGTERM);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || wait_for_unix_pid(pid, remaining).is_err() {
+                    unsafe {
+                        let _ = libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                    let _ = wait_for_unix_pid(pid, Duration::from_secs(2));
+                    if unix_pid_alive(pid) {
+                        return Err(WaitError::Timeout);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = app_exe;
         Ok(())
@@ -361,6 +436,7 @@ mod tests {
 
     #[test]
     fn target_name_is_main_app_not_updater() {
+        assert!(is_target_app_exe_name("rusticdl", "rusticdl"));
         assert!(is_target_app_exe_name("rusticdl.exe", "rusticdl.exe"));
         assert!(is_target_app_exe_name("RusticDL.exe", "rusticdl.exe"));
         assert!(is_target_app_exe_name(

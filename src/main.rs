@@ -10,6 +10,7 @@ mod extension_settings;
 mod format;
 mod hyprland;
 mod ipc;
+mod native_host_register;
 mod notifications;
 mod persistence;
 mod prompt_window;
@@ -49,6 +50,12 @@ fn main() {
 
     let paths = app_paths();
     let _ = ensure_app_dirs(&paths);
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(error) = native_host_register::sync_native_host_registration() {
+            eprintln!("[native-host] {error}");
+        }
+    }
     let settings = load_settings(&paths);
     // Keep the OS autostart entry aligned with saved prefs (self-heal after moves/updates).
     let _ = apply_launch_at_startup(settings.launch_at_startup, settings.startup_minimized);

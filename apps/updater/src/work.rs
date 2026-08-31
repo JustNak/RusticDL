@@ -2,7 +2,7 @@
 
 use crate::args::UpdaterArgs;
 use crate::download::{download_installer, resolve_local_installer};
-use crate::install::{relaunch_app, run_silent_installer};
+use crate::install::{apply_update_package, relaunch_app};
 use crate::process::{close_app_for_replace, WaitError};
 use crate::ui::ProgressSink;
 
@@ -70,6 +70,7 @@ trait UpdateDriver {
         &mut self,
         url: &str,
         expected_size: Option<u64>,
+        expected_sha256: Option<&str>,
         progress: &dyn ProgressSink,
     ) -> Result<PathBuf, String>;
     fn resolve_local(
@@ -84,7 +85,12 @@ trait UpdateDriver {
         timeout: Duration,
         progress: &dyn ProgressSink,
     ) -> Result<(), WaitError>;
-    fn install(&mut self, path: &Path, progress: &dyn ProgressSink) -> Result<(), String>;
+    fn install(
+        &mut self,
+        path: &Path,
+        app_exe: &Path,
+        progress: &dyn ProgressSink,
+    ) -> Result<(), String>;
     fn relaunch(&mut self, app_exe: &Path) -> Result<(), String>;
 }
 
@@ -95,9 +101,10 @@ impl UpdateDriver for RealDriver {
         &mut self,
         url: &str,
         expected_size: Option<u64>,
+        expected_sha256: Option<&str>,
         progress: &dyn ProgressSink,
     ) -> Result<PathBuf, String> {
-        download_installer(url, expected_size, progress)
+        download_installer(url, expected_size, expected_sha256, progress)
     }
 
     fn resolve_local(
@@ -119,8 +126,13 @@ impl UpdateDriver for RealDriver {
         close_app_for_replace(wait_pid, app_exe, timeout, progress)
     }
 
-    fn install(&mut self, path: &Path, progress: &dyn ProgressSink) -> Result<(), String> {
-        run_silent_installer(path, progress)
+    fn install(
+        &mut self,
+        path: &Path,
+        app_exe: &Path,
+        progress: &dyn ProgressSink,
+    ) -> Result<(), String> {
+        apply_update_package(path, app_exe, progress)
     }
 
     fn relaunch(&mut self, app_exe: &Path) -> Result<(), String> {
@@ -139,7 +151,12 @@ fn run_update_with(
     driver: &mut dyn UpdateDriver,
 ) -> UpdateOutcome {
     let installer_path = if let Some(url) = &args.download_url {
-        match driver.download(url, args.expected_size, progress) {
+        match driver.download(
+            url,
+            args.expected_size,
+            args.expected_sha256.as_deref(),
+            progress,
+        ) {
             Ok(path) => path,
             Err(e) => return UpdateOutcome::DownloadFailed(e),
         }
@@ -161,7 +178,7 @@ fn run_update_with(
         return UpdateOutcome::WaitTimeout;
     }
 
-    if let Err(e) = driver.install(&installer_path, progress) {
+    if let Err(e) = driver.install(&installer_path, &args.app_exe, progress) {
         return UpdateOutcome::InstallFailed(e);
     }
 
@@ -228,6 +245,7 @@ mod tests {
             &mut self,
             _url: &str,
             _expected_size: Option<u64>,
+            _expected_sha256: Option<&str>,
             _progress: &dyn ProgressSink,
         ) -> Result<PathBuf, String> {
             self.push(Call::Download);
@@ -258,7 +276,12 @@ mod tests {
             }
         }
 
-        fn install(&mut self, _path: &Path, _progress: &dyn ProgressSink) -> Result<(), String> {
+        fn install(
+            &mut self,
+            _path: &Path,
+            _app_exe: &Path,
+            _progress: &dyn ProgressSink,
+        ) -> Result<(), String> {
             self.push(Call::Install);
             if self.fail_install {
                 Err("install failed".into())

@@ -1,10 +1,11 @@
-//! A second launch activates the existing window via the named-pipe
+//! A second launch activates the existing window via the IPC
 //! `show_window` request and exits instead of opening a duplicate UI.
 
-use crate::branding::PIPE_NAME;
+use crate::branding::ipc_transport_path;
 use crate::ipc::PROTOCOL_VERSION;
 
 /// Named mutex held for the lifetime of the primary process.
+#[cfg(windows)]
 const MUTEX_NAME: &str = "Local\\RusticDL.App";
 
 const ACTIVATE_ATTEMPTS: usize = 15;
@@ -19,8 +20,8 @@ pub enum InstanceRole {
     Secondary,
 }
 
-/// On Windows, if another instance holds the mutex, send `show_window` over the
-/// IPC pipe (best-effort) and return [`InstanceRole::Secondary`].
+/// If another instance holds the lock, send `show_window` over IPC (best-effort)
+/// and return [`InstanceRole::Secondary`].
 pub fn claim_instance() -> InstanceRole {
     #[cfg(windows)]
     {
@@ -30,7 +31,15 @@ pub fn claim_instance() -> InstanceRole {
         }
         InstanceRole::Primary
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        if !try_acquire_flock() {
+            let _ = activate_existing_instance();
+            return InstanceRole::Secondary;
+        }
+        InstanceRole::Primary
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         InstanceRole::Primary
     }
@@ -62,8 +71,38 @@ fn try_acquire_mutex() -> bool {
     }
 }
 
+#[cfg(unix)]
+fn try_acquire_flock() -> bool {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::OnceLock;
+
+    static INSTANCE_LOCK: OnceLock<std::fs::File> = OnceLock::new();
+
+    let path = crate::branding::instance_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(_) => return true,
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        let _ = INSTANCE_LOCK.set(file);
+        true
+    } else {
+        false
+    }
+}
+
 /// Ask the primary instance to restore/focus its main window.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn activate_existing_instance() -> bool {
     let request = serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -90,8 +129,35 @@ fn activate_existing_instance() -> bool {
 fn send_show_window_once(request_json: &str) -> bool {
     use std::io::{BufRead, BufReader, Write};
 
-    let mut stream = match open_pipe(PIPE_NAME) {
+    let mut stream = match open_pipe(&ipc_transport_path()) {
         Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    if stream
+        .write_all(request_json.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(n) if n > 0 => line.contains("\"ok\":true") || line.contains("\"ok\": true"),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn send_show_window_once(request_json: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = match UnixStream::connect(ipc_transport_path()) {
+        Ok(stream) => stream,
         Err(_) => return false,
     };
 

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=RusticDL
+Comment=Local-first HTTP(S) download manager
+Exec=rusticdl
+Icon=rusticdl
+Terminal=false
+Categories=Network;FileTransfer;
+StartupWMClass=RusticDL
+Keywords=download;http;manager;

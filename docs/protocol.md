@@ -6,7 +6,8 @@
 Browser extension
   → native messaging (stdio, length-prefixed JSON)
   → native host
-  → named pipe \\.\pipe\rusticdl.v1
+  → Windows: named pipe \\.\pipe\rusticdl.v1
+    Linux:   Unix socket $XDG_RUNTIME_DIR/rusticdl.v1.sock
   → desktop app
 ```
 
@@ -43,4 +44,4 @@ Only `http` and `https` URLs are accepted.
 - Browser session headers (`handoffAuth`) are memory-only and never written to `state.json`.
 - `handoffAuth.originAuth` is optional per-origin Cookie/Authorization so a Canvas → Drive redirect can keep the Drive session without sending Canvas cookies cross-origin.
 - Browser captures replay the LMS session URL (not a consumed Inst-FS / Drive `finalUrl`). The desktop discovers the signed Location without fetching it during preflight; a 401 on that hop remints once from the session URL.
-- Named pipe rejects remote clients.
+- Named pipe rejects remote clients. The Linux socket is `0600` under `$XDG_RUNTIME_DIR`.

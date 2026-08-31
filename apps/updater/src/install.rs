@@ -14,6 +14,82 @@ pub fn installer_silent_args() -> &'static [&'static str] {
     &["/S"]
 }
 
+/// Apply a downloaded update package (NSIS on Windows, tarball on Linux).
+pub fn apply_update_package(
+    path: &Path,
+    app_exe: &Path,
+    progress: &dyn ProgressSink,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = app_exe;
+        run_silent_installer(path, progress)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extract_linux_tarball(path, app_exe, progress)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (path, app_exe, progress);
+        Err("In-app updates are not supported on this platform.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn extract_linux_tarball(
+    archive: &Path,
+    app_exe: &Path,
+    progress: &dyn ProgressSink,
+) -> Result<(), String> {
+    progress.set_status("Installing update…".into());
+    progress.set_progress_unknown();
+
+    if !archive.is_file() {
+        return Err(format!("Update archive missing: {}", archive.display()));
+    }
+
+    let prefix = app_exe
+        .parent()
+        .ok_or_else(|| "Could not resolve install directory.".to_string())?;
+    if !prefix.is_dir() {
+        return Err(format!(
+            "Install directory is missing:\n{}",
+            prefix.display()
+        ));
+    }
+
+    progress.set_status("Extracting update…".into());
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(prefix)
+        .status()
+        .map_err(|e| format!("Could not extract update (tar): {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "tar exited with code {:?}. RusticDL may be partially updated.",
+            status.code()
+        ));
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["rusticdl", "rusticdl-native-host", "rusticdl-updater"] {
+        let bin = prefix.join(name);
+        if !bin.is_file() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&bin) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o755);
+            let _ = std::fs::set_permissions(&bin, perms);
+        }
+    }
+
+    Ok(())
+}
+
 /// Run a downloaded NSIS setup silently. Updater owns relaunch, so no `/R`.
 pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<(), String> {
     progress.set_status("Installing update…".into());
@@ -307,5 +383,42 @@ mod tests {
             !err.contains("Could not start installer"),
             "execute-without-Authenticode: must fail closed before Command / ShellExecute, got {err:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_update_package_extracts_tarball_into_app_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-linux-extract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let prefix = dir.join("prefix");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&prefix).expect("prefix");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("rusticdl"), b"new-bin").expect("src rusticdl");
+        std::fs::write(prefix.join("rusticdl"), b"old-bin").expect("old rusticdl");
+        let archive = dir.join("RusticDL-linux-x64.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("rusticdl")
+            .status()
+            .expect("tar create");
+        assert!(status.success(), "tar create failed");
+
+        apply_update_package(&archive, &prefix.join("rusticdl"), &NoopProgress)
+            .expect("extract tarball");
+        assert_eq!(
+            std::fs::read(prefix.join("rusticdl")).expect("read rusticdl"),
+            b"new-bin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

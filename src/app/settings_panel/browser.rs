@@ -1,9 +1,9 @@
-use gpui::{Context, IntoElement, ParentElement, Styled};
-use gpui_component::v_flex;
+use gpui::{prelude::FluentBuilder, Context, IntoElement, ParentElement, Styled};
+use gpui_component::{button::Button, v_flex};
 
 use super::super::widgets::{
-    field_hint, settings_bays, settings_field_label, settings_input_with_reset, ExclusiveOpt,
-    SettingsBay, SettingsExclusiveRow, SettingsToggleRow,
+    field_hint, settings_bays, settings_control_row, settings_field_label,
+    settings_input_with_reset, ExclusiveOpt, SettingsBay, SettingsExclusiveRow, SettingsToggleRow,
 };
 use super::super::DownloadApp;
 use crate::extension_settings::{DownloadHandoffMode, ExtensionIntegrationSettings};
@@ -22,6 +22,9 @@ impl DownloadApp {
         let ext_def = defaults.captured_file_extensions.join(", ");
         let ext_val = self.captured_extensions_input.read(cx).value().to_string();
         let app = cx.entity();
+        let host_path = crate::native_host_register::sibling_native_host_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Not found next to the app".into());
 
         v_flex()
             .w_full()
@@ -32,6 +35,27 @@ impl DownloadApp {
             ))
             .child(
                 settings_bays()
+                    .when(cfg!(target_os = "linux"), |bays| {
+                        bays.child(
+                            SettingsBay::new("Native host")
+                                .child(settings_control_row(
+                                    "Register browser host",
+                                    Some(
+                                        "Writes native-messaging JSON with an absolute host path. \
+Needed after a portable move; updates rewrite this automatically."
+                                            .into(),
+                                    ),
+                                    Button::new("register-native-host")
+                                        .outline()
+                                        .label("Register")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.register_browser_host(cx);
+                                        })),
+                                    cx,
+                                ))
+                                .child(field_hint(format!("Host path: {host_path}"), cx)),
+                        )
+                    })
                     .child(
                         SettingsBay::new("Capture").child(
                             SettingsToggleRow::new(

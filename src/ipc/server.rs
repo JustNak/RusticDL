@@ -3,11 +3,13 @@ use std::time::Duration;
 use super::bridge::IpcBridge;
 use super::handlers::handle_request;
 use super::protocol::HostRequest;
+#[cfg(windows)]
 use crate::branding::PIPE_NAME;
 
 const MAX_PIPE_REQUEST_BYTES: usize = 1024 * 1024;
 const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
 const PIPE_MAX_INSTANCES: usize = 4;
 
 /// Remote SMB clients stay rejected even after the local DACL is tightened.
@@ -88,10 +90,18 @@ pub fn start_ipc_server(bridge: IpcBridge) {
             }
         });
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            if let Err(error) = run_unix_socket_server(bridge).await {
+                eprintln!("[ipc] unix socket listener error: {error}");
+            }
+        });
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = bridge;
-        eprintln!("[ipc] named pipe server is only available on Windows");
+        eprintln!("[ipc] IPC server is not available on this platform");
     }
 }
 
@@ -288,7 +298,6 @@ async fn accept_single_connection(
     bridge: IpcBridge,
     first_pipe_instance: bool,
 ) -> Result<(), String> {
-    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let server = {
@@ -318,46 +327,7 @@ async fn accept_single_connection(
         .map_err(|error| format!("Could not accept named pipe connection: {error}"))?;
 
     tokio::spawn(async move {
-        let result: Result<(), String> = async {
-            let (reader, mut writer) = tokio::io::split(server);
-            let mut reader = BufReader::new(reader);
-            let request_line =
-                tokio::time::timeout(PIPE_READ_TIMEOUT, read_limited_request_line(&mut reader))
-                    .await
-                    .map_err(|_| "Timed out reading named pipe payload.".to_string())??;
-
-            if request_line.trim().is_empty() {
-                return Ok(());
-            }
-
-            let request = serde_json::from_str::<HostRequest>(&request_line)
-                .map_err(|error| format!("Could not parse host request: {error}"))?;
-
-            let response = handle_request(&bridge, request).await;
-            let response_json = serde_json::to_string(&response)
-                .map_err(|error| format!("Could not serialize host response: {error}"))?;
-
-            tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
-                writer
-                    .write_all(response_json.as_bytes())
-                    .await
-                    .map_err(|error| format!("Could not write named pipe response: {error}"))?;
-                writer.write_all(b"\n").await.map_err(|error| {
-                    format!("Could not write named pipe response terminator: {error}")
-                })?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|error| format!("Could not flush named pipe response: {error}"))
-            })
-            .await
-            .map_err(|_| "Timed out writing named pipe response.".to_string())??;
-
-            Ok(())
-        }
-        .await;
-
-        if let Err(error) = result {
+        if let Err(error) = handle_connected_stream(server, bridge).await {
             eprintln!("[ipc] named pipe request error: {error}");
         }
     });
@@ -365,7 +335,100 @@ async fn accept_single_connection(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+async fn run_unix_socket_server(bridge: IpcBridge) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    let path = crate::branding::ipc_transport_path();
+    let socket_path = std::path::Path::new(&path);
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Could not create IPC socket directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).map_err(|error| {
+            format!(
+                "Could not remove stale IPC socket {}: {error}",
+                socket_path.display()
+            )
+        })?;
+    }
+
+    let listener = UnixListener::bind(socket_path).map_err(|error| {
+        format!(
+            "Could not bind unix socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let bridge = bridge.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connected_stream(stream, bridge).await {
+                        eprintln!("[ipc] unix socket request error: {error}");
+                    }
+                });
+            }
+            Err(error) => {
+                eprintln!("[ipc] unix socket accept error: {error}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+async fn handle_connected_stream<S>(stream: S, bridge: IpcBridge) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let request_line =
+        tokio::time::timeout(PIPE_READ_TIMEOUT, read_limited_request_line(&mut reader))
+            .await
+            .map_err(|_| "Timed out reading IPC payload.".to_string())??;
+
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let request = serde_json::from_str::<HostRequest>(&request_line)
+        .map_err(|error| format!("Could not parse host request: {error}"))?;
+
+    let response = handle_request(&bridge, request).await;
+    let response_json = serde_json::to_string(&response)
+        .map_err(|error| format!("Could not serialize host response: {error}"))?;
+
+    tokio::time::timeout(PIPE_WRITE_TIMEOUT, async {
+        writer
+            .write_all(response_json.as_bytes())
+            .await
+            .map_err(|error| format!("Could not write IPC response: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|error| format!("Could not write IPC response terminator: {error}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|error| format!("Could not flush IPC response: {error}"))
+    })
+    .await
+    .map_err(|_| "Timed out writing IPC response.".to_string())??;
+
+    Ok(())
+}
+
 async fn read_limited_request_line<R>(reader: &mut R) -> Result<String, String>
 where
     R: tokio::io::AsyncBufRead + Unpin,
