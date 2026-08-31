@@ -261,8 +261,11 @@ mod tests {
     fn xdg_config_dirs_are_absolute_when_home_is_set() {
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_home = std::env::var_os("HOME");
-        std::env::set_var("XDG_CONFIG_HOME", "/tmp/rusticdl-test-config");
-        std::env::set_var("HOME", "/tmp/rusticdl-test-home");
+        let config = std::env::temp_dir().join("rusticdl-test-config");
+        let home = std::env::temp_dir().join("rusticdl-test-home");
+        assert!(config.is_absolute(), "temp_dir must be absolute");
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("HOME", &home);
         let chrome = chromium_native_messaging_dirs();
         let firefox = firefox_native_messaging_dirs();
         match prev_config {
