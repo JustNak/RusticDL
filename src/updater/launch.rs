@@ -10,6 +10,7 @@ pub struct LaunchUpdaterOpts {
     pub to_version: String,
     pub release_page: String,
     pub setup_size: Option<u64>,
+    pub setup_sha256: Option<String>,
 }
 
 /// Resolve `rusticdl-updater.exe` next to the running main executable.
@@ -75,6 +76,10 @@ pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
     if let Some(size) = opts.setup_size {
         args.push("--expected-size".into());
         args.push(size.to_string());
+    }
+    if let Some(sha256) = &opts.setup_sha256 {
+        args.push("--expected-sha256".into());
+        args.push(sha256.clone());
     }
 
     #[cfg(windows)]

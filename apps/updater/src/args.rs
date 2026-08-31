@@ -12,6 +12,7 @@ pub struct UpdaterArgs {
     pub to_version: Option<String>,
     pub release_page: Option<String>,
     pub expected_size: Option<u64>,
+    pub expected_sha256: Option<String>,
     pub wait_timeout_secs: u64,
 }
 
@@ -29,6 +30,7 @@ impl UpdaterArgs {
         let mut to_version = None;
         let mut release_page = None;
         let mut expected_size = None;
+        let mut expected_sha256 = None;
         let mut wait_timeout_secs = 90_u64;
 
         let mut iter = args.into_iter().map(|s| s.as_ref().to_string());
@@ -60,6 +62,7 @@ impl UpdaterArgs {
                             .map_err(|_| format!("Invalid --expected-size: {raw}"))?,
                     );
                 }
+                "--expected-sha256" => expected_sha256 = Some(next("--expected-sha256")?),
                 "--wait-timeout-secs" => {
                     let raw = next("--wait-timeout-secs")?;
                     wait_timeout_secs = raw
@@ -95,6 +98,7 @@ impl UpdaterArgs {
             to_version,
             release_page,
             expected_size,
+            expected_sha256,
             wait_timeout_secs,
         })
     }
@@ -115,6 +119,7 @@ Options:
   --to-version <semver>      Target version (UI)
   --release-page <url>       Opened when the update fails
   --expected-size <bytes>    Optional Content-Length hint
+  --expected-sha256 <hex>    Required on Linux (SHA-256 of the tarball)
   --wait-timeout-secs <n>    Max seconds to wait for main exit (default 90)
 "#
     .trim()

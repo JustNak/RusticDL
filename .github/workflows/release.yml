@@ -71,7 +71,7 @@ jobs:
           body: |
             ## RusticDL ${{ github.ref_name }}
 
-            Local-first HTTP(S) download manager for Windows.
+            Local-first HTTP(S) download manager for Windows and Linux.
 
             ### Downloads
             | Asset | Contents |
@@ -79,6 +79,7 @@ jobs:
             | **RusticDL-windows-x64-setup.exe** | **Recommended** — NSIS installer (app + native host + browser host registration) |
             | **RusticDL-windows-x64.zip** | Portable desktop app only |
             | **RusticDL-full-windows-x64.zip** | Portable app + native host + scripts + extensions |
+            | **RusticDL-linux-x64.tar.gz** | Linux app + native host + updater + install.sh |
             | **extension-chromium.zip** | Chromium / Edge / Brave extension |
             | **extension-firefox.zip** | Firefox extension |
 
@@ -91,4 +92,53 @@ jobs:
 
             See the [README](https://github.com/JustNak/RusticDL#readme) for portable ZIP and build-from-source docs.
 
+            **Linux:** extract `RusticDL-linux-x64.tar.gz` and run `./install-linux.sh` (per-user, no sudo). In-app updates replace that prefix. Snap/Flatpak browsers may not see the native messaging host.
+
             **License:** MIT — commercial use allowed; keep attribution (copyright notice).
+
+  release-linux:
+    name: Build & publish (Linux)
+    needs: release-windows
+    if: github.repository == 'JustNak/RusticDL'
+    runs-on: ubuntu-latest
+    env:
+      RUSTICDL_VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libstdc++6 g++ libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux release binaries
+        run: |
+          cargo build --release -p rusticdl
+          cargo build --release -p rusticdl-native-host
+          cargo build --release -p rusticdl-updater
+
+      - name: Verify ELF
+        run: |
+          for bin in rusticdl rusticdl-native-host rusticdl-updater; do
+            readelf -h target/release/$bin | grep -q 'Class: *ELF64'
+            readelf -h target/release/$bin | grep -Eq 'Type: *(EXEC|DYN)'
+            test -x target/release/$bin
+          done
+
+      - name: Package tarball
+        run: bash scripts/package-linux.sh
+
+      - name: Upload Linux tarball
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            dist-release/RusticDL-linux-x64.tar.gz \
+            dist-release/SHA256SUMS

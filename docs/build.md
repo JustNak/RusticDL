@@ -23,7 +23,7 @@ HTTP/3 support is enabled in this repo via `.cargo/config.toml` (`reqwest_unstab
 │   ├── extension/          WebExtension (Firefox + Chromium)
 │   └── native-host/        Native messaging bridge (stdio → named pipe)
 ├── packages/protocol/      Shared TypeScript protocol types
-├── scripts/                Windows native-host register / unregister
+├── scripts/                native-host register / unregister (Windows + Linux)
 ├── assets/brand/           Icons and logo
 └── docs/protocol.md        Extension ↔ app wire format
 ```
@@ -51,7 +51,7 @@ cargo build -p rusticdl-native-host
 cargo build --release -p rusticdl-native-host
 ```
 
-Output: `target/*/rusticdl-native-host.exe`
+Output: `target/*/rusticdl-native-host.exe` (Windows) or `target/*/rusticdl-native-host` (Linux)
 
 ## Tests
 
@@ -110,5 +110,14 @@ powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 Output: `dist-release/RusticDL-windows-x64-setup.exe` (plus the packager’s `rusticdl_*_x64-setup.exe` name).
 
 Packager config lives in `[package.metadata.packager]` in `Cargo.toml`, with a custom NSIS template at `installer/nsis/installer.nsi` that registers/unregisters the native messaging host on install/uninstall.
+
+## Build the Linux tarball
+
+```bash
+cargo build --release -p rusticdl -p rusticdl-native-host -p rusticdl-updater
+bash scripts/package-linux.sh
+```
+
+Output: `dist-release/RusticDL-linux-x64.tar.gz` and `dist-release/SHA256SUMS`.
 
 See also [protocol.md](protocol.md) for the extension ↔ app wire format.

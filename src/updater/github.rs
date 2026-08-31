@@ -4,7 +4,10 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde::Deserialize;
 
 use super::version::{is_nightly_version, normalize_version, should_offer_on_channel};
-use crate::branding::{APP_NAME, APP_VERSION, GITHUB_OWNER, GITHUB_REPO, SETUP_ASSET_NAME};
+use crate::branding::{
+    update_asset_name, APP_NAME, APP_VERSION, CHECKSUMS_ASSET_NAME, GITHUB_OWNER, GITHUB_REPO,
+    LINUX_TARBALL_ASSET_NAME, SETUP_ASSET_NAME,
+};
 use crate::settings::UpdateChannel;
 
 /// GitHub API: latest stable (non-prerelease) release for this project.
@@ -58,6 +61,8 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
+    /// SHA-256 of the Linux tarball from `SHA256SUMS` (Windows uses Authenticode).
+    pub setup_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +90,7 @@ pub async fn check_for_update(channel: UpdateChannel) -> Result<UpdateCheck, Str
         UpdateChannel::Stable => fetch_stable_release(&client).await?,
         UpdateChannel::Nightly => fetch_nightly_release(&client).await?,
     };
-    compare_release(release, channel)
+    compare_release(&client, release, channel).await
 }
 
 async fn fetch_stable_release(client: &reqwest::Client) -> Result<GhRelease, String> {
@@ -140,7 +145,12 @@ async fn fetch_nightly_release(client: &reqwest::Client) -> Result<GhRelease, St
     releases
         .into_iter()
         .find(is_published_nightly)
-        .ok_or_else(|| "No Nightly build with a setup installer was found on GitHub.".into())
+        .ok_or_else(|| {
+            format!(
+                "No Nightly build with “{}” was found on GitHub.",
+                update_asset_name()
+            )
+        })
 }
 
 fn is_published_nightly(release: &GhRelease) -> bool {
@@ -150,10 +160,14 @@ fn is_published_nightly(release: &GhRelease) -> bool {
         && release
             .assets
             .iter()
-            .any(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
+            .any(|a| a.name.eq_ignore_ascii_case(update_asset_name()))
 }
 
-fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateCheck, String> {
+async fn compare_release(
+    client: &reqwest::Client,
+    release: GhRelease,
+    channel: UpdateChannel,
+) -> Result<UpdateCheck, String> {
     let latest_raw = release.tag_name.trim();
     let latest = normalize_version(latest_raw);
     let current = normalize_version(APP_VERSION);
@@ -165,15 +179,22 @@ fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateC
         });
     }
 
+    let asset_name = update_asset_name();
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name.eq_ignore_ascii_case(SETUP_ASSET_NAME))
+        .find(|a| a.name.eq_ignore_ascii_case(asset_name))
         .ok_or_else(|| {
             format!(
-                "Release (v{latest}) has no “{SETUP_ASSET_NAME}” asset. Open the release page instead."
+                "Release (v{latest}) has no “{asset_name}” asset. Open the release page instead."
             )
         })?;
+
+    let setup_sha256 = if cfg!(target_os = "linux") {
+        Some(fetch_release_sha256(client, &release, asset_name).await?)
+    } else {
+        None
+    };
 
     let notes = release
         .body
@@ -193,7 +214,64 @@ fn compare_release(release: GhRelease, channel: UpdateChannel) -> Result<UpdateC
         notes,
         setup_download_url: asset.browser_download_url.clone(),
         setup_size: Some(asset.size),
+        setup_sha256,
     }))
+}
+
+async fn fetch_release_sha256(
+    client: &reqwest::Client,
+    release: &GhRelease,
+    asset_name: &str,
+) -> Result<String, String> {
+    let sums = release
+        .assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(CHECKSUMS_ASSET_NAME))
+        .ok_or_else(|| {
+            "Release has no SHA256SUMS asset. Cannot verify the Linux tarball.".to_string()
+        })?;
+
+    let response = client
+        .get(&sums.browser_download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not download SHA256SUMS: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub returned {} while downloading SHA256SUMS.",
+            response.status()
+        ));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Could not read SHA256SUMS: {e}"))?;
+    parse_sha256sums(&text, asset_name).ok_or_else(|| {
+        format!(
+            "SHA256SUMS has no entry for {asset_name}. Refuse to install an unverified archive."
+        )
+    })
+}
+
+/// Parse a GNU `sha256sum` listing and return the hash for `file_name`.
+pub fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        if base.eq_ignore_ascii_case(file_name) {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 /// Open the releases list in the default browser (includes nightly pre-releases).
@@ -257,7 +335,23 @@ mod tests {
         assert!(list.ends_with("/releases"));
         assert!(releases_list_api().contains("per_page=100"));
         assert!(SETUP_ASSET_NAME.ends_with(".exe"));
+        assert!(LINUX_TARBALL_ASSET_NAME.ends_with(".tar.gz"));
+        assert_eq!(CHECKSUMS_ASSET_NAME, "SHA256SUMS");
         assert!(!APP_VERSION.is_empty());
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn parse_sha256sums_matches_basename() {
+        let text = "\
+# comment
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  RusticDL-linux-x64.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
+";
+        assert_eq!(
+            parse_sha256sums(text, LINUX_TARBALL_ASSET_NAME).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(parse_sha256sums(text, SETUP_ASSET_NAME).is_none());
     }
 }

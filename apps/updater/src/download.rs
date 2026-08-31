@@ -9,13 +9,19 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 
 use crate::ui::ProgressSink;
 
+#[cfg(windows)]
 const SETUP_ASSET_NAME: &str = "RusticDL-windows-x64-setup.exe";
+#[cfg(target_os = "linux")]
+const SETUP_ASSET_NAME: &str = "RusticDL-linux-x64.tar.gz";
+#[cfg(not(any(windows, target_os = "linux")))]
+const SETUP_ASSET_NAME: &str = "RusticDL-update.bin";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub fn download_installer(
     url: &str,
     expected_size: Option<u64>,
+    expected_sha256: Option<&str>,
     progress: &dyn ProgressSink,
 ) -> Result<PathBuf, String> {
     progress.set_status("Downloading update…".into());
@@ -89,8 +95,44 @@ pub fn download_installer(
         }
     }
 
+    if cfg!(target_os = "linux") {
+        let expected = expected_sha256
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "Linux update is missing SHA-256. Refuse to install an unverified archive."
+                    .to_string()
+            })?;
+        verify_sha256(&installer_path, expected)?;
+    } else if let Some(expected) = expected_sha256
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        verify_sha256(&installer_path, expected)?;
+    }
+
     progress.set_progress_percent(100);
     Ok(installer_path)
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file =
+        File::open(path).map_err(|e| format!("Could not read downloaded archive: {e}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("Could not hash downloaded archive: {e}"))?;
+    let digest = hasher.finalize();
+    let got: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    if !got.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "SHA-256 mismatch for {}.\nExpected {expected}\nGot      {got}\n\
+The download may be corrupt. Install manually from the release page.",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub fn resolve_local_installer(path: &Path) -> Result<PathBuf, String> {
@@ -127,5 +169,40 @@ fn format_bytes(n: u64) -> String {
         format!("{:.0} KB", n / KB)
     } else {
         format!("{n:.0} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_sha256_accepts_matching_digest() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-sha256-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"rusticdl-sha256-fixture\n").expect("payload");
+        verify_sha256(
+            &path,
+            "2f3c6d1c0b6a0c1d8b7f4a3e5c9d2a1b0e8f7c6d5a4b3c2d1e0f9a8b7c6d5e4f",
+        )
+        .expect_err("wrong hash must fail");
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(b"rusticdl-sha256-fixture\n");
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        verify_sha256(&path, &expected).expect("matching hash");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

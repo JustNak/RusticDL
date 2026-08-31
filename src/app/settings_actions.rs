@@ -273,6 +273,24 @@ impl DownloadApp {
         cx.notify();
     }
 
+    pub(crate) fn register_browser_host(&mut self, cx: &mut Context<Self>) {
+        match crate::native_host_register::register_native_host() {
+            Ok(report) => {
+                self.show_toast(
+                    format!(
+                        "Registered RusticDL Backend at {}",
+                        report.host_path.display()
+                    ),
+                    cx,
+                );
+            }
+            Err(message) => {
+                self.show_error_toast(message, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn update_extension_settings_draft(
         &mut self,
         f: impl FnOnce(&mut ExtensionIntegrationSettings),

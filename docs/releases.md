@@ -7,8 +7,8 @@ GitHub Actions workflows live in `.github/workflows/`:
 | Workflow | When it runs | What it does |
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
-| **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build Windows release binaries, NSIS setup.exe, extension zips; publish a **Stable** GitHub Release |
-| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Windows release assets plus **`RusticDL-linux-x64.tar.gz`**, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. (`release.yml` remains Windows-only.) |
+| **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build Windows release binaries, NSIS setup.exe, extension zips, plus **`RusticDL-linux-x64.tar.gz`** and **`SHA256SUMS`**; publish a **Stable** GitHub Release |
+| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Windows release assets plus the full Linux tarball (app + native host + updater + `install-linux.sh`) and **`SHA256SUMS`**, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
 
 To cut a new **stable** release from a clean tree:
 

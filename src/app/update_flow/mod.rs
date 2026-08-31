@@ -288,6 +288,7 @@ impl DownloadApp {
             to_version: info.latest_version.clone(),
             release_page: info.html_url.clone(),
             setup_size: info.setup_size,
+            setup_sha256: info.setup_sha256.clone(),
         };
 
         if let Err(message) = launch_updater(&opts) {

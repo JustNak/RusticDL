@@ -24,6 +24,10 @@ winresource = "0.1"
 [dependencies]
 open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

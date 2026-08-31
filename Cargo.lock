@@ -4975,6 +4975,7 @@ dependencies = [
  "gpui-component",
  "image",
  "include_dir",
+ "libc",
  "open",
  "percent-encoding",
  "raw-window-handle",
@@ -4994,6 +4995,7 @@ dependencies = [
 name = "rusticdl-native-host"
 version = "0.1.4"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "url",
@@ -5004,8 +5006,10 @@ dependencies = [
 name = "rusticdl-updater"
 version = "0.3.5"
 dependencies = [
+ "libc",
  "open",
  "reqwest",
+ "sha2 0.10.9",
  "windows 0.61.3",
  "winresource",
 ]

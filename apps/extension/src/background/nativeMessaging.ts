@@ -24,6 +24,22 @@ import {
 import browser from './browser';
 import type { PopupStateResponse } from '../shared/messages';
 
+function isLinuxHost(): boolean {
+  const platform = `${navigator.platform} ${navigator.userAgent}`;
+  return /linux/i.test(platform);
+}
+
+function registerNativeHostHint(includeHostPath: boolean): string {
+  if (isLinuxHost()) {
+    return includeHostPath
+      ? './scripts/register-native-host.sh --host-binary "$PWD/target/debug/rusticdl-native-host"'
+      : './scripts/register-native-host.sh';
+  }
+  return includeHostPath
+    ? '.\\scripts\\register-native-host.ps1 -HostBinaryPath "$PWD\\target\\debug\\rusticdl-native-host.exe"'
+    : '.\\scripts\\register-native-host.ps1';
+}
+
 function browserLabel(): string {
   switch (detectBrowser()) {
     case 'firefox':
@@ -50,7 +66,7 @@ function mapNativeMessagingError(error: unknown): {
         `This ${browserLabel()} extension is not allowed to use RusticDL Backend. `
         + 'The host is registered, but this extension id is missing from allowed_origins. '
         + 'Reload the unpacked extension after rebuilding, or from the repo root run:\n'
-        + '.\\scripts\\register-native-host.ps1',
+        + registerNativeHostHint(false),
       connection: 'host_missing',
     };
   }
@@ -65,7 +81,7 @@ function mapNativeMessagingError(error: unknown): {
       code: 'HOST_REGISTRATION_MISSING',
       message:
         `RusticDL Backend is not registered for ${browserLabel()}. From the repo root run:\n`
-        + '.\\scripts\\register-native-host.ps1 -HostBinaryPath "$PWD\\target\\debug\\rusticdl-native-host.exe"',
+        + registerNativeHostHint(true),
       connection: 'host_missing',
     };
   }

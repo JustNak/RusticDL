@@ -34,7 +34,7 @@ Get the latest Windows build from GitHub Releases:
 
 **[→ Download RusticDL for Windows](https://github.com/JustNak/RusticDL/releases/latest)**
 
-Linux builds are not on Stable yet. Grab **`RusticDL-linux-x64.tar.gz`** from a [Nightly pre-release](https://github.com/JustNak/RusticDL/releases) (ELF only — no updater, no native-host).
+Linux builds ship as **`RusticDL-linux-x64.tar.gz`** on [Stable](https://github.com/JustNak/RusticDL/releases/latest) and [Nightly](https://github.com/JustNak/RusticDL/releases) (app + native host + updater).
 
 Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
 
@@ -43,7 +43,7 @@ Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testi
 | **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app + native host + browser host registration) |
 | **`RusticDL-windows-x64.zip`** | Portable desktop app (`rusticdl.exe`) |
 | **`RusticDL-full-windows-x64.zip`** | Portable app + native host + register scripts + browser extension packages |
-| **`RusticDL-linux-x64.tar.gz`** | Linux desktop app (`rusticdl` ELF; Nightly only today) |
+| **`RusticDL-linux-x64.tar.gz`** | Linux app + native host + updater + `install-linux.sh` |
 | **`extension-chromium.zip`** | Chromium / Edge / Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 
@@ -61,16 +61,21 @@ Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & 
 
 ### Install (Linux)
 
-1. Download **`RusticDL-linux-x64.tar.gz`** from a Nightly pre-release.
-2. Extract and run:
+1. Download **`RusticDL-linux-x64.tar.gz`** from [Releases](https://github.com/JustNak/RusticDL/releases/latest).
+2. Extract and install (per-user, **no sudo**):
 
 ```bash
 tar -xzf RusticDL-linux-x64.tar.gz
-chmod +x rusticdl
-./rusticdl
+./install-linux.sh
 ```
 
-In-app updater and the Nightly update channel are Windows-only today.
+That copies binaries to `~/.local/lib/RusticDL/`, puts `rusticdl` on `PATH` (`~/.local/bin/rusticdl`), writes a desktop entry, and registers the browser native messaging host with an absolute path.
+
+Portable (no PATH / desktop entry): extract and run `./rusticdl`. Register the host with `./scripts/register-native-host.sh` or use **Settings → Browser → Register browser host**.
+
+In-app updates replace files in the install prefix (or the portable extract folder). Snap/Flatpak browsers may not see user-level native messaging hosts.
+
+Load the browser extension separately (see [Browser extension](docs/browser-extension.md)).
 
 ### Portable install (ZIP)
 
@@ -138,7 +143,7 @@ Install via **`RusticDL-windows-x64-setup.exe`**, then open **RusticDL** from th
 
 ### Linux tarball
 
-Download **`RusticDL-linux-x64.tar.gz`** from a Nightly pre-release, extract, and run `./rusticdl` (see [Install (Linux)](#install-linux) above).
+Download **`RusticDL-linux-x64.tar.gz`**, extract, and run `./install-linux.sh` (see [Install (Linux)](#install-linux) above).
 
 ### From a portable ZIP
 
