@@ -147,6 +147,37 @@ export function isWeakCaptureExtension(ext: string | undefined): boolean {
   return Boolean(ext && WEAK_CAPTURE_EXTENSIONS.has(ext));
 }
 
+/**
+ * Documents browsers commonly preview in-page (chat widgets, PDF.js, Office
+ * viewers). XHR / plugin fetches of these are not downloads unless the server
+ * marks them `Content-Disposition: attachment`.
+ */
+export const PREVIEWABLE_CAPTURE_EXTENSIONS = new Set([
+  'pdf',
+  'doc',
+  'docx',
+  'ppt',
+  'pptx',
+  'xls',
+  'xlsx',
+]);
+
+const PREVIEWABLE_CAPTURE_MIME = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.ms-excel',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+]);
+
+export function isPreviewableDownload(ext: string | undefined, mime: string | undefined): boolean {
+  if (ext && PREVIEWABLE_CAPTURE_EXTENSIONS.has(ext.toLowerCase())) return true;
+  const normalizedMime = mime?.split(';')[0].trim().toLowerCase();
+  return Boolean(normalizedMime && PREVIEWABLE_CAPTURE_MIME.has(normalizedMime));
+}
+
 /** Page documents / XHR-style payloads — never treat as a file download. */
 export function isPageOrApiMime(mime: string): boolean {
   if (!mime) return false;
