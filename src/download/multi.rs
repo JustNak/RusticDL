@@ -9,15 +9,13 @@ use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::context::TransferContext;
 use super::eta::EtaSmoother;
 use super::fetch::{
-    classify_segment_status, control_outcome, fetch_range, FetchRequest, RangeSpec,
+    classify_segment_status, control_outcome, fetch_range, sleep_interruptible, FetchRequest,
+    RangeSpec, STALL_TIMEOUT,
 };
 use super::filesystem::{
     ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
 };
-use super::http::{
-    progress_percent, reconnect_backoff, run_http_download_with_ctx, sleep_interruptible,
-    RECONNECT_MAX,
-};
+use super::http::{progress_percent, reconnect_backoff, run_http_download_with_ctx, RECONNECT_MAX};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
     TransferMode,
@@ -543,7 +541,7 @@ async fn run_segment_workers(
         }),
     });
 
-    let mut handles = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
     for segment in &map.segments {
         if segment.written >= segment.length() {
             continue;
@@ -563,32 +561,24 @@ async fn run_segment_workers(
             validators: ctx.job.validators.clone(),
         };
         let client = client.clone();
-        handles.push(tokio::spawn(async move { run_segment(client, task).await }));
+        set.spawn(async move { run_segment(client, task).await });
     }
 
-    if handles.is_empty() {
+    if set.is_empty() {
         return Ok((DownloadOutcome::Completed, map));
     }
 
-    let results = futures_util::future::join_all(handles).await;
-    let map = lock_map(&shared.map).clone();
-    ctx.job.reconnect_count = shared.reconnects.load(Ordering::Relaxed);
-    ctx.job.segment_map = Some(map.clone());
-    ctx.job.downloaded_bytes = map.written_sum();
-
-    if let Some(outcome) = control_outcome(&ctx.control) {
-        return Ok((outcome, map));
-    }
-
     let mut first_error = None;
-    for result in results {
+    while let Some(result) = set.join_next().await {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+                set.abort_all();
             }
+            Err(join) if join.is_cancelled() => {}
             Err(join) => {
                 if first_error.is_none() {
                     first_error = Some(download_error(
@@ -597,8 +587,18 @@ async fn run_segment_workers(
                         false,
                     ));
                 }
+                set.abort_all();
             }
         }
+    }
+
+    let map = lock_map(&shared.map).clone();
+    ctx.job.reconnect_count = shared.reconnects.load(Ordering::Relaxed);
+    ctx.job.segment_map = Some(map.clone());
+    ctx.job.downloaded_bytes = map.written_sum();
+
+    if let Some(outcome) = control_outcome(&ctx.control) {
+        return Ok((outcome, map));
     }
 
     if map.segments.iter().all(|s| s.written >= s.length()) {
@@ -700,6 +700,7 @@ async fn run_segment_loop(
             handoff: task.handoff.as_ref(),
             follow_redirects: false,
             control: &task.control,
+            header_timeout: STALL_TIMEOUT,
         })
         .await;
 
@@ -846,12 +847,18 @@ async fn try_segment_reconnect(
     *short_reconnects = next;
     let total = task.shared.reconnects.fetch_add(1, Ordering::Relaxed) + 1;
     emit_progress(task, false);
-    (task.on_progress)(TransferEvent::Tick(ProgressTick {
-        reconnect_count: Some(total),
+    (task.on_progress)(TransferEvent::Tick(reconnect_progress_tick(total)));
+    Ok(true)
+}
+
+fn reconnect_progress_tick(reconnect_count: u32) -> ProgressTick {
+    ProgressTick {
+        speed: Some(0),
+        eta_secs: Some(0),
+        reconnect_count: Some(reconnect_count),
         state_hint: Some(ProgressHint::Starting),
         ..Default::default()
-    }));
-    Ok(true)
+    }
 }
 
 fn mark_segment(shared: &SharedMulti, index: u32, f: impl FnOnce(&mut super::segment::Segment)) {
@@ -987,6 +994,20 @@ mod tests {
             PathBuf::from("C:\\dl\\file.bin"),
             PathBuf::from("C:\\dl\\file.bin.part"),
         )
+    }
+
+    #[test]
+    fn reconnect_tick_zeros_speed_so_merge_cannot_keep_stale_live() {
+        let live = ProgressTick {
+            speed: Some(1_140_000),
+            eta_secs: Some(40),
+            ..Default::default()
+        };
+        let merged = live.merge(reconnect_progress_tick(3));
+        assert_eq!(merged.speed, Some(0));
+        assert_eq!(merged.eta_secs, Some(0));
+        assert_eq!(merged.reconnect_count, Some(3));
+        assert_eq!(merged.state_hint, Some(ProgressHint::Starting));
     }
 
     fn test_ctx(

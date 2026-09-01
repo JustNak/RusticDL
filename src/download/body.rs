@@ -4,22 +4,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::fetch::{control_outcome, format_reqwest_error};
+use super::fetch::{control_outcome, format_reqwest_error, CONTROL_POLL};
 use super::job::{download_error, DownloadError, DownloadOutcome, FailureCategory};
 use super::segment_io::SegmentFileWriter;
 
-pub(crate) const CONTROL_POLL: Duration = Duration::from_millis(200);
-
-/// Shorter than the client `read_timeout` (120s) so a silent TCP/HTTP2 body
-/// does not sit at 98% with a stale live speed. Empty frames that reset
-/// reqwest's read timer do not reset this clock.
-pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) use super::fetch::stall_error;
+pub use super::fetch::STALL_TIMEOUT;
 
 const WRITE_BUF: usize = 256 * 1024;
 
@@ -221,9 +217,39 @@ pub(crate) async fn stream_body_with_stall(
     control: &AtomicU8,
     limiter: &GlobalBandwidthLimiter,
     stall_timeout: Duration,
-    mut on_chunk: impl FnMut(u64),
+    on_chunk: impl FnMut(u64),
 ) -> Result<StreamEnd, DownloadError> {
-    let mut stream = response.bytes_stream();
+    let stream = response.bytes_stream().map(|item| match item {
+        Ok(chunk) => Ok(chunk),
+        Err(error) => {
+            let retryable = error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || error.is_decode();
+            Err(download_error(
+                FailureCategory::Network,
+                format!("Download stream failed: {}", format_reqwest_error(&error)),
+                retryable,
+            ))
+        }
+    });
+    futures_util::pin_mut!(stream);
+    stream_body_loop(stream, sink, control, limiter, stall_timeout, on_chunk).await
+}
+
+pub(crate) async fn stream_body_loop<S, B>(
+    mut stream: S,
+    sink: &mut impl BodySink,
+    control: &AtomicU8,
+    limiter: &GlobalBandwidthLimiter,
+    stall_timeout: Duration,
+    mut on_chunk: impl FnMut(u64),
+) -> Result<StreamEnd, DownloadError>
+where
+    S: Stream<Item = Result<B, DownloadError>> + Unpin,
+    B: AsRef<[u8]>,
+{
     let mut last_byte = Instant::now();
 
     loop {
@@ -232,37 +258,35 @@ pub(crate) async fn stream_body_with_stall(
             return Ok(StreamEnd::Control(outcome));
         }
 
-        tokio::select! {
-            item = stream.next() => {
-                let Some(chunk_result) = item else {
-                    break;
-                };
+        let idle = last_byte.elapsed();
+        if idle >= stall_timeout {
+            sink.flush().await?;
+            return Err(stall_error(stall_timeout));
+        }
+        let wait = stall_timeout.saturating_sub(idle).min(CONTROL_POLL);
 
-                let chunk = match chunk_result {
-                    Ok(c) => c,
-                    Err(error) => {
-                        sink.flush().await?;
-                        let retryable = error.is_timeout()
-                            || error.is_connect()
-                            || error.is_request()
-                            || error.is_body()
-                            || error.is_decode();
-                        return Err(download_error(
-                            FailureCategory::Network,
-                            format!("Download stream failed: {}", format_reqwest_error(&error)),
-                            retryable,
-                        ));
-                    }
-                };
-
-                if chunk.is_empty() {
+        match timeout(wait, stream.next()).await {
+            Err(_elapsed) => {
+                on_chunk(0);
+            }
+            Ok(None) => break,
+            Ok(Some(Err(error))) => {
+                sink.flush().await?;
+                return Err(error);
+            }
+            Ok(Some(Ok(chunk))) => {
+                let data = chunk.as_ref();
+                if data.is_empty() {
+                    on_chunk(0);
+                    // Empty frames are idle. Sleep the remaining poll slice so a
+                    // ready empty stream cannot starve the stall clock or the runtime.
+                    sleep(wait).await;
                     continue;
                 }
 
+                let acquired = limiter.acquire(data.len(), Some(control)).await;
+                let n = sink.write_chunk(data).await?;
                 last_byte = Instant::now();
-
-                let acquired = limiter.acquire(chunk.len(), Some(control)).await;
-                let n = sink.write_chunk(&chunk).await?;
                 if n > 0 {
                     on_chunk(n as u64);
                 }
@@ -273,16 +297,9 @@ pub(crate) async fn stream_body_with_stall(
                     return Ok(StreamEnd::Control(outcome));
                 }
 
-                if n == 0 || n < chunk.len() {
+                if n == 0 || n < data.len() {
                     break;
                 }
-            }
-            _ = sleep(CONTROL_POLL) => {
-                if last_byte.elapsed() >= stall_timeout {
-                    sink.flush().await?;
-                    return Err(stall_error(stall_timeout));
-                }
-                on_chunk(0);
             }
         }
     }
@@ -313,14 +330,6 @@ fn disk_write_error(error: std::io::Error) -> DownloadError {
         FailureCategory::Disk,
         format!("Could not write download data: {error}"),
         false,
-    )
-}
-
-pub(crate) fn stall_error(idle: Duration) -> DownloadError {
-    download_error(
-        FailureCategory::Network,
-        format!("Download stalled (no data for {}s).", idle.as_secs().max(1)),
-        true,
     )
 }
 
@@ -676,6 +685,77 @@ mod tests {
             "idle polls must emit zero-byte ticks so UI speed can drop, got {ticks:?}"
         );
         drop(hold);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn empty_chunk_flood_still_stalls() {
+        let stream = futures_util::stream::iter(
+            std::iter::once(Ok::<Vec<u8>, DownloadError>(b"head".to_vec()))
+                .chain(std::iter::repeat(Ok(Vec::new()))),
+        );
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-empty-flood-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap().with_target(1000);
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_body_loop(
+                stream,
+                &mut sink,
+                &control,
+                limiter.as_ref(),
+                Duration::from_millis(80),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("empty-chunk flood must not hang")
+        .expect_err("empty chunks must not reset the stall clock");
+        assert!(err.message.contains("Download stalled"));
+        assert_eq!(sink.offset(), b"head".len() as u64);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn limiter_wait_does_not_count_as_stall() {
+        let limiter = GlobalBandwidthLimiter::new(Some(200));
+        assert!(
+            limiter
+                .acquire(GlobalBandwidthLimiter::MAX_ACQUIRE_QUANTUM, None)
+                .await
+        );
+        let stream = futures_util::stream::iter([
+            Ok::<Vec<u8>, DownloadError>(vec![1u8; 64]),
+            Ok(vec![2u8; 64]),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-throttle-stall-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap().with_target(128);
+        let control = AtomicU8::new(0);
+        let end = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_body_loop(
+                stream,
+                &mut sink,
+                &control,
+                limiter.as_ref(),
+                Duration::from_millis(80),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("throttled write must finish")
+        .expect("must not stall while waiting on the limiter");
+        match end {
+            StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, 128),
+            StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
+        }
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

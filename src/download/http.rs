@@ -3,16 +3,16 @@ use reqwest::StatusCode;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{stream_body, AppendSink, StreamEnd, CONTROL_POLL};
+use super::body::{stream_body, AppendSink, StreamEnd};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
 use super::eta::EtaSmoother;
 use super::fetch::{
-    content_range_size_mismatch, fetch_range, FetchRequest, RangeSpec, RangeStatus,
+    content_range_size_mismatch, fetch_range, sleep_interruptible, FetchRequest, RangeSpec,
+    RangeStatus, STALL_TIMEOUT,
 };
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
@@ -150,6 +150,7 @@ pub async fn run_http_download_with_ctx(
             handoff: handoff_auth.as_ref(),
             follow_redirects: true,
             control: &control,
+            header_timeout: STALL_TIMEOUT,
         })
         .await;
 
@@ -647,24 +648,6 @@ pub(crate) fn reconnect_backoff(attempt_1_based: u32) -> Duration {
     Duration::from_millis(ms.min(RECONNECT_CAP.as_millis() as u64))
 }
 
-pub(crate) async fn sleep_interruptible(
-    control: &AtomicU8,
-    total: Duration,
-) -> Option<DownloadOutcome> {
-    let deadline = tokio::time::Instant::now() + total;
-    loop {
-        if let Some(outcome) = control_outcome(control) {
-            return Some(outcome);
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return None;
-        }
-        let slice = (deadline - now).min(CONTROL_POLL);
-        sleep(slice).await;
-    }
-}
-
 async fn refresh_reconnect_offset(
     transfer_format_version: u32,
     tracked_downloaded: u64,
@@ -866,10 +849,9 @@ fn filename_from_response_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fetch::{CONTROL_CANCELED, CONTROL_CONTINUE, CONTROL_PAUSED};
+    use super::super::fetch::CONTROL_CONTINUE;
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn progress_clamps() {
@@ -1170,39 +1152,6 @@ mod tests {
         assert!(ranges_usable_for_reconnect(0, true));
         assert!(ranges_usable_for_reconnect(10, true));
         assert!(!ranges_usable_for_reconnect(10, false));
-    }
-
-    #[tokio::test]
-    async fn sleep_interruptible_respects_cancel() {
-        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
-        let control_sleep = control.clone();
-        let sleeper = tokio::spawn(async move {
-            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
-        });
-        sleep(Duration::from_millis(20)).await;
-        control.store(CONTROL_CANCELED, Ordering::Relaxed);
-        let outcome = sleeper.await.expect("join");
-        assert_eq!(outcome, Some(DownloadOutcome::Canceled));
-    }
-
-    #[tokio::test]
-    async fn sleep_interruptible_respects_pause() {
-        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
-        let control_sleep = control.clone();
-        let sleeper = tokio::spawn(async move {
-            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
-        });
-        sleep(Duration::from_millis(20)).await;
-        control.store(CONTROL_PAUSED, Ordering::Relaxed);
-        let outcome = sleeper.await.expect("join");
-        assert_eq!(outcome, Some(DownloadOutcome::Paused));
-    }
-
-    #[tokio::test]
-    async fn sleep_interruptible_completes_without_control() {
-        let control = AtomicU8::new(CONTROL_CONTINUE);
-        let outcome = sleep_interruptible(&control, Duration::from_millis(30)).await;
-        assert!(outcome.is_none());
     }
 
     #[test]
