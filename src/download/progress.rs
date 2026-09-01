@@ -323,6 +323,27 @@ mod tests {
     }
 
     #[test]
+    fn merge_zero_speed_clears_stale_live_sample() {
+        let live = ProgressTick {
+            speed: Some(1_140_000),
+            eta_secs: Some(12),
+            ..Default::default()
+        };
+        let reconnect = ProgressTick {
+            speed: Some(0),
+            eta_secs: Some(0),
+            reconnect_count: Some(1),
+            state_hint: Some(ProgressHint::Starting),
+            ..Default::default()
+        };
+        let merged = live.merge(reconnect);
+        assert_eq!(merged.speed, Some(0));
+        assert_eq!(merged.eta_secs, Some(0));
+        assert_eq!(merged.reconnect_count, Some(1));
+        assert_eq!(merged.state_hint, Some(ProgressHint::Starting));
+    }
+
+    #[test]
     fn downloading_tick_sets_scalars_only() {
         let tick = ProgressTick::downloading(25, 100, 10, 7, 25.0);
         assert_eq!(tick.downloaded_bytes, Some(25));

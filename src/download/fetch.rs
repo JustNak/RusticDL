@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT_ENCODING, IF_RANGE, RANGE, REFERER};
 use reqwest::{Client, StatusCode, Version};
+use tokio::time::sleep;
 
 use super::client::referer_for_url;
 use super::filesystem::parse_content_range;
@@ -16,6 +17,12 @@ use super::job::{
 
 pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const MAX_REDIRECTS: u32 = 10;
+
+/// Shorter than the client `read_timeout` (120s) so a silent TCP/HTTP2 body
+/// or header wait does not sit at 98% with a stale live speed.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONTROL_POLL: Duration = Duration::from_millis(200);
+const HEADER_CONTROL_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) const CONTROL_CONTINUE: u8 = 0;
 pub(crate) const CONTROL_PAUSED: u8 = 1;
@@ -36,6 +43,44 @@ pub fn store_control(control: &AtomicU8, value: WorkerControl) {
         WorkerControl::Canceled => CONTROL_CANCELED,
     };
     control.store(raw, Ordering::Relaxed);
+}
+
+pub(crate) fn stall_error(idle: Duration) -> DownloadError {
+    download_error(
+        FailureCategory::Network,
+        format!("Download stalled (no data for {}s).", idle.as_secs().max(1)),
+        true,
+    )
+}
+
+pub(crate) fn download_error_from_control(outcome: DownloadOutcome) -> DownloadError {
+    download_error(
+        FailureCategory::Internal,
+        match outcome {
+            DownloadOutcome::Paused => "Download paused.".into(),
+            DownloadOutcome::Canceled => "Download canceled.".into(),
+            DownloadOutcome::Completed => "Interrupted.".into(),
+        },
+        false,
+    )
+}
+
+pub(crate) async fn sleep_interruptible(
+    control: &AtomicU8,
+    total: Duration,
+) -> Option<DownloadOutcome> {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        if let Some(outcome) = control_outcome(control) {
+            return Some(outcome);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let slice = (deadline - now).min(CONTROL_POLL);
+        sleep(slice).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +106,7 @@ pub struct FetchRequest<'a> {
     pub handoff: Option<&'a HandoffAuth>,
     pub follow_redirects: bool,
     pub control: &'a AtomicU8,
+    pub header_timeout: Duration,
 }
 
 pub struct FetchOutcome {
@@ -109,8 +155,20 @@ pub async fn fetch_range(req: FetchRequest<'_>) -> Result<FetchOutcome, Download
             let range = req.range;
             let validators = req.validators;
             let handoff = req.handoff;
+            let control = req.control;
+            let header_timeout = req.header_timeout;
             async move {
-                send_transfer_get(client, job_url, &current, range, validators, handoff).await
+                send_transfer_get(
+                    client,
+                    job_url,
+                    &current,
+                    range,
+                    validators,
+                    handoff,
+                    control,
+                    header_timeout,
+                )
+                .await
             }
         })
         .await?
@@ -122,6 +180,8 @@ pub async fn fetch_range(req: FetchRequest<'_>) -> Result<FetchOutcome, Download
             req.range,
             req.validators,
             req.handoff,
+            req.control,
+            req.header_timeout,
         )
         .await?;
         if response.status().is_redirection() {
@@ -156,15 +216,7 @@ where
 
     loop {
         if let Some(outcome) = control_outcome(control) {
-            return Err(download_error(
-                FailureCategory::Internal,
-                match outcome {
-                    DownloadOutcome::Paused => "Download paused.".into(),
-                    DownloadOutcome::Canceled => "Download canceled.".into(),
-                    DownloadOutcome::Completed => "Interrupted.".into(),
-                },
-                false,
-            ));
+            return Err(download_error_from_control(outcome));
         }
 
         let response = send_once(&current).await?;
@@ -384,6 +436,49 @@ fn range_kind(range: RangeSpec) -> TransferRequestKind {
     }
 }
 
+enum HeaderSendError {
+    Reqwest(reqwest::Error),
+    Stalled,
+    Control(DownloadOutcome),
+}
+
+async fn send_with_header_stall(
+    builder: reqwest::RequestBuilder,
+    control: &AtomicU8,
+    header_timeout: Duration,
+) -> Result<reqwest::Response, HeaderSendError> {
+    if let Some(outcome) = control_outcome(control) {
+        return Err(HeaderSendError::Control(outcome));
+    }
+    let send = builder.send();
+    tokio::pin!(send);
+    let deadline = tokio::time::Instant::now() + header_timeout;
+    loop {
+        if let Some(outcome) = control_outcome(control) {
+            return Err(HeaderSendError::Control(outcome));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(HeaderSendError::Stalled);
+        }
+        let slice = (deadline - now).min(HEADER_CONTROL_POLL);
+        tokio::select! {
+            result = send.as_mut() => {
+                return result.map_err(HeaderSendError::Reqwest);
+            }
+            _ = sleep(slice) => {}
+        }
+    }
+}
+
+fn map_header_send_error(error: HeaderSendError, header_timeout: Duration) -> DownloadError {
+    match error {
+        HeaderSendError::Reqwest(error) => connect_error_tcp(&error),
+        HeaderSendError::Stalled => stall_error(header_timeout),
+        HeaderSendError::Control(outcome) => download_error_from_control(outcome),
+    }
+}
+
 async fn send_transfer_get(
     client: &Client,
     job_url: &str,
@@ -391,32 +486,47 @@ async fn send_transfer_get(
     range: RangeSpec,
     validators: &ContentValidators,
     handoff: Option<&HandoffAuth>,
+    control: &AtomicU8,
+    header_timeout: Duration,
 ) -> Result<reqwest::Response, DownloadError> {
-    let primary = apply_if_range(
-        build_transfer_request(client, range_kind(range), job_url, url, handoff),
-        range.start(),
-        validators,
+    let primary = send_with_header_stall(
+        apply_if_range(
+            build_transfer_request(client, range_kind(range), job_url, url, handoff),
+            range.start(),
+            validators,
+        ),
+        control,
+        header_timeout,
     )
-    .send()
     .await;
 
     match primary {
         Ok(response) => Ok(response),
-        Err(error) if should_try_http3(&error) && url.starts_with("https://") => {
-            match apply_if_range(
-                build_transfer_request(client, range_kind(range), job_url, url, handoff),
-                range.start(),
-                validators,
+        Err(HeaderSendError::Control(outcome)) => Err(download_error_from_control(outcome)),
+        Err(HeaderSendError::Stalled) => Err(stall_error(header_timeout)),
+        Err(HeaderSendError::Reqwest(error))
+            if should_try_http3(&error) && url.starts_with("https://") =>
+        {
+            match send_with_header_stall(
+                apply_if_range(
+                    build_transfer_request(client, range_kind(range), job_url, url, handoff),
+                    range.start(),
+                    validators,
+                )
+                .version(Version::HTTP_3),
+                control,
+                header_timeout,
             )
-            .version(Version::HTTP_3)
-            .send()
             .await
             {
                 Ok(response) => Ok(response),
-                Err(http3_error) => Err(connect_error_tcp_and_h3(&error, &http3_error)),
+                Err(HeaderSendError::Reqwest(http3_error)) => {
+                    Err(connect_error_tcp_and_h3(&error, &http3_error))
+                }
+                Err(other) => Err(map_header_send_error(other, header_timeout)),
             }
         }
-        Err(error) => Err(connect_error_tcp(&error)),
+        Err(HeaderSendError::Reqwest(error)) => Err(connect_error_tcp(&error)),
     }
 }
 
@@ -464,21 +574,28 @@ fn classify_range_status(response: &reqwest::Response, requested_start: u64) -> 
 }
 
 fn should_try_http3(error: &reqwest::Error) -> bool {
-    should_try_http3_flags(
-        error.is_connect(),
+    should_try_http3_decision(
         error.is_timeout(),
+        error.is_connect(),
         error.is_request(),
         &format_error_chain(error),
     )
 }
 
-fn should_try_http3_flags(
-    is_connect: bool,
+fn should_try_http3_decision(
     is_timeout: bool,
+    is_connect: bool,
     is_request: bool,
     chain: &str,
 ) -> bool {
-    is_connect || is_timeout || is_request || looks_like_tls_failure_text(chain)
+    if is_timeout {
+        return false;
+    }
+    should_try_http3_flags(is_connect, is_request, chain)
+}
+
+fn should_try_http3_flags(is_connect: bool, is_request: bool, chain: &str) -> bool {
+    is_connect || is_request || looks_like_tls_failure_text(chain)
 }
 
 fn looks_like_tls_failure_text(text: &str) -> bool {
@@ -646,10 +763,11 @@ mod tests {
     use crate::download::client::download_client;
     use crate::download::handoff::{HandoffAuth, HandoffAuthHeader};
     use reqwest::header::{IF_RANGE, RANGE};
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     async fn spawn_scripted_server(
         replies: Vec<String>,
@@ -715,6 +833,7 @@ mod tests {
             handoff,
             follow_redirects,
             control,
+            header_timeout: STALL_TIMEOUT,
         }
     }
 
@@ -730,27 +849,10 @@ mod tests {
     }
 
     #[test]
-    fn http3_fallback_triggers_on_connect_timeout_request_and_tls() {
+    fn http3_fallback_triggers_on_connect_request_and_tls_not_timeout() {
+        assert!(should_try_http3_flags(true, false, "connection refused"));
+        assert!(should_try_http3_flags(false, true, "connection refused"));
         assert!(should_try_http3_flags(
-            true,
-            false,
-            false,
-            "connection refused"
-        ));
-        assert!(should_try_http3_flags(
-            false,
-            true,
-            false,
-            "connection refused"
-        ));
-        assert!(should_try_http3_flags(
-            false,
-            false,
-            true,
-            "connection refused"
-        ));
-        assert!(should_try_http3_flags(
-            false,
             false,
             false,
             "error sending request (received corrupt message of type InvalidContentType)"
@@ -758,14 +860,14 @@ mod tests {
         assert!(should_try_http3_flags(
             false,
             false,
-            false,
             "TLS handshake failure"
         ));
-        assert!(!should_try_http3_flags(
-            false,
-            false,
-            false,
-            "connection refused"
+        assert!(!should_try_http3_flags(false, false, "connection refused"));
+        assert!(!should_try_http3_decision(
+            true,
+            true,
+            true,
+            "TLS handshake failure"
         ));
         assert!(looks_like_tls_failure_text(
             "error sending request (received corrupt message of type InvalidContentType)"
@@ -1186,6 +1288,7 @@ Content-Length: 4\r\n\
             handoff: Some(&auth),
             follow_redirects: true,
             control: &control,
+            header_timeout: STALL_TIMEOUT,
         })
         .await
         .expect("fetch");
@@ -1233,6 +1336,7 @@ Content-Length: 1\r\n\
             handoff: Some(&auth),
             follow_redirects: true,
             control: &control,
+            header_timeout: STALL_TIMEOUT,
         })
         .await
         .expect("fetch");
@@ -1282,6 +1386,7 @@ Content-Length: 1\r\n\
             handoff: Some(&auth),
             follow_redirects: true,
             control: &control,
+            header_timeout: STALL_TIMEOUT,
         })
         .await
         .expect("fetch");
@@ -1295,5 +1400,134 @@ Content-Length: 1\r\n\
             !lower.contains("canvas=secret"),
             "Canvas cookie must not leak to Drive origin:\n{recorded}"
         );
+    }
+
+    async fn spawn_accept_hold() -> (String, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut collected = Vec::new();
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = release_rx.await;
+            drop(socket);
+        });
+        (format!("http://{addr}/file.bin"), release_tx)
+    }
+
+    #[tokio::test]
+    async fn fetch_range_silent_headers_is_retryable_stall() {
+        let (url, hold) = spawn_accept_hold().await;
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(CONTROL_CONTINUE);
+        let validators = ContentValidators::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_range(FetchRequest {
+                client: &client,
+                job_url: &url,
+                url: &url,
+                range: RangeSpec::Open { start: 0 },
+                validators: &validators,
+                handoff: None,
+                follow_redirects: true,
+                control: &control,
+                header_timeout: Duration::from_millis(80),
+            }),
+        )
+        .await
+        .expect("header stall should fire well before 2s");
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("silent headers must stall, not hang"),
+        };
+        assert_eq!(err.category, FailureCategory::Network);
+        assert!(err.retryable);
+        assert!(err.message.contains("Download stalled"));
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_pause_during_header_wait_returns_promptly() {
+        let (url, hold) = spawn_accept_hold().await;
+        let client = download_client().unwrap();
+        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
+        let validators = ContentValidators::default();
+        let control_fetch = control.clone();
+        let url_fetch = url.clone();
+        let fetch = tokio::spawn(async move {
+            fetch_range(FetchRequest {
+                client: &client,
+                job_url: &url_fetch,
+                url: &url_fetch,
+                range: RangeSpec::Open { start: 0 },
+                validators: &validators,
+                handoff: None,
+                follow_redirects: true,
+                control: control_fetch.as_ref(),
+                header_timeout: Duration::from_secs(30),
+            })
+            .await
+        });
+        sleep(Duration::from_millis(30)).await;
+        control.store(CONTROL_PAUSED, Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(1), fetch)
+            .await
+            .expect("pause must interrupt header wait")
+            .expect("join");
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("paused fetch returns an error the caller maps to Paused"),
+        };
+        assert_eq!(err.category, FailureCategory::Internal);
+        assert!(!err.retryable);
+        assert!(err.message.contains("paused"));
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn sleep_interruptible_respects_cancel() {
+        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
+        let control_sleep = control.clone();
+        let sleeper = tokio::spawn(async move {
+            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
+        });
+        sleep(Duration::from_millis(20)).await;
+        control.store(CONTROL_CANCELED, Ordering::Relaxed);
+        let outcome = sleeper.await.expect("join");
+        assert_eq!(outcome, Some(DownloadOutcome::Canceled));
+    }
+
+    #[tokio::test]
+    async fn sleep_interruptible_respects_pause() {
+        let control = Arc::new(AtomicU8::new(CONTROL_CONTINUE));
+        let control_sleep = control.clone();
+        let sleeper = tokio::spawn(async move {
+            sleep_interruptible(control_sleep.as_ref(), Duration::from_secs(30)).await
+        });
+        sleep(Duration::from_millis(20)).await;
+        control.store(CONTROL_PAUSED, Ordering::Relaxed);
+        let outcome = sleeper.await.expect("join");
+        assert_eq!(outcome, Some(DownloadOutcome::Paused));
+    }
+
+    #[tokio::test]
+    async fn sleep_interruptible_completes_without_control() {
+        let control = AtomicU8::new(CONTROL_CONTINUE);
+        let outcome = sleep_interruptible(&control, Duration::from_millis(30)).await;
+        assert!(outcome.is_none());
     }
 }

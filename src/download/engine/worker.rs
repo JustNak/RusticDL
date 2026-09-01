@@ -3,13 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 use super::super::bandwidth::GlobalBandwidthLimiter;
 use super::super::context::TransferContext;
+use super::super::fetch::{sleep_interruptible, store_control};
 use super::super::filesystem::{metadata_len, reconcile_from_oracle, remove_partial};
 use super::super::handoff::HandoffAuth;
-use super::super::http::store_control;
 use super::super::job::{DownloadError, DownloadOutcome, Job, JobState, WorkerControl};
 use super::super::progress::{TransferEvent, TransferEventCallback};
 use super::super::resume::{resume_oracle, ResumeOracle};
@@ -140,9 +139,9 @@ async fn run_attempts(
                             emit_jobs_locked(&guard);
                         }
                     }
-                    sleep(delay).await;
-                    if control.load(Ordering::Relaxed) != 0 {
-                        break Err(error);
+                    match sleep_interruptible(&control, delay).await {
+                        Some(outcome) => break Ok(outcome),
+                        None => {}
                     }
                     {
                         let guard = inner.lock().await;
@@ -302,5 +301,35 @@ pub(super) async fn finalize_worker(
         guard.pending_partial_deletes.remove(job_id);
         guard.requeue_on_cancel.remove(job_id);
         guard.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::download::fetch::{sleep_interruptible, CONTROL_PAUSED};
+    use std::sync::atomic::AtomicU8;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn retry_delay_pause_returns_paused_without_waiting_full_delay() {
+        let control = Arc::new(AtomicU8::new(0));
+        let control_wait = control.clone();
+        let waiter = tokio::spawn(async move {
+            match sleep_interruptible(control_wait.as_ref(), Duration::from_secs(45)).await {
+                Some(outcome) => Ok(outcome),
+                None => Err("delay completed"),
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control.store(CONTROL_PAUSED, Ordering::Relaxed);
+        let outcome = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("pause must interrupt retry delay")
+            .expect("join")
+            .expect("Paused");
+        assert_eq!(outcome, DownloadOutcome::Paused);
     }
 }
