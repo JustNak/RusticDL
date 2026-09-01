@@ -5,6 +5,7 @@ use gpui_component::{
     h_flex, v_flex, ActiveTheme, Disableable, Sizable, WindowExt,
 };
 
+use super::dialog_layout::dialog_margin_top_in;
 use super::DownloadApp;
 use crate::branding::{APP_NAME, APP_VERSION};
 use crate::updater::open_release_page;
@@ -20,10 +21,7 @@ impl DownloadApp {
             let muted = theme.muted_foreground;
             let app_view_check = app_view.clone();
 
-            let est_h = 320.0;
-            let view_h = window.viewport_size().height.to_f64() as f32;
-            let max_top = (view_h - est_h - 20.0).max(24.0);
-            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
+            let margin_top = dialog_margin_top_in(window, 320.0);
 
             dialog
                 .title(format!("About {APP_NAME}"))

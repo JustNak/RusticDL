@@ -139,7 +139,7 @@ impl BrowserPromptWindow {
             self.canceling = true;
             self.engine.send(EngineCommand::Cancel {
                 id: id.clone(),
-                delete_partial: false,
+                delete_partial: true,
             });
             self.release_ownership();
             window.remove_window();

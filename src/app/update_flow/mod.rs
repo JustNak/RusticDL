@@ -12,6 +12,7 @@ use gpui_component::{
     v_flex, ActiveTheme, Sizable, WindowExt,
 };
 
+use super::dialog_layout::dialog_margin_top_in;
 use super::toast::{ToastActionKind, ToastKind};
 use super::DownloadApp;
 use crate::branding::{APP_VERSION, UPDATER_NAME};
@@ -179,9 +180,7 @@ impl DownloadApp {
             } else {
                 200.0
             };
-            let view_h = window.viewport_size().height.to_f64() as f32;
-            let max_top = (view_h - est_h - 20.0).max(24.0);
-            let margin_top = ((view_h - est_h) * 0.5).clamp(24.0, max_top);
+            let margin_top = dialog_margin_top_in(window, est_h);
 
             let mut body = v_flex().gap_2().child(
                 div()
