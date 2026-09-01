@@ -1,14 +1,21 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use gpui::{div, Context, ParentElement, Styled, Window};
+use gpui::{div, px, Context, ParentElement, Styled, Window};
 use gpui_component::{
     button::ButtonVariant, dialog::DialogButtonProps, v_flex, ActiveTheme, WindowExt,
 };
 
 use super::add_dialog::enqueue_urls;
+use super::dialog_layout::dialog_margin_top_in;
 use super::DownloadApp;
 use crate::download::EngineCommand;
+
+const CONFIRM_DIALOG_W: f32 = 420.0;
+const CONFIRM_TWO_LINE_H: f32 = 200.0;
+const CONFIRM_ONE_LINE_H: f32 = 180.0;
+const CONFIRM_RESET_H: f32 = 240.0;
+const CONFIRM_CLIPBOARD_H: f32 = 280.0;
 
 pub(crate) fn clipboard_urls_key(urls: &[String]) -> u64 {
     let mut sorted: Vec<&str> = urls.iter().map(String::as_str).collect();
@@ -30,15 +37,19 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         let engine = self.engine.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let id = id.clone();
-            let muted = cx.theme().muted_foreground;
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
             dialog
                 .title("Remove download?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_TWO_LINE_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Remove")
@@ -75,15 +86,19 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         let engine = self.engine.clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let id = id.clone();
-            let muted = cx.theme().muted_foreground;
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
             dialog
                 .title("Delete downloaded file?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_TWO_LINE_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete file")
@@ -125,18 +140,21 @@ impl DownloadApp {
 
         let engine = self.engine.clone();
         let count = ids.len();
-        let muted = cx.theme().muted_foreground;
         let body = format!("Remove {count} selected item(s) from the queue?");
         let note = "Downloaded files are kept. Leftover .part files are deleted. Active downloads are left alone.";
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let ids = ids.clone();
+            let theme = cx.theme().clone();
             dialog
                 .title("Remove selected downloads?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_TWO_LINE_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Remove")
@@ -146,7 +164,12 @@ impl DownloadApp {
                     v_flex()
                         .gap_2()
                         .child(div().text_sm().child(body.clone()))
-                        .child(div().text_xs().text_color(muted).child(note)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(note),
+                        ),
                 )
                 .on_ok(move |_, _, _| {
                     for id in &ids {
@@ -176,19 +199,22 @@ impl DownloadApp {
 
         let engine = self.engine.clone();
         let count = ids.len();
-        let muted = cx.theme().muted_foreground;
         let body =
             format!("Delete {count} selected file(s) from disk and remove them from the queue?");
         let note = "This cannot be undone. Leftover .part files are also removed. Active downloads are left alone.";
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let ids = ids.clone();
+            let theme = cx.theme().clone();
             dialog
                 .title("Delete selected files?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_TWO_LINE_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Delete files")
@@ -198,7 +224,12 @@ impl DownloadApp {
                     v_flex()
                         .gap_2()
                         .child(div().text_sm().child(body.clone()))
-                        .child(div().text_xs().text_color(muted).child(note)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(note),
+                        ),
                 )
                 .on_ok(move |_, _, _| {
                     for id in &ids {
@@ -232,15 +263,19 @@ impl DownloadApp {
             "Remove {count} finished item(s) from the queue? Active downloads stay. Files on disk are kept."
         );
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let ids = ids.clone();
             let body = body.clone();
+            let theme = cx.theme().clone();
             dialog
                 .title("Clear all finished downloads?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_ONE_LINE_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Clear all")
@@ -266,14 +301,18 @@ impl DownloadApp {
         cx: &mut Context<Self>,
     ) {
         let app_view = cx.entity().clone();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let app_view = app_view.clone();
-            let muted = cx.theme().muted_foreground;
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
             dialog
                 .title("Reset settings to defaults?")
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_RESET_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(DialogButtonProps::default().ok_text("Reset defaults"))
                 .child(
                     v_flex()
@@ -344,19 +383,23 @@ impl DownloadApp {
         let settings = self.settings.clone();
         let app_view = cx.entity().clone();
 
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let engine = engine.clone();
             let urls = urls.clone();
             let settings = settings.clone();
             let app_view = app_view.clone();
             let title = title.clone();
             let body = body.clone();
-            let muted = cx.theme().muted_foreground;
+            let theme = cx.theme().clone();
+            let muted = theme.muted_foreground;
             dialog
                 .title(title)
                 .confirm()
                 .overlay_closable(true)
                 .keyboard(true)
+                .w(px(CONFIRM_DIALOG_W))
+                .margin_top(px(dialog_margin_top_in(window, CONFIRM_CLIPBOARD_H)))
+                .border_color(theme.border.opacity(0.32))
                 .button_props(DialogButtonProps::default().ok_text(if count == 1 {
                     "Add download"
                 } else {

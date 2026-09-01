@@ -14,6 +14,7 @@ use gpui_component::{
     v_flex, ActiveTheme, Icon, IconName, Root, Sizable, StyledExt, WindowExt,
 };
 
+use super::dialog_layout::dialog_margin_top_in;
 use super::widgets::{browse_directory, field_hint, field_label, shorten_path_display};
 use super::DownloadApp;
 use crate::download::{
@@ -28,11 +29,6 @@ fn estimated_dialog_height(is_advanced: bool, is_multi: bool) -> f32 {
         (false, true) => 400.0,
         (false, false) => 280.0,
     }
-}
-
-fn dialog_margin_top(view_h: f32, est_h: f32) -> f32 {
-    let max_top = (view_h - est_h - 20.0).max(24.0);
-    ((view_h - est_h) * 0.5).clamp(24.0, max_top)
 }
 
 fn preferred_filename(url: &str, override_name: Option<&str>) -> String {
@@ -212,9 +208,8 @@ impl DownloadApp {
                     settings_preview.resolve_save_directory(&preview_name, preview_explicit);
                 let save_preview = shorten_path_display(&save_dest.to_string_lossy());
 
-                let est_h = estimated_dialog_height(is_advanced, is_multi);
-                let view_h = window.viewport_size().height.to_f64() as f32;
-                let margin_top = dialog_margin_top(view_h, est_h);
+                let margin_top =
+                    dialog_margin_top_in(window, estimated_dialog_height(is_advanced, is_multi));
 
                 dialog
                     .title("Add download")

@@ -3,6 +3,7 @@ mod add_dialog;
 mod browser_capture;
 mod confirm_dialogs;
 mod detail;
+mod dialog_layout;
 mod filter;
 mod job_row;
 mod jobs_ui;

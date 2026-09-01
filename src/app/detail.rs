@@ -475,7 +475,7 @@ pub(crate) fn render_detail(
                                                 .on_click(cx.listener(move |this, _, _, _| {
                                                     this.engine.send(EngineCommand::Cancel {
                                                         id: id.clone(),
-                                                        delete_partial: false,
+                                                        delete_partial: true,
                                                     });
                                                 })),
                                         )
