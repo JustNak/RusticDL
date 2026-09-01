@@ -36,7 +36,7 @@ Get the latest Windows build from GitHub Releases:
 
 Linux builds ship as **`RusticDL-linux-x64.tar.gz`** on [Stable](https://github.com/JustNak/RusticDL/releases/latest) and [Nightly](https://github.com/JustNak/RusticDL/releases) (app + native host + updater).
 
-Nightly (unsigned, may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
+Nightly (may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
 
 | Asset | What it contains |
 | --- | --- |
@@ -57,7 +57,7 @@ The installer places files under `%LOCALAPPDATA%\RusticDL\`, creates a Start Men
 
 Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & Features (optionally remove app data).
 
-> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see [Browser extension](docs/browser-extension.md)). SmartScreen may warn on unsigned builds until code signing is added.
+> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see [Browser extension](docs/browser-extension.md)). Stable and Nightly Windows installers are Authenticode-signed via Azure Trusted Signing. Local source builds are unsigned.
 
 ### Install (Linux)
 

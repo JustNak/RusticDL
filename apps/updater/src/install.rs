@@ -221,12 +221,38 @@ fn win_verify_trust_authenticode(path: &Path) -> Result<(), String> {
     if status == 0 {
         Ok(())
     } else {
-        Err(format!(
-            "Installer rejected: Authenticode verification failed (WinVerifyTrust status 0x{:08X}). \
-The update is unsigned, tampered, or not trusted. Install manually from the release page.",
-            status as u32
-        ))
+        Err(authenticode_failure_message(status as u32))
     }
+}
+
+/// WinVerifyTrust HRESULT → user-facing reject (still fail closed).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn authenticode_failure_message(status: u32) -> String {
+    // TRUST_E_NOSIGNATURE / TRUST_E_BAD_DIGEST / CERT_E_* (winerror.h).
+    const TRUST_E_NOSIGNATURE: u32 = 0x800B_0100;
+    const TRUST_E_BAD_DIGEST: u32 = 0x8009_6010;
+    const TRUST_E_SUBJECT_NOT_TRUSTED: u32 = 0x800B_0004;
+    const CERT_E_EXPIRED: u32 = 0x800B_0101;
+    const CERT_E_UNTRUSTEDROOT: u32 = 0x800B_0109;
+    const CERT_E_CHAINING: u32 = 0x800B_010A;
+    const TRUST_E_EXPLICIT_DISTRUST: u32 = 0x800B_0111;
+
+    let detail = match status {
+        TRUST_E_NOSIGNATURE => "The installer is unsigned.",
+        TRUST_E_BAD_DIGEST => {
+            "The installer signature does not match the file (tampered or corrupt)."
+        }
+        CERT_E_EXPIRED => "The installer signing certificate has expired.",
+        TRUST_E_SUBJECT_NOT_TRUSTED
+        | CERT_E_UNTRUSTEDROOT
+        | CERT_E_CHAINING
+        | TRUST_E_EXPLICIT_DISTRUST => "The installer is signed but not trusted by this PC.",
+        _ => "The update is unsigned, tampered, or not trusted.",
+    };
+    format!(
+        "Installer rejected: Authenticode verification failed (WinVerifyTrust status 0x{status:08X}). \
+{detail} Install manually from the release page."
+    )
 }
 
 #[cfg(windows)]
@@ -383,6 +409,35 @@ mod tests {
             !err.contains("Could not start installer"),
             "execute-without-Authenticode: must fail closed before Command / ShellExecute, got {err:?}"
         );
+    }
+
+    #[test]
+    fn authenticode_failure_message_distinguishes_unsigned_and_untrusted() {
+        let unsigned = authenticode_failure_message(0x800B_0100);
+        assert!(
+            unsigned.contains("unsigned") && unsigned.contains("0x800B0100"),
+            "missing signature must name unsigned, got {unsigned:?}"
+        );
+        let bad_digest = authenticode_failure_message(0x8009_6010);
+        assert!(
+            bad_digest.contains("tampered") && bad_digest.contains("0x80096010"),
+            "bad digest must name tamper, got {bad_digest:?}"
+        );
+        let untrusted = authenticode_failure_message(0x800B_0109);
+        assert!(
+            untrusted.contains("not trusted") && untrusted.contains("0x800B0109"),
+            "untrusted root must say not trusted, got {untrusted:?}"
+        );
+        for msg in [&unsigned, &bad_digest, &untrusted] {
+            assert!(
+                msg.contains("Authenticode") && msg.contains("WinVerifyTrust"),
+                "fail-closed copy must keep Authenticode/WinVerifyTrust, got {msg:?}"
+            );
+            assert!(
+                msg.contains("release page"),
+                "hard verify failure still offers the release page, got {msg:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
