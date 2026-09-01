@@ -376,6 +376,84 @@ assert(
   })?.reason === 'download_mime_navigation',
 );
 
+// --- In-page PDF / Office preview fetches (Grok, chat widgets, PDF.js) ---
+const grokPdf = {
+  url: 'https://assets.grok.com/users/f0123456789abcdef4a6f7536f/MPC-Operating-Plan.pdf',
+  type: 'xmlhttprequest',
+  method: 'GET',
+  statusCode: 200,
+  originUrl: 'https://grok.com/',
+  documentUrl: 'https://grok.com/',
+  responseHeaders: [
+    { name: 'content-type', value: 'application/pdf' },
+    { name: 'content-length', value: String(643 * 1024) },
+  ],
+};
+
+assert(
+  'rejects Grok in-page PDF xhr without Content-Disposition',
+  candidate(grokPdf) === null,
+);
+
+assert(
+  'rejects Grok in-page PDF xhr with Content-Disposition: inline',
+  candidate({
+    ...grokPdf,
+    responseHeaders: [
+      ...grokPdf.responseHeaders,
+      { name: 'content-disposition', value: 'inline; filename="MPC-Operating-Plan.pdf"' },
+    ],
+  }) === null,
+);
+
+assert(
+  'captures Grok PDF xhr when Content-Disposition is attachment',
+  candidate({
+    ...grokPdf,
+    responseHeaders: [
+      ...grokPdf.responseHeaders,
+      { name: 'content-disposition', value: 'attachment; filename="MPC-Operating-Plan.pdf"' },
+    ],
+  })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'rejects PDF.js / object embed PDF without attachment',
+  candidate({
+    ...grokPdf,
+    type: 'object',
+  }) === null,
+);
+
+assert(
+  'captures object PDF when Content-Disposition is attachment',
+  candidate({
+    ...grokPdf,
+    type: 'object',
+    responseHeaders: [
+      ...grokPdf.responseHeaders,
+      { name: 'content-disposition', value: 'attachment; filename="MPC-Operating-Plan.pdf"' },
+    ],
+  })?.reason === 'attachment_disposition',
+);
+
+assert(
+  'rejects large Office docx xhr without attachment',
+  candidate({
+    url: 'https://cdn.example.com/exports/report.docx',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      {
+        name: 'content-type',
+        value: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 50_000) },
+    ],
+  }) === null,
+);
+
 assert(
   'captures user-added log served as text/plain on onCreated',
   shouldCaptureDownloadItem(

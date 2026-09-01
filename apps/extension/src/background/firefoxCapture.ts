@@ -3,10 +3,11 @@
  * Cancels eligible responses before the browser commits the file, then hands off.
  *
  * Heuristics intentionally err on the side of *not* capturing. False positives
- * (YouTube suggestqueries, Nexus stats CSVs, 3 KB HTML wait-pages named .rar)
- * are far more annoying than missing an exotic download — those still fall
- * through to downloads.onCreated or the context menu. Large file-host XHRs
- * (Gofile / Pixeldrain) are intercepted so they do not become blob: downloads.
+ * (YouTube suggestqueries, Nexus stats CSVs, 3 KB HTML wait-pages named .rar,
+ * Grok-style in-page PDF/Office preview fetches) are far more annoying than
+ * missing an exotic download — those still fall through to downloads.onCreated
+ * or the context menu. Large file-host XHRs (Gofile / Pixeldrain) are
+ * intercepted so they do not become blob: downloads.
  */
 import {
   isUrlHostExcludedByPatterns,
@@ -16,6 +17,7 @@ import {
   MIN_CAPTURE_BYTES,
   filenameFromContentDisposition,
   isPageOrApiMime,
+  isPreviewableDownload,
   isWeakCaptureExtension,
   shouldSkipAppOwnedDownloadOrigin,
 } from './captureFilter';
@@ -63,6 +65,7 @@ export {
   handoffUrlForCapturedDownload,
   httpOrigin,
   isEphemeralSignedUrl,
+  isPreviewableDownload,
   isSessionGatewayUrl,
   isWeakSuggestedFilename,
   lookupRedirectSessionUrl,
@@ -305,7 +308,8 @@ export function firefoxWebRequestDownloadCandidate(
   const knownNonCapturedExt = Boolean(ext && !captured.has(ext));
   const isMainFrame = resourceType === 'main_frame';
   const isXhr = resourceType === 'xmlhttprequest';
-  const navType = isMainFrame || resourceType === 'object' || resourceType === 'other';
+  const isObject = resourceType === 'object';
+  const navType = isMainFrame || isObject || resourceType === 'other';
 
   // CORS without attachment is usually a page data fetch (Nexus stats CSVs).
   // File-host CDNs also send ACAO on huge octet-stream bodies — those are real.
@@ -341,6 +345,16 @@ export function firefoxWebRequestDownloadCandidate(
     if (totalBytes == null && !(hasAttachment && strongMime)) {
       return null;
     }
+  }
+
+  // Chat UIs (Grok, etc.) fetch generated PDFs/Office docs to preview them.
+  // type=object is PDF.js / <embed>. Archives and attachment downloads stay.
+  if (
+    (isXhr || isObject) &&
+    isPreviewableDownload(ext, mime) &&
+    !hasAttachment
+  ) {
+    return null;
   }
 
   let reason: string | null = null;
