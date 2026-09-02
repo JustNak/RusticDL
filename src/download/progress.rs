@@ -97,6 +97,13 @@ pub trait IdentityCommit: Send + Sync {
 
     /// Record the path this transfer actually created (after uniquify/replace).
     async fn note_produced_file(&self, _job_id: &str, _path: PathBuf) {}
+
+    /// Drop a recorded produced path after this transfer already deleted it.
+    ///
+    /// `finalize_worker` deletes `produced_files` on discard. If the transfer
+    /// already removed the file, leaving the entry would let finalize delete
+    /// a later job that uniquified into the now-free name.
+    async fn clear_produced_file(&self, _job_id: &str) {}
 }
 
 #[derive(Default)]

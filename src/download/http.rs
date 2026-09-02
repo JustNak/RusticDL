@@ -527,7 +527,7 @@ pub async fn run_http_download_with_ctx(
                     .await
                     .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
                 if committer.output_discarded(&ctx.job.id).await {
-                    remove_partial(&final_path).await;
+                    remove_and_forget_produced(committer.as_ref(), &ctx.job.id, &final_path).await;
                     return Ok(DownloadOutcome::Canceled);
                 }
                 return Ok(DownloadOutcome::Completed);
@@ -858,10 +858,19 @@ pub(crate) async fn move_to_final_path_unless_discarded(
         .note_produced_file(job_id, final_path.clone())
         .await;
     if committer.output_discarded(job_id).await {
-        remove_partial(&final_path).await;
+        remove_and_forget_produced(committer, job_id, &final_path).await;
         return Ok(None);
     }
     Ok(Some(final_path))
+}
+
+pub(crate) async fn remove_and_forget_produced(
+    committer: &dyn IdentityCommit,
+    job_id: &str,
+    path: &Path,
+) {
+    remove_partial(path).await;
+    committer.clear_produced_file(job_id).await;
 }
 
 fn emit_control_exit_progress(
@@ -1290,6 +1299,32 @@ mod tests {
         }
     }
 
+    struct DiscardAfterNote {
+        discard: std::sync::atomic::AtomicBool,
+        cleared: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityCommit for DiscardAfterNote {
+        async fn commit(&self, _job: &mut Job, _c: CommitIdentity) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn output_discarded(&self, _job_id: &str) -> bool {
+            self.discard.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn note_produced_file(&self, _job_id: &str, _path: PathBuf) {
+            self.discard
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn clear_produced_file(&self, _job_id: &str) {
+            self.cleared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn discarded_completion_does_not_rename_part() {
         let dir =
@@ -1311,6 +1346,38 @@ mod tests {
         assert!(
             !target.exists(),
             "discarded completion must not create the final file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn discarded_after_rename_clears_produced_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-discard-after-rename-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join("file.bin.part");
+        let target = dir.join("file.bin");
+        std::fs::write(&temp, b"done").unwrap();
+
+        let committer = DiscardAfterNote {
+            discard: std::sync::atomic::AtomicBool::new(false),
+            cleared: std::sync::atomic::AtomicBool::new(false),
+        };
+        let moved = move_to_final_path_unless_discarded(&committer, "job-1", &temp, &target, true)
+            .await
+            .unwrap();
+        assert!(moved.is_none());
+        assert!(!temp.exists(), "rename already consumed the .part");
+        assert!(
+            !target.exists(),
+            "post-rename discard must delete the finished file"
+        );
+        assert!(
+            committer.cleared.load(std::sync::atomic::Ordering::SeqCst),
+            "must forget the produced path so finalize cannot delete a later job at that name"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

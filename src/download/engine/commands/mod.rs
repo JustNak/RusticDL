@@ -1210,6 +1210,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_skips_produced_delete_when_transfer_already_cleared_it() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/cleared-produced.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        let id = job.id.clone();
+        let recycled = dir.join("file.bin");
+        std::fs::write(&recycled, b"other-job").expect("write recycled name");
+        let control = Arc::new(AtomicU8::new(2));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::cancel(&inner, id.clone(), true).await;
+
+        super::super::worker::finalize_worker(&inner, &id, &control, Ok(DownloadOutcome::Canceled))
+            .await;
+
+        assert!(
+            recycled.exists(),
+            "finalize must not delete a later job's file at a path this transfer already removed"
+        );
+        assert_eq!(
+            std::fs::read(&recycled).expect("read recycled"),
+            b"other-job"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn overwrite_add_keeps_original_name_and_leaves_existing_file() {
         let dir = temp_dir();
         let target = dir.join("same.bin");

@@ -223,6 +223,8 @@ pub(super) async fn finalize_worker(
         } else {
             guard.pending_partial_deletes.remove(job_id)
         };
+        // Transfer-side discards must `clear_produced_file` after deleting, or
+        // this would remove a later job that uniquified into the free name.
         let produced = guard.produced_files.remove(job_id);
         let produced_to_delete = if discard_produced { produced } else { None };
 

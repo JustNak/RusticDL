@@ -122,6 +122,11 @@ impl IdentityCommit for EngineIdentity {
         let mut guard = self.inner.lock().await;
         guard.produced_files.insert(job_id.to_string(), path);
     }
+
+    async fn clear_produced_file(&self, job_id: &str) {
+        let mut guard = self.inner.lock().await;
+        guard.produced_files.remove(job_id);
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +437,30 @@ mod tests {
             !committer.output_discarded(&job_id).await,
             "Remove+keep-file must not discard just because a .part delete is pending"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_produced_file_drops_recorded_path() {
+        let store = Arc::new(MemoryJobStore::default());
+        let job = sample_job("produced-id");
+        let job_id = job.id.clone();
+        let inner = inner_with_store(vec![job], store).await;
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        let path = PathBuf::from("C:\\downloads\\file.bin");
+        committer.note_produced_file(&job_id, path.clone()).await;
+        {
+            let guard = inner.lock().await;
+            assert_eq!(guard.produced_files.get(&job_id), Some(&path));
+        }
+        committer.clear_produced_file(&job_id).await;
+        {
+            let guard = inner.lock().await;
+            assert!(
+                !guard.produced_files.contains_key(&job_id),
+                "transfer-side delete must drop the produced path so finalize cannot delete it again"
+            );
+        }
     }
 }
