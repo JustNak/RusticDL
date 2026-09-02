@@ -194,9 +194,9 @@ export function resetCaptureCoordinatorForTests(): void {
   pausedForCapture.clear();
 }
 
-export async function flushQueuedCaptureEvents(
+export function flushQueuedCaptureEvents(
   settings: ExtensionIntegrationSettings,
-): Promise<void> {
+): void {
   if (!sessionsReady) return;
   const events = queuedCaptureEvents.splice(0, queuedCaptureEvents.length);
   for (const event of events) {
@@ -205,7 +205,10 @@ export async function flushQueuedCaptureEvents(
         followCaptureRedirect(event.from, event.to, event.requestId);
         break;
       case 'firefox-handoff':
-        await replayQueuedFirefoxHandoff(event, settings);
+        // Same as the live webRequest path: claim/restore is sync, the
+        // ask-mode native prompt is fire-and-forget so startup is not
+        // blocked for DOWNLOAD_PROMPT_TIMEOUT.
+        void replayQueuedFirefoxHandoff(event, settings);
         break;
       default: {
         const _exhaustive: never = event;
@@ -892,10 +895,10 @@ function firefoxCandidateFromQueued(
   }
 }
 
-async function replayQueuedFirefoxHandoff(
+function replayQueuedFirefoxHandoff(
   event: Extract<QueuedCaptureEvent, { kind: 'firefox-handoff' }>,
   settings: ExtensionIntegrationSettings,
-): Promise<void> {
+): void {
   const probe: CaptureFamilyProbe = {
     urls: [event.candidate.url, lookupRedirectSessionUrl(event.candidate.url)],
     requestId: event.details.requestId,
@@ -910,14 +913,14 @@ async function replayQueuedFirefoxHandoff(
     case 'ignore':
       return;
     case 'restore':
-      await restoreBrowserDownload({
+      void restoreBrowserDownload({
         url: event.candidate.url,
         filename: event.candidate.filename,
         sessionId: existing?.id,
       });
       return;
     case 'handoff':
-      await handoffFirefoxCandidate(
+      void handoffFirefoxCandidate(
         stillCandidate ?? event.candidate,
         settings,
         existing?.id,

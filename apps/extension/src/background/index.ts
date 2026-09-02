@@ -418,7 +418,7 @@ const whenCaptureReady = (async () => {
     hydrateCaptureSessions(),
     getCachedSettings(),
   ]);
-  await flushQueuedCaptureEvents(settings);
+  flushQueuedCaptureEvents(settings);
   return settings;
 })();
 registerDownloadCaptureListeners(whenCaptureReady);
