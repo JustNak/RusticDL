@@ -20,6 +20,7 @@ const HINT_TTL_MS = 15_000;
 export type FilenameHint = {
   filename?: string;
   totalBytes?: number;
+  hasAttachment?: boolean;
   ts: number;
 };
 
@@ -132,14 +133,15 @@ export function rememberResponseFilenameHint(
     .split(';')[0]
     .trim();
   const totalBytes = contentLength(details.responseHeaders);
+  const hasAttachment = /\battachment\b/i.test(disposition);
   const downloadLike =
     Boolean(filename)
-    || /\battachment\b/i.test(disposition)
+    || hasAttachment
     || mimeLooksLikeDownload(mime);
   if (!downloadLike || (!filename && totalBytes == null)) {
     return undefined;
   }
-  const hint: FilenameHint = { filename, totalBytes, ts: Date.now() };
+  const hint: FilenameHint = { filename, totalBytes, hasAttachment, ts: Date.now() };
   pruneFilenameHints(hint.ts);
   filenameHints.set(normalizeCaptureUrl(url), hint);
   return hint;

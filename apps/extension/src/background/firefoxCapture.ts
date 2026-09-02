@@ -61,6 +61,7 @@ export {
   downloadCreatedAction,
   filenameFromContentDisposition,
   followRestoreSkip,
+  CAPTURE_SESSION_TTL_MS,
   RESTORE_SKIP_TTL_MS,
   handoffUrlForCapturedDownload,
   httpOrigin,
@@ -439,6 +440,15 @@ export function firefoxBeforeRequestDownloadCandidate(
     return null;
   }
   if (isUrlHostExcludedByPatterns(url, settings.excludedHosts)) {
+    return null;
+  }
+  if (
+    shouldSkipAppOwnedDownloadOrigin({
+      url,
+      pageUrl: details.documentUrl,
+      referrer: details.originUrl,
+    })
+  ) {
     return null;
   }
 

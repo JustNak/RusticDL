@@ -21,6 +21,12 @@ import {
 export const MIN_CAPTURE_BYTES = 8 * 1024;
 
 /**
+ * Desktop ask-mode waits 5 minutes. Keep a capture family (and LMS redirect
+ * map) until that prompt settles, plus a short grace for Drive/CDN hops.
+ */
+export const CAPTURE_SESSION_TTL_MS = 6 * 60 * 1000;
+
+/**
  * Extensions that pages commonly fetch as data, not as user-initiated files.
  * Even if the user added them to capturedFileExtensions, filename-alone is
  * never enough — need a download MIME / top-level navigation.
@@ -76,6 +82,8 @@ export type DownloadItemLike = {
   byExtensionId?: string;
   incognito?: boolean;
   cookieStoreId?: string;
+  /** Content-Disposition: attachment from Chromium header hints. */
+  hasAttachment?: boolean;
 };
 
 /** Prefer Firefox totalBytes, then fileSize (totalBytes is often -1 onCreated). */
@@ -172,10 +180,14 @@ const PREVIEWABLE_CAPTURE_MIME = new Set([
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]);
 
-export function isPreviewableDownload(ext: string | undefined, mime: string | undefined): boolean {
-  if (ext && PREVIEWABLE_CAPTURE_EXTENSIONS.has(ext.toLowerCase())) return true;
+export function isPreviewableMime(mime: string | undefined): boolean {
   const normalizedMime = mime?.split(';')[0].trim().toLowerCase();
   return Boolean(normalizedMime && PREVIEWABLE_CAPTURE_MIME.has(normalizedMime));
+}
+
+export function isPreviewableDownload(ext: string | undefined, mime: string | undefined): boolean {
+  if (ext && PREVIEWABLE_CAPTURE_EXTENSIONS.has(ext.toLowerCase())) return true;
+  return isPreviewableMime(mime);
 }
 
 /** Page documents / XHR-style payloads — never treat as a file download. */
@@ -243,6 +255,17 @@ export function shouldCaptureDownloadItem(
   const captured = new Set(settings.capturedFileExtensions.map((e) => e.toLowerCase()));
   const strongName = Boolean(ext && captured.has(ext) && !isWeakCaptureExtension(ext));
   const dispositionHint = mimeLooksLikeDownload(mime);
+  const hasAttachment = item.hasAttachment === true;
+
+  // In-page PDF/Office previews (Grok, PDF.js) must not prompt. A .docx
+  // served as octet-stream (Canvas → Drive) is a real shelf save.
+  if (
+    !hasAttachment
+    && isPreviewableDownload(ext, mime)
+    && (!mime || isPreviewableMime(mime))
+  ) {
+    return false;
+  }
 
   // text/plain is common for user-added .log/.srt; only veto weak/unknown names.
   if (isPageOrApiMime(mime) && !strongName) return false;
@@ -271,7 +294,11 @@ export function shouldCaptureDownloadItem(
 
   if (strongName) return true;
   if (ext) return false;
-  return dispositionHint;
+  // MIME-only octet-stream with no name is page noise. Chromium CDN tokens
+  // (UUID / long hex) still count so we can wait for Content-Disposition.
+  if (hasAttachment && dispositionHint) return true;
+  const name = downloadBasename(item.filename);
+  return Boolean(name && isWeakSuggestedFilename(name) && dispositionHint);
 }
 
 /**
@@ -410,7 +437,7 @@ export function followRestoreSkip(args: {
  * browser already used. Replay the original http(s) URL so the desktop can
  * mint a fresh Location with the tab session.
  */
-const REDIRECT_TTL_MS = 15_000;
+const REDIRECT_TTL_MS = CAPTURE_SESSION_TTL_MS;
 const redirectSessionByUrl = new Map<string, { sessionUrl: string; ts: number }>();
 
 export function httpOrigin(url: string | undefined): string | undefined {

@@ -61,6 +61,36 @@ const {
   rememberRequestAuth,
   lookupOriginAuth,
 } = require(chromiumOutfile);
+const sessionOutfile = join(tmp, 'captureSession.cjs');
+await esbuild.build({
+  entryPoints: [join(root, 'src/background/captureSession.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: sessionOutfile,
+  plugins: [
+    {
+      name: 'stub-browser',
+      setup(build) {
+        build.onResolve({ filter: /^\.\/browser$/ }, () => ({ path: browserStub }));
+      },
+    },
+  ],
+});
+const {
+  createCaptureSessionStore,
+  beginHandoff,
+  beginPending,
+  finishHandoff,
+  followCaptureFamily,
+  shouldEraseGhostSession,
+  decideCreatedAction,
+  peekCreatedAction,
+  decideFirefoxCandidateAction,
+  sessionsToStorageValue,
+  sessionsFromStorageValue,
+  dropCaptureSession,
+} = require(sessionOutfile);
 const {
   firefoxWebRequestDownloadCandidate,
   firefoxBeforeRequestDownloadCandidate,
@@ -71,6 +101,7 @@ const {
   knownDownloadBytes,
   matchesInterceptedDownload,
   followRestoreSkip,
+  CAPTURE_SESSION_TTL_MS,
   RESTORE_SKIP_TTL_MS,
   canonicalDownloadFilename,
   filenameFromContentDisposition,
@@ -1483,6 +1514,199 @@ assert(
       ts: Date.now(),
     }],
   ) === true,
+);
+
+console.log('\nUnified onCreated / Firefox previewable policy\n');
+
+assert(
+  'rejects Grok-style PDF on onCreated without attachment (same as webRequest)',
+  shouldCaptureDownloadItem(
+    {
+      url: grokPdf.url,
+      filename: 'MPC-Operating-Plan.pdf',
+      mime: 'application/pdf',
+      totalBytes: 643 * 1024,
+      referrer: 'https://grok.com/',
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'captures a PDF shelf download when Content-Disposition is attachment',
+  shouldCaptureDownloadItem(
+    {
+      url: grokPdf.url,
+      filename: 'MPC-Operating-Plan.pdf',
+      mime: 'application/pdf',
+      totalBytes: 643 * 1024,
+      hasAttachment: true,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+assert(
+  'rejects MIME-only octet-stream with no filename',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://cdn.example.com/api/blob',
+      mime: 'application/octet-stream',
+      totalBytes: 5_000_000,
+    },
+    defaultSettings,
+  ) === false,
+);
+
+assert(
+  'skips Drive on Firefox onBeforeRequest (app-owned origin)',
+  firefoxBeforeRequestDownloadCandidate(
+    {
+      url: 'https://drive.google.com/uc?export=download&id=abc&confirm=1/file.zip',
+      method: 'GET',
+    },
+    defaultSettings,
+  ) === null,
+);
+
+console.log('\nCapture session coordinator (false + looping prompts)\n');
+
+const zipItem = {
+  url: 'https://cdn.example.com/files/app.zip',
+  filename: 'app.zip',
+  mime: 'application/zip',
+  totalBytes: 5_000_000,
+};
+const canvasUrl = 'https://school.instructure.com/files/99/download?download_frd=1';
+const driveUrl = 'https://drive.google.com/uc?export=download&id=abc';
+const docsUrl = 'https://doc-00-00-docs.googleusercontent.com/docs/securesc/file.docx';
+
+const storeA = createCaptureSessionStore();
+const first = decideCreatedAction(storeA, zipItem, defaultSettings);
+assert('first zip onCreated claims a handoff session', first === 'handoff');
+
+const retryAt30s = decideCreatedAction(
+  storeA,
+  zipItem,
+  defaultSettings,
+  {},
+  Date.now() + 30_000,
+);
+assert(
+  'same URL retry 30s into an open ask-prompt does not start a second handoff',
+  retryAt30s === 'erase-ghost' && storeA.sessions.length === 1,
+);
+
+const firefoxRetry = decideFirefoxCandidateAction(
+  storeA,
+  { urls: [zipItem.url], filename: zipItem.filename },
+  Date.now() + 30_000,
+);
+assert(
+  'Firefox webRequest retry during handoff only cancels the ghost',
+  firefoxRetry === 'cancel-ghost',
+);
+
+const storeB = createCaptureSessionStore();
+const claimed = beginHandoff(storeB, {
+  urls: [canvasUrl],
+  requestId: 'req-restore',
+  filename: 'Google Drive Folder.docx',
+});
+finishHandoff(storeB, claimed.session.id, 'rejected');
+followCaptureFamily(storeB, {
+  urls: [driveUrl],
+  requestId: 'req-restore',
+  sessionUrl: canvasUrl,
+});
+assert(
+  'Canvas → Drive 302 after dismiss stays restoring',
+  storeB.sessions[0]?.phase === 'restoring'
+    && storeB.sessions[0].urls.includes(driveUrl),
+);
+
+assert(
+  'restoring Drive hop is not treated as a ghost to erase',
+  shouldEraseGhostSession(storeB, { urls: [docsUrl], requestId: 'req-restore', sessionUrl: canvasUrl })
+    === undefined,
+);
+
+assert(
+  'onCreated after dismiss+redirect is skip-restore, not a new prompt',
+  decideCreatedAction(
+    storeB,
+    { url: docsUrl, filename: 'Google Drive Folder.docx', mime: 'application/pdf', hasAttachment: true, totalBytes: 20_000 },
+    defaultSettings,
+    { requestId: 'req-restore', sessionUrl: canvasUrl },
+  ) === 'skip-restore',
+);
+
+const storeC = createCaptureSessionStore();
+const longPrompt = beginHandoff(storeC, { urls: [zipItem.url], filename: zipItem.filename });
+const after15s = Date.now() + 15_001;
+finishHandoff(storeC, longPrompt.session.id, 'rejected', after15s);
+assert(
+  'dismiss after 15s still skips restore (session TTL is the prompt window, not 15s)',
+  decideCreatedAction(
+    storeC,
+    zipItem,
+    defaultSettings,
+    {},
+    after15s + 1_000,
+  ) === 'skip-restore',
+);
+
+const storeD = createCaptureSessionStore();
+const accepted = beginHandoff(storeD, { urls: [zipItem.url], filename: zipItem.filename });
+finishHandoff(storeD, accepted.session.id, 'accepted');
+const dumped = sessionsToStorageValue(storeD);
+const reloaded = sessionsFromStorageValue(dumped, Date.now() + 30_000);
+assert(
+  'session reload from storage still skips an accepted family',
+  decideCreatedAction(reloaded, zipItem, defaultSettings, {}, Date.now() + 30_000) === 'erase-ghost',
+);
+
+const expired = sessionsFromStorageValue(dumped, Date.now() + CAPTURE_SESSION_TTL_MS + 1);
+assert(
+  'expired session can be recaptured after the prompt window',
+  decideCreatedAction(expired, zipItem, defaultSettings) === 'handoff',
+);
+
+assert(
+  'filename-only does not erase an unrelated report.pdf',
+  shouldEraseGhostSession(
+    storeD,
+    { urls: ['https://other.example.com/report.pdf'], filename: 'app.zip' },
+  ) === undefined,
+);
+
+const storeE = createCaptureSessionStore();
+beginPending(storeE, { urls: [zipItem.url] });
+dropCaptureSession(storeE, storeE.sessions[0].id);
+assert(
+  'dropping a pending stub wait allows the later real file to claim',
+  decideCreatedAction(storeE, zipItem, defaultSettings) === 'handoff',
+);
+
+const peekStore = createCaptureSessionStore();
+assert(
+  'peek does not open a session (sync pause path)',
+  peekCreatedAction(peekStore, zipItem, defaultSettings) === 'handoff'
+    && peekStore.sessions.length === 0,
+);
+
+assert(
+  'strong main_frame zip still captures via webRequest',
+  candidate({
+    url: zipItem.url,
+    type: 'main_frame',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+      { name: 'content-length', value: '5000000' },
+    ],
+  })?.reason === 'attachment_disposition',
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
