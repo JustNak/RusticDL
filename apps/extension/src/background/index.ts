@@ -333,20 +333,22 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
   })();
 });
 
-// Firefox primary: blocking webRequest. downloads.onCreated is fallback.
-registerFirefoxWebRequestInterception();
-// Chromium: observe Content-Disposition so handoff is not a URL token.
-registerChromiumFilenameHints();
-if (browser.downloads?.onCreated) {
-  browser.downloads.onCreated.addListener((item) => {
-    pauseIfLikelyCapture(item, settingsForSyncCapture());
-    void getCachedSettings().then((settings) => onDownloadCreated(item, settings));
-  });
-}
-if (browser.downloads?.onChanged) {
-  browser.downloads.onChanged.addListener((delta) => {
-    onDownloadChanged(delta, settingsForSyncCapture());
-  });
+function registerDownloadCaptureListeners(): void {
+  // Firefox primary: blocking webRequest. downloads.onCreated is fallback.
+  registerFirefoxWebRequestInterception();
+  // Chromium: observe Content-Disposition so handoff is not a URL token.
+  registerChromiumFilenameHints();
+  if (browser.downloads?.onCreated) {
+    browser.downloads.onCreated.addListener((item) => {
+      pauseIfLikelyCapture(item, settingsForSyncCapture());
+      void getCachedSettings().then((settings) => onDownloadCreated(item, settings));
+    });
+  }
+  if (browser.downloads?.onChanged) {
+    browser.downloads.onChanged.addListener((delta) => {
+      onDownloadChanged(delta, settingsForSyncCapture());
+    });
+  }
 }
 
 browser.runtime.onMessage.addListener((message: PopupRequest) => {
@@ -398,7 +400,12 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupStateResp
   }
 }
 
-void hydrateCaptureSessions();
-void getCachedSettings();
-void ensureContextMenu();
-void refreshConnectionState();
+void (async () => {
+  // Hydrate persisted capture families before any download listener can
+  // persist an empty store or drop the event that woke the MV3 worker.
+  await hydrateCaptureSessions();
+  await getCachedSettings();
+  registerDownloadCaptureListeners();
+  void ensureContextMenu();
+  void refreshConnectionState();
+})();

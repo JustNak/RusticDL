@@ -143,6 +143,7 @@ function sessionStorageArea(): {
 }
 
 function persistSessions(): void {
+  if (!sessionsReady) return;
   const snapshot = sessionsToStorageValue(store);
   persistChain = persistChain.then(
     () => sessionStorageArea().set({ [CAPTURE_SESSIONS_STORAGE_KEY]: snapshot }),
@@ -151,6 +152,7 @@ function persistSessions(): void {
 }
 
 export async function hydrateCaptureSessions(): Promise<void> {
+  await persistChain;
   try {
     const stored = await sessionStorageArea().get(CAPTURE_SESSIONS_STORAGE_KEY);
     store = sessionsFromStorageValue(stored[CAPTURE_SESSIONS_STORAGE_KEY]);
@@ -182,6 +184,7 @@ export function followCaptureRedirect(
   requestId?: string,
 ): void {
   rememberDownloadRedirect(from, to);
+  if (!sessionsReady) return;
   const sessionUrl =
     lookupRedirectSessionUrl(to) ?? lookupRedirectSessionUrl(from);
   followCaptureFamily(store, {
