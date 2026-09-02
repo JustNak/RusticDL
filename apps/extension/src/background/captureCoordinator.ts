@@ -37,6 +37,7 @@ import {
   finishHandoff,
   firefoxQueuedReplayAction,
   followCaptureFamily,
+  createdActionShouldResume,
   probeFromDownload,
   sessionsFromStorageValue,
   sessionsToStorageValue,
@@ -649,7 +650,7 @@ export async function onDownloadCreated(
   switch (decision) {
     case 'skip-restore':
     case 'ignore':
-      if (decision === 'ignore' && pausedForCapture.has(tracked.id)) {
+      if (createdActionShouldResume(decision) && pausedForCapture.has(tracked.id)) {
         await resumeBrowserDownload(tracked.id);
       }
       return;

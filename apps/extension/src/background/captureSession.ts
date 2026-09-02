@@ -43,6 +43,23 @@ export type ClaimResult =
 
 export type CreatedAction = 'ignore' | 'skip-restore' | 'erase-ghost' | 'wait' | 'handoff';
 
+/** True when a created download should keep running in the browser shelf. */
+export function createdActionShouldResume(action: CreatedAction): boolean {
+  switch (action) {
+    case 'skip-restore':
+    case 'ignore':
+      return true;
+    case 'erase-ghost':
+    case 'wait':
+    case 'handoff':
+      return false;
+    default: {
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
+}
+
 export type FirefoxCandidateAction = 'handoff' | 'cancel-ghost' | 'allow';
 
 /** What to do with a Firefox request we canceled before hydrate finished. */

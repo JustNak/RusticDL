@@ -88,6 +88,7 @@ const {
   peekCreatedAction,
   decideFirefoxCandidateAction,
   firefoxQueuedReplayAction,
+  createdActionShouldResume,
   sessionsToStorageValue,
   sessionsFromStorageValue,
   dropCaptureSession,
@@ -1694,6 +1695,24 @@ assert(
   'peek does not open a session (sync pause path)',
   peekCreatedAction(peekStore, zipItem, defaultSettings) === 'handoff'
     && peekStore.sessions.length === 0,
+);
+
+assert(
+  'skip-restore and ignore resume a download paused before hydrate',
+  createdActionShouldResume('skip-restore')
+    && createdActionShouldResume('ignore')
+    && !createdActionShouldResume('handoff')
+    && !createdActionShouldResume('wait')
+    && !createdActionShouldResume('erase-ghost'),
+);
+
+const restorePauseStore = createCaptureSessionStore();
+const dismissed = beginHandoff(restorePauseStore, { urls: [zipItem.url], filename: zipItem.filename });
+finishHandoff(restorePauseStore, dismissed.session.id, 'rejected');
+assert(
+  'dismissed site retry is skip-restore so a pre-hydrate pause must be released',
+  decideCreatedAction(restorePauseStore, zipItem, defaultSettings) === 'skip-restore'
+    && createdActionShouldResume('skip-restore'),
 );
 
 assert(
