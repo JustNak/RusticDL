@@ -205,11 +205,14 @@ pub(super) async fn finalize_worker(
     control: &Arc<AtomicU8>,
     final_result: Result<DownloadOutcome, DownloadError>,
 ) {
-    let (partial_to_delete, defer_start) = {
+    let (partial_to_delete, produced_to_delete, defer_start) = {
         let mut guard = inner.lock().await;
         let requeue = guard.requeue_on_cancel.contains_key(job_id);
         let has_partial = guard.pending_partial_deletes.contains_key(job_id);
+        let has_final = guard.pending_final_deletes.remove(job_id).is_some();
+        let job_present = guard.jobs.iter().any(|job| job.id == job_id);
         let defer_start = requeue && has_partial;
+        let discard_produced = requeue || has_final || (has_partial && job_present);
 
         guard.active.remove(job_id);
         if !defer_start {
@@ -220,6 +223,10 @@ pub(super) async fn finalize_worker(
         } else {
             guard.pending_partial_deletes.remove(job_id)
         };
+        // Transfer-side discards must `clear_produced_file` after deleting, or
+        // this would remove a later job that uniquified into the free name.
+        let produced = guard.produced_files.remove(job_id);
+        let produced_to_delete = if discard_produced { produced } else { None };
 
         if requeue {
             if let Some(job) = find_job_mut(&mut guard.jobs, job_id) {
@@ -228,6 +235,14 @@ pub(super) async fn finalize_worker(
                 }
                 clear_live_metrics(job);
             }
+        } else if has_partial && matches!(final_result, Ok(DownloadOutcome::Completed)) {
+            if let Some(job) = find_job_mut(&mut guard.jobs, job_id) {
+                job.state = JobState::Canceled;
+                job.mark_finished();
+                clear_live_metrics(job);
+                job.clear_partial_and_identity();
+            }
+            guard.handoff_auth.remove(job_id);
         } else {
             match final_result {
                 Ok(DownloadOutcome::Completed) => {
@@ -289,10 +304,13 @@ pub(super) async fn finalize_worker(
         if !defer_start {
             guard.wake.notify_one();
         }
-        (partial_to_delete, defer_start)
+        (partial_to_delete, produced_to_delete, defer_start)
     };
 
     if let Some(path) = partial_to_delete {
+        remove_partial(&path).await;
+    }
+    if let Some(path) = produced_to_delete {
         remove_partial(&path).await;
     }
 

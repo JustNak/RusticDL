@@ -654,6 +654,8 @@ mod tests {
             handoff_auth: HashMap::new(),
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: test_config(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -738,6 +740,8 @@ mod tests {
             handoff_auth: HashMap::new(),
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: test_config(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -979,6 +983,288 @@ mod tests {
         assert!(jobs.is_empty(), "missing target still drops the job");
 
         engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_delete_file_while_worker_live_deletes_after_finalize() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/active-remove.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        std::fs::write(&job.target_path, b"finished").expect("write target");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+        let target = job.target_path.clone();
+        let control = Arc::new(AtomicU8::new(0));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::remove(&inner, id.clone(), true, true).await;
+
+        {
+            let guard = inner.lock().await;
+            assert!(guard.jobs.iter().all(|j| j.id != id));
+            assert!(
+                guard.pending_partial_deletes.contains_key(&id),
+                "live Remove+delete_partial must wait for the worker"
+            );
+            assert!(
+                guard.pending_final_deletes.contains_key(&id),
+                "live Remove+delete_file must wait for the worker"
+            );
+        }
+        assert!(part.exists(), ".part must remain until finalize");
+        assert!(target.exists(), "final file must remain until finalize");
+        {
+            let mut guard = inner.lock().await;
+            guard.produced_files.insert(id.clone(), target.clone());
+        }
+
+        super::super::worker::finalize_worker(
+            &inner,
+            &id,
+            &control,
+            Ok(DownloadOutcome::Completed),
+        )
+        .await;
+
+        assert!(!part.exists(), ".part deleted after worker exits");
+        assert!(!target.exists(), "final file deleted after worker exits");
+        {
+            let guard = inner.lock().await;
+            assert!(!guard.pending_partial_deletes.contains_key(&id));
+            assert!(!guard.pending_final_deletes.contains_key(&id));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finalize_deletes_produced_file_not_original_uniquified_target() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/uniquify-remove.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        let id = job.id.clone();
+        let original = job.target_path.clone();
+        std::fs::write(&original, b"pre-existing").expect("write original");
+        let uniquified = dir.join("file (1).bin");
+        std::fs::write(&uniquified, b"this-download").expect("write uniquified");
+        let control = Arc::new(AtomicU8::new(0));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::remove(&inner, id.clone(), false, true).await;
+        {
+            let mut guard = inner.lock().await;
+            guard.produced_files.insert(id.clone(), uniquified.clone());
+        }
+
+        super::super::worker::finalize_worker(
+            &inner,
+            &id,
+            &control,
+            Ok(DownloadOutcome::Completed),
+        )
+        .await;
+
+        assert!(
+            original.exists(),
+            "pre-existing uniquify source must not be deleted"
+        );
+        assert!(
+            !uniquified.exists(),
+            "the file this transfer created must be deleted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_delete_partial_does_not_complete_after_rename() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/cancel-complete.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        let id = job.id.clone();
+        let produced = dir.join("file.bin");
+        std::fs::write(&produced, b"finished").expect("write produced");
+        let control = Arc::new(AtomicU8::new(2));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::cancel(&inner, id.clone(), true).await;
+        {
+            let mut guard = inner.lock().await;
+            guard.produced_files.insert(id.clone(), produced.clone());
+        }
+
+        super::super::worker::finalize_worker(
+            &inner,
+            &id,
+            &control,
+            Ok(DownloadOutcome::Completed),
+        )
+        .await;
+
+        {
+            let guard = inner.lock().await;
+            let job = guard.jobs.iter().find(|j| j.id == id).expect("job remains");
+            assert_eq!(job.state, JobState::Canceled);
+        }
+        assert!(
+            !produced.exists(),
+            "cancel+delete must drop the renamed file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finalize_skips_produced_delete_when_transfer_already_cleared_it() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/cleared-produced.bin",
+            JobState::Downloading,
+            &dir,
+        );
+        let id = job.id.clone();
+        let recycled = dir.join("file.bin");
+        std::fs::write(&recycled, b"other-job").expect("write recycled name");
+        let control = Arc::new(AtomicU8::new(2));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::cancel(&inner, id.clone(), true).await;
+
+        super::super::worker::finalize_worker(&inner, &id, &control, Ok(DownloadOutcome::Canceled))
+            .await;
+
+        assert!(
+            recycled.exists(),
+            "finalize must not delete a later job's file at a path this transfer already removed"
+        );
+        assert_eq!(
+            std::fs::read(&recycled).expect("read recycled"),
+            b"other-job"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -145,6 +145,8 @@ pub(super) struct EngineInner {
     handoff_auth: HashMap<String, HandoffAuth>,
     requeue_on_cancel: HashMap<String, ()>,
     pending_partial_deletes: HashMap<String, PathBuf>,
+    pending_final_deletes: HashMap<String, ()>,
+    produced_files: HashMap<String, PathBuf>,
     pub(super) config: EngineRuntimeConfig,
     pub(super) limiter: Arc<GlobalBandwidthLimiter>,
     pub(super) conn_budget: Arc<ConnectionBudget>,
@@ -187,6 +189,8 @@ pub fn spawn_engine(
         handoff_auth: HashMap::new(),
         requeue_on_cancel: HashMap::new(),
         pending_partial_deletes: HashMap::new(),
+        pending_final_deletes: HashMap::new(),
+        produced_files: HashMap::new(),
         config,
         limiter,
         conn_budget,
@@ -477,6 +481,8 @@ mod tests {
             handoff_auth: HashMap::new(),
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: EngineRuntimeConfig::default(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -499,6 +505,8 @@ mod tests {
             handoff_auth: HashMap::new(),
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: EngineRuntimeConfig::default(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -987,6 +995,51 @@ mod tests {
 
         let guard = inner.lock().await;
         let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert!(canonical.segment_map.is_none());
+        assert_eq!(canonical.transfer_format_version, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_identity_skips_unchanged_after_restart_requeue() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut job = sample_job(JobState::Queued);
+        job.id = "restart-unchanged".into();
+        job.downloaded_bytes = 0;
+        job.total_bytes = 0;
+        job.progress = 0.0;
+        job.clear_transfer_identity();
+        let job_id = job.id.clone();
+        let inner = test_inner(job.clone(), event_tx);
+        inner
+            .lock()
+            .await
+            .requeue_on_cancel
+            .insert(job_id.clone(), ());
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    downloaded_bytes: Some(50),
+                    total_bytes: Some(1000),
+                    progress: Some(5.0),
+                    resume_supported: Some(true),
+                    map: MapUpdate::Unchanged,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = inner.lock().await;
+        let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+        assert_eq!(canonical.downloaded_bytes, 0);
+        assert_eq!(canonical.total_bytes, 0);
+        assert_eq!(canonical.progress, 0.0);
+        assert!(!canonical.resume_supported);
         assert!(canonical.segment_map.is_none());
         assert_eq!(canonical.transfer_format_version, 0);
     }

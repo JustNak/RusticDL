@@ -245,10 +245,14 @@ pub(super) async fn remove(
         if !worker_still_running {
             guard.controls.remove(&id);
             guard.pending_partial_deletes.remove(&id);
+            guard.pending_final_deletes.remove(&id);
         } else if delete_partial {
             if let Some((path, _)) = paths.clone() {
                 guard.pending_partial_deletes.insert(id.clone(), path);
             }
+        }
+        if worker_still_running && delete_file {
+            guard.pending_final_deletes.insert(id.clone(), ());
         }
         emit_jobs_locked(&guard);
         match paths {

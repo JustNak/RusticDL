@@ -89,6 +89,21 @@ pub type TransferEventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 #[async_trait]
 pub trait IdentityCommit: Send + Sync {
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String>;
+
+    /// Restart, Remove+delete_file, or Cancel+delete_partial raced with completion.
+    async fn output_discarded(&self, _job_id: &str) -> bool {
+        false
+    }
+
+    /// Record the path this transfer actually created (after uniquify/replace).
+    async fn note_produced_file(&self, _job_id: &str, _path: PathBuf) {}
+
+    /// Drop a recorded produced path after this transfer already deleted it.
+    ///
+    /// `finalize_worker` deletes `produced_files` on discard. If the transfer
+    /// already removed the file, leaving the entry would let finalize delete
+    /// a later job that uniquified into the now-free name.
+    async fn clear_produced_file(&self, _job_id: &str) {}
 }
 
 #[derive(Default)]

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -84,11 +85,10 @@ impl IdentityCommit for EngineIdentity {
             let identity_wiped = guard.requeue_on_cancel.contains_key(&job.id)
                 || guard.pending_partial_deletes.contains_key(&job.id);
             if let Some(canonical) = find_job_mut(&mut guard.jobs, &job.id) {
-                if identity_wiped
-                    && canonical.segment_map.is_none()
-                    && canonical.transfer_format_version == 0
-                    && matches!(c.map, MapUpdate::Set(_) | MapUpdate::Clear)
-                {
+                // Restart/cancel-delete wipes identity under these flags. In-flight
+                // commits must not restore progress, validators, paths, or a map —
+                // including MapUpdate::Unchanged payloads from single-stream GETs.
+                if identity_wiped {
                     false
                 } else {
                     apply_commit_identity(canonical, &c);
@@ -105,6 +105,28 @@ impl IdentityCommit for EngineIdentity {
             Ok(())
         }
     }
+
+    async fn output_discarded(&self, job_id: &str) -> bool {
+        let guard = self.inner.lock().await;
+        if guard.requeue_on_cancel.contains_key(job_id)
+            || guard.pending_final_deletes.contains_key(job_id)
+        {
+            return true;
+        }
+        // Cancel+delete_partial keeps the job row. Remove+keep-file does not.
+        guard.pending_partial_deletes.contains_key(job_id)
+            && guard.jobs.iter().any(|job| job.id == job_id)
+    }
+
+    async fn note_produced_file(&self, job_id: &str, path: PathBuf) {
+        let mut guard = self.inner.lock().await;
+        guard.produced_files.insert(job_id.to_string(), path);
+    }
+
+    async fn clear_produced_file(&self, job_id: &str) {
+        let mut guard = self.inner.lock().await;
+        guard.produced_files.remove(job_id);
+    }
 }
 
 #[cfg(test)]
@@ -113,10 +135,9 @@ mod tests {
     use crate::download::bandwidth::GlobalBandwidthLimiter;
     use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::{EngineEvent, EngineRuntimeConfig};
-    use crate::download::job::JobState;
+    use crate::download::job::{ContentValidators, JobState, TransferMode};
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use tokio::sync::Notify;
 
     fn sample_job(id: &str) -> Job {
@@ -183,6 +204,8 @@ mod tests {
             handoff_auth: HashMap::new(),
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: EngineRuntimeConfig::default(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -301,5 +324,143 @@ mod tests {
             .expect("job in store");
         assert_eq!(saved.transfer_format_version, 0);
         assert!(saved.segment_map.is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_commit_after_restart_does_not_restore_or_persist() {
+        let store = Arc::new(MemoryJobStore::default());
+        let mut job = sample_job("restart-unchanged");
+        job.clear_transfer_identity();
+        let job_id = job.id.clone();
+        let original_target = job.target_path.clone();
+        let inner = inner_with_store(vec![job.clone()], store.clone()).await;
+
+        {
+            let mut guard = inner.lock().await;
+            guard.requeue_on_cancel.insert(job_id.clone(), ());
+        }
+        persist_live_jobs(&inner).await.unwrap();
+        let snaps_after_wipe = store.snapshots.lock().unwrap().len();
+
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        committer
+            .commit(
+                &mut job,
+                CommitIdentity {
+                    downloaded_bytes: Some(50),
+                    total_bytes: Some(1000),
+                    progress: Some(5.0),
+                    filename: Some("renamed.bin".into()),
+                    target_path: Some(PathBuf::from("C:\\downloads\\renamed.bin")),
+                    resume_supported: Some(true),
+                    validators: Some(ContentValidators {
+                        etag: Some("\"poison\"".into()),
+                        last_modified: None,
+                        expected_size: Some(1000),
+                    }),
+                    transfer_mode: Some(TransferMode::Single),
+                    fallback_reason: Some("size_unknown".into()),
+                    map: MapUpdate::Unchanged,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        {
+            let guard = inner.lock().await;
+            let canonical = guard.jobs.iter().find(|j| j.id == job_id).unwrap();
+            assert_eq!(canonical.downloaded_bytes, 0);
+            assert_eq!(canonical.total_bytes, 0);
+            assert_eq!(canonical.progress, 0.0);
+            assert_eq!(canonical.filename, "file.bin");
+            assert_eq!(canonical.target_path, original_target);
+            assert!(!canonical.resume_supported);
+            assert!(canonical.validators.is_empty());
+            assert!(canonical.transfer_mode.is_none());
+            assert!(canonical.fallback_reason.is_none());
+            assert_eq!(canonical.transfer_format_version, 0);
+            assert!(canonical.segment_map.is_none());
+        }
+
+        assert_eq!(
+            store.snapshots.lock().unwrap().len(),
+            snaps_after_wipe,
+            "skipped Unchanged commit must not persist a restored identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_discarded_follows_restart_and_final_delete_flags() {
+        let store = Arc::new(MemoryJobStore::default());
+        let job = sample_job("discard-id");
+        let job_id = job.id.clone();
+        let inner = inner_with_store(vec![job], store).await;
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        assert!(!committer.output_discarded(&job_id).await);
+
+        {
+            let mut guard = inner.lock().await;
+            guard.requeue_on_cancel.insert(job_id.clone(), ());
+        }
+        assert!(committer.output_discarded(&job_id).await);
+
+        {
+            let mut guard = inner.lock().await;
+            guard.requeue_on_cancel.remove(&job_id);
+            guard.pending_final_deletes.insert(job_id.clone(), ());
+        }
+        assert!(committer.output_discarded(&job_id).await);
+
+        {
+            let mut guard = inner.lock().await;
+            guard.pending_final_deletes.remove(&job_id);
+            guard.pending_partial_deletes.insert(
+                job_id.clone(),
+                PathBuf::from("C:\\downloads\\file.bin.part"),
+            );
+        }
+        assert!(
+            committer.output_discarded(&job_id).await,
+            "Cancel+delete_partial must discard while the job row remains"
+        );
+
+        {
+            let mut guard = inner.lock().await;
+            guard.jobs.clear();
+        }
+        assert!(
+            !committer.output_discarded(&job_id).await,
+            "Remove+keep-file must not discard just because a .part delete is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_produced_file_drops_recorded_path() {
+        let store = Arc::new(MemoryJobStore::default());
+        let job = sample_job("produced-id");
+        let job_id = job.id.clone();
+        let inner = inner_with_store(vec![job], store).await;
+        let committer = EngineIdentity {
+            inner: inner.clone(),
+        };
+        let path = PathBuf::from("C:\\downloads\\file.bin");
+        committer.note_produced_file(&job_id, path.clone()).await;
+        {
+            let guard = inner.lock().await;
+            assert_eq!(guard.produced_files.get(&job_id), Some(&path));
+        }
+        committer.clear_produced_file(&job_id).await;
+        {
+            let guard = inner.lock().await;
+            assert!(
+                !guard.produced_files.contains_key(&job_id),
+                "transfer-side delete must drop the produced path so finalize cannot delete it again"
+            );
+        }
     }
 }
