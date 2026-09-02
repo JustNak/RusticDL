@@ -11,6 +11,7 @@ import {
   type ExtensionIntegrationSettings,
   type HostToExtensionResponse,
 } from '@rusticdl/protocol';
+import { createDefaultExtensionSettings } from '../shared/defaultExtensionSettings';
 import browser from './browser';
 import {
   downloadCreatedAction,
@@ -22,6 +23,7 @@ import {
   MIN_CAPTURE_BYTES,
   normalizeCaptureUrl,
   rememberDownloadRedirect,
+  shouldPauseDownloadItem,
 } from './captureFilter';
 import {
   attachToSession,
@@ -33,6 +35,7 @@ import {
   peekCreatedAction,
   dropCaptureSession,
   finishHandoff,
+  firefoxQueuedReplayAction,
   followCaptureFamily,
   probeFromDownload,
   sessionsFromStorageValue,
@@ -108,6 +111,17 @@ type CoordinatorHostHooks = {
 const pendingSizeWaits = new Map<number, PendingSizeWait>();
 const pausedForCapture = new Set<number>();
 
+type QueuedCaptureEvent =
+  | { kind: 'redirect'; from: string; to: string; requestId?: string }
+  | {
+      kind: 'firefox-handoff';
+      source: 'before-request' | 'headers-received';
+      details: FirefoxBeforeRequestDetails | FirefoxHeadersReceivedDetails;
+      candidate: FirefoxCaptureCandidate;
+    };
+
+const queuedCaptureEvents: QueuedCaptureEvent[] = [];
+
 let store: CaptureSessionStore = createCaptureSessionStore();
 let sessionsReady = false;
 let persistChain = Promise.resolve();
@@ -116,6 +130,16 @@ let hostHooks: CoordinatorHostHooks = {
     // set by index.ts after badge helper exists
   },
 };
+
+function heuristicCaptureSettings(
+  settings: ExtensionIntegrationSettings | null,
+): ExtensionIntegrationSettings {
+  return settings ?? createDefaultExtensionSettings();
+}
+
+function enqueueCaptureEvent(event: QueuedCaptureEvent): void {
+  queuedCaptureEvents.push(event);
+}
 
 export function configureCaptureCoordinator(hooks: CoordinatorHostHooks): void {
   hostHooks = hooks;
@@ -165,8 +189,30 @@ export async function hydrateCaptureSessions(): Promise<void> {
 export function resetCaptureCoordinatorForTests(): void {
   store = createCaptureSessionStore();
   sessionsReady = true;
+  queuedCaptureEvents.length = 0;
   pendingSizeWaits.clear();
   pausedForCapture.clear();
+}
+
+export async function flushQueuedCaptureEvents(
+  settings: ExtensionIntegrationSettings,
+): Promise<void> {
+  if (!sessionsReady) return;
+  const events = queuedCaptureEvents.splice(0, queuedCaptureEvents.length);
+  for (const event of events) {
+    switch (event.kind) {
+      case 'redirect':
+        followCaptureRedirect(event.from, event.to, event.requestId);
+        break;
+      case 'firefox-handoff':
+        await replayQueuedFirefoxHandoff(event, settings);
+        break;
+      default: {
+        const _exhaustive: never = event;
+        return _exhaustive;
+      }
+    }
+  }
 }
 
 function familyProbe(
@@ -184,7 +230,10 @@ export function followCaptureRedirect(
   requestId?: string,
 ): void {
   rememberDownloadRedirect(from, to);
-  if (!sessionsReady) return;
+  if (!sessionsReady) {
+    enqueueCaptureEvent({ kind: 'redirect', from, to, requestId });
+    return;
+  }
   const sessionUrl =
     lookupRedirectSessionUrl(to) ?? lookupRedirectSessionUrl(from);
   followCaptureFamily(store, {
@@ -548,8 +597,16 @@ export function pauseIfLikelyCapture(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings | null,
 ): void {
-  if (!sessionsReady || !settings) return;
   const tracked = withHeaderSize(item);
+  if (!sessionsReady) {
+    // Pause on the waking onCreated turn; do not touch the session store
+    // until hydrate finishes (peek/follow would write into an empty store).
+    if (shouldPauseDownloadItem(tracked, heuristicCaptureSettings(settings))) {
+      requestPause(item.id);
+    }
+    return;
+  }
+  if (!settings) return;
   const decision = peekCreatedAction(store, tracked, settings, familyProbe(tracked));
   persistSessions();
   switch (decision) {
@@ -632,8 +689,9 @@ export function onDownloadChanged(
   delta: DownloadChangeDelta,
   settings: ExtensionIntegrationSettings | null,
 ): void {
+  if (!sessionsReady || !settings) return;
   const pending = pendingSizeWaits.get(delta.id);
-  if (!pending || !settings) return;
+  if (!pending) return;
 
   const merged = mergeDownloadDelta(pending.item, delta);
   pending.item = merged;
@@ -812,12 +870,87 @@ function decideFirefoxRequest(
   });
 }
 
+function firefoxCandidateFromQueued(
+  event: Extract<QueuedCaptureEvent, { kind: 'firefox-handoff' }>,
+  settings: ExtensionIntegrationSettings,
+): FirefoxCaptureCandidate | null {
+  switch (event.source) {
+    case 'before-request':
+      return firefoxBeforeRequestDownloadCandidate(
+        event.details as FirefoxBeforeRequestDetails,
+        settings,
+      );
+    case 'headers-received':
+      return firefoxWebRequestDownloadCandidate(
+        event.details as FirefoxHeadersReceivedDetails,
+        settings,
+      );
+    default: {
+      const _exhaustive: never = event.source;
+      return _exhaustive;
+    }
+  }
+}
+
+async function replayQueuedFirefoxHandoff(
+  event: Extract<QueuedCaptureEvent, { kind: 'firefox-handoff' }>,
+  settings: ExtensionIntegrationSettings,
+): Promise<void> {
+  const probe: CaptureFamilyProbe = {
+    urls: [event.candidate.url, lookupRedirectSessionUrl(event.candidate.url)],
+    requestId: event.details.requestId,
+    sessionUrl: lookupRedirectSessionUrl(event.candidate.url),
+    filename: event.candidate.filename,
+  };
+  const existing = followCaptureFamily(store, probe);
+  persistSessions();
+  const stillCandidate = firefoxCandidateFromQueued(event, settings);
+  const action = firefoxQueuedReplayAction(existing?.phase, stillCandidate != null);
+  switch (action) {
+    case 'ignore':
+      return;
+    case 'restore':
+      await restoreBrowserDownload({
+        url: event.candidate.url,
+        filename: event.candidate.filename,
+        sessionId: existing?.id,
+      });
+      return;
+    case 'handoff':
+      await handoffFirefoxCandidate(
+        stillCandidate ?? event.candidate,
+        settings,
+        existing?.id,
+        event.details.requestId,
+      );
+      return;
+    default: {
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
+}
+
 export function handleFirefoxBeforeRequestSync(
   details: FirefoxBeforeRequestDetails,
   settings: ExtensionIntegrationSettings | null,
 ): { cancel?: boolean } {
   try {
-    if (!sessionsReady || !settings) return {};
+    if (!sessionsReady) {
+      const candidate = firefoxBeforeRequestDownloadCandidate(
+        details,
+        heuristicCaptureSettings(settings),
+      );
+      if (!candidate) return {};
+      enqueueCaptureEvent({
+        kind: 'firefox-handoff',
+        source: 'before-request',
+        details,
+        candidate,
+      });
+      return { cancel: true };
+    }
+    if (!settings) return {};
     const candidate = firefoxBeforeRequestDownloadCandidate(details, settings);
     const action = decideFirefoxRequest(details, candidate);
     persistSessions();
@@ -833,7 +966,22 @@ export function handleFirefoxHeadersReceivedSync(
   settings: ExtensionIntegrationSettings | null,
 ): { cancel?: boolean } {
   try {
-    if (!sessionsReady || !settings) return {};
+    if (!sessionsReady) {
+      const candidate = firefoxWebRequestDownloadCandidate(
+        details,
+        heuristicCaptureSettings(settings),
+      );
+      if (!candidate) return {};
+      abortFirefoxResponseBody(webRequest, details.requestId);
+      enqueueCaptureEvent({
+        kind: 'firefox-handoff',
+        source: 'headers-received',
+        details,
+        candidate,
+      });
+      return { cancel: true };
+    }
+    if (!settings) return {};
     const candidate = firefoxWebRequestDownloadCandidate(details, settings);
     const action = decideFirefoxRequest(details, candidate);
     persistSessions();

@@ -45,6 +45,9 @@ export type CreatedAction = 'ignore' | 'skip-restore' | 'erase-ghost' | 'wait' |
 
 export type FirefoxCandidateAction = 'handoff' | 'cancel-ghost' | 'allow';
 
+/** What to do with a Firefox request we canceled before hydrate finished. */
+export type FirefoxQueuedReplayAction = 'handoff' | 'restore' | 'ignore';
+
 export const CAPTURE_SESSIONS_STORAGE_KEY = 'rusticdl.capture-sessions';
 
 export function createCaptureSessionStore(): CaptureSessionStore {
@@ -308,6 +311,34 @@ export function decideFirefoxCandidateAction(
   const claim = beginHandoff(store, probe, now);
   if (claim.ok) return 'handoff';
   return claim.session.phase === 'restoring' ? 'allow' : 'cancel-ghost';
+}
+
+/**
+ * Replay a Firefox `{ cancel: true }` that ran before sessions/settings loaded.
+ * Restoring families must not open a second prompt. Off/ignore restores the
+ * browser download we already canceled. An in-flight or accepted family is a
+ * ghost of the same capture — leave it canceled.
+ */
+export function firefoxQueuedReplayAction(
+  phase: CapturePhase | undefined,
+  stillCandidate: boolean,
+): FirefoxQueuedReplayAction {
+  if (phase === undefined) {
+    return stillCandidate ? 'handoff' : 'restore';
+  }
+  switch (phase) {
+    case 'accepted':
+    case 'handoff':
+      return 'ignore';
+    case 'restoring':
+      return 'restore';
+    case 'pending':
+      return stillCandidate ? 'handoff' : 'restore';
+    default: {
+      const _exhaustive: never = phase;
+      return _exhaustive;
+    }
+  }
 }
 
 function isCaptureSession(value: unknown): value is CaptureSession {

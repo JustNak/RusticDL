@@ -6,7 +6,9 @@ import {
 } from '@rusticdl/protocol';
 import browser from './browser';
 import {
+  captureSessionsReady,
   configureCaptureCoordinator,
+  flushQueuedCaptureEvents,
   followCaptureRedirect,
   handleFirefoxBeforeRequestSync,
   handleFirefoxHeadersReceivedSync,
@@ -333,7 +335,9 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
   })();
 });
 
-function registerDownloadCaptureListeners(): void {
+function registerDownloadCaptureListeners(
+  whenReady: Promise<ExtensionIntegrationSettings>,
+): void {
   // Firefox primary: blocking webRequest. downloads.onCreated is fallback.
   registerFirefoxWebRequestInterception();
   // Chromium: observe Content-Disposition so handoff is not a URL token.
@@ -341,12 +345,17 @@ function registerDownloadCaptureListeners(): void {
   if (browser.downloads?.onCreated) {
     browser.downloads.onCreated.addListener((item) => {
       pauseIfLikelyCapture(item, settingsForSyncCapture());
-      void getCachedSettings().then((settings) => onDownloadCreated(item, settings));
+      void whenReady.then((settings) => onDownloadCreated(item, settings));
     });
   }
   if (browser.downloads?.onChanged) {
     browser.downloads.onChanged.addListener((delta) => {
-      onDownloadChanged(delta, settingsForSyncCapture());
+      const settings = settingsForSyncCapture();
+      if (captureSessionsReady() && settings) {
+        onDownloadChanged(delta, settings);
+        return;
+      }
+      void whenReady.then((readySettings) => onDownloadChanged(delta, readySettings));
     });
   }
 }
@@ -400,12 +409,20 @@ async function handlePopupMessage(message: PopupRequest): Promise<PopupStateResp
   }
 }
 
-void (async () => {
-  // Hydrate persisted capture families before any download listener can
-  // persist an empty store or drop the event that woke the MV3 worker.
-  await hydrateCaptureSessions();
-  await getCachedSettings();
-  registerDownloadCaptureListeners();
+// Chromium MV3 only delivers the event that woke the worker if addListener
+// ran in this turn. Start hydrate first (it yields on await), then register
+// so the waking download is paused and replayed after sessions + settings
+// load — without persisting an empty store over storage.
+const whenCaptureReady = (async () => {
+  const [, settings] = await Promise.all([
+    hydrateCaptureSessions(),
+    getCachedSettings(),
+  ]);
+  await flushQueuedCaptureEvents(settings);
+  return settings;
+})();
+registerDownloadCaptureListeners(whenCaptureReady);
+void whenCaptureReady.then(() => {
   void ensureContextMenu();
   void refreshConnectionState();
-})();
+});

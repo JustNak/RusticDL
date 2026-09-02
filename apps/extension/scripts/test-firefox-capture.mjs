@@ -4,7 +4,7 @@
  */
 import * as esbuild from 'esbuild';
 import { createRequire } from 'module';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
@@ -87,6 +87,7 @@ const {
   decideCreatedAction,
   peekCreatedAction,
   decideFirefoxCandidateAction,
+  firefoxQueuedReplayAction,
   sessionsToStorageValue,
   sessionsFromStorageValue,
   dropCaptureSession,
@@ -1696,6 +1697,35 @@ assert(
 );
 
 assert(
+  'queued Firefox cancel before hydrate hands off when still a candidate',
+  firefoxQueuedReplayAction(undefined, true) === 'handoff',
+);
+assert(
+  'queued Firefox cancel restores when settings later say Off/ignore',
+  firefoxQueuedReplayAction(undefined, false) === 'restore',
+);
+assert(
+  'queued Firefox cancel during restoring does not open a second prompt',
+  firefoxQueuedReplayAction('restoring', true) === 'restore',
+);
+assert(
+  'queued Firefox cancel of an in-flight handoff is treated as a ghost',
+  firefoxQueuedReplayAction('handoff', true) === 'ignore',
+);
+assert(
+  'queued Firefox cancel of an accepted family stays canceled',
+  firefoxQueuedReplayAction('accepted', true) === 'ignore',
+);
+assert(
+  'queued Firefox cancel on a pending wait hands off when still a candidate',
+  firefoxQueuedReplayAction('pending', true) === 'handoff',
+);
+assert(
+  'queued Firefox cancel on a pending wait restores when no longer a candidate',
+  firefoxQueuedReplayAction('pending', false) === 'restore',
+);
+
+assert(
   'strong main_frame zip still captures via webRequest',
   candidate({
     url: zipItem.url,
@@ -1707,6 +1737,18 @@ assert(
       { name: 'content-length', value: '5000000' },
     ],
   })?.reason === 'attachment_disposition',
+);
+
+const indexSrc = readFileSync(join(root, 'src/background/index.ts'), 'utf8');
+const registerIdx = indexSrc.indexOf('registerDownloadCaptureListeners(whenCaptureReady)');
+const hydrateIdx = indexSrc.indexOf('const whenCaptureReady = (async () => {');
+assert(
+  'MV3 startup registers download listeners on the first turn after starting hydrate',
+  hydrateIdx !== -1 && registerIdx !== -1 && hydrateIdx < registerIdx,
+);
+assert(
+  'MV3 startup does not await hydrate before addListener',
+  !/await hydrateCaptureSessions\(\);\s*await getCachedSettings\(\);\s*registerDownloadCaptureListeners/.test(indexSrc),
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
