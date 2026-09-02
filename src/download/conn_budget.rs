@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,9 +10,8 @@ use super::job::DownloadOutcome;
 
 pub struct ConnectionBudget {
     global: Arc<Semaphore>,
-    #[allow(dead_code)]
-    max_total: usize,
-    max_per_host: usize,
+    max_total: AtomicUsize,
+    max_per_host: AtomicUsize,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
@@ -37,26 +36,43 @@ pub fn host_key_for_budget(url: &str) -> String {
     }
 }
 
+fn clamp_limits(max_total: u32, max_per_host: u32) -> (usize, usize) {
+    let max_total = max_total.clamp(1, 256) as usize;
+    let max_per_host = max_per_host.clamp(1, 64).min(max_total as u32) as usize;
+    (max_total, max_per_host)
+}
+
 impl ConnectionBudget {
     pub fn new(max_total: u32, max_per_host: u32) -> Arc<Self> {
-        let max_total = max_total.clamp(1, 256) as usize;
-        let max_per_host = max_per_host.clamp(1, 64).min(max_total as u32) as usize;
+        let (max_total, max_per_host) = clamp_limits(max_total, max_per_host);
         Arc::new(Self {
             global: Arc::new(Semaphore::new(max_total)),
-            max_total,
-            max_per_host,
+            max_total: AtomicUsize::new(max_total),
+            max_per_host: AtomicUsize::new(max_per_host),
             hosts: Mutex::new(HashMap::new()),
         })
     }
 
-    #[allow(dead_code)]
-    pub fn max_total(&self) -> usize {
-        self.max_total
+    /// Resize this budget in place so in-flight workers keep sharing one cap.
+    pub async fn update_limits(&self, max_total: u32, max_per_host: u32) {
+        let (max_total, max_per_host) = clamp_limits(max_total, max_per_host);
+        let old_total = self.max_total.swap(max_total, Ordering::SeqCst);
+        let old_host = self.max_per_host.swap(max_per_host, Ordering::SeqCst);
+        resize_semaphore(&self.global, old_total, max_total);
+        if old_host != max_per_host {
+            let hosts = self.hosts.lock().await;
+            for sem in hosts.values() {
+                resize_semaphore(sem, old_host, max_per_host);
+            }
+        }
     }
 
-    #[allow(dead_code)]
+    pub fn max_total(&self) -> usize {
+        self.max_total.load(Ordering::SeqCst)
+    }
+
     pub fn max_per_host(&self) -> usize {
-        self.max_per_host
+        self.max_per_host.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
@@ -130,11 +146,44 @@ impl ConnectionBudget {
 
     async fn host_semaphore(&self, key: String) -> Arc<Semaphore> {
         let mut hosts = self.hosts.lock().await;
+        let max_per_host = self.max_per_host.load(Ordering::SeqCst);
         hosts
             .entry(key)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
+            .or_insert_with(|| Arc::new(Semaphore::new(max_per_host)))
             .clone()
     }
+}
+
+fn resize_semaphore(sem: &Arc<Semaphore>, old: usize, new: usize) {
+    if new == old {
+        return;
+    }
+    if new > old {
+        sem.add_permits(new - old);
+        return;
+    }
+    let mut remaining = old - new;
+    while remaining > 0 {
+        match sem.try_acquire() {
+            Ok(permit) => {
+                permit.forget();
+                remaining -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    if remaining == 0 {
+        return;
+    }
+    let sem = sem.clone();
+    tokio::spawn(async move {
+        for _ in 0..remaining {
+            match sem.acquire().await {
+                Ok(permit) => permit.forget(),
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 async fn acquire_owned_interruptible(
@@ -370,5 +419,40 @@ mod tests {
         let hi = ConnectionBudget::new(10_000, 10_000);
         assert_eq!(hi.max_total(), 256);
         assert_eq!(hi.max_per_host(), 64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_limits_raises_cap_on_same_budget() {
+        let budget = ConnectionBudget::new(1, 1);
+        let held = budget.try_acquire("a.com").await.expect("first");
+        assert!(budget.try_acquire("b.com").await.is_none());
+        budget.update_limits(2, 1).await;
+        assert!(
+            budget.try_acquire("b.com").await.is_some(),
+            "raising total connections must add permits to the live budget"
+        );
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_limits_lowers_cap_on_same_budget() {
+        let budget = ConnectionBudget::new(4, 4);
+        let a = budget.try_acquire("a.com").await.expect("a");
+        let b = budget.try_acquire("b.com").await.expect("b");
+        budget.update_limits(2, 2).await;
+        assert!(
+            budget.try_acquire("c.com").await.is_none(),
+            "lowering total connections must not issue a third permit"
+        );
+        drop(a);
+        drop(b);
+        let c = budget.try_acquire("c.com").await.expect("after release");
+        let d = budget.try_acquire("d.com").await.expect("new cap is two");
+        assert!(
+            budget.try_acquire("e.com").await.is_none(),
+            "cap must stay at the lowered total after in-flight permits drop"
+        );
+        drop(c);
+        drop(d);
     }
 }

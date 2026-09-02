@@ -1,5 +1,6 @@
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
 use reqwest::StatusCode;
+use std::path::Path;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,15 +17,15 @@ use super::fetch::{
 };
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
-    sanitize_filename,
+    remove_partial, sanitize_filename,
 };
 use super::handoff::{session_url_after_auth_denied, HandoffAuth};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory, Job,
 };
 use super::progress::{
-    CommitIdentity, MapUpdate, NoopIdentity, ProgressHint, ProgressTick, TransferEvent,
-    TransferEventCallback,
+    CommitIdentity, IdentityCommit, MapUpdate, NoopIdentity, ProgressHint, ProgressTick,
+    TransferEvent, TransferEventCallback,
 };
 use super::resume::{resume_oracle, ResumeOracle};
 use super::verify::verify_sha256_if_expected;
@@ -491,10 +492,17 @@ pub async fn run_http_download_with_ctx(
             Ok(StreamEnd::Exhausted { downloaded }) => {
                 drop(sink);
                 verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
-                let final_path =
-                    move_to_final_path(&temp_path, &target_path, ctx.job.replace_existing)
-                        .await
-                        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+                let Some(final_path) = move_to_final_path_unless_discarded(
+                    ctx.committer.as_ref(),
+                    &ctx.job.id,
+                    &temp_path,
+                    &target_path,
+                    ctx.job.replace_existing,
+                )
+                .await?
+                else {
+                    return Ok(DownloadOutcome::Canceled);
+                };
                 committer
                     .commit(
                         &mut ctx.job,
@@ -521,7 +529,6 @@ pub async fn run_http_download_with_ctx(
                 return Ok(DownloadOutcome::Completed);
             }
             Err(error) => {
-                drop(sink);
                 if let Some(outcome) = control_outcome(&control) {
                     if error.retryable
                         || matches!(
@@ -529,10 +536,15 @@ pub async fn run_http_download_with_ctx(
                             FailureCategory::Network | FailureCategory::Http
                         )
                     {
-                        emit_control_exit_progress(&on_progress, existing_bytes, total_bytes);
+                        if should_sync_data_on_exit(outcome) {
+                            let _ = sink.sync_data().await;
+                        }
+                        drop(sink);
+                        emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                         return Ok(outcome);
                     }
                 }
+                drop(sink);
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
@@ -823,6 +835,26 @@ fn content_validators_patch(
 
 fn should_sync_data_on_exit(outcome: DownloadOutcome) -> bool {
     matches!(outcome, DownloadOutcome::Paused)
+}
+
+pub(crate) async fn move_to_final_path_unless_discarded(
+    committer: &dyn IdentityCommit,
+    job_id: &str,
+    temp_path: &Path,
+    target_path: &Path,
+    replace: bool,
+) -> Result<Option<std::path::PathBuf>, DownloadError> {
+    if committer.output_discarded(job_id).await {
+        return Ok(None);
+    }
+    let final_path = move_to_final_path(temp_path, target_path, replace)
+        .await
+        .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+    if committer.output_discarded(job_id).await {
+        remove_partial(&final_path).await;
+        return Ok(None);
+    }
+    Ok(Some(final_path))
 }
 
 fn emit_control_exit_progress(
@@ -1236,5 +1268,44 @@ mod tests {
         assert_eq!(tick.state_hint, Some(ProgressHint::Starting));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    struct AlwaysDiscard;
+
+    #[async_trait::async_trait]
+    impl IdentityCommit for AlwaysDiscard {
+        async fn commit(&self, _job: &mut Job, _c: CommitIdentity) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn output_discarded(&self, _job_id: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn discarded_completion_does_not_rename_part() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-discard-final-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join("file.bin.part");
+        let target = dir.join("file.bin");
+        std::fs::write(&temp, b"done").unwrap();
+
+        let moved =
+            move_to_final_path_unless_discarded(&AlwaysDiscard, "job-1", &temp, &target, true)
+                .await
+                .unwrap();
+        assert!(moved.is_none());
+        assert!(
+            temp.exists(),
+            "discarded completion must leave .part in place"
+        );
+        assert!(
+            !target.exists(),
+            "discarded completion must not create the final file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

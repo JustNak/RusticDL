@@ -12,10 +12,11 @@ use super::fetch::{
     classify_segment_status, control_outcome, fetch_range, sleep_interruptible, FetchRequest,
     RangeSpec, STALL_TIMEOUT,
 };
-use super::filesystem::{
-    ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, move_to_final_path,
+use super::filesystem::{ensure_parent_directory, is_untracked_preallocate_hole, metadata_len};
+use super::http::{
+    move_to_final_path_unless_discarded, progress_percent, reconnect_backoff,
+    run_http_download_with_ctx, RECONNECT_MAX,
 };
-use super::http::{progress_percent, reconnect_backoff, run_http_download_with_ctx, RECONNECT_MAX};
 use super::job::{
     download_error, ContentValidators, DownloadError, DownloadOutcome, FailureCategory,
     TransferMode,
@@ -156,15 +157,19 @@ pub async fn run_multi_segment_download(
     match result {
         Ok((DownloadOutcome::Completed, map)) => finalize_completed(ctx, writer, &map).await,
         Ok((outcome, map)) => {
-            persist_map_exit(ctx, &map, 0).await?;
-            if matches!(outcome, DownloadOutcome::Paused) {
-                let flush = writer.clone();
-                let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
+            // Fsync before persisting the map so a crash cannot save written
+            // counts past durable .part bytes.
+            if matches!(outcome, DownloadOutcome::Paused | DownloadOutcome::Canceled) {
+                flush_writer_to_disk(&writer).await;
             }
+            persist_map_exit(ctx, &map, 0).await?;
             drop(writer);
             Ok(outcome)
         }
         Err((error, map)) => {
+            if !may_convert_multi_to_single(&map) {
+                flush_writer_to_disk(&writer).await;
+            }
             persist_map_exit(ctx, &map, 0).await?;
             if may_convert_multi_to_single(&map) {
                 drop(writer);
@@ -176,6 +181,11 @@ pub async fn run_multi_segment_download(
             }
         }
     }
+}
+
+async fn flush_writer_to_disk(writer: &Arc<SegmentFileWriter>) {
+    let flush = writer.clone();
+    let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
 }
 
 fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
@@ -934,13 +944,17 @@ async fn finalize_completed(
         return Err(error);
     }
 
-    let final_path = move_to_final_path(
+    let Some(final_path) = move_to_final_path_unless_discarded(
+        ctx.committer.as_ref(),
+        &ctx.job.id,
         &ctx.job.temp_path,
         &ctx.job.target_path,
         ctx.job.replace_existing,
     )
-    .await
-    .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+    .await?
+    else {
+        return Ok(DownloadOutcome::Canceled);
+    };
 
     let downloaded = map.written_sum().max(map.total_bytes);
     ctx.job.downloaded_bytes = downloaded;

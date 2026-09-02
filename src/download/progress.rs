@@ -89,6 +89,11 @@ pub type TransferEventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 #[async_trait]
 pub trait IdentityCommit: Send + Sync {
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String>;
+
+    /// Restart or Remove+delete_file raced with completion: do not keep the output file.
+    async fn output_discarded(&self, _job_id: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
