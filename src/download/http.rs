@@ -518,7 +518,7 @@ pub async fn run_http_download_with_ctx(
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string()),
-                            target_path: Some(final_path),
+                            target_path: Some(final_path.clone()),
                             temp_path: Some(temp_path.clone()),
                             resume_supported: Some(resume_supported),
                             ..Default::default()
@@ -526,6 +526,10 @@ pub async fn run_http_download_with_ctx(
                     )
                     .await
                     .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+                if committer.output_discarded(&ctx.job.id).await {
+                    remove_partial(&final_path).await;
+                    return Ok(DownloadOutcome::Canceled);
+                }
                 return Ok(DownloadOutcome::Completed);
             }
             Err(error) => {
@@ -850,6 +854,9 @@ pub(crate) async fn move_to_final_path_unless_discarded(
     let final_path = move_to_final_path(temp_path, target_path, replace)
         .await
         .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
+    committer
+        .note_produced_file(job_id, final_path.clone())
+        .await;
     if committer.output_discarded(job_id).await {
         remove_partial(&final_path).await;
         return Ok(None);

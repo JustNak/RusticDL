@@ -57,10 +57,11 @@ impl ConnectionBudget {
     pub async fn update_limits(&self, max_total: u32, max_per_host: u32) {
         let (max_total, max_per_host) = clamp_limits(max_total, max_per_host);
         let old_total = self.max_total.swap(max_total, Ordering::SeqCst);
-        let old_host = self.max_per_host.swap(max_per_host, Ordering::SeqCst);
         resize_semaphore(&self.global, old_total, max_total);
+
+        let hosts = self.hosts.lock().await;
+        let old_host = self.max_per_host.swap(max_per_host, Ordering::SeqCst);
         if old_host != max_per_host {
-            let hosts = self.hosts.lock().await;
             for sem in hosts.values() {
                 resize_semaphore(sem, old_host, max_per_host);
             }
@@ -454,5 +455,19 @@ mod tests {
         );
         drop(c);
         drop(d);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_limits_new_host_sees_new_per_host_cap_once() {
+        let budget = ConnectionBudget::new(4, 1);
+        budget.update_limits(4, 2).await;
+        let a = budget.try_acquire("fresh.com").await.expect("first");
+        let b = budget.try_acquire("fresh.com").await.expect("second");
+        assert!(
+            budget.try_acquire("fresh.com").await.is_none(),
+            "a host created after resize must not get the delta applied twice"
+        );
+        drop(a);
+        drop(b);
     }
 }

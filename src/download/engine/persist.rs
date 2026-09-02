@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -107,8 +108,19 @@ impl IdentityCommit for EngineIdentity {
 
     async fn output_discarded(&self, job_id: &str) -> bool {
         let guard = self.inner.lock().await;
-        guard.requeue_on_cancel.contains_key(job_id)
+        if guard.requeue_on_cancel.contains_key(job_id)
             || guard.pending_final_deletes.contains_key(job_id)
+        {
+            return true;
+        }
+        // Cancel+delete_partial keeps the job row. Remove+keep-file does not.
+        guard.pending_partial_deletes.contains_key(job_id)
+            && guard.jobs.iter().any(|job| job.id == job_id)
+    }
+
+    async fn note_produced_file(&self, job_id: &str, path: PathBuf) {
+        let mut guard = self.inner.lock().await;
+        guard.produced_files.insert(job_id.to_string(), path);
     }
 }
 
@@ -121,7 +133,6 @@ mod tests {
     use crate::download::job::{ContentValidators, JobState, TransferMode};
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use tokio::sync::Notify;
 
     fn sample_job(id: &str) -> Job {
@@ -189,6 +200,7 @@ mod tests {
             requeue_on_cancel: HashMap::new(),
             pending_partial_deletes: HashMap::new(),
             pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
             config: EngineRuntimeConfig::default(),
             limiter: GlobalBandwidthLimiter::new(None),
             conn_budget: ConnectionBudget::new(32, 8),
@@ -395,10 +407,30 @@ mod tests {
         {
             let mut guard = inner.lock().await;
             guard.requeue_on_cancel.remove(&job_id);
-            guard
-                .pending_final_deletes
-                .insert(job_id.clone(), PathBuf::from("C:\\downloads\\file.bin"));
+            guard.pending_final_deletes.insert(job_id.clone(), ());
         }
         assert!(committer.output_discarded(&job_id).await);
+
+        {
+            let mut guard = inner.lock().await;
+            guard.pending_final_deletes.remove(&job_id);
+            guard.pending_partial_deletes.insert(
+                job_id.clone(),
+                PathBuf::from("C:\\downloads\\file.bin.part"),
+            );
+        }
+        assert!(
+            committer.output_discarded(&job_id).await,
+            "Cancel+delete_partial must discard while the job row remains"
+        );
+
+        {
+            let mut guard = inner.lock().await;
+            guard.jobs.clear();
+        }
+        assert!(
+            !committer.output_discarded(&job_id).await,
+            "Remove+keep-file must not discard just because a .part delete is pending"
+        );
     }
 }

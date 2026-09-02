@@ -12,7 +12,9 @@ use super::fetch::{
     classify_segment_status, control_outcome, fetch_range, sleep_interruptible, FetchRequest,
     RangeSpec, STALL_TIMEOUT,
 };
-use super::filesystem::{ensure_parent_directory, is_untracked_preallocate_hole, metadata_len};
+use super::filesystem::{
+    ensure_parent_directory, is_untracked_preallocate_hole, metadata_len, remove_partial,
+};
 use super::http::{
     move_to_final_path_unless_discarded, progress_percent, reconnect_backoff,
     run_http_download_with_ctx, RECONNECT_MAX,
@@ -970,7 +972,7 @@ async fn finalize_completed(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string()),
-                target_path: Some(final_path),
+                target_path: Some(final_path.clone()),
                 temp_path: Some(temp_path),
                 resume_supported: Some(true),
                 ..Default::default()
@@ -978,6 +980,10 @@ async fn finalize_completed(
         )
         .await
         .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+    if ctx.committer.output_discarded(&ctx.job.id).await {
+        remove_partial(&final_path).await;
+        return Ok(DownloadOutcome::Canceled);
+    }
     Ok(DownloadOutcome::Completed)
 }
 

@@ -252,9 +252,7 @@ pub(super) async fn remove(
             }
         }
         if worker_still_running && delete_file {
-            if let Some((_, path)) = paths.clone() {
-                guard.pending_final_deletes.insert(id.clone(), path);
-            }
+            guard.pending_final_deletes.insert(id.clone(), ());
         }
         emit_jobs_locked(&guard);
         match paths {

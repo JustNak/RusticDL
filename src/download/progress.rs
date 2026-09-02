@@ -90,10 +90,13 @@ pub type TransferEventCallback = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 pub trait IdentityCommit: Send + Sync {
     async fn commit(&self, job: &mut Job, c: CommitIdentity) -> Result<(), String>;
 
-    /// Restart or Remove+delete_file raced with completion: do not keep the output file.
+    /// Restart, Remove+delete_file, or Cancel+delete_partial raced with completion.
     async fn output_discarded(&self, _job_id: &str) -> bool {
         false
     }
+
+    /// Record the path this transfer actually created (after uniquify/replace).
+    async fn note_produced_file(&self, _job_id: &str, _path: PathBuf) {}
 }
 
 #[derive(Default)]
