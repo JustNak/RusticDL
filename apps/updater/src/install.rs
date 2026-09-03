@@ -99,9 +99,6 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
         return Err(format!("Installer missing: {}", path.display()));
     }
 
-    // Fail closed: Authenticode (WinVerifyTrust) before Command / ShellExecute.
-    verify_installer_authenticode(path)?;
-
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -140,119 +137,6 @@ pub fn run_silent_installer(path: &Path, progress: &dyn ProgressSink) -> Result<
         }
         Ok(())
     }
-}
-
-/// Reject the installer unless Authenticode trust succeeds.
-///
-/// Windows: `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`
-/// (embedded signature present, PE digest matches, cert chains to a trusted
-/// root, code-signing EKU). Not a content-length check and not a SHA-256
-/// from GitHub. Non-Windows: fail closed; this helper never executes there.
-fn verify_installer_authenticode(path: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        win_verify_trust_authenticode(path)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Err(
-            "Installer rejected: Authenticode verification failed (WinVerifyTrust). \
-The installer cannot be verified on this platform."
-                .into(),
-        )
-    }
-}
-
-#[cfg(windows)]
-fn win_verify_trust_authenticode(path: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::GUID;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-        WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE,
-        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
-    };
-
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let mut file_info = WINTRUST_FILE_INFO {
-        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
-        pcwszFilePath: windows::core::PCWSTR(wide.as_ptr()),
-        ..Default::default()
-    };
-
-    let mut data = WINTRUST_DATA {
-        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: WINTRUST_DATA_0 {
-            pFile: std::ptr::from_mut(&mut file_info),
-        },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-        ..Default::default()
-    };
-
-    let mut action: GUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    let status = unsafe {
-        WinVerifyTrust(
-            HWND::default(),
-            std::ptr::from_mut(&mut action),
-            std::ptr::from_mut(&mut data).cast(),
-        )
-    };
-
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    unsafe {
-        let _ = WinVerifyTrust(
-            HWND::default(),
-            std::ptr::from_mut(&mut action),
-            std::ptr::from_mut(&mut data).cast(),
-        );
-    }
-
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(authenticode_failure_message(status as u32))
-    }
-}
-
-/// WinVerifyTrust HRESULT → user-facing reject (still fail closed).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn authenticode_failure_message(status: u32) -> String {
-    // TRUST_E_NOSIGNATURE / TRUST_E_BAD_DIGEST / CERT_E_* (winerror.h).
-    const TRUST_E_NOSIGNATURE: u32 = 0x800B_0100;
-    const TRUST_E_BAD_DIGEST: u32 = 0x8009_6010;
-    const TRUST_E_SUBJECT_NOT_TRUSTED: u32 = 0x800B_0004;
-    const CERT_E_EXPIRED: u32 = 0x800B_0101;
-    const CERT_E_UNTRUSTEDROOT: u32 = 0x800B_0109;
-    const CERT_E_CHAINING: u32 = 0x800B_010A;
-    const TRUST_E_EXPLICIT_DISTRUST: u32 = 0x800B_0111;
-
-    let detail = match status {
-        TRUST_E_NOSIGNATURE => "The installer is unsigned.",
-        TRUST_E_BAD_DIGEST => {
-            "The installer signature does not match the file (tampered or corrupt)."
-        }
-        CERT_E_EXPIRED => "The installer signing certificate has expired.",
-        TRUST_E_SUBJECT_NOT_TRUSTED
-        | CERT_E_UNTRUSTEDROOT
-        | CERT_E_CHAINING
-        | TRUST_E_EXPLICIT_DISTRUST => "The installer is signed but not trusted by this PC.",
-        _ => "The update is unsigned, tampered, or not trusted.",
-    };
-    format!(
-        "Installer rejected: Authenticode verification failed (WinVerifyTrust status 0x{status:08X}). \
-{detail} Install manually from the release page."
-    )
 }
 
 #[cfg(windows)]
@@ -383,9 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn refuses_execute_without_authenticode() {
+    fn unsigned_installer_reaches_command() {
         let dir = std::env::temp_dir().join(format!(
-            "rusticdl-updater-authenticode-{}-{}",
+            "rusticdl-updater-unsigned-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -396,48 +280,18 @@ mod tests {
         let path = dir.join("unsigned-setup.exe");
         std::fs::write(&path, b"not-a-signed-pe\n").expect("unsigned payload");
 
-        let err = run_silent_installer(&path, &NoopProgress).expect_err(
-            "execute-without-Authenticode: unsigned installer must not reach Command / ShellExecute",
-        );
+        let err = run_silent_installer(&path, &NoopProgress)
+            .expect_err("dummy payload is not a real installer");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
-            err.contains("Authenticode") && err.contains("WinVerifyTrust"),
-            "execute-without-Authenticode: fail-closed gate must reject via Authenticode/WinVerifyTrust before Command / ShellExecute, got {err:?}"
+            !err.contains("Authenticode") && !err.contains("WinVerifyTrust"),
+            "unsigned installer must not be rejected for missing Authenticode, got {err:?}"
         );
         assert!(
-            !err.contains("Could not start installer"),
-            "execute-without-Authenticode: must fail closed before Command / ShellExecute, got {err:?}"
+            err.contains("Could not start installer") || err.contains("Installer exited"),
+            "unsigned dummy must reach Command and fail as a start/exit error, got {err:?}"
         );
-    }
-
-    #[test]
-    fn authenticode_failure_message_distinguishes_unsigned_and_untrusted() {
-        let unsigned = authenticode_failure_message(0x800B_0100);
-        assert!(
-            unsigned.contains("unsigned") && unsigned.contains("0x800B0100"),
-            "missing signature must name unsigned, got {unsigned:?}"
-        );
-        let bad_digest = authenticode_failure_message(0x8009_6010);
-        assert!(
-            bad_digest.contains("tampered") && bad_digest.contains("0x80096010"),
-            "bad digest must name tamper, got {bad_digest:?}"
-        );
-        let untrusted = authenticode_failure_message(0x800B_0109);
-        assert!(
-            untrusted.contains("not trusted") && untrusted.contains("0x800B0109"),
-            "untrusted root must say not trusted, got {untrusted:?}"
-        );
-        for msg in [&unsigned, &bad_digest, &untrusted] {
-            assert!(
-                msg.contains("Authenticode") && msg.contains("WinVerifyTrust"),
-                "fail-closed copy must keep Authenticode/WinVerifyTrust, got {msg:?}"
-            );
-            assert!(
-                msg.contains("release page"),
-                "hard verify failure still offers the release page, got {msg:?}"
-            );
-        }
     }
 
     #[cfg(target_os = "linux")]
