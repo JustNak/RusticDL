@@ -1,6 +1,7 @@
 /**
  * Capture family sessions. Replace 15s URL maps so an ask-mode prompt (5 min)
- * and its dismiss/restore cannot be recaptured by a retry or Drive 302.
+ * cannot be recaptured by a retry or Drive 302. User cancel stays canceled;
+ * host errors restore to the browser and skip recapture.
  *
  * Identity is URL + session-gateway + Firefox requestId. Filename is stored
  * on the family but is never enough to match a new download by itself.
@@ -13,7 +14,9 @@ import {
 } from './captureFilter';
 import type { ExtensionIntegrationSettings } from '@rusticdl/protocol';
 
-export type CapturePhase = 'pending' | 'handoff' | 'restoring' | 'accepted';
+export type CapturePhase = 'pending' | 'handoff' | 'restoring' | 'accepted' | 'canceled';
+
+export type HandoffFinishOutcome = 'accepted' | 'rejected' | 'canceled';
 
 export type CaptureFamilyProbe = {
   urls?: Array<string | undefined>;
@@ -201,12 +204,26 @@ export function beginHandoff(
 export function finishHandoff(
   store: CaptureSessionStore,
   sessionId: string,
-  outcome: 'accepted' | 'rejected',
+  outcome: HandoffFinishOutcome,
   now = Date.now(),
 ): CaptureSession | undefined {
   const session = store.sessions.find((entry) => entry.id === sessionId);
   if (!session) return undefined;
-  session.phase = outcome === 'accepted' ? 'accepted' : 'restoring';
+  switch (outcome) {
+    case 'accepted':
+      session.phase = 'accepted';
+      break;
+    case 'rejected':
+      session.phase = 'restoring';
+      break;
+    case 'canceled':
+      session.phase = 'canceled';
+      break;
+    default: {
+      const _exhaustive: never = outcome;
+      return _exhaustive;
+    }
+  }
   session.updatedAt = now;
   session.expiresAt = now + CAPTURE_SESSION_TTL_MS;
   return session;
@@ -229,6 +246,7 @@ export function shouldEraseGhostSession(
     case 'pending':
     case 'handoff':
     case 'accepted':
+    case 'canceled':
       return session;
     default: {
       const _exhaustive: never = session.phase;
@@ -244,6 +262,7 @@ function actionForBlockedPhase(phase: CapturePhase): CreatedAction {
     case 'pending':
     case 'handoff':
     case 'accepted':
+    case 'canceled':
       return 'erase-ghost';
     default: {
       const _exhaustive: never = phase;
@@ -333,8 +352,8 @@ export function decideFirefoxCandidateAction(
 /**
  * Replay a Firefox `{ cancel: true }` that ran before sessions/settings loaded.
  * Restoring families must not open a second prompt. Off/ignore restores the
- * browser download we already canceled. An in-flight or accepted family is a
- * ghost of the same capture — leave it canceled.
+ * browser download we already canceled. In-flight, accepted, or user-canceled
+ * families are ghosts of the same capture — leave them canceled.
  */
 export function firefoxQueuedReplayAction(
   phase: CapturePhase | undefined,
@@ -345,6 +364,7 @@ export function firefoxQueuedReplayAction(
   }
   switch (phase) {
     case 'accepted':
+    case 'canceled':
     case 'handoff':
       return 'ignore';
     case 'restoring':
@@ -362,7 +382,13 @@ function isCaptureSession(value: unknown): value is CaptureSession {
   if (!value || typeof value !== 'object') return false;
   const raw = value as Partial<CaptureSession>;
   if (typeof raw.id !== 'string' || typeof raw.phase !== 'string') return false;
-  if (raw.phase !== 'pending' && raw.phase !== 'handoff' && raw.phase !== 'restoring' && raw.phase !== 'accepted') {
+  if (
+    raw.phase !== 'pending'
+    && raw.phase !== 'handoff'
+    && raw.phase !== 'restoring'
+    && raw.phase !== 'accepted'
+    && raw.phase !== 'canceled'
+  ) {
     return false;
   }
   if (!Array.isArray(raw.urls) || !Array.isArray(raw.requestIds)) return false;

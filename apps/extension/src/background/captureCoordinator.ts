@@ -1,8 +1,10 @@
 /**
  * Download capture orchestration: pause / erase / handoff / restore.
  *
- * Session state lives in captureSession (persisted). This module talks to the
- * downloads API and native host. index.ts only registers listeners.
+ * User cancel on the ask prompt aborts (no browser restore). Host errors still
+ * restore the shelf item. Session state lives in captureSession (persisted).
+ * This module talks to the downloads API and native host. index.ts only
+ * registers listeners.
  */
 import {
   isErrorResponse,
@@ -103,7 +105,8 @@ type DownloadChangeDelta = {
   fileSize?: { current?: number };
 };
 
-type HandoffAttempt = 'accepted' | 'already_claimed' | 'rejected';
+type HandoffAttempt = 'accepted' | 'already_claimed' | 'dismissed' | 'rejected';
+type HandoffOutcome = 'accepted' | 'dismissed' | 'rejected';
 
 type CoordinatorHostHooks = {
   updateBadge(state: PopupStateResponse): Promise<void>;
@@ -324,11 +327,21 @@ async function eraseBrowserDownload(id: number): Promise<void> {
   }
 }
 
-function isSuccessfulHandoff(response: HostToExtensionResponse): boolean {
-  if (isErrorResponse(response) || !response.ok) return false;
-  if (response.type !== 'accepted') return false;
-  const status = response.payload.status;
-  return status === 'queued' || status === 'duplicate_existing_job';
+function classifyHandoffResponse(response: HostToExtensionResponse): HandoffOutcome {
+  if (isErrorResponse(response) || !response.ok || response.type !== 'accepted') {
+    return 'rejected';
+  }
+  switch (response.payload.status) {
+    case 'queued':
+    case 'duplicate_existing_job':
+      return 'accepted';
+    case 'dismissed':
+      return 'dismissed';
+    default: {
+      const _exhaustive: never = response.payload.status;
+      return _exhaustive;
+    }
+  }
 }
 
 async function restoreBrowserDownload(snapshot: {
@@ -432,26 +445,37 @@ async function handOffUrl(
     handoffAuth: metadata.handoffAuth ?? handoffAuth,
   });
 
-  if (isErrorResponse(response) || !isSuccessfulHandoff(response)) {
-    finishHandoff(store, sessionId, 'rejected');
-    persistSessions();
-    if (isErrorResponse(response)) {
-      const connection = connectionForErrorCode(response.code);
-      const state = await setHostError(
-        response.code,
-        response.message || toUserFacingMessage(response.code, response.message),
-        connection,
-      );
+  const outcome = classifyHandoffResponse(response);
+  switch (outcome) {
+    case 'accepted': {
+      finishHandoff(store, sessionId, 'accepted');
+      persistSessions();
+      const state = await setLastResult('connected', response);
       await hostHooks.updateBadge(state);
+      return 'accepted';
     }
-    return 'rejected';
+    case 'dismissed':
+      finishHandoff(store, sessionId, 'canceled');
+      persistSessions();
+      return 'dismissed';
+    case 'rejected':
+      finishHandoff(store, sessionId, 'rejected');
+      persistSessions();
+      if (isErrorResponse(response)) {
+        const connection = connectionForErrorCode(response.code);
+        const state = await setHostError(
+          response.code,
+          response.message || toUserFacingMessage(response.code, response.message),
+          connection,
+        );
+        await hostHooks.updateBadge(state);
+      }
+      return 'rejected';
+    default: {
+      const _exhaustive: never = outcome;
+      return _exhaustive;
+    }
   }
-
-  finishHandoff(store, sessionId, 'accepted');
-  persistSessions();
-  const state = await setLastResult('connected', response);
-  await hostHooks.updateBadge(state);
-  return 'accepted';
 }
 
 async function handoffBrowserDownload(
@@ -482,13 +506,11 @@ async function handoffBrowserDownload(
     sessionId,
   });
 
-  if (attempt === 'rejected') {
-    await restoreBrowserDownload({
-      url,
-      filename: suggestedFilename,
-      sessionId,
-    });
-  }
+  await restoreIfHandoffRejected(attempt, {
+    url,
+    filename: suggestedFilename,
+    sessionId,
+  });
 }
 
 function deltaCurrent<T>(field: { current?: T } | T | undefined): T | undefined {
@@ -774,6 +796,30 @@ export function onChromiumDeterminingFilename(
   void finalizePendingCapture(pending.item, settings, pending.sessionId);
 }
 
+async function restoreIfHandoffRejected(
+  attempt: HandoffAttempt,
+  snapshot: {
+    url: string;
+    filename?: string;
+    relatedUrl?: string;
+    sessionId?: string;
+  },
+): Promise<void> {
+  switch (attempt) {
+    case 'accepted':
+    case 'already_claimed':
+    case 'dismissed':
+      return;
+    case 'rejected':
+      await restoreBrowserDownload(snapshot);
+      return;
+    default: {
+      const _exhaustive: never = attempt;
+      return _exhaustive;
+    }
+  }
+}
+
 async function handoffFirefoxCandidate(
   candidate: FirefoxCaptureCandidate,
   settings: ExtensionIntegrationSettings,
@@ -795,14 +841,12 @@ async function handoffFirefoxCandidate(
     requestId,
     sessionId,
   });
-  if (attempt === 'rejected') {
-    await restoreBrowserDownload({
-      url,
-      filename: candidate.filename,
-      relatedUrl: candidate.url !== url ? candidate.url : undefined,
-      sessionId,
-    });
-  }
+  await restoreIfHandoffRejected(attempt, {
+    url,
+    filename: candidate.filename,
+    relatedUrl: candidate.url !== url ? candidate.url : undefined,
+    sessionId,
+  });
 }
 
 function acceptFirefoxCandidate(

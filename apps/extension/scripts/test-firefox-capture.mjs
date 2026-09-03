@@ -1622,7 +1622,7 @@ followCaptureFamily(storeB, {
   sessionUrl: canvasUrl,
 });
 assert(
-  'Canvas → Drive 302 after dismiss stays restoring',
+  'Canvas → Drive 302 after host-error restore stays restoring',
   storeB.sessions[0]?.phase === 'restoring'
     && storeB.sessions[0].urls.includes(driveUrl),
 );
@@ -1634,7 +1634,7 @@ assert(
 );
 
 assert(
-  'onCreated after dismiss+redirect is skip-restore, not a new prompt',
+  'onCreated after host-error restore+redirect is skip-restore, not a new prompt',
   decideCreatedAction(
     storeB,
     { url: docsUrl, filename: 'Google Drive Folder.docx', mime: 'application/pdf', hasAttachment: true, totalBytes: 20_000 },
@@ -1648,7 +1648,7 @@ const longPrompt = beginHandoff(storeC, { urls: [zipItem.url], filename: zipItem
 const after15s = Date.now() + 15_001;
 finishHandoff(storeC, longPrompt.session.id, 'rejected', after15s);
 assert(
-  'dismiss after 15s still skips restore (session TTL is the prompt window, not 15s)',
+  'host-error restore after 15s still skips recapture (session TTL is the prompt window, not 15s)',
   decideCreatedAction(
     storeC,
     zipItem,
@@ -1656,6 +1656,32 @@ assert(
     {},
     after15s + 1_000,
   ) === 'skip-restore',
+);
+
+const cancelStore = createCaptureSessionStore();
+const userCancel = beginHandoff(cancelStore, { urls: [zipItem.url], filename: zipItem.filename });
+finishHandoff(cancelStore, userCancel.session.id, 'canceled');
+assert(
+  'user cancel marks the family canceled',
+  cancelStore.sessions[0]?.phase === 'canceled',
+);
+assert(
+  'onCreated after user cancel erases the ghost instead of restoring',
+  decideCreatedAction(cancelStore, zipItem, defaultSettings) === 'erase-ghost'
+    && shouldEraseGhostSession(cancelStore, { urls: [zipItem.url] }) != null,
+);
+assert(
+  'Firefox retry after user cancel is cancel-ghost, not allow',
+  decideFirefoxCandidateAction(cancelStore, { urls: [zipItem.url], filename: zipItem.filename })
+    === 'cancel-ghost',
+);
+const canceledDump = sessionsToStorageValue(cancelStore);
+const canceledReloaded = sessionsFromStorageValue(canceledDump, Date.now() + 30_000);
+assert(
+  'canceled session reloads and still erases ghosts',
+  canceledReloaded.sessions[0]?.phase === 'canceled'
+    && decideCreatedAction(canceledReloaded, zipItem, defaultSettings, {}, Date.now() + 30_000)
+      === 'erase-ghost',
 );
 
 const storeD = createCaptureSessionStore();
@@ -1707,10 +1733,10 @@ assert(
 );
 
 const restorePauseStore = createCaptureSessionStore();
-const dismissed = beginHandoff(restorePauseStore, { urls: [zipItem.url], filename: zipItem.filename });
-finishHandoff(restorePauseStore, dismissed.session.id, 'rejected');
+const hostRejected = beginHandoff(restorePauseStore, { urls: [zipItem.url], filename: zipItem.filename });
+finishHandoff(restorePauseStore, hostRejected.session.id, 'rejected');
 assert(
-  'dismissed site retry is skip-restore so a pre-hydrate pause must be released',
+  'host-error site retry is skip-restore so a pre-hydrate pause must be released',
   decideCreatedAction(restorePauseStore, zipItem, defaultSettings) === 'skip-restore'
     && createdActionShouldResume('skip-restore'),
 );
@@ -1734,6 +1760,10 @@ assert(
 assert(
   'queued Firefox cancel of an accepted family stays canceled',
   firefoxQueuedReplayAction('accepted', true) === 'ignore',
+);
+assert(
+  'queued Firefox cancel of a user-canceled family stays canceled',
+  firefoxQueuedReplayAction('canceled', true) === 'ignore',
 );
 assert(
   'queued Firefox cancel on a pending wait hands off when still a candidate',
