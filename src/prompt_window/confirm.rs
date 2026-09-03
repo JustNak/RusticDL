@@ -308,7 +308,7 @@ impl BrowserPromptWindow {
                     .pt_1()
                     .child(
                         Button::new("prompt-dismiss")
-                            .label("Dismiss")
+                            .label("Cancel")
                             .outline()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.dismiss_confirm(window, cx);
