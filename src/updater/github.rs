@@ -61,7 +61,7 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
-    /// SHA-256 of the Linux tarball from `SHA256SUMS` (Windows uses Authenticode).
+    /// SHA-256 of the Linux tarball from `SHA256SUMS` (Windows has no checksum gate).
     pub setup_sha256: Option<String>,
 }
 

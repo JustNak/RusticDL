@@ -57,7 +57,7 @@ The installer places files under `%LOCALAPPDATA%\RusticDL\`, creates a Start Men
 
 Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & Features (optionally remove app data).
 
-> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see [Browser extension](docs/browser-extension.md)). Stable and Nightly Windows installers are Authenticode-signed via Azure Trusted Signing. Local source builds are unsigned.
+> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see [Browser extension](docs/browser-extension.md)). GitHub Windows installers are unsigned; Windows may show SmartScreen (“Windows protected your PC”) and/or UAC. Local source builds are also unsigned.
 
 ### Install (Linux)
 

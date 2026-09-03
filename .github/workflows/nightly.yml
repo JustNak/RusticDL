@@ -87,10 +87,6 @@ jobs:
     needs: decide
     if: github.repository == 'JustNak/RusticDL' && github.ref == 'refs/heads/master' && needs.decide.result == 'success' && needs.decide.outputs.skip != 'true'
     runs-on: windows-latest
-    environment: windows-signing
-    permissions:
-      contents: write
-      id-token: write
     env:
       RUSTICDL_VERSION: ${{ needs.decide.outputs.version }}
     steps:
@@ -118,31 +114,6 @@ jobs:
           cargo build --release -p rusticdl-updater
           cargo build --release -p rusticdl-native-host
 
-      - name: Require Azure Trusted Signing
-        env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
-          AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
-          AZURE_TRUSTED_SIGNING_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts/require-trusted-signing.ps1
-
-      - name: Sign release binaries
-        uses: ./.github/actions/sign-windows
-        with:
-          files: |
-            ${{ github.workspace }}/target/release/rusticdl.exe
-            ${{ github.workspace }}/target/release/rusticdl-updater.exe
-            ${{ github.workspace }}/target/release/rusticdl-native-host.exe
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          endpoint: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
-
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version 0.11.8
 
@@ -157,17 +128,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           powershell -ExecutionPolicy Bypass -File scripts/package-release-assets.ps1
-
-      - name: Sign NSIS setup
-        uses: ./.github/actions/sign-windows
-        with:
-          files: ${{ github.workspace }}/dist-release/RusticDL-windows-x64-setup.exe
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          endpoint: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
-          account: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
-          profile: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
 
       - name: Create nightly GitHub Release
         uses: softprops/action-gh-release@v2
