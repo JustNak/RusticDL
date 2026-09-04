@@ -739,31 +739,34 @@ impl Render for DownloadApp {
                 }
             }))
             .child(
-                v_flex().size_full().child(self.render_title_bar(cx)).child(
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .child(if self.filter == FilterKind::Settings {
-                            self.render_settings_sidebar(cx).into_any_element()
-                        } else {
-                            self.render_sidebar(cx).into_any_element()
-                        })
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .h_full()
-                                .min_w_0()
-                                .child(if self.filter == FilterKind::Settings {
-                                    self.render_settings(cx).into_any_element()
-                                } else {
-                                    self.render_queue(window, cx)
-                                })
-                                .when(self.filter != FilterKind::Settings, |col| {
-                                    col.child(self.render_status_bar(cx))
-                                }),
-                        ),
-                ),
+                h_flex()
+                    .size_full()
+                    .child(if self.filter == FilterKind::Settings {
+                        self.render_settings_sidebar(cx).into_any_element()
+                    } else {
+                        self.render_sidebar(cx).into_any_element()
+                    })
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .child(self.render_title_bar(cx))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .child(if self.filter == FilterKind::Settings {
+                                        self.render_settings(cx).into_any_element()
+                                    } else {
+                                        self.render_queue(window, cx)
+                                    })
+                                    .when(self.filter != FilterKind::Settings, |col| {
+                                        col.child(self.render_status_bar(cx))
+                                    }),
+                            ),
+                    ),
             )
             // (GPUI canvas `.opacity()` does not affect paint_image).
             .when(noise_on, |this| {
