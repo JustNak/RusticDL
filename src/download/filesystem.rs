@@ -101,7 +101,27 @@ fn free_space_bytes_sync(path: &Path) -> Option<u64> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn free_space_bytes_sync(path: &Path) -> Option<u64> {
+    statvfs_free(path).or_else(|| path.parent().and_then(statvfs_free))
+}
+
+#[cfg(unix)]
+fn statvfs_free(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), vfs.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let vfs = unsafe { vfs.assume_init() };
+    Some((vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64))
+}
+
+#[cfg(not(any(windows, unix)))]
 fn free_space_bytes_sync(_path: &Path) -> Option<u64> {
     None
 }
@@ -1299,7 +1319,12 @@ mod tests {
             let free = free.expect("GetDiskFreeSpaceExW should work on temp dir");
             assert!(free > 0, "expected positive free space on temp volume");
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        {
+            let free = free.expect("statvfs should work on temp dir");
+            assert!(free > 0, "expected positive free space on temp volume");
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let _ = free;
         }

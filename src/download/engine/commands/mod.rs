@@ -17,6 +17,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             directory,
             handoff_auth,
             conflict,
+            total_bytes,
             reply,
         } => {
             add::handle(
@@ -26,6 +27,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                 directory,
                 handoff_auth,
                 conflict,
+                total_bytes,
                 reply,
             )
             .await;
@@ -54,6 +56,9 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
         }
         EngineCommand::PauseAll => {
             bulk::pause_all(inner).await;
+        }
+        EngineCommand::Drain { ack } => {
+            bulk::drain(inner, ack).await;
         }
         EngineCommand::ResumeAll => {
             bulk::resume_all(inner).await;
@@ -230,6 +235,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -243,6 +249,65 @@ mod tests {
 
         let toast = next_toast(&mut events).await;
         assert_eq!(toast, format!("Already downloading: {existing_name}"));
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_sets_total_bytes_from_capture_without_resume_supported() {
+        let dir = temp_dir();
+        let (engine, mut events) = spawn_test_engine(vec![]);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/sized.bin".into(),
+            filename: None,
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: Some(10_000_000),
+            reply: Some(reply_tx),
+        });
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        let sized_id = outcome.job_id.clone();
+        let sized = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let jobs = next_jobs(&mut events).await;
+                if let Some(job) = jobs.iter().find(|job| job.id == sized_id) {
+                    break job.clone();
+                }
+            }
+        })
+        .await
+        .expect("sized job");
+        assert_eq!(sized.total_bytes, 10_000_000);
+        assert!(!sized.resume_supported);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/unknown.bin".into(),
+            filename: None,
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
+            reply: Some(reply_tx),
+        });
+        let outcome = reply_rx.await.expect("reply");
+        let unknown_id = outcome.job_id.clone();
+        let unknown = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let jobs = next_jobs(&mut events).await;
+                if let Some(job) = jobs.iter().find(|job| job.id == unknown_id) {
+                    break job.clone();
+                }
+            }
+        })
+        .await
+        .expect("unknown job");
+        assert_eq!(unknown.total_bytes, 0);
+        assert!(!unknown.resume_supported);
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -265,6 +330,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -295,6 +361,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -335,6 +402,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
         let outcome = reply_rx.await.expect("reply");
@@ -359,6 +427,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -405,6 +474,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -444,6 +514,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -476,6 +547,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1071,6 +1143,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_worker_finalizes_when_reserved_job_was_removed() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/reserved-remove.bin",
+            JobState::Starting,
+            &dir,
+        );
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+        let control = Arc::new(AtomicU8::new(0));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::remove(&inner, id.clone(), true, false).await;
+
+        {
+            let guard = inner.lock().await;
+            assert!(guard.jobs.iter().all(|j| j.id != id));
+            assert_eq!(guard.pending_partial_deletes.get(&id), Some(&part));
+        }
+        assert!(
+            part.exists(),
+            ".part must remain until start_worker finalizes"
+        );
+
+        super::super::worker::start_worker(inner.clone(), id.clone());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let guard = inner.lock().await;
+                    if !guard.active.contains_key(&id) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reserved worker occupancy should clear");
+
+        assert!(!part.exists(), ".part deleted after missing-job finalize");
+        {
+            let guard = inner.lock().await;
+            assert!(!guard.pending_partial_deletes.contains_key(&id));
+            assert!(!guard.pending_final_deletes.contains_key(&id));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn finalize_deletes_produced_file_not_original_uniquified_target() {
         let dir = temp_dir();
         let job = sample_job(
@@ -1282,6 +1434,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1317,6 +1470,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1348,6 +1502,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1381,6 +1536,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 

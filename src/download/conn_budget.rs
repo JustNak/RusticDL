@@ -26,10 +26,10 @@ pub struct ConnectionPermit {
 pub fn host_key_for_budget(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => {
-            let host = parsed.host_str().unwrap_or("unknown");
-            match parsed.port() {
-                Some(port) => format!("{host}:{port}"),
-                None => host.to_string(),
+            let host = parsed.host_str().unwrap_or("unknown").to_ascii_lowercase();
+            match parsed.port_or_known_default() {
+                Some(port) => format!("{}://{}:{port}", parsed.scheme(), host),
+                None => format!("{}://{}", parsed.scheme(), host),
             }
         }
         Err(_) => "unknown".into(),
@@ -288,14 +288,31 @@ mod tests {
     #[tokio::test]
     async fn host_key_is_case_insensitive() {
         let budget = ConnectionBudget::new(4, 1);
-        let a = budget.try_acquire("Example.COM").await.expect("first");
+        let https = host_key_for_budget("https://Example.COM/file.bin");
+        let a = budget.try_acquire(&https).await.expect("first");
         assert!(
-            budget.try_acquire("example.com").await.is_none(),
+            budget
+                .try_acquire(&host_key_for_budget("https://example.com/file.bin"))
+                .await
+                .is_none(),
             "mixed case must share per-host cap"
         );
-        assert!(budget.try_acquire("EXAMPLE.com:443").await.is_some());
+        assert!(
+            budget
+                .try_acquire(&host_key_for_budget("https://EXAMPLE.com:443/file.bin"))
+                .await
+                .is_none(),
+            "default https port must share the same host key"
+        );
+        assert!(
+            budget
+                .try_acquire(&host_key_for_budget("http://example.com/file.bin"))
+                .await
+                .is_some(),
+            "http and https must be distinct keys"
+        );
         drop(a);
-        assert!(budget.try_acquire("example.com").await.is_some());
+        assert!(budget.try_acquire(&https).await.is_some());
     }
 
     #[test]
@@ -399,11 +416,19 @@ mod tests {
     fn host_key_for_budget_uses_host_and_port() {
         assert_eq!(
             host_key_for_budget("https://CDN.Example.COM/file.bin"),
-            "cdn.example.com"
+            "https://cdn.example.com:443"
+        );
+        assert_eq!(
+            host_key_for_budget("https://h/"),
+            host_key_for_budget("https://h:443/")
+        );
+        assert_ne!(
+            host_key_for_budget("http://h/"),
+            host_key_for_budget("https://h/")
         );
         assert_eq!(
             host_key_for_budget("http://127.0.0.1:8080/x"),
-            "127.0.0.1:8080"
+            "http://127.0.0.1:8080"
         );
         assert_eq!(host_key_for_budget("not a url"), "unknown");
     }
