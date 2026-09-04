@@ -4,6 +4,8 @@ use gpui::{
 };
 #[cfg(target_os = "linux")]
 use gpui::{App, MouseButton, StatefulInteractiveElement, WindowControlArea};
+#[cfg(target_os = "linux")]
+use gpui_component::InteractiveElementExt;
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
@@ -159,16 +161,17 @@ impl DownloadApp {
 
         #[cfg(target_os = "linux")]
         let content = content
-            .when(on_hyprland, |el| {
+            .when(on_hyprland || chrome_on_left, |el| {
                 el.child(if show_queue_chrome {
                     hyprland_title_bar_drag_region().w(px(12.)).flex_shrink_0()
                 } else {
                     hyprland_title_bar_drag_region().flex_1()
                 })
             })
-            .when(!on_hyprland && !show_queue_chrome, |el| {
-                el.child(div().flex_1())
-            });
+            .when(
+                !on_hyprland && !chrome_on_left && !show_queue_chrome,
+                |el| el.child(div().flex_1()),
+            );
 
         #[cfg(not(target_os = "linux"))]
         let content = content.when(!show_queue_chrome, |el| el.child(div().flex_1()));
@@ -452,6 +455,16 @@ mod hyprland_title_bar_tests {
         assert!(
             call_sites >= 1,
             "expected at least one linux-gated hyprland_title_bar_drag_region call"
+        );
+    }
+
+    #[test]
+    fn left_controls_linux_title_bar_mounts_drag_region() {
+        let source = normalized_source(SOURCE);
+        assert!(
+            source.contains("on_hyprland || chrome_on_left")
+                || source.contains("chrome_on_left || on_hyprland"),
+            "left-controls linux title bar must mount the drag region used by Hyprland"
         );
     }
 }
