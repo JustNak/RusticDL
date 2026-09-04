@@ -23,4 +23,6 @@ Large files can split across parallel HTTP Range connections. Smaller files, ser
 
 If **Max concurrent × Max segments** exceeds **Total connections**, extra segments wait on the budget — that is expected, not an error. Jobs that already have a segment map keep using that map until they finish or you Restart. The engine picks multi-connection when the file is large enough and the server supports ranges.
 
+The engine persists `segment_map.written` only after fsync on pause, cancel, error, complete, or start identity. Live progress ticks do not write that field. Quit sends Drain, which pauses in-flight jobs so they fsync before the process exits. Max concurrent occupancy is reserved when a job becomes Starting.
+
 > **Do not downgrade mid multi download.** A 0.3.0 multi job writes `transfer_format_version = 1` and a segment map. Older builds ignore those fields and can mis-resume a preallocated `.part` (holes treated as real bytes). Finish or Restart multi jobs on 0.3.0 before installing an older release.

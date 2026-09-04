@@ -17,6 +17,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
             directory,
             handoff_auth,
             conflict,
+            total_bytes,
             reply,
         } => {
             add::handle(
@@ -26,6 +27,7 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
                 directory,
                 handoff_auth,
                 conflict,
+                total_bytes,
                 reply,
             )
             .await;
@@ -54,6 +56,9 @@ pub(super) async fn handle_command(inner: &Arc<Mutex<EngineInner>>, cmd: EngineC
         }
         EngineCommand::PauseAll => {
             bulk::pause_all(inner).await;
+        }
+        EngineCommand::Drain { ack } => {
+            bulk::drain(inner, ack).await;
         }
         EngineCommand::ResumeAll => {
             bulk::resume_all(inner).await;
@@ -230,6 +235,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -243,6 +249,65 @@ mod tests {
 
         let toast = next_toast(&mut events).await;
         assert_eq!(toast, format!("Already downloading: {existing_name}"));
+
+        engine.send(EngineCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_sets_total_bytes_from_capture_without_resume_supported() {
+        let dir = temp_dir();
+        let (engine, mut events) = spawn_test_engine(vec![]);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/sized.bin".into(),
+            filename: None,
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: Some(10_000_000),
+            reply: Some(reply_tx),
+        });
+        let outcome = reply_rx.await.expect("reply");
+        assert_eq!(outcome.status, EnqueueStatus::Queued);
+        let sized_id = outcome.job_id.clone();
+        let sized = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let jobs = next_jobs(&mut events).await;
+                if let Some(job) = jobs.iter().find(|job| job.id == sized_id) {
+                    break job.clone();
+                }
+            }
+        })
+        .await
+        .expect("sized job");
+        assert_eq!(sized.total_bytes, 10_000_000);
+        assert!(!sized.resume_supported);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.send(EngineCommand::Add {
+            url: "https://example.com/unknown.bin".into(),
+            filename: None,
+            directory: dir.clone(),
+            handoff_auth: None,
+            conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
+            reply: Some(reply_tx),
+        });
+        let outcome = reply_rx.await.expect("reply");
+        let unknown_id = outcome.job_id.clone();
+        let unknown = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let jobs = next_jobs(&mut events).await;
+                if let Some(job) = jobs.iter().find(|job| job.id == unknown_id) {
+                    break job.clone();
+                }
+            }
+        })
+        .await
+        .expect("unknown job");
+        assert_eq!(unknown.total_bytes, 0);
+        assert!(!unknown.resume_supported);
 
         engine.send(EngineCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -265,6 +330,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -295,6 +361,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -335,6 +402,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
         let outcome = reply_rx.await.expect("reply");
@@ -359,6 +427,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -405,6 +474,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -444,6 +514,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -476,6 +547,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1282,6 +1354,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1317,6 +1390,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1348,6 +1422,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 
@@ -1381,6 +1456,7 @@ mod tests {
             directory: dir.clone(),
             handoff_auth: None,
             conflict: crate::download::FilenameConflictPolicy::Overwrite,
+            total_bytes: None,
             reply: Some(reply_tx),
         });
 

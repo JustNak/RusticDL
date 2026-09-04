@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio::time::{sleep, Instant};
 
 use super::super::super::http::store_control;
 use super::super::super::job::{JobState, WorkerControl};
@@ -33,6 +35,32 @@ pub(super) async fn pause_all(inner: &Arc<Mutex<EngineInner>>) {
         }
     }
     emit_jobs_locked(&guard);
+}
+
+pub(super) async fn drain(inner: &Arc<Mutex<EngineInner>>, ack: Option<oneshot::Sender<()>>) {
+    pause_all(inner).await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (wake, empty) = {
+            let guard = inner.lock().await;
+            (guard.wake.clone(), guard.active.is_empty())
+        };
+        if empty {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let slice = Duration::from_millis(50).min(deadline - now);
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = sleep(slice) => {}
+        }
+    }
+    if let Some(ack) = ack {
+        let _ = ack.send(());
+    }
 }
 
 pub(super) async fn resume_all(inner: &Arc<Mutex<EngineInner>>) {

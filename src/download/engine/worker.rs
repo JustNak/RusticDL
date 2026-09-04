@@ -33,13 +33,18 @@ pub(super) fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
     tokio::spawn(async move {
         let (job_snapshot, control, limiter, handoff_auth) = {
             let mut guard = inner.lock().await;
-            let control = Arc::new(AtomicU8::new(0));
-            guard.controls.insert(job_id.clone(), control.clone());
+            // Reuse the scheduler Arc so a Pause stored during Starting is not dropped.
+            let control = guard
+                .controls
+                .entry(job_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU8::new(0)))
+                .clone();
             guard.active.insert(job_id.clone(), ());
             let job = match guard.jobs.iter().find(|j| j.id == job_id) {
                 Some(j) => j.clone(),
                 None => {
                     guard.active.remove(&job_id);
+                    guard.controls.remove(&job_id);
                     return;
                 }
             };

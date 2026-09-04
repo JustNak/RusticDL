@@ -213,17 +213,8 @@ pub fn apply_tick(job: &mut Job, tick: ProgressTick) -> bool {
     if let Some(n) = tick.reconnect_count {
         job.reconnect_count = n;
     }
-    if let Some(written) = tick.segment_written {
-        if let Some(map) = job.segment_map.as_mut() {
-            if written.len() == map.segments.len() {
-                for (segment, n) in map.segments.iter_mut().zip(written) {
-                    if n > segment.written {
-                        segment.written = n;
-                    }
-                }
-            }
-        }
-    }
+    // Live ticks must not touch map.written. That field is the crash-resume
+    // oracle and moves only through IdentityCommit after fsync (or multi start set_len).
 
     true
 }
@@ -511,11 +502,29 @@ mod tests {
         );
         assert!(ok);
         let after = job.segment_map.expect("map kept");
-        assert_eq!(after.segments[0].written, 40);
+        assert_eq!(after.segments[0].written, map.segments[0].written);
         assert_eq!(after.segments[0].start, map.segments[0].start);
         assert_eq!(after.segments[0].end, map.segments[0].end);
         assert_eq!(job.downloaded_bytes, 40);
         assert_eq!(job.validators, ContentValidators::default());
+    }
+
+    #[test]
+    fn apply_tick_does_not_raise_durable_written_from_tick() {
+        let mut job = sample_job(JobState::Downloading);
+        let mut map = sample_map();
+        map.segments[0].written = 0;
+        job.segment_map = Some(map);
+        apply_tick(
+            &mut job,
+            ProgressTick {
+                downloaded_bytes: Some(40),
+                segment_written: Some(vec![40]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.downloaded_bytes, 40);
+        assert_eq!(job.segment_map.as_ref().unwrap().segments[0].written, 0);
     }
 
     #[test]

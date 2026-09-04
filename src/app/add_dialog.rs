@@ -67,6 +67,7 @@ pub(crate) fn enqueue_urls(
             directory,
             handoff_auth: None,
             conflict: FilenameConflictPolicy::Uniquify,
+            total_bytes: None,
             reply: None,
         });
         count += 1;

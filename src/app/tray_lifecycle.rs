@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use gpui::{Context, Window};
+use tokio::sync::oneshot;
 
 use super::DownloadApp;
-use crate::download::open_path;
+use crate::download::{open_path, EngineCommand};
 use crate::notifications::BalloonOutcome;
 use crate::prompt_window::close_capture_window;
 use crate::settings::OsNotifyMode;
@@ -16,17 +19,19 @@ impl DownloadApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.force_quit || !self.settings.close_to_tray {
+        if self.force_quit {
             self.flush_window_layout_now();
-            self.flush_jobs_save_now();
             return true;
+        }
+        if !self.settings.close_to_tray {
+            self.force_quit_app(cx);
+            return false;
         }
 
         self.ensure_tray(cx);
         if self.system_tray.is_none() {
-            self.flush_window_layout_now();
-            self.flush_jobs_save_now();
-            return true;
+            self.force_quit_app(cx);
+            return false;
         }
 
         self.flush_window_layout_now();
@@ -89,9 +94,20 @@ impl DownloadApp {
     pub(crate) fn force_quit_app(&mut self, cx: &mut Context<Self>) {
         self.force_quit = true;
         self.flush_window_layout_now();
-        self.flush_jobs_save_now();
-        self.stop_tray_nonblocking();
-        cx.quit();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.engine.send(EngineCommand::Drain { ack: Some(ack_tx) });
+        cx.spawn(async move |this, cx| {
+            tokio::select! {
+                _ = ack_rx => {}
+                _ = cx.background_executor().timer(Duration::from_secs(2)) => {}
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.flush_jobs_save_now();
+                app.stop_tray_nonblocking();
+                cx.quit();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn sync_tray_lifetime(&mut self, cx: &mut Context<Self>) {

@@ -183,6 +183,7 @@ async fn enqueue_download(
         directory,
         handoff_auth,
         FilenameConflictPolicy::Uniquify,
+        payload.total_bytes,
     )
     .await
 }
@@ -269,6 +270,7 @@ async fn prompt_download(
                 directory,
                 handoff_auth,
                 conflict,
+                payload.total_bytes,
             )
             .await
         }
@@ -283,6 +285,7 @@ async fn engine_enqueue(
     directory: PathBuf,
     handoff_auth: Option<HandoffAuth>,
     conflict: FilenameConflictPolicy,
+    total_bytes: Option<u64>,
 ) -> HostResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
     let name = filename
@@ -303,6 +306,7 @@ async fn engine_enqueue(
         directory,
         handoff_auth,
         conflict,
+        total_bytes,
         reply: Some(reply_tx),
     });
 

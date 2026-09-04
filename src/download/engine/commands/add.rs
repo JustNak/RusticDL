@@ -19,6 +19,7 @@ pub(super) async fn handle(
     directory: PathBuf,
     handoff_auth: Option<HandoffAuth>,
     conflict: FilenameConflictPolicy,
+    total_bytes: Option<u64>,
     reply: Option<oneshot::Sender<EnqueueOutcome>>,
 ) {
     let mut urls = extract_http_urls(&url);
@@ -108,6 +109,11 @@ pub(super) async fn handle(
             let mut job = Job::new(url, name, target, temp);
             job.replace_existing = replace_existing;
             if first_outcome.is_none() {
+                if let Some(n) = total_bytes {
+                    if n > 0 {
+                        job.total_bytes = n;
+                    }
+                }
                 first_outcome = Some(EnqueueOutcome {
                     job_id: job.id.clone(),
                     filename: job.filename.clone(),

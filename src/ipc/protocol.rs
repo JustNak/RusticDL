@@ -54,7 +54,6 @@ pub(crate) struct EnqueuePayload {
     pub url: String,
     pub source: EnqueueSource,
     pub suggested_filename: Option<String>,
-    #[allow(dead_code)]
     pub total_bytes: Option<u64>,
     pub handoff_auth: Option<RawHandoffAuth>,
 }

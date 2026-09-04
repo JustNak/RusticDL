@@ -96,6 +96,7 @@ pub enum EngineCommand {
         directory: PathBuf,
         handoff_auth: Option<HandoffAuth>,
         conflict: FilenameConflictPolicy,
+        total_bytes: Option<u64>,
         reply: Option<oneshot::Sender<EnqueueOutcome>>,
     },
     Pause(String),
@@ -112,6 +113,9 @@ pub enum EngineCommand {
         delete_file: bool,
     },
     PauseAll,
+    Drain {
+        ack: Option<oneshot::Sender<()>>,
+    },
     ResumeAll,
     RetryAll,
     UpdateSettings(EngineRuntimeConfig),
@@ -240,35 +244,43 @@ fn job_keeps_scheduler_awake(job: &Job) -> bool {
     )
 }
 
+fn reserve_startable_jobs(guard: &mut EngineInner) -> Vec<String> {
+    let max = guard.config.max_concurrent as usize;
+    let active = guard.active.len();
+    if active >= max {
+        return Vec::new();
+    }
+    let slots = max - active;
+    let mut ids = Vec::new();
+    for job in &guard.jobs {
+        if ids.len() >= slots {
+            break;
+        }
+        if job_is_startable(guard, &job.id) {
+            ids.push(job.id.clone());
+        }
+    }
+    for id in &ids {
+        if let Some(job) = find_job_mut(&mut guard.jobs, id) {
+            job.state = JobState::Starting;
+        }
+        guard.active.insert(id.clone(), ());
+        guard
+            .controls
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(AtomicU8::new(0)));
+    }
+    if !ids.is_empty() {
+        emit_jobs_locked(guard);
+    }
+    ids
+}
+
 async fn scheduler_loop(inner: Arc<Mutex<EngineInner>>) {
     loop {
         let to_start = {
             let mut guard = inner.lock().await;
-            let max = guard.config.max_concurrent as usize;
-            let active = guard.active.len();
-            if active >= max {
-                Vec::new()
-            } else {
-                let slots = max - active;
-                let mut ids = Vec::new();
-                for job in &guard.jobs {
-                    if ids.len() >= slots {
-                        break;
-                    }
-                    if job_is_startable(&guard, &job.id) {
-                        ids.push(job.id.clone());
-                    }
-                }
-                for id in &ids {
-                    if let Some(job) = find_job_mut(&mut guard.jobs, id) {
-                        job.state = JobState::Starting;
-                    }
-                }
-                if !ids.is_empty() {
-                    emit_jobs_locked(&guard);
-                }
-                ids
-            }
+            reserve_startable_jobs(&mut guard)
         };
 
         for id in to_start {
@@ -1128,6 +1140,42 @@ mod tests {
         assert!(!scheduler_should_park(&inner));
     }
 
+    #[test]
+    fn scheduler_reserves_occupancy_before_spawn() {
+        let mut inner = idle_engine_inner(sample_job(JobState::Queued));
+        inner.config.max_concurrent = 2;
+        inner.jobs.clear();
+        for i in 0..5 {
+            let mut job = sample_job(JobState::Queued);
+            job.id = format!("q{i}");
+            inner.jobs.push(job);
+        }
+        let ids = reserve_startable_jobs(&mut inner);
+        assert_eq!(ids.len(), 2);
+        assert!(inner.active.len() <= 2);
+        assert_eq!(inner.active.len(), 2);
+        assert_eq!(inner.controls.len(), 2);
+        assert_eq!(
+            inner
+                .jobs
+                .iter()
+                .filter(|job| job.state == JobState::Starting)
+                .count(),
+            2
+        );
+        assert_eq!(
+            inner
+                .jobs
+                .iter()
+                .filter(|job| job.state == JobState::Queued)
+                .count(),
+            3
+        );
+        let more = reserve_startable_jobs(&mut inner);
+        assert!(more.is_empty());
+        assert_eq!(inner.active.len(), 2);
+    }
+
     #[tokio::test]
     async fn scheduler_parks_while_idle_and_wakes_on_queued_job() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1202,6 +1250,127 @@ mod tests {
             "queued job must start without waiting out a 500ms poll"
         );
         handle.send(EngineCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn spawn_engine_remaps_downloading_to_queued() {
+        let mut first = sample_job(JobState::Downloading);
+        first.id = "loaded-dl".into();
+        first.speed = 99;
+        first.eta_secs = 12;
+        first.active_connections = 4;
+        let mut second = sample_job(JobState::Downloading);
+        second.id = "loaded-queued".into();
+        second.speed = 88;
+        second.eta_secs = 9;
+        second.active_connections = 3;
+        let mut config = EngineRuntimeConfig::default();
+        config.max_concurrent = 1;
+        let (handle, mut event_rx) = spawn_engine(
+            vec![first, second],
+            config,
+            Arc::new(MemoryJobStore::default()),
+        );
+        let jobs = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(EngineEvent::JobsChanged(jobs)) => break jobs,
+                    Some(_) => {}
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("spawn remap must emit jobs");
+        let leftover = jobs
+            .iter()
+            .find(|job| job.id == "loaded-queued")
+            .expect("second job");
+        assert_eq!(leftover.state, JobState::Queued);
+        assert_eq!(leftover.speed, 0);
+        assert_eq!(leftover.eta_secs, 0);
+        assert_eq!(leftover.active_connections, 0);
+        handle.send(EngineCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn drain_pauses_in_flight_worker_and_acks() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hang = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-drain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut job = Job::new(
+            format!("http://{addr}/file.bin"),
+            "file.bin".into(),
+            dir.join("file.bin"),
+            dir.join("file.bin.part"),
+        );
+        job.state = JobState::Queued;
+        let job_id = job.id.clone();
+        let mut config = EngineRuntimeConfig::default();
+        config.auto_retry = 0;
+        let (handle, mut event_rx) =
+            spawn_engine(vec![job], config, Arc::new(MemoryJobStore::default()));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(EngineEvent::JobsChanged(jobs))
+                        if jobs.iter().any(|job| {
+                            job.id == job_id
+                                && matches!(job.state, JobState::Starting | JobState::Downloading)
+                        }) =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("worker must start");
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle.send(EngineCommand::Drain { ack: Some(ack_tx) });
+        tokio::time::timeout(Duration::from_secs(3), ack_rx)
+            .await
+            .expect("drain ack timeout")
+            .expect("drain ack dropped");
+
+        let mut last = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let EngineEvent::JobsChanged(jobs) = ev {
+                last = Some(jobs);
+            }
+        }
+        let paused = last
+            .expect("paused jobs emit")
+            .iter()
+            .find(|job| job.id == job_id)
+            .expect("job")
+            .state;
+        assert_eq!(paused, JobState::Paused);
+
+        handle.send(EngineCommand::Shutdown);
+        hang.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
