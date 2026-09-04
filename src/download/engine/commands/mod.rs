@@ -1143,6 +1143,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_worker_finalizes_when_reserved_job_was_removed() {
+        let dir = temp_dir();
+        let job = sample_job(
+            "https://example.com/reserved-remove.bin",
+            JobState::Starting,
+            &dir,
+        );
+        std::fs::write(&job.temp_path, b"partial").expect("write part");
+        let id = job.id.clone();
+        let part = job.temp_path.clone();
+        let control = Arc::new(AtomicU8::new(0));
+
+        let store = Arc::new(MemoryJobStore::default());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(32);
+        let mut controls = HashMap::new();
+        controls.insert(id.clone(), control.clone());
+        let mut active = HashMap::new();
+        active.insert(id.clone(), ());
+        let inner = Arc::new(Mutex::new(super::super::EngineInner {
+            jobs: vec![job],
+            controls,
+            active,
+            handoff_auth: HashMap::new(),
+            requeue_on_cancel: HashMap::new(),
+            pending_partial_deletes: HashMap::new(),
+            pending_final_deletes: HashMap::new(),
+            produced_files: HashMap::new(),
+            config: test_config(),
+            limiter: GlobalBandwidthLimiter::new(None),
+            conn_budget: ConnectionBudget::new(32, 8),
+            event_tx,
+            wake: Arc::new(Notify::new()),
+            store,
+            persist_tx,
+        }));
+        tokio::spawn(super::super::persist::persist_actor(
+            inner.clone(),
+            persist_rx,
+        ));
+
+        job_control::remove(&inner, id.clone(), true, false).await;
+
+        {
+            let guard = inner.lock().await;
+            assert!(guard.jobs.iter().all(|j| j.id != id));
+            assert_eq!(guard.pending_partial_deletes.get(&id), Some(&part));
+        }
+        assert!(
+            part.exists(),
+            ".part must remain until start_worker finalizes"
+        );
+
+        super::super::worker::start_worker(inner.clone(), id.clone());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let guard = inner.lock().await;
+                    if !guard.active.contains_key(&id) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reserved worker occupancy should clear");
+
+        assert!(!part.exists(), ".part deleted after missing-job finalize");
+        {
+            let guard = inner.lock().await;
+            assert!(!guard.pending_partial_deletes.contains_key(&id));
+            assert!(!guard.pending_final_deletes.contains_key(&id));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn finalize_deletes_produced_file_not_original_uniquified_target() {
         let dir = temp_dir();
         let job = sample_job(

@@ -43,8 +43,8 @@ pub(super) fn start_worker(inner: Arc<Mutex<EngineInner>>, job_id: String) {
             let job = match guard.jobs.iter().find(|j| j.id == job_id) {
                 Some(j) => j.clone(),
                 None => {
-                    guard.active.remove(&job_id);
-                    guard.controls.remove(&job_id);
+                    drop(guard);
+                    finalize_worker(&inner, &job_id, &control, Ok(DownloadOutcome::Canceled)).await;
                     return;
                 }
             };
