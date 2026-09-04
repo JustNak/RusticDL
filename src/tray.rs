@@ -541,16 +541,16 @@ mod windows_impl {
                     LRESULT(0)
                 }
                 _ => {
-                    let handled = with_tray_state(hwnd, |state| {
+                    let taskbar = with_tray_state(hwnd, |state| {
                         if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
                             state.icon_added = false;
-                            apply_pending_balloons(hwnd);
                             true
                         } else {
                             false
                         }
                     });
-                    if handled {
+                    if taskbar {
+                        apply_pending_balloons(hwnd);
                         LRESULT(0)
                     } else {
                         DefWindowProcW(hwnd, msg, wparam, lparam)
