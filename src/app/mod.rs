@@ -741,6 +741,7 @@ impl Render for DownloadApp {
             .child(
                 h_flex()
                     .size_full()
+                    .when(layout::sidebar_on_right(), |el| el.flex_row_reverse())
                     .child(if self.filter == FilterKind::Settings {
                         self.render_settings_sidebar(cx).into_any_element()
                     } else {
@@ -751,7 +752,7 @@ impl Render for DownloadApp {
                             .flex_1()
                             .h_full()
                             .min_w_0()
-                            .child(self.render_title_bar(cx))
+                            .child(self.render_title_bar(window, cx))
                             .child(
                                 v_flex()
                                     .flex_1()

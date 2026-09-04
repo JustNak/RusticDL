@@ -1,9 +1,9 @@
 use gpui::{
     div, prelude::FluentBuilder, px, Context, Corner, InteractiveElement, IntoElement,
-    ParentElement, Styled,
+    ParentElement, Styled, Window,
 };
 #[cfg(target_os = "linux")]
-use gpui::{MouseButton, WindowControlArea};
+use gpui::{App, MouseButton, StatefulInteractiveElement, WindowControlArea};
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
@@ -13,6 +13,8 @@ use gpui_component::{
 };
 
 use super::filter::FilterKind;
+#[cfg(target_os = "linux")]
+use super::layout::sidebar_on_right;
 use super::DownloadApp;
 use crate::download::{EngineCommand, JobState};
 #[cfg(target_os = "linux")]
@@ -29,15 +31,108 @@ fn hyprland_title_bar_drag_region() -> gpui::Stateful<gpui::Div> {
         })
 }
 
+#[cfg(target_os = "linux")]
+fn linux_caption_btn(
+    id: &'static str,
+    icon: IconName,
+    is_close: bool,
+    cx: &App,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let hover_bg = if is_close {
+        theme.danger
+    } else {
+        theme.secondary_hover
+    };
+    let hover_fg = if is_close {
+        theme.danger_foreground
+    } else {
+        theme.secondary_foreground
+    };
+    let active_bg = if is_close {
+        theme.danger_active
+    } else {
+        theme.secondary_active
+    };
+    div()
+        .id(id)
+        .flex()
+        .w(px(46.))
+        .h_full()
+        .flex_shrink_0()
+        .justify_center()
+        .items_center()
+        .text_color(theme.foreground)
+        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
+        .active(move |s| s.bg(active_bg).text_color(hover_fg))
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_click(window, cx);
+        })
+        .child(Icon::new(icon).small())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_left_window_controls(window: &Window, cx: &App) -> impl IntoElement {
+    let is_max = window.is_maximized();
+    h_flex()
+        .id("window-controls")
+        .flex_shrink_0()
+        .h_full()
+        .items_center()
+        .child(linux_caption_btn(
+            "close",
+            IconName::WindowClose,
+            true,
+            cx,
+            |window, _| {
+                window.remove_window();
+            },
+        ))
+        .child(linux_caption_btn(
+            "minimize",
+            IconName::WindowMinimize,
+            false,
+            cx,
+            |window, _| {
+                window.minimize_window();
+            },
+        ))
+        .child(linux_caption_btn(
+            if is_max { "restore" } else { "maximize" },
+            if is_max {
+                IconName::WindowRestore
+            } else {
+                IconName::WindowMaximize
+            },
+            false,
+            cx,
+            |window, _| {
+                window.zoom_window();
+            },
+        ))
+}
+
 impl DownloadApp {
-    pub(crate) fn render_title_bar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(crate) fn render_title_bar(
+        &mut self,
+        #[cfg_attr(not(target_os = "linux"), allow(unused))] window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let show_queue_chrome = self.filter != FilterKind::Settings;
         let view = cx.entity();
+        #[cfg(target_os = "linux")]
+        let chrome_on_left = sidebar_on_right();
 
-        // TitleBar lives on the main pane (sidebar owns the left edge), so the
-        // macOS traffic-light inset would leave a dead gap. Use the Windows /
-        // Linux gutter on every platform.
+        // Main pane is on the left when the sidebar is on the right (macOS /
+        // left-button Linux). TitleBar already insets 80px for traffic lights
+        // on macOS; Windows / right-button Linux only need a 12px gutter.
         const TITLE_BAR_LEFT_PAD: f32 = 12.0;
 
         let content = h_flex()
@@ -109,6 +204,7 @@ impl DownloadApp {
                 .flex_shrink_0()
                 .items_center()
                 .pl(px(TITLE_BAR_LEFT_PAD))
+                .when(chrome_on_left, |el| el.pr(px(TITLE_BAR_LEFT_PAD)))
                 .border_b_1()
                 .border_color(theme.title_bar_border)
                 .bg(theme.title_bar)
@@ -116,11 +212,30 @@ impl DownloadApp {
                 .into_any_element();
         }
 
-        TitleBar::new()
-            .h(px(48.))
-            .pl(px(TITLE_BAR_LEFT_PAD))
-            .child(content)
-            .into_any_element()
+        #[cfg(target_os = "linux")]
+        if chrome_on_left {
+            return h_flex()
+                .id("title-bar")
+                .w_full()
+                .h(px(48.))
+                .flex_shrink_0()
+                .items_center()
+                .pr(px(TITLE_BAR_LEFT_PAD))
+                .border_b_1()
+                .border_color(theme.title_bar_border)
+                .bg(theme.title_bar)
+                .on_double_click(|_, window, _| window.zoom_window())
+                .child(linux_left_window_controls(window, cx))
+                .child(content)
+                .into_any_element();
+        }
+
+        let bar = TitleBar::new().h(px(48.));
+        #[cfg(not(target_os = "macos"))]
+        let bar = bar.pl(px(TITLE_BAR_LEFT_PAD));
+        #[cfg(target_os = "macos")]
+        let bar = bar.pr(px(TITLE_BAR_LEFT_PAD));
+        bar.child(content).into_any_element()
     }
 
     fn queue_overflow_menu_builder(

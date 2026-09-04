@@ -11,6 +11,7 @@ use gpui_component::{
 };
 
 use super::filter::FilterKind;
+use super::layout::sidebar_on_right;
 use super::settings_category::SettingsCategory;
 use super::widgets::{library_parent_nav, nav_item, settings_nav_item, type_nav_item};
 use super::DownloadApp;
@@ -26,12 +27,14 @@ impl DownloadApp {
     fn sidebar_frame(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().clone();
         let sidebar_w = self.settings.ui_density.sidebar_w();
+        let on_right = sidebar_on_right();
         v_flex()
             .w(px(sidebar_w))
             .flex_shrink_0()
             .h_full()
             .bg(theme.sidebar)
-            .border_r_1()
+            .when(on_right, |el| el.border_l_1())
+            .when(!on_right, |el| el.border_r_1())
             .border_color(theme.sidebar_border)
             .child(self.render_sidebar_brand(cx))
     }
@@ -159,7 +162,14 @@ impl DownloadApp {
                                     .child(APP_NAME),
                             ),
                     )
-                    .dropdown_menu_with_anchor(Corner::BottomLeft, brand_menu),
+                    .dropdown_menu_with_anchor(
+                        if sidebar_on_right() {
+                            Corner::BottomRight
+                        } else {
+                            Corner::BottomLeft
+                        },
+                        brand_menu,
+                    ),
             )
     }
 
