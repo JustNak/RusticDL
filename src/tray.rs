@@ -249,24 +249,38 @@ mod windows_impl {
         NOTIFY_ICON_INFOTIP_FLAGS,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-        DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadImageW,
-        PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+        AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+        GetWindowLongPtrW, KillTimer, LoadIconW, LoadImageW, PostMessageW, PostQuitMessage,
+        RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
         TrackPopupMenu, TranslateMessage, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-        GWLP_USERDATA, HICON, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_STRING,
-        MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
-        WNDCLASSW,
+        GWLP_USERDATA, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
+        MF_STRING, MSG, MSGFLT_ALLOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
+        WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_OVERLAPPED,
     };
 
     const TRAY_UID: u32 = 1;
     const ID_TRAY_SHOW: usize = 1001;
     const ID_TRAY_EXIT: usize = 1002;
-    /// Custom callback message delivered to our message-only window.
+    const ID_RETRY_ADD: usize = 1;
+    const RETRY_ADD_INTERVAL_MS: u32 = 1000;
+    /// Custom callback message delivered to our hidden tray host window.
     const WM_TRAYICON: u32 = WM_APP + 40;
     /// UI → tray thread: drain pending balloon queue and apply.
     /// `LPARAM` is unused — payloads live in [`PendingBalloons`].
     const WM_SHOW_BALLOON: u32 = WM_APP + 41;
+
+    /// Hidden top-level window. `HWND_MESSAGE` is not a top-level window, so it
+    /// never receives the `TaskbarCreated` broadcast Explorer sends after restart.
+    fn tray_host_ex_style() -> WINDOW_EX_STYLE {
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    }
+
+    fn tray_host_style() -> WINDOW_STYLE {
+        WS_OVERLAPPED
+    }
 
     /// Shared queue of balloon payloads. Always owns the heap data; `PostMessage`
     /// is only a wake-up so DestroyWindow cannot leak discarded LPARAMs.
@@ -282,10 +296,13 @@ mod windows_impl {
     struct TrayState {
         event_tx: async_channel::Sender<TrayEvent>,
         icon: HICON,
+        icon_owned: bool,
         pending_balloons: PendingBalloons,
         /// Context id of the balloon currently shown (if any).
         /// Only set after a successful `NIM_MODIFY`.
         active_balloon_context_id: Option<u64>,
+        taskbar_created_msg: u32,
+        icon_added: bool,
     }
 
     pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
@@ -307,7 +324,15 @@ mod windows_impl {
             if hwnd_slot.load(Ordering::SeqCst) != 0 {
                 break;
             }
+            if thread.is_finished() {
+                break;
+            }
             thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        if hwnd_slot.load(Ordering::SeqCst) == 0 && thread.is_finished() {
+            let _ = thread.join();
+            return None;
         }
 
         Some(SystemTray {
@@ -366,7 +391,7 @@ mod windows_impl {
         unsafe {
             let module = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandle: {e}"))?;
             let hinstance = HINSTANCE(module.0);
-            let class_name = w!("RusticDLTrayMessageWindow");
+            let class_name = w!("RusticDLTrayHostWindow");
 
             let wc = WNDCLASSW {
                 style: CS_HREDRAW | CS_VREDRAW,
@@ -376,26 +401,29 @@ mod windows_impl {
                 ..Default::default()
             };
             let _ = RegisterClassW(&wc);
-
-            let icon = load_tray_icon().unwrap_or(HICON(std::ptr::null_mut()));
+            let loaded = load_tray_icon(hinstance);
+            let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
             let state = Box::new(TrayState {
                 event_tx,
-                icon,
+                icon: loaded.icon,
+                icon_owned: loaded.owned,
                 pending_balloons: pending_balloons.clone(),
                 active_balloon_context_id: None,
+                taskbar_created_msg,
+                icon_added: false,
             });
             let state_ptr = Box::into_raw(state);
 
             let hwnd = match CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                tray_host_ex_style(),
                 class_name,
                 w!("RusticDL Tray"),
-                WINDOW_STYLE::default(),
+                tray_host_style(),
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                Some(HWND_MESSAGE),
+                None,
                 None,
                 Some(hinstance),
                 Some(state_ptr as *const core::ffi::c_void),
@@ -409,40 +437,12 @@ mod windows_impl {
             };
 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
-
-            let mut nid = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: hwnd,
-                uID: TRAY_UID,
-                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-                uCallbackMessage: WM_TRAYICON,
-                hIcon: icon,
-                ..Default::default()
-            };
-            write_utf16_buf(&mut nid.szTip, APP_NAME);
-
-            if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-                let _ = DestroyWindow(hwnd);
-                let _ = drain_pending(&pending_balloons);
-                return Err("Shell_NotifyIcon NIM_ADD failed".into());
-            }
-
-            let ver = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: hwnd,
-                uID: TRAY_UID,
-                Anonymous: NOTIFYICONDATAW_0 {
-                    uVersion: NOTIFYICON_VERSION,
-                },
-                ..Default::default()
-            };
-            if !Shell_NotifyIconW(NIM_SETVERSION, &ver).as_bool() {
-                eprintln!(
-                    "[rusticdl] tray: NIM_SETVERSION failed; balloon click callbacks may be unreliable"
-                );
+            if taskbar_created_msg != 0 {
+                let _ = ChangeWindowMessageFilterEx(hwnd, taskbar_created_msg, MSGFLT_ALLOW, None);
             }
 
             hwnd_slot.store(hwnd.0 as isize, Ordering::SeqCst);
+            ensure_notify_icon(hwnd, &mut *state_ptr);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -488,7 +488,7 @@ mod windows_impl {
                         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                         let state = Box::from_raw(ptr);
                         let _ = drain_pending(&state.pending_balloons);
-                        if !state.icon.0.is_null() {
+                        if state.icon_owned && !state.icon.0.is_null() {
                             let _ = DestroyIcon(state.icon);
                         }
                     }
@@ -497,6 +497,12 @@ mod windows_impl {
                 }
                 WM_CLOSE => {
                     let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                WM_TIMER => {
+                    if wparam.0 == ID_RETRY_ADD {
+                        apply_pending_balloons(hwnd);
+                    }
                     LRESULT(0)
                 }
                 WM_SHOW_BALLOON => {
@@ -534,8 +540,89 @@ mod windows_impl {
                     }
                     LRESULT(0)
                 }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+                _ => {
+                    let taskbar = with_tray_state(hwnd, |state| {
+                        if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
+                            state.icon_added = false;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if taskbar {
+                        apply_pending_balloons(hwnd);
+                        LRESULT(0)
+                    } else {
+                        DefWindowProcW(hwnd, msg, wparam, lparam)
+                    }
+                }
             }
+        }
+    }
+
+    fn with_tray_state<T: Default>(hwnd: HWND, f: impl FnOnce(&mut TrayState) -> T) -> T {
+        unsafe {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TrayState;
+            if ptr.is_null() {
+                return T::default();
+            }
+            f(&mut *ptr)
+        }
+    }
+
+    unsafe fn ensure_notify_icon(hwnd: HWND, state: &mut TrayState) {
+        if state.icon_added {
+            return;
+        }
+        if add_notify_icon(hwnd, state.icon) {
+            state.icon_added = true;
+            let _ = KillTimer(Some(hwnd), ID_RETRY_ADD);
+            return;
+        }
+        let _ = SetTimer(Some(hwnd), ID_RETRY_ADD, RETRY_ADD_INTERVAL_MS, None);
+    }
+
+    unsafe fn add_notify_icon(hwnd: HWND, icon: HICON) -> bool {
+        let nid = notify_icon_data(hwnd, icon);
+        if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            set_notify_icon_version(hwnd);
+            return true;
+        }
+        if Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
+            set_notify_icon_version(hwnd);
+            return true;
+        }
+        false
+    }
+
+    fn notify_icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_UID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_TRAYICON,
+            hIcon: icon,
+            ..Default::default()
+        };
+        write_utf16_buf(&mut nid.szTip, APP_NAME);
+        nid
+    }
+
+    fn set_notify_icon_version(hwnd: HWND) {
+        let ver = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_UID,
+            Anonymous: NOTIFYICONDATAW_0 {
+                uVersion: NOTIFYICON_VERSION,
+            },
+            ..Default::default()
+        };
+        if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &ver) }.as_bool() {
+            eprintln!(
+                "[rusticdl] tray: NIM_SETVERSION failed; balloon click callbacks may be unreliable"
+            );
         }
     }
 
@@ -546,6 +633,10 @@ mod windows_impl {
                 return;
             }
             let state = &mut *ptr;
+            ensure_notify_icon(hwnd, state);
+            if !state.icon_added {
+                return;
+            }
             let pending = drain_pending(&state.pending_balloons);
             for req in pending {
                 apply_balloon(hwnd, state, req);
@@ -645,7 +736,39 @@ mod windows_impl {
         }
     }
 
-    fn load_tray_icon() -> Option<HICON> {
+    struct LoadedIcon {
+        icon: HICON,
+        owned: bool,
+    }
+
+    fn load_tray_icon(hinstance: HINSTANCE) -> LoadedIcon {
+        if let Some(icon) = load_icon_from_file() {
+            return LoadedIcon { icon, owned: true };
+        }
+        let from_resource = unsafe {
+            LoadImageW(
+                Some(hinstance),
+                PCWSTR(1usize as *const u16),
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE,
+            )
+        };
+        if let Ok(handle) = from_resource {
+            return LoadedIcon {
+                icon: HICON(handle.0),
+                owned: true,
+            };
+        }
+        let fallback = unsafe { LoadIconW(None, IDI_APPLICATION) };
+        LoadedIcon {
+            icon: fallback.unwrap_or(HICON(std::ptr::null_mut())),
+            owned: false,
+        }
+    }
+
+    fn load_icon_from_file() -> Option<HICON> {
         let path = resolve_icon_path()?;
         let wide: Vec<u16> = path
             .as_os_str()
@@ -691,6 +814,154 @@ mod windows_impl {
 
     fn wide_null(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(test)]
+    mod host_window_tests {
+        use super::{tray_host_ex_style, tray_host_style};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW,
+            RegisterWindowMessageW, SendMessageTimeoutW, SetWindowLongPtrW, UnregisterClassW,
+            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_BROADCAST, HWND_MESSAGE,
+            SMTO_ABORTIFHUNG, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+        };
+
+        struct Probe {
+            hwnd: HWND,
+            class: PCWSTR,
+            hinstance: windows::Win32::Foundation::HINSTANCE,
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.hwnd);
+                    let _ = UnregisterClassW(self.class, Some(self.hinstance));
+                }
+            }
+        }
+
+        unsafe extern "system" fn probe_wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ProbeState;
+                if !ptr.is_null() && msg == (*ptr).taskbar_created {
+                    (*ptr).hit.store(true, Ordering::SeqCst);
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+
+        struct ProbeState {
+            taskbar_created: u32,
+            hit: AtomicBool,
+        }
+
+        fn create_probe(
+            class: PCWSTR,
+            parent: Option<HWND>,
+            ex: WINDOW_EX_STYLE,
+            style: WINDOW_STYLE,
+        ) -> (Probe, Box<ProbeState>) {
+            unsafe {
+                let module = GetModuleHandleW(None).expect("GetModuleHandleW");
+                let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(probe_wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                let _ = RegisterClassW(&wc);
+                let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+                assert_ne!(taskbar_created, 0, "RegisterWindowMessageW(TaskbarCreated)");
+                let mut state = Box::new(ProbeState {
+                    taskbar_created,
+                    hit: AtomicBool::new(false),
+                });
+                let hwnd = CreateWindowExW(
+                    ex,
+                    class,
+                    w!("RusticDL Tray Probe"),
+                    style,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    parent,
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+                .expect("CreateWindowExW");
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *state as *mut ProbeState as isize);
+                (
+                    Probe {
+                        hwnd,
+                        class,
+                        hinstance,
+                    },
+                    state,
+                )
+            }
+        }
+
+        fn broadcast_taskbar_created() {
+            let msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+            let _ = unsafe {
+                SendMessageTimeoutW(
+                    HWND_BROADCAST,
+                    msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG,
+                    1000,
+                    None,
+                )
+            };
+        }
+
+        #[test]
+        fn message_only_window_misses_taskbar_created_broadcast() {
+            let (probe, state) = create_probe(
+                w!("RusticDLTrayProbeMessageOnly"),
+                Some(HWND_MESSAGE),
+                WINDOW_EX_STYLE::default(),
+                WINDOW_STYLE::default(),
+            );
+            broadcast_taskbar_created();
+            assert!(
+                !state.hit.load(Ordering::SeqCst),
+                "HWND_MESSAGE windows are not top-level and must not see TaskbarCreated"
+            );
+            drop(probe);
+        }
+
+        #[test]
+        fn tray_host_window_receives_taskbar_created_broadcast() {
+            let (probe, state) = create_probe(
+                w!("RusticDLTrayProbeHost"),
+                None,
+                tray_host_ex_style(),
+                tray_host_style(),
+            );
+            broadcast_taskbar_created();
+            assert!(
+                state.hit.load(Ordering::SeqCst),
+                "tray host must be a top-level window so Explorer restart can re-add the icon"
+            );
+            drop(probe);
+        }
     }
 }
 
