@@ -544,7 +544,7 @@ mod windows_impl {
                     let handled = with_tray_state(hwnd, |state| {
                         if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
                             state.icon_added = false;
-                            ensure_notify_icon(hwnd, state);
+                            apply_pending_balloons(hwnd);
                             true
                         } else {
                             false
