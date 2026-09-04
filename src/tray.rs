@@ -501,7 +501,7 @@ mod windows_impl {
                 }
                 WM_TIMER => {
                     if wparam.0 == ID_RETRY_ADD {
-                        with_tray_state(hwnd, |state| ensure_notify_icon(hwnd, state));
+                        apply_pending_balloons(hwnd);
                     }
                     LRESULT(0)
                 }
@@ -634,6 +634,9 @@ mod windows_impl {
             }
             let state = &mut *ptr;
             ensure_notify_icon(hwnd, state);
+            if !state.icon_added {
+                return;
+            }
             let pending = drain_pending(&state.pending_balloons);
             for req in pending {
                 apply_balloon(hwnd, state, req);
