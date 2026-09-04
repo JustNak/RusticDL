@@ -266,7 +266,6 @@ mod windows_impl {
     const ID_TRAY_EXIT: usize = 1002;
     const ID_RETRY_ADD: usize = 1;
     const RETRY_ADD_INTERVAL_MS: u32 = 1000;
-    const MAX_ADD_RETRIES: u32 = 30;
     /// Custom callback message delivered to our hidden tray host window.
     const WM_TRAYICON: u32 = WM_APP + 40;
     /// UI → tray thread: drain pending balloon queue and apply.
@@ -304,7 +303,6 @@ mod windows_impl {
         active_balloon_context_id: Option<u64>,
         taskbar_created_msg: u32,
         icon_added: bool,
-        add_retries: u32,
     }
 
     pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
@@ -413,7 +411,6 @@ mod windows_impl {
                 active_balloon_context_id: None,
                 taskbar_created_msg,
                 icon_added: false,
-                add_retries: 0,
             });
             let state_ptr = Box::into_raw(state);
 
@@ -547,7 +544,6 @@ mod windows_impl {
                     let handled = with_tray_state(hwnd, |state| {
                         if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
                             state.icon_added = false;
-                            state.add_retries = 0;
                             ensure_notify_icon(hwnd, state);
                             true
                         } else {
@@ -580,14 +576,10 @@ mod windows_impl {
         }
         if add_notify_icon(hwnd, state.icon) {
             state.icon_added = true;
-            state.add_retries = 0;
             let _ = KillTimer(Some(hwnd), ID_RETRY_ADD);
             return;
         }
-        state.add_retries = state.add_retries.saturating_add(1);
-        if state.add_retries <= MAX_ADD_RETRIES {
-            let _ = SetTimer(Some(hwnd), ID_RETRY_ADD, RETRY_ADD_INTERVAL_MS, None);
-        }
+        let _ = SetTimer(Some(hwnd), ID_RETRY_ADD, RETRY_ADD_INTERVAL_MS, None);
     }
 
     unsafe fn add_notify_icon(hwnd: HWND, icon: HICON) -> bool {
