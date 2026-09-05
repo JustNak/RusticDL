@@ -203,6 +203,32 @@ pub fn show_main_window_hwnd(hwnd: isize) {
     }
 }
 
+/// Hide `hwnd` again if it is visible.
+///
+/// GPUI's `WM_DISPLAYCHANGE` handler calls `ShowWindow(SW_SHOWNORMAL)` when
+/// the window's last monitor is gone. That unhides an `SW_HIDE` tray window.
+pub fn reassert_tray_hide(hwnd: isize) {
+    #[cfg(windows)]
+    {
+        if hwnd != 0 && hwnd_is_visible(hwnd) {
+            show_hwnd(hwnd, false);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+    }
+}
+
+#[cfg(windows)]
+fn hwnd_is_visible(hwnd_raw: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+    unsafe { IsWindowVisible(hwnd).as_bool() }
+}
+
 #[cfg(windows)]
 fn show_hwnd(hwnd_raw: isize, show: bool) {
     use windows::Win32::Foundation::HWND;
@@ -961,6 +987,115 @@ mod windows_impl {
                 "tray host must be a top-level window so Explorer restart can re-add the icon"
             );
             drop(probe);
+        }
+    }
+
+    #[cfg(test)]
+    mod tray_hide_display_change_tests {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, RegisterClassW,
+            ShowWindow, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, SW_HIDE, SW_SHOWNORMAL,
+            WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+        };
+
+        struct HideProbe {
+            hwnd: HWND,
+            class: PCWSTR,
+            hinstance: windows::Win32::Foundation::HINSTANCE,
+        }
+
+        impl Drop for HideProbe {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    let _ = DestroyWindow(self.hwnd);
+                    let _ = UnregisterClassW(self.class, Some(self.hinstance));
+                }
+            }
+        }
+
+        unsafe extern "system" fn hide_probe_wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        fn create_hidden_top_level(class: PCWSTR) -> HideProbe {
+            unsafe {
+                let module = GetModuleHandleW(None).expect("GetModuleHandleW");
+                let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(hide_probe_wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                let _ = RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    class,
+                    w!("RusticDL Hide Probe"),
+                    WS_OVERLAPPEDWINDOW,
+                    -32000,
+                    -32000,
+                    160,
+                    90,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )
+                .expect("CreateWindowExW");
+                HideProbe {
+                    hwnd,
+                    class,
+                    hinstance,
+                }
+            }
+        }
+
+        #[test]
+        fn shownormal_unhides_sw_hide() {
+            let probe = create_hidden_top_level(w!("RusticDLTrayHideShownormalProbe"));
+            unsafe {
+                let _ = ShowWindow(probe.hwnd, SW_HIDE);
+                assert!(
+                    !IsWindowVisible(probe.hwnd).as_bool(),
+                    "SW_HIDE must leave the HWND invisible"
+                );
+                let _ = ShowWindow(probe.hwnd, SW_SHOWNORMAL);
+                assert!(
+                    IsWindowVisible(probe.hwnd).as_bool(),
+                    "GPUI WM_DISPLAYCHANGE uses SW_SHOWNORMAL, which unhides SW_HIDE"
+                );
+            }
+        }
+
+        #[test]
+        fn reassert_tray_hide_undoes_shownormal() {
+            let probe = create_hidden_top_level(w!("RusticDLTrayHideReassertProbe"));
+            unsafe {
+                let _ = ShowWindow(probe.hwnd, SW_HIDE);
+                let _ = ShowWindow(probe.hwnd, SW_SHOWNORMAL);
+                assert!(
+                    IsWindowVisible(probe.hwnd).as_bool(),
+                    "precondition: SW_SHOWNORMAL made the HWND visible"
+                );
+            }
+            super::super::reassert_tray_hide(probe.hwnd.0 as isize);
+            unsafe {
+                assert!(
+                    !IsWindowVisible(probe.hwnd).as_bool(),
+                    "tray-hidden HWND must be SW_HIDE after GPUI SW_SHOWNORMAL"
+                );
+            }
         }
     }
 }
