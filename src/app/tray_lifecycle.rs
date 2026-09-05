@@ -9,8 +9,8 @@ use crate::notifications::BalloonOutcome;
 use crate::prompt_window::close_capture_window;
 use crate::settings::OsNotifyMode;
 use crate::tray::{
-    hide_main_window, main_window_hwnd, show_main_window, show_main_window_hwnd, SystemTray,
-    TrayEvent,
+    hide_main_window, main_window_hwnd, reassert_tray_hide, show_main_window,
+    show_main_window_hwnd, SystemTray, TrayEvent,
 };
 
 impl DownloadApp {
@@ -170,6 +170,8 @@ impl DownloadApp {
             self.pending_tray_show = false;
             self.window_hidden_to_tray = false;
             show_main_window(window);
+        } else if self.window_hidden_to_tray {
+            reassert_tray_hide(self.main_hwnd);
         }
         if let Some(context_id) = self.pending_balloon_click.take() {
             self.handle_balloon_click(context_id, cx);
