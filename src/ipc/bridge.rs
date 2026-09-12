@@ -47,6 +47,8 @@ pub struct BrowserPromptView {
     pub total_bytes: Option<u64>,
     pub browser: String,
     pub entry_point: String,
+    /// Still populated from the capture payload; Confirm no longer displays it.
+    #[allow(dead_code)]
     pub page_title: Option<String>,
     pub default_directory: PathBuf,
 }

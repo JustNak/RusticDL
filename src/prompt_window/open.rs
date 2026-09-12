@@ -5,8 +5,8 @@ use gpui::{
 use gpui_component::Root;
 
 use super::{
-    BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W,
-    CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
+    BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_CONFIRM_H, CAPTURE_CONFIRM_TITLE,
+    CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
 };
 use crate::branding::APP_NAME;
 use crate::download::{EngineHandle, Job, JobState};
@@ -38,14 +38,14 @@ pub fn open_browser_prompt_window(
     let title = if opens_conflict {
         format!("{APP_NAME} — File already exists")
     } else {
-        format!("{APP_NAME} — Confirm download")
+        format!("{APP_NAME} — {CAPTURE_CONFIRM_TITLE}")
     };
     open_capture_window(
         title,
         if opens_conflict {
             size(px(CAPTURE_CONFLICT_W), px(CAPTURE_CONFLICT_H))
         } else {
-            size(px(CAPTURE_WINDOW_W), px(CAPTURE_WINDOW_H))
+            size(px(CAPTURE_WINDOW_W), px(CAPTURE_CONFIRM_H))
         },
         {
             let prompt = prompt.clone();
