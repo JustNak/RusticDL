@@ -23,8 +23,14 @@ const TRAIL_BUCKET: usize = 2;
 const TRAIL_EASE: f32 = 0.42;
 /// Reduce-motion keeps a short flat trail (matches the sample-ring cap in `mod`).
 const REDUCE_MOTION_COLUMNS: usize = 12;
-/// Keep the plot inside the clip rect so AA does not bleed past the card.
-const SPARK_INSET: f32 = 1.0;
+/// Live marker is a rounded quad centered on the last sample.
+const SPARK_TIP_SIZE: f32 = 5.0;
+const SPARK_TIP_HALF: f32 = SPARK_TIP_SIZE / 2.0;
+/// Series stroke width. Clip inset is half the tip plus this full width.
+const SPARK_STROKE: f32 = 1.5;
+/// Half the tip plus the stroke. GPUI overflow clip is rectangular, so L/R/B
+/// paints also need `max(this, theme.radius)` or they cut through rounded corners.
+const SPARK_TIP_INSET: f32 = SPARK_TIP_HALF + SPARK_STROKE;
 
 /// Append-only speed trail. Committed columns never rematerialize; only the live
 /// tip eases toward the newest samples. This is the motion fix: same `speed_samples`
@@ -162,6 +168,7 @@ pub(super) fn speed_sparkline(
     let peak = session_peak.max(visible_max.ceil() as u64);
     let smooth = !reduce_motion;
     let header_right = sparkline_header_right(status, has_data, peak, avg);
+    let corner_radius = f32::from(theme.radius);
 
     v_flex()
         .id("capture-speed-sparkline")
@@ -212,7 +219,15 @@ pub(super) fn speed_sparkline(
                         move |_, _, _| (),
                         move |bounds, _, window, _| {
                             paint_speed_graph(
-                                bounds, &columns, scale_max, avg, bar_color, muted, smooth, window,
+                                bounds,
+                                &columns,
+                                scale_max,
+                                avg,
+                                bar_color,
+                                muted,
+                                smooth,
+                                corner_radius,
+                                window,
                             );
                         },
                     )
@@ -435,6 +450,12 @@ fn spark_column_x(i: usize, n: usize, width: f32, inset: f32) -> f32 {
     }
 }
 
+/// Series stretch inset: room for the live tip + stroke, and ≥ card corner radius
+/// so rectangular overflow clip does not square off the rounded speed card.
+fn spark_plot_inset(corner_radius: f32) -> f32 {
+    SPARK_TIP_INSET.max(corner_radius)
+}
+
 fn paint_speed_graph(
     bounds: Bounds<gpui::Pixels>,
     columns: &[Option<f32>],
@@ -443,6 +464,7 @@ fn paint_speed_graph(
     line_color: Hsla,
     muted: Hsla,
     smooth: bool,
+    corner_radius: f32,
     window: &mut Window,
 ) {
     let width = f32::from(bounds.size.width);
@@ -452,7 +474,7 @@ fn paint_speed_graph(
     }
 
     let n = columns.len().max(1);
-    let inset = SPARK_INSET;
+    let inset = spark_plot_inset(corner_radius);
     let inner_w = (width - inset * 2.0).max(1.0);
     let plot_h = (height - inset * 2.0).max(1.0);
     let origin_x = f32::from(bounds.origin.x);
@@ -512,7 +534,7 @@ fn paint_speed_graph(
         window.paint_path(path, line_color.opacity(0.16));
     }
 
-    let mut stroke = PathBuilder::stroke(px(1.5));
+    let mut stroke = PathBuilder::stroke(px(SPARK_STROKE));
     stroke.move_to(point(px(first_x), px(first_y)));
     append_series(&mut stroke, &points, smooth);
     if let Ok(path) = stroke.build() {
@@ -522,16 +544,16 @@ fn paint_speed_graph(
     window.paint_quad(
         fill(
             Bounds {
-                origin: point(px(last_x - 2.5), px(last_y - 2.5)),
-                size: size(px(5.0), px(5.0)),
+                origin: point(px(last_x - SPARK_TIP_HALF), px(last_y - SPARK_TIP_HALF)),
+                size: size(px(SPARK_TIP_SIZE), px(SPARK_TIP_SIZE)),
             },
             line_color,
         )
         .corner_radii(Corners {
-            top_left: px(2.5),
-            top_right: px(2.5),
-            bottom_right: px(2.5),
-            bottom_left: px(2.5),
+            top_left: px(SPARK_TIP_HALF),
+            top_right: px(SPARK_TIP_HALF),
+            bottom_right: px(SPARK_TIP_HALF),
+            bottom_left: px(SPARK_TIP_HALF),
         }),
     );
 }
@@ -615,6 +637,7 @@ pub(super) fn shorten_folder(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::CornerRadiusScale;
 
     #[test]
     fn downsample_keeps_short_series() {
@@ -722,7 +745,7 @@ mod tests {
     #[test]
     fn spark_column_x_stretches_full_series_to_edges() {
         let width = 200.0;
-        let inset = SPARK_INSET;
+        let inset = spark_plot_inset(CornerRadiusScale::Default.radii().0);
         let n = SPARK_COLUMNS;
         assert_eq!(spark_column_x(0, n, width, inset), inset);
         assert_eq!(spark_column_x(n - 1, n, width, inset), width - inset);
@@ -731,7 +754,7 @@ mod tests {
     #[test]
     fn spark_column_x_maps_empty_leading_columns_by_index() {
         let width = 100.0;
-        let inset = SPARK_INSET;
+        let inset = spark_plot_inset(CornerRadiusScale::Default.radii().0);
         let n = 4;
         assert_eq!(spark_column_x(0, n, width, inset), inset);
         assert_eq!(spark_column_x(n - 1, n, width, inset), width - inset);
@@ -741,6 +764,79 @@ mod tests {
             "leading None slots stay empty on the left, not compacted: {first_populated}"
         );
         assert!(first_populated < spark_column_x(3, n, width, inset));
+    }
+
+    #[test]
+    fn spark_plot_inset_covers_tip_stroke_and_corner_radius() {
+        for scale in CornerRadiusScale::ALL {
+            let (radius, _) = scale.radii();
+            let inset = spark_plot_inset(radius);
+            assert!(
+                inset >= SPARK_TIP_HALF + SPARK_STROKE,
+                "{scale:?}: inset {inset} must cover half tip plus stroke"
+            );
+            assert!(
+                inset >= radius,
+                "{scale:?}: inset {inset} must cover corner radius {radius} (rectangular overflow clip)"
+            );
+        }
+        assert_eq!(
+            spark_plot_inset(CornerRadiusScale::Sharp.radii().0),
+            SPARK_TIP_INSET
+        );
+        assert_eq!(
+            spark_plot_inset(CornerRadiusScale::Default.radii().0),
+            CornerRadiusScale::Default.radii().0
+        );
+        assert_eq!(
+            spark_plot_inset(CornerRadiusScale::Soft.radii().0),
+            CornerRadiusScale::Soft.radii().0
+        );
+    }
+
+    #[test]
+    fn spark_live_tip_stays_inside_plot_clip() {
+        let width = 400.0;
+        let height = 40.0;
+        let n = SPARK_COLUMNS;
+        for scale in CornerRadiusScale::ALL {
+            let (radius, _) = scale.radii();
+            let inset = spark_plot_inset(radius);
+            let last_x = spark_column_x(n - 1, n, width, inset);
+            let first_x = spark_column_x(0, n, width, inset);
+            let stalled_y = height - inset;
+            let peak_y = inset;
+
+            let tip_right = last_x + SPARK_TIP_HALF;
+            let tip_bottom = stalled_y + SPARK_TIP_HALF;
+            let tip_top = peak_y - SPARK_TIP_HALF;
+            let stroke_right = last_x + SPARK_STROKE;
+            let stroke_bottom = stalled_y + SPARK_STROKE;
+
+            assert!(
+                tip_right <= width,
+                "{scale:?}: live tip clipped on the right ({tip_right} > {width})"
+            );
+            assert!(
+                stroke_right <= width,
+                "{scale:?}: series stroke clipped on the right"
+            );
+            assert!(
+                tip_bottom <= height,
+                "{scale:?}: stalled tip clipped on the bottom ({tip_bottom} > {height})"
+            );
+            assert!(
+                stroke_bottom <= height,
+                "{scale:?}: series stroke clipped on the bottom"
+            );
+            assert!(tip_top >= 0.0, "{scale:?}: peak tip clipped on the top");
+            assert!(first_x - SPARK_STROKE >= 0.0);
+
+            assert!(
+                first_x >= radius && width - last_x >= radius && height - stalled_y >= radius,
+                "{scale:?}: fill/baseline inset {inset} is inside corner radius {radius}"
+            );
+        }
     }
 
     #[test]
