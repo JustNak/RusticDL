@@ -29,7 +29,11 @@ use crate::settings::ProgressStyle;
 use helpers::TrailMotion;
 
 const CAPTURE_WINDOW_W: f32 = 480.0;
+/// Progress HUD (sparkline). Confirm uses CAPTURE_CONFIRM_H so this stays 320.
 const CAPTURE_WINDOW_H: f32 = 320.0;
+/// Confirm form: title 34 + padding + filename/size + save-to + actions.
+const CAPTURE_CONFIRM_H: f32 = 268.0;
+const CAPTURE_CONFIRM_TITLE: &str = "Confirm Download";
 /// Four medium action buttons (Cancel / Overwrite / Rename / Start download)
 /// plus the Duplicate Name row and hint need more width and height than Confirm.
 const CAPTURE_CONFLICT_W: f32 = 540.0;
@@ -154,6 +158,7 @@ impl BrowserPromptWindow {
         match self.phase {
             CapturePhase::Complete { .. } => (CAPTURE_WINDOW_W, CAPTURE_COMPLETE_H),
             CapturePhase::Conflict => (CAPTURE_CONFLICT_W, CAPTURE_CONFLICT_H),
+            CapturePhase::Confirm => (CAPTURE_WINDOW_W, CAPTURE_CONFIRM_H),
             _ => (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H),
         }
     }
@@ -170,7 +175,7 @@ impl BrowserPromptWindow {
 
     fn title_for_phase(&self) -> &'static str {
         match &self.phase {
-            CapturePhase::Confirm => "Confirm browser download",
+            CapturePhase::Confirm => CAPTURE_CONFIRM_TITLE,
             CapturePhase::Conflict => "File already exists",
             CapturePhase::Progress { .. } => {
                 if let Some(job) = &self.job {
@@ -286,8 +291,19 @@ mod tests {
     #[test]
     fn conflict_window_is_larger_than_confirm() {
         assert!(CAPTURE_CONFLICT_W > CAPTURE_WINDOW_W);
-        assert!(CAPTURE_CONFLICT_H > CAPTURE_WINDOW_H);
-        assert!(CAPTURE_CONFLICT_H - CAPTURE_WINDOW_H >= 48.0);
+        assert!(CAPTURE_CONFLICT_H > CAPTURE_CONFIRM_H);
+        assert!(CAPTURE_CONFLICT_H - CAPTURE_CONFIRM_H >= 48.0);
+    }
+
+    #[test]
+    fn confirm_window_is_shorter_than_progress() {
+        assert!(CAPTURE_CONFIRM_H < CAPTURE_WINDOW_H);
+        assert!(CAPTURE_CONFLICT_H > CAPTURE_CONFIRM_H);
+    }
+
+    #[test]
+    fn confirm_title_is_confirm_download() {
+        assert_eq!(CAPTURE_CONFIRM_TITLE, "Confirm Download");
     }
 
     #[test]

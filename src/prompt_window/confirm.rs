@@ -9,13 +9,13 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputState, SelectAll},
-    v_flex, ActiveTheme, IconName, StyledExt,
+    v_flex, ActiveTheme, Icon, IconName, StyledExt,
 };
 
-use super::helpers::{default_prompt_filename, shorten_path, truncate_middle};
+use super::helpers::{default_prompt_filename, truncate_middle};
 use super::start_sync_timer;
 use super::{
-    BrowserPromptWindow, CapturePhase, CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W, CAPTURE_WINDOW_H,
+    BrowserPromptWindow, CapturePhase, CAPTURE_CONFIRM_H, CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W,
     CAPTURE_WINDOW_W,
 };
 use crate::appearance::apply_window_opacity;
@@ -91,7 +91,7 @@ impl BrowserPromptWindow {
             fitted_size: Some(if opens_conflict {
                 (CAPTURE_CONFLICT_W, CAPTURE_CONFLICT_H)
             } else {
-                (CAPTURE_WINDOW_W, CAPTURE_WINDOW_H)
+                (CAPTURE_WINDOW_W, CAPTURE_CONFIRM_H)
             }),
             cascade_index,
         }
@@ -231,22 +231,9 @@ impl BrowserPromptWindow {
             .filter(|n| *n > 0)
             .map(format_bytes)
             .unwrap_or_else(|| "Unknown size".into());
-        let source_label = prompt
-            .map(|p| format!("{} · {}", p.browser, p.entry_point.replace('_', " ")))
-            .unwrap_or_default();
-        let title_line = prompt
-            .and_then(|p| p.page_title.as_deref())
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or("Browser download")
-            .to_string();
         let url_display = prompt
             .map(|p| truncate_middle(&p.url, 64))
             .unwrap_or_default();
-        let save_preview = self
-            .dir_input
-            .as_ref()
-            .map(|d| shorten_path(&d.read(cx).value()))
-            .unwrap_or_else(|| "default folder".into());
 
         v_flex()
             .gap_3()
@@ -254,10 +241,14 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_sm().font_medium().child(title_line))
-                    .child(div().text_xs().text_color(muted).child(source_label))
+                    .flex_shrink_0()
+                    .child(div().text_xs().font_medium().child("Filename"))
+                    .when_some(self.name_input.as_ref(), |el, input| {
+                        el.child(Input::new(input).w_full())
+                    })
                     .child(
                         div()
+                            .w_full()
                             .text_xs()
                             .text_color(muted)
                             .child(format!("{size_label} · {url_display}")),
@@ -266,14 +257,7 @@ impl BrowserPromptWindow {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(div().text_xs().font_medium().child("Filename"))
-                    .when_some(self.name_input.as_ref(), |el, input| {
-                        el.child(Input::new(input).w_full())
-                    }),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
+                    .flex_shrink_0()
                     .child(div().text_xs().font_medium().child("Save to"))
                     .child(
                         h_flex()
@@ -292,12 +276,6 @@ impl BrowserPromptWindow {
                                         this.browse_directory(window, cx);
                                     })),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("Preview: {save_preview}")),
                     ),
             )
             .child(
@@ -306,6 +284,7 @@ impl BrowserPromptWindow {
                     .justify_end()
                     .gap_2()
                     .pt_1()
+                    .flex_shrink_0()
                     .child(
                         Button::new("prompt-dismiss")
                             .label("Cancel")
@@ -316,7 +295,8 @@ impl BrowserPromptWindow {
                     )
                     .child(
                         Button::new("prompt-start")
-                            .label("Start download")
+                            .label("Download")
+                            .icon(Icon::empty().path("icons/download.svg"))
                             .primary()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.accept(window, cx);

@@ -120,6 +120,7 @@ mod tests {
         for path in [
             "icons/inbox.svg",
             "icons/arrow-down.svg",
+            "icons/download.svg",
             "icons/circle-check.svg",
             "icons/circle-x.svg",
             "icons/settings.svg",
