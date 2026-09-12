@@ -126,6 +126,19 @@ pub(super) fn sparkline_status(paused: bool, samples: &[u64]) -> &'static str {
     }
 }
 
+/// Top-right speed-card text: peak/avg once samples exist, otherwise `status`.
+fn sparkline_header_right(status: &str, has_data: bool, peak: u64, avg: Option<u64>) -> String {
+    if has_data && peak > 0 {
+        let mut bits = vec![format!("peak {}", format_speed(peak))];
+        if let Some(avg) = avg.filter(|&v| v > 0) {
+            bits.push(format!("avg {}", format_speed(avg)));
+        }
+        bits.join(" · ")
+    } else {
+        status.to_string()
+    }
+}
+
 /// Compact throughput graph of recent bytes/sec samples.
 pub(super) fn speed_sparkline(
     samples: &[u64],
@@ -148,6 +161,7 @@ pub(super) fn speed_sparkline(
     let current = samples.last().copied().filter(|&s| s > 0);
     let peak = session_peak.max(visible_max.ceil() as u64);
     let smooth = !reduce_motion;
+    let header_right = sparkline_header_right(status, has_data, peak, avg);
 
     v_flex()
         .id("capture-speed-sparkline")
@@ -160,14 +174,14 @@ pub(super) fn speed_sparkline(
         .border_1()
         .border_color(theme.border.opacity(0.55))
         .bg(theme.secondary.opacity(0.35))
-        .px_2()
-        .py_1p5()
         .child(
             h_flex()
                 .w_full()
                 .flex_shrink_0()
                 .justify_between()
                 .items_center()
+                .px_2()
+                .pt_1p5()
                 .child(
                     h_flex()
                         .gap_2()
@@ -184,20 +198,8 @@ pub(super) fn speed_sparkline(
                             el.child(div().text_xs().font_medium().child(format_speed(speed)))
                         }),
                 )
-                .child(div().text_xs().text_color(muted).child(status)),
+                .child(div().text_xs().text_color(muted).child(header_right)),
         )
-        .when(has_data && peak > 0, |el| {
-            let mut bits = vec![format!("peak {}", format_speed(peak))];
-            if let Some(avg) = avg.filter(|&v| v > 0) {
-                bits.push(format!("avg {}", format_speed(avg)));
-            }
-            el.child(
-                div()
-                    .text_xs()
-                    .text_color(muted.opacity(0.85))
-                    .child(bits.join(" · ")),
-            )
-        })
         .child(
             div()
                 .id("sparkline-plot")
@@ -422,6 +424,17 @@ fn paint_h_line(window: &mut Window, x: f32, y: f32, w: f32, color: Hsla) {
     ));
 }
 
+/// Column `i` of `n` across `width`: first slot at `inset`, last at `width - inset`.
+/// Empty leading columns still occupy their index (right-aligned history).
+fn spark_column_x(i: usize, n: usize, width: f32, inset: f32) -> f32 {
+    let inner = (width - inset * 2.0).max(1.0);
+    if n <= 1 {
+        inset
+    } else {
+        inset + (i as f32) * inner / (n as f32 - 1.0)
+    }
+}
+
 fn paint_speed_graph(
     bounds: Bounds<gpui::Pixels>,
     columns: &[Option<f32>],
@@ -438,40 +451,32 @@ fn paint_speed_graph(
         return;
     }
 
-    let n = columns.len().max(1) as f32;
+    let n = columns.len().max(1);
     let inset = SPARK_INSET;
     let inner_w = (width - inset * 2.0).max(1.0);
-    let usable_h = (height - inset * 2.0).max(1.0);
+    let plot_h = (height - inset * 2.0).max(1.0);
     let origin_x = f32::from(bounds.origin.x);
     let origin_y = f32::from(bounds.origin.y);
     let x0 = origin_x + inset;
     let base_y = origin_y + height - inset;
-    let plot_h = (usable_h - 1.0).max(1.0);
-    let step = inner_w / n;
     let peak = scale_max.max(1);
 
-    paint_h_line(window, x0, base_y - 1.0, inner_w, muted.opacity(0.42));
+    paint_h_line(window, x0, base_y, inner_w, muted.opacity(0.42));
     paint_h_line(
         window,
         x0,
-        base_y - 1.0 - plot_h * 0.5,
+        base_y - plot_h * 0.5,
         inner_w,
         muted.opacity(0.18),
     );
-    paint_h_line(
-        window,
-        x0,
-        base_y - 1.0 - plot_h,
-        inner_w,
-        muted.opacity(0.22),
-    );
+    paint_h_line(window, x0, base_y - plot_h, inner_w, muted.opacity(0.22));
 
     let peak_f = peak as f32;
     if let Some(avg) = avg.filter(|&v| v > 0) {
         let avg_h = bar_height_px(avg as f32, peak_f, plot_h);
         if avg_h > 0.0 {
             let mut dash = PathBuilder::stroke(px(1.0)).dash_array(&[px(3.0), px(3.0)]);
-            let y = base_y - 1.0 - avg_h;
+            let y = base_y - avg_h;
             dash.move_to(point(px(x0), px(y)));
             dash.line_to(point(px(x0 + inner_w), px(y)));
             if let Ok(path) = dash.build() {
@@ -488,8 +493,8 @@ fn paint_speed_graph(
     let points: Vec<(f32, f32)> = plotted
         .iter()
         .map(|&(i, speed)| {
-            let x = x0 + (i as f32 + 0.5) * step;
-            let y = base_y - 1.0 - bar_height_px(speed, peak_f, plot_h);
+            let x = origin_x + spark_column_x(i, n, width, inset);
+            let y = base_y - bar_height_px(speed, peak_f, plot_h);
             (x, y)
         })
         .collect();
@@ -498,10 +503,10 @@ fn paint_speed_graph(
     let (last_x, last_y) = points[points.len() - 1];
 
     let mut area = PathBuilder::fill();
-    area.move_to(point(px(first_x), px(base_y - 1.0)));
+    area.move_to(point(px(first_x), px(base_y)));
     area.line_to(point(px(first_x), px(first_y)));
     append_series(&mut area, &points, smooth);
-    area.line_to(point(px(last_x), px(base_y - 1.0)));
+    area.line_to(point(px(last_x), px(base_y)));
     area.close();
     if let Ok(path) = area.build() {
         window.paint_path(path, line_color.opacity(0.16));
@@ -688,6 +693,54 @@ mod tests {
         assert_eq!(sparkline_status(false, &[0, 0]), "waiting…");
         assert_eq!(sparkline_status(false, &[1_140_000]), "live");
         assert_eq!(sparkline_status(false, &[1_140_000, 0, 0]), "stalled");
+    }
+
+    #[test]
+    fn sparkline_header_right_uses_peak_avg_when_data_exists() {
+        let peak = 53_000_000;
+        let avg = 45_400_000;
+        let text = sparkline_header_right("live", true, peak, Some(avg));
+        assert_eq!(
+            text,
+            format!("peak {} · avg {}", format_speed(peak), format_speed(avg))
+        );
+        assert!(!text.contains("live"));
+        assert!(!text.contains("paused"));
+        assert!(!text.contains("stalled"));
+    }
+
+    #[test]
+    fn sparkline_header_right_falls_back_to_status_when_waiting() {
+        assert_eq!(
+            sparkline_header_right("waiting…", false, 0, None),
+            "waiting…"
+        );
+        assert_eq!(sparkline_header_right("paused", false, 0, None), "paused");
+        assert_eq!(sparkline_header_right("live", true, 0, None), "live");
+    }
+
+    #[test]
+    fn spark_column_x_stretches_full_series_to_edges() {
+        let width = 200.0;
+        let inset = SPARK_INSET;
+        let n = SPARK_COLUMNS;
+        assert_eq!(spark_column_x(0, n, width, inset), inset);
+        assert_eq!(spark_column_x(n - 1, n, width, inset), width - inset);
+    }
+
+    #[test]
+    fn spark_column_x_maps_empty_leading_columns_by_index() {
+        let width = 100.0;
+        let inset = SPARK_INSET;
+        let n = 4;
+        assert_eq!(spark_column_x(0, n, width, inset), inset);
+        assert_eq!(spark_column_x(n - 1, n, width, inset), width - inset);
+        let first_populated = spark_column_x(2, n, width, inset);
+        assert!(
+            first_populated > width * 0.5,
+            "leading None slots stay empty on the left, not compacted: {first_populated}"
+        );
+        assert!(first_populated < spark_column_x(3, n, width, inset));
     }
 
     #[test]
