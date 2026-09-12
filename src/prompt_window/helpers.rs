@@ -815,4 +815,18 @@ mod tests {
         assert!(out.ends_with(".mkv"));
         assert!(out.chars().count() <= 40);
     }
+
+    #[test]
+    fn confirm_size_url_line_keeps_url_tail() {
+        let url = "https://cdn.example.com/very/long/path/that/exceeds/sixty-four/characters/video.mp4";
+        let url_display = truncate_middle(url, 64);
+        let line = format!("Unknown size · {url_display}");
+        assert!(line.starts_with("Unknown size · "));
+        assert!(
+            line.ends_with("video.mp4"),
+            "truncate_middle keeps the URL tail; CSS nowrap+end-ellipsis would clip it: {line}"
+        );
+        assert!(url_display.contains('…'));
+        assert!(url_display.chars().count() <= 64);
+    }
 }

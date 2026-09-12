@@ -251,9 +251,6 @@ impl BrowserPromptWindow {
                             .w_full()
                             .text_xs()
                             .text_color(muted)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
                             .child(format!("{size_label} · {url_display}")),
                     ),
             )
