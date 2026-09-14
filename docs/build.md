@@ -107,7 +107,7 @@ cargo install cargo-packager --locked --version 0.11.8
 powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-Output: `dist-release/RusticDL-windows-x64-setup.exe` (plus the packager’s `rusticdl_*_x64-setup.exe` name).
+Output: `dist-release/RusticDL-windows-x64-setup.exe` (plus the packager’s `rusticdl_*_x64-setup.exe` name) and `dist-release/SHA256SUMS.windows` (GNU sha256sum line for setup.exe). Release CI merges that line into `SHA256SUMS` after the Linux tarball hash so both coexist.
 
 Packager config lives in `[package.metadata.packager]` in `Cargo.toml`, with a custom NSIS template at `installer/nsis/installer.nsi` that registers/unregisters the native messaging host on install/uninstall.
 
@@ -118,6 +118,6 @@ cargo build --release -p rusticdl -p rusticdl-native-host -p rusticdl-updater
 bash scripts/package-linux.sh
 ```
 
-Output: `dist-release/RusticDL-linux-x64.tar.gz` and `dist-release/SHA256SUMS`.
+Output: `dist-release/RusticDL-linux-x64.tar.gz` and `dist-release/SHA256SUMS` (tarball line, plus `SHA256SUMS.windows` when that file is present).
 
 See also [protocol.md](protocol.md) for the extension ↔ app wire format.

@@ -56,6 +56,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           powershell -ExecutionPolicy Bypass -File scripts/package-release-assets.ps1
 
+      - name: Upload Windows SHA256SUMS line
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-sha256sums
+          path: dist-release/SHA256SUMS.windows
+          if-no-files-found: error
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -80,6 +87,7 @@ jobs:
             | **RusticDL-windows-x64.zip** | Portable desktop app only |
             | **RusticDL-full-windows-x64.zip** | Portable app + native host + scripts + extensions |
             | **RusticDL-linux-x64.tar.gz** | Linux app + native host + updater + install.sh |
+            | **SHA256SUMS** | GNU sha256sum listing (Linux tarball + Windows setup.exe) |
             | **extension-chromium.zip** | Chromium / Edge / Brave extension |
             | **extension-firefox.zip** | Firefox extension |
 
@@ -131,6 +139,12 @@ jobs:
             readelf -h target/release/$bin | grep -Eq 'Type: *(EXEC|DYN)'
             test -x target/release/$bin
           done
+
+      - name: Download Windows SHA256SUMS line
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-sha256sums
+          path: dist-release
 
       - name: Package tarball
         run: bash scripts/package-linux.sh

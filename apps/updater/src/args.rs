@@ -119,7 +119,7 @@ Options:
   --to-version <semver>      Target version (UI)
   --release-page <url>       Opened when the update fails
   --expected-size <bytes>    Optional Content-Length hint
-  --expected-sha256 <hex>    Required on Linux (SHA-256 of the tarball)
+  --expected-sha256 <hex>    Required on Linux; used on Windows when SHA256SUMS has setup.exe
   --wait-timeout-secs <n>    Max seconds to wait for main exit (default 90)
 "#
     .trim()
@@ -143,11 +143,17 @@ mod tests {
             "0.2.1",
             "--expected-size",
             "1024",
+            "--expected-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ])
         .unwrap();
         assert_eq!(args.wait_pid, Some(1234));
         assert_eq!(args.to_version.as_deref(), Some("0.2.1"));
         assert_eq!(args.expected_size, Some(1024));
+        assert_eq!(
+            args.expected_sha256.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
         assert!(args.download_url.is_some());
         assert!(args.installer_path.is_none());
     }
