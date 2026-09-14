@@ -65,16 +65,18 @@ pub struct UpdateInfo {
     ///
     /// Linux **requires** a tarball line. Windows uses the setup.exe line when
     /// present and continues without a hash if `SHA256SUMS` or that line is
-    /// missing (current GitHub releases).
+    /// missing (current GitHub releases). A listed `SHA256SUMS` that fails to
+    /// download still fails the check.
     pub setup_sha256: Option<String>,
 }
 
-/// Whether a missing `SHA256SUMS` / missing asset line fails the update check.
+/// Whether a missing checksums asset or missing asset line fails the update check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sha256Gate {
     /// Linux: missing file or missing tarball line fails the check.
     Required,
-    /// Windows: missing file or missing setup.exe line still offers the update.
+    /// Windows: no checksums asset or no setup.exe line still offers the update.
+    /// A listed `SHA256SUMS` that fails to download fails the check.
     Optional,
 }
 
@@ -242,14 +244,23 @@ async fn fetch_setup_sha256(
     asset_name: &str,
     gate: Sha256Gate,
 ) -> Result<Option<String>, String> {
-    let sums = match load_sha256sums_text(client, release).await {
-        Ok(text) => text,
-        Err(err) => match gate {
-            Sha256Gate::Required => return Err(err),
-            Sha256Gate::Optional => return Ok(None),
-        },
-    };
-    resolve_setup_sha256(gate, sums.as_deref(), asset_name)
+    setup_sha256_from_loaded(
+        gate,
+        load_sha256sums_text(client, release).await,
+        asset_name,
+    )
+}
+
+/// Map a `SHA256SUMS` load result through the gate.
+///
+/// `Ok(None)` means the release listed no checksums asset. `Err` is a fetch or
+/// body-read failure for a listed asset and fails the check on every gate.
+fn setup_sha256_from_loaded(
+    gate: Sha256Gate,
+    loaded: Result<Option<String>, String>,
+    asset_name: &str,
+) -> Result<Option<String>, String> {
+    resolve_setup_sha256(gate, loaded?.as_deref(), asset_name)
 }
 
 async fn load_sha256sums_text(
@@ -284,8 +295,8 @@ async fn load_sha256sums_text(
 
 /// Resolve the hash for `asset_name` from an optional `SHA256SUMS` body.
 ///
-/// `sums_text` is `None` when the release has no checksums asset (or Windows
-/// could not read it). Linux still refuses that case.
+/// `sums_text` is `None` when the release has no checksums asset. Linux still
+/// refuses that case. Fetch errors are not `None`; they fail before this.
 pub fn resolve_setup_sha256(
     gate: Sha256Gate,
     sums_text: Option<&str>,
@@ -325,42 +336,6 @@ pub fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Append GNU `sha256sum` lines from `extra` onto `existing` without dropping
-/// existing entries. If a basename is already present, the existing line wins.
-#[cfg(test)]
-fn append_sha256sums(existing: &str, extra: &str) -> String {
-    let mut out = existing.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    for line in extra.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(hash) = parts.next() else {
-            continue;
-        };
-        let Some(name) = parts.next() else {
-            continue;
-        };
-        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            continue;
-        }
-        let base = name
-            .trim_start_matches('*')
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(name);
-        if parse_sha256sums(&out, base).is_some() {
-            continue;
-        }
-        out.push_str(&format!("{}  {base}\n", hash.to_ascii_lowercase()));
-    }
-    out
 }
 
 /// Open the releases list in the default browser (includes nightly pre-releases).
@@ -459,7 +434,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
 
     #[test]
     fn parse_sha256sums_reads_appended_windows_setup_line() {
-        let merged = append_sha256sums(&tarball_only_sums(), &windows_setup_sums());
+        let merged = format!("{}{}", tarball_only_sums(), windows_setup_sums());
         assert_eq!(
             parse_sha256sums(&merged, LINUX_TARBALL_ASSET_NAME).as_deref(),
             Some(TARBALL_HASH)
@@ -471,35 +446,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
     }
 
     #[test]
-    fn append_sha256sums_does_not_drop_or_replace_tarball_line() {
-        let extra = format!(
-            "{SETUP_HASH}  {SETUP_ASSET_NAME}\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  {LINUX_TARBALL_ASSET_NAME}\n"
-        );
-        let merged = append_sha256sums(&tarball_only_sums(), &extra);
-        assert_eq!(
-            parse_sha256sums(&merged, LINUX_TARBALL_ASSET_NAME).as_deref(),
-            Some(TARBALL_HASH),
-            "existing tarball line must win"
-        );
-        assert_eq!(
-            parse_sha256sums(&merged, SETUP_ASSET_NAME).as_deref(),
-            Some(SETUP_HASH)
-        );
-        assert_eq!(
-            merged
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count(),
-            2
-        );
-    }
-
-    #[test]
     fn windows_verifies_when_setup_exe_line_present() {
-        let merged = append_sha256sums(&tarball_only_sums(), &windows_setup_sums());
+        let merged = format!("{}{}", tarball_only_sums(), windows_setup_sums());
         let hash = resolve_setup_sha256(Sha256Gate::Optional, Some(&merged), SETUP_ASSET_NAME)
             .expect("optional gate must not fail the check");
         assert_eq!(hash.as_deref(), Some(SETUP_HASH));
+    }
+
+    #[test]
+    fn listed_sha256sums_fetch_error_fails_optional_and_required() {
+        let loaded = Err("GitHub returned 502 while downloading SHA256SUMS.".to_string());
+        for gate in [Sha256Gate::Optional, Sha256Gate::Required] {
+            let err = setup_sha256_from_loaded(gate, loaded.clone(), SETUP_ASSET_NAME)
+                .expect_err("listed SHA256SUMS fetch error must fail the check");
+            assert!(err.contains("SHA256SUMS"));
+        }
     }
 
     #[test]
@@ -559,8 +520,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
         std::fs::create_dir_all(&dir).expect("temp dir");
         let dest = dir.join("SHA256SUMS");
         let extra = dir.join("SHA256SUMS.windows");
+        let colliding_tarball_hash =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let extra_text = format!(
+            "{}{colliding_tarball_hash}  {LINUX_TARBALL_ASSET_NAME}\n",
+            windows_setup_sums()
+        );
         std::fs::write(&dest, tarball_only_sums()).expect("dest");
-        std::fs::write(&extra, windows_setup_sums()).expect("extra");
+        std::fs::write(&extra, extra_text).expect("extra");
         let status = Command::new("bash")
             .arg(&script)
             .arg(&dest)
@@ -572,11 +539,19 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             parse_sha256sums(&merged, LINUX_TARBALL_ASSET_NAME).as_deref(),
-            Some(TARBALL_HASH)
+            Some(TARBALL_HASH),
+            "existing dest tarball line must win"
         );
         assert_eq!(
             parse_sha256sums(&merged, SETUP_ASSET_NAME).as_deref(),
             Some(SETUP_HASH)
+        );
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            2
         );
     }
 }
