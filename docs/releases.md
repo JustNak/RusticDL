@@ -7,8 +7,8 @@ GitHub Actions workflows live in `.github/workflows/`:
 | Workflow | When it runs | What it does |
 | --- | --- | --- |
 | **CI** (`ci.yml`) | Push / PR to `master` | `cargo fmt` check, `clippy`, `test`, extension typecheck + build |
-| **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build unsigned Windows release binaries, NSIS setup.exe, extension zips, plus **`RusticDL-linux-x64.tar.gz`** and **`SHA256SUMS`**; publish a **Stable** GitHub Release. |
-| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Same unsigned Windows publish as Stable, plus the full Linux tarball (app + native host + updater + `install-linux.sh`) and **`SHA256SUMS`**, stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
+| **Release** (`release.yml`) | Tag `v*` except `v*-nightly.*` (e.g. `v0.3.1`) | Build unsigned Windows release binaries, NSIS setup.exe, extension zips, plus **`RusticDL-linux-x64.tar.gz`** and **`SHA256SUMS`** (Linux tarball line plus Windows setup.exe); publish a **Stable** GitHub Release. |
+| **Nightly** (`nightly.yml`) | Manual **Run workflow** only | Same unsigned Windows publish as Stable, plus the full Linux tarball (app + native host + updater + `install-linux.sh`) and **`SHA256SUMS`** (tarball + setup.exe), stamped `X.Y.Z-nightly.YYYYMMDDHHMMSS`, published as a GitHub **pre-release** (`make_latest: false`) for testing before a Stable cut. Skips when that commit already has a nightly. Keeps the last 14 nightlies. |
 
 To cut a new **stable** release from a clean tree:
 
@@ -26,7 +26,7 @@ To publish a **nightly** (when you want testers to try new work):
 
 The in-app updater on the Nightly channel follows tags matching `vX.Y.Z-nightly.*`. Stable still uses `/releases/latest`. Switching channels installs that stream’s current build even when its version number is lower.
 
-GitHub Windows installers (`RusticDL-windows-x64-setup.exe` and the PE binaries inside) are **unsigned**. First run and in-app update may show SmartScreen (“Windows protected your PC”) and/or UAC. The updater still runs NSIS silently (`/S`); if Windows requires elevation it prompts via UAC instead of rejecting the file for lack of a signature. Local `scripts/package-windows.ps1` builds are likewise unsigned. Linux in-app updates still verify the tarball against **`SHA256SUMS`**.
+GitHub Windows installers (`RusticDL-windows-x64-setup.exe` and the PE binaries inside) are **unsigned**. First run and in-app update may show SmartScreen (“Windows protected your PC”) and/or UAC. The updater still runs NSIS silently (`/S`); if Windows requires elevation it prompts via UAC instead of rejecting the file for lack of a signature. Local `scripts/package-windows.ps1` builds are likewise unsigned. Linux in-app updates **require** the tarball line in **`SHA256SUMS`**. Windows in-app updates **verify** setup.exe when that file has a matching line, and still update if `SHA256SUMS` is missing or tarball-only (all current GitHub releases). ZIP hashes are not an in-app gate.
 
 ## Contributing / attribution
 

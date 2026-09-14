@@ -8,7 +8,8 @@
 #   powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 #
 # Output:
-#   dist-release/*-setup.exe  (and intermediate packager files under dist-release/)
+#   dist-release/RusticDL-windows-x64-setup.exe  (and intermediate packager files under dist-release/)
+#   dist-release/SHA256SUMS.windows             (GNU sha256sum line for setup.exe; merged into SHA256SUMS by Linux CI)
 
 [CmdletBinding()]
 param(
@@ -65,9 +66,19 @@ if ($primary.FullName -ne $normalized) {
   Copy-Item -Force $primary.FullName $normalized
 }
 
+# GNU sha256sum line for the in-app payload only. ZIP hashes are optional and
+# are not an updater gate; Linux CI appends this file into SHA256SUMS.
+$windowsSums = Join-Path $outDir "SHA256SUMS.windows"
+$hash = (Get-FileHash -LiteralPath $normalized -Algorithm SHA256).Hash.ToLowerInvariant()
+$line = "$hash  RusticDL-windows-x64-setup.exe`n"
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($windowsSums, $line, $utf8)
+
 Write-Host ""
 Write-Host "Installer ready:"
 Write-Host "  $($primary.FullName)"
 Write-Host "  $normalized"
+Write-Host "  $windowsSums"
+Write-Host "    $hash  RusticDL-windows-x64-setup.exe"
 Write-Host ""
 Write-Host "Tip: run the setup silently with /S (NSIS). Per-user install does not require admin."
