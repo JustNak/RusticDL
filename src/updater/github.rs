@@ -329,7 +329,8 @@ pub fn parse_sha256sums(text: &str, file_name: &str) -> Option<String> {
 
 /// Append GNU `sha256sum` lines from `extra` onto `existing` without dropping
 /// existing entries. If a basename is already present, the existing line wins.
-pub fn append_sha256sums(existing: &str, extra: &str) -> String {
+#[cfg(test)]
+fn append_sha256sums(existing: &str, extra: &str) -> String {
     let mut out = existing.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');

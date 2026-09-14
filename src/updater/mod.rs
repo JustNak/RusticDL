@@ -20,9 +20,8 @@ mod launch;
 mod version;
 
 pub use github::{
-    append_sha256sums, check_for_update, latest_release_api, latest_release_page,
-    open_release_page, open_url, parse_sha256sums, releases_list_api, releases_page,
-    resolve_setup_sha256, Sha256Gate, UpdateCheck, UpdateInfo,
+    check_for_update, latest_release_api, latest_release_page, open_release_page, open_url,
+    parse_sha256sums, releases_list_api, releases_page, UpdateCheck, UpdateInfo,
 };
 pub use launch::{launch_updater, updater_exe_path, LaunchUpdaterOpts};
 pub use version::{is_newer, is_nightly_version, normalize_version, should_offer_on_channel};
