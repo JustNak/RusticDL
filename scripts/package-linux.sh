@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stage and pack RusticDL-linux-x64.tar.gz plus SHA256SUMS.
+# Writes the tarball hash first, then appends dist-release/SHA256SUMS.windows
+# when present (Windows CI artifact) so both lines coexist.
 # Expects release binaries in target/release/.
 set -euo pipefail
 
@@ -53,6 +55,9 @@ tar -czf "$dist/RusticDL-linux-x64.tar.gz" -C "$stage" \
 (
   cd "$dist"
   sha256sum RusticDL-linux-x64.tar.gz > SHA256SUMS
+  if [ -f SHA256SUMS.windows ]; then
+    bash "$root/scripts/merge-sha256sums.sh" "$dist/SHA256SUMS" "$dist/SHA256SUMS.windows"
+  fi
 )
 
 echo "Wrote $dist/RusticDL-linux-x64.tar.gz"

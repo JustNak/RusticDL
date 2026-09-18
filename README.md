@@ -44,6 +44,7 @@ Nightly (may be unstable) is an on-demand GitHub pre-release for testing new wor
 | **`RusticDL-windows-x64.zip`** | Portable desktop app (`rusticdl.exe`) |
 | **`RusticDL-full-windows-x64.zip`** | Portable app + native host + register scripts + browser extension packages |
 | **`RusticDL-linux-x64.tar.gz`** | Linux app + native host + updater + `install-linux.sh` |
+| **`SHA256SUMS`** | GNU sha256sum listing for the Linux tarball and Windows setup.exe |
 | **`extension-chromium.zip`** | Chromium / Edge / Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 
