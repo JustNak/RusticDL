@@ -101,8 +101,6 @@ pub struct DownloadApp {
     window_layout_dirty: bool,
     last_window_layout_save: Instant,
     browser_watch_complete_ids: Vec<String>,
-    jobs_dirty: bool,
-    last_jobs_save: Instant,
     update_busy: bool,
     update_check_gen: u64,
     available_update: Option<UpdateInfo>,
@@ -133,6 +131,7 @@ impl DownloadApp {
         engine: EngineHandle,
         event_rx: async_channel::Receiver<EngineEvent>,
         ipc: IpcBridge,
+        state_load_error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -473,10 +472,6 @@ impl DownloadApp {
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
             browser_watch_complete_ids: Vec::new(),
-            jobs_dirty: false,
-            last_jobs_save: Instant::now()
-                .checked_sub(Duration::from_secs(2))
-                .unwrap_or_else(Instant::now),
             update_busy: false,
             update_check_gen: 0,
             available_update: None,
@@ -503,6 +498,10 @@ impl DownloadApp {
         }
 
         app.begin_update_check(false, cx);
+
+        if let Some(message) = state_load_error {
+            app.show_error_toast(message, cx);
+        }
 
         let entity = cx.entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -678,7 +677,6 @@ impl DownloadApp {
 impl Drop for DownloadApp {
     fn drop(&mut self) {
         self.flush_window_layout_now();
-        self.flush_jobs_save_now();
     }
 }
 

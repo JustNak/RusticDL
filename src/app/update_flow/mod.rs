@@ -263,7 +263,6 @@ impl DownloadApp {
         );
         cx.notify();
 
-        self.flush_jobs_save_now();
         self.flush_window_layout_now();
 
         let from_version = if info.current_version.trim().is_empty() {

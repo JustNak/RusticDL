@@ -1,6 +1,13 @@
 use percent_encoding::percent_decode_str;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 use super::job::Job;
 use super::resume::{resume_oracle, ResumeOracle};
@@ -137,7 +144,137 @@ pub async fn ensure_parent_directory(path: &Path) -> Result<(), String> {
 }
 
 pub async fn metadata_len(path: &Path) -> Option<u64> {
-    fs::metadata(path).await.ok().map(|metadata| metadata.len())
+    let metadata = fs::symlink_metadata(io_path(path)).await.ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    Some(metadata.len())
+}
+
+/// Open a partial download without following a symlink or other reparse point
+/// at the final path component. `O_CREAT` on a dangling symlink must not create
+/// the link target outside the save folder.
+pub fn open_download_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+    truncate: bool,
+) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create(create)
+        .truncate(truncate);
+    apply_nofollow(&mut options);
+    let file = options.open(io_path(path))?;
+    reject_reparse_point(&file)?;
+    Ok(file)
+}
+
+fn apply_nofollow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = options;
+    }
+}
+
+fn reject_reparse_point(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to open a reparse point",
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+/// Filesystem path used for open, preallocate, and rename.
+///
+/// On Windows this is a `\\?\` absolute path (or `\\?\UNC\`) so paths longer
+/// than `MAX_PATH` can be opened. The job still stores the normal path.
+pub fn io_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(extended_windows_path_str(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+pub fn path_exists(path: &Path) -> bool {
+    // `metadata` follows links and treats a dangling symlink as absent.
+    // `symlink_metadata` sees the node itself, so allocation will not reuse it.
+    std::fs::symlink_metadata(io_path(path)).is_ok()
+}
+
+pub(crate) fn extended_windows_path_str(path: &str) -> String {
+    if path.starts_with(r"\\?\") {
+        return path.to_string();
+    }
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        if !rest.is_empty() {
+            return format!(r"\\?\UNC\{}", rest.trim_start_matches('\\'));
+        }
+    }
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if drive {
+        format!(r"\\?\{path}")
+    } else {
+        path.to_string()
+    }
+}
+
+pub(crate) fn ordinal_upcase_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_uppercase();
+    }
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(mapped), None) => mapped,
+        _ => c,
+    }
+}
+
+pub(crate) fn ordinal_casefold_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(ordinal_upcase_char)
+        .collect()
+}
+
+pub(crate) fn paths_equal_for_volume(left: &Path, right: &Path, case_insensitive: bool) -> bool {
+    left == right || (case_insensitive && ordinal_casefold_key(left) == ordinal_casefold_key(right))
+}
+
+pub(crate) fn same_occupied_path(left: &Path, right: &Path) -> bool {
+    paths_equal_for_volume(left, right, cfg!(windows))
+}
+
+pub(crate) fn path_occupied(path: &Path, occupied: &[PathBuf]) -> bool {
+    occupied.iter().any(|other| same_occupied_path(other, path))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +407,7 @@ pub async fn move_to_final_path(
         allocate_final_path(target_path).await?
     };
 
-    fs::rename(temp_path, &final_path)
+    fs::rename(io_path(temp_path), io_path(&final_path))
         .await
         .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
 
@@ -278,8 +415,8 @@ pub async fn move_to_final_path(
 }
 
 async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), String> {
-    if !target_path.exists() {
-        fs::rename(temp_path, target_path)
+    if !path_exists(target_path) {
+        fs::rename(io_path(temp_path), io_path(target_path))
             .await
             .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
         return Ok(());
@@ -288,29 +425,29 @@ async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), 
     let mut sidecar = target_path.as_os_str().to_os_string();
     sidecar.push(".replaced");
     let sidecar = PathBuf::from(sidecar);
-    if sidecar.exists() {
-        fs::remove_file(&sidecar)
+    if path_exists(&sidecar) {
+        fs::remove_file(io_path(&sidecar))
             .await
             .map_err(|error| format!("Could not clear leftover replacement backup: {error}"))?;
     }
 
-    fs::rename(target_path, &sidecar)
+    fs::rename(io_path(target_path), io_path(&sidecar))
         .await
         .map_err(|error| format!("Could not move existing download aside: {error}"))?;
 
-    if let Err(error) = fs::rename(temp_path, target_path).await {
-        let _ = fs::rename(&sidecar, target_path).await;
+    if let Err(error) = fs::rename(io_path(temp_path), io_path(target_path)).await {
+        let _ = fs::rename(io_path(&sidecar), io_path(target_path)).await;
         return Err(format!(
             "Could not finalize downloaded file: {error}. The original file was kept."
         ));
     }
 
-    let _ = fs::remove_file(&sidecar).await;
+    let _ = fs::remove_file(io_path(&sidecar)).await;
     Ok(())
 }
 
 pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> {
-    if !target_path.exists() {
+    if !path_exists(target_path) {
         return Ok(target_path.to_path_buf());
     }
 
@@ -329,7 +466,7 @@ pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> 
 
     for index in 1..10_000 {
         let candidate = parent.join(format!("{stem} ({index}){extension}"));
-        if !candidate.exists() {
+        if !path_exists(&candidate) {
             return Ok(candidate);
         }
     }
@@ -338,7 +475,7 @@ pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> 
 }
 
 pub async fn remove_partial(path: &Path) {
-    let _ = fs::remove_file(path).await;
+    let _ = fs::remove_file(io_path(path)).await;
 }
 
 pub fn parse_content_disposition_filename(header_value: &str) -> Option<String> {
@@ -472,20 +609,31 @@ pub fn preferred_download_paths(
     (preferred, target, temp)
 }
 
+fn occupied_union_hits(
+    path: &Path,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+) -> bool {
+    occupied_targets
+        .iter()
+        .chain(occupied_temps.iter())
+        .any(|occupied| same_occupied_path(occupied, path))
+}
+
 fn paths_are_taken(
     target: &Path,
     temp: &Path,
     occupied_targets: &[PathBuf],
     occupied_temps: &[PathBuf],
 ) -> bool {
-    occupied_targets.iter().any(|path| path == target)
-        || occupied_temps.iter().any(|path| path == temp)
-        || target.exists()
-        || temp.exists()
+    occupied_union_hits(target, occupied_targets, occupied_temps)
+        || occupied_union_hits(temp, occupied_targets, occupied_temps)
+        || path_exists(target)
+        || path_exists(temp)
 }
 
 fn job_owns_paths(job: &Job, target: &Path, temp: &Path) -> bool {
-    job.target_path == target || job.temp_path == temp
+    same_occupied_path(&job.target_path, target) || same_occupied_path(&job.temp_path, temp)
 }
 
 fn job_blocks_overwrite(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
@@ -500,13 +648,16 @@ fn pending_temp_blocks_overwrite(
     jobs: &[Job],
     extra_jobs: &[Job],
 ) -> bool {
-    if !occupied_temps.iter().any(|path| path == temp) {
+    if !occupied_temps
+        .iter()
+        .any(|path| same_occupied_path(path, temp))
+    {
         return false;
     }
     !jobs
         .iter()
         .chain(extra_jobs.iter())
-        .any(|job| job.temp_path == temp)
+        .any(|job| same_occupied_path(&job.temp_path, temp))
 }
 
 pub fn find_filename_collision(
@@ -560,7 +711,13 @@ pub fn allocate_download_paths(
         let (name, target, temp) = preferred_download_paths(directory, preferred_name);
         let blocked = job_blocks_overwrite(&target, &temp, jobs)
             || job_blocks_overwrite(&target, &temp, extra_jobs)
-            || pending_temp_blocks_overwrite(&temp, occupied_temps, jobs, extra_jobs);
+            || pending_temp_blocks_overwrite(&temp, occupied_temps, jobs, extra_jobs)
+            || occupied_temps
+                .iter()
+                .any(|path| same_occupied_path(path, &target))
+            || occupied_targets
+                .iter()
+                .any(|path| same_occupied_path(path, &temp));
         if !blocked {
             return (name, target, temp, true);
         }
@@ -1327,6 +1484,133 @@ mod tests {
         #[cfg(not(any(windows, unix)))]
         {
             let _ = free;
+        }
+    }
+
+    #[test]
+    fn ordinal_casefold_collides_names_that_differ_only_by_case() {
+        let upper = Path::new(r"C:\dl\Report.pdf");
+        let lower = Path::new(r"C:\dl\report.pdf");
+        assert_ne!(upper, lower);
+        assert!(paths_equal_for_volume(upper, lower, true));
+        assert!(!paths_equal_for_volume(upper, lower, false));
+        assert!(paths_equal_for_volume(
+            Path::new("Résumé.bin"),
+            Path::new("résumé.bin"),
+            true
+        ));
+    }
+
+    #[test]
+    fn extended_windows_path_prefixes_absolute_and_unc() {
+        assert_eq!(
+            extended_windows_path_str(r"C:\dl\file.bin"),
+            r"\\?\C:\dl\file.bin"
+        );
+        assert_eq!(
+            extended_windows_path_str(r"\\server\share\file.bin"),
+            r"\\?\UNC\server\share\file.bin"
+        );
+        assert_eq!(
+            extended_windows_path_str(r"\\?\C:\already"),
+            r"\\?\C:\already"
+        );
+        assert_eq!(extended_windows_path_str("file.bin"), "file.bin");
+    }
+
+    #[test]
+    fn case_variant_is_taken_before_the_part_file_exists() {
+        let dir = Path::new(r"C:\dl");
+        let jobs = Vec::new();
+        let occupied_targets = vec![dir.join("Report.pdf")];
+        let occupied_temps = vec![dir.join("Report.pdf.part")];
+        let (_name, target, temp, _) = allocate_download_paths(
+            dir,
+            "report.pdf",
+            &occupied_targets,
+            &occupied_temps,
+            &jobs,
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        if cfg!(windows) {
+            assert!(
+                !paths_equal_for_volume(&target, &occupied_targets[0], true),
+                "Windows must not share one .part across case variants, got {}",
+                target.display()
+            );
+            assert!(!paths_equal_for_volume(&temp, &occupied_temps[0], true));
+        } else {
+            assert_eq!(target, dir.join("report.pdf"));
+        }
+    }
+
+    #[test]
+    fn final_path_that_matches_another_temp_is_taken() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, temp, _) = allocate_download_paths(
+            dir,
+            "Notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        assert!(
+            !same_occupied_path(&target, &occupied_temps[0]),
+            "a new final path must not reuse another job's temp, got {}",
+            target.display()
+        );
+        assert!(!same_occupied_path(&temp, &occupied_temps[0]));
+    }
+
+    #[test]
+    fn overwrite_falls_back_when_final_name_is_another_temp() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, _, replace) = allocate_download_paths(
+            dir,
+            "Notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert!(!replace);
+        assert!(
+            !same_occupied_path(&target, &occupied_temps[0]),
+            "overwrite must not land on another job's temp, got {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn case_variant_of_another_temp_is_taken_on_windows() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, _, _) = allocate_download_paths(
+            dir,
+            "notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        if cfg!(windows) {
+            assert!(
+                !paths_equal_for_volume(&target, &occupied_temps[0], true),
+                "Windows must case-fold a new final path against another temp, got {}",
+                target.display()
+            );
+        } else {
+            assert_eq!(target, dir.join("notes.txt.part"));
         }
     }
 }

@@ -13,8 +13,9 @@ use super::super::job::{DownloadError, DownloadOutcome, Job, JobState, WorkerCon
 use super::super::progress::{TransferEvent, TransferEventCallback};
 use super::super::resume::{resume_oracle, ResumeOracle};
 use super::super::transfer::run_transfer;
+use super::persist::persist_live_jobs;
 use super::{
-    apply_failed_lifecycle, clear_live_metrics, emit_jobs_locked, find_job_mut,
+    apply_failed_lifecycle, bump_jobs, clear_live_metrics, emit_jobs_locked, find_job_mut,
     spawn_progress_pump, EngineIdentity, EngineInner,
 };
 
@@ -94,11 +95,21 @@ async fn run_attempts(
             inner: inner.clone(),
         });
 
-        let (config, conn_budget) = {
+        let (config, conn_budget, occupied_paths) = {
             let guard = inner.lock().await;
-            (guard.config.clone(), guard.conn_budget.clone())
+            let occupied_paths = guard
+                .jobs
+                .iter()
+                .filter(|job| job.id != job_id)
+                .flat_map(|job| [job.target_path.clone(), job.temp_path.clone()])
+                .collect();
+            (
+                guard.config.clone(),
+                guard.conn_budget.clone(),
+                occupied_paths,
+            )
         };
-        let ctx = TransferContext::from_runtime(
+        let mut ctx = TransferContext::from_runtime(
             attempt_job.clone(),
             control.clone(),
             on_progress.clone(),
@@ -108,6 +119,7 @@ async fn run_attempts(
             committer,
             &config,
         );
+        ctx.occupied_paths = occupied_paths;
         let attempt_result = run_transfer(ctx).await;
 
         drop(on_progress);
@@ -116,16 +128,22 @@ async fn run_attempts(
         match attempt_result {
             Ok(outcome) => break Ok(outcome),
             Err(error) => {
-                {
+                let (requeue, max_retry, progressed) = {
                     let guard = inner.lock().await;
-                    if guard.requeue_on_cancel.contains_key(&job_id) {
-                        break Ok(DownloadOutcome::Canceled);
-                    }
-                }
-                let max_retry = {
-                    let guard = inner.lock().await;
-                    guard.config.auto_retry
+                    let requeue = guard.requeue_on_cancel.contains_key(&job_id);
+                    let progressed = guard
+                        .jobs
+                        .iter()
+                        .find(|job| job.id == job_id)
+                        .is_some_and(|job| durable_progress(job) > durable_progress(&attempt_job));
+                    (requeue, guard.config.auto_retry, progressed)
                 };
+                if requeue {
+                    break Ok(DownloadOutcome::Canceled);
+                }
+                if progressed {
+                    retry_attempts = 0;
+                }
                 let can_retry = error.retryable && retry_attempts < max_retry;
                 if can_retry {
                     retry_attempts += 1;
@@ -141,9 +159,11 @@ async fn run_attempts(
                                 delay.as_secs().max(1),
                                 error.message
                             ));
+                            bump_jobs(&mut guard);
                             emit_jobs_locked(&guard);
                         }
                     }
+                    let _ = persist_live_jobs(&inner).await;
                     match sleep_interruptible(&control, delay).await {
                         Some(outcome) => break Ok(outcome),
                         None => {}
@@ -156,10 +176,26 @@ async fn run_attempts(
                     }
                     continue;
                 }
+                {
+                    let mut guard = inner.lock().await;
+                    if let Some(job) = find_job_mut(&mut guard.jobs, &job_id) {
+                        if progressed {
+                            job.retry_attempts = 0;
+                            bump_jobs(&mut guard);
+                        }
+                    }
+                }
                 break Err(error);
             }
         }
     }
+}
+
+fn durable_progress(job: &Job) -> u64 {
+    job.segment_map
+        .as_ref()
+        .map(|map| map.written_sum())
+        .unwrap_or(job.downloaded_bytes)
 }
 
 /// Multi / Restart skip metadata_len so a sparse `.part` cannot lie.
@@ -305,12 +341,15 @@ pub(super) async fn finalize_worker(
             }
         }
         guard.controls.remove(job_id);
+        bump_jobs(&mut guard);
         emit_jobs_locked(&guard);
         if !defer_start {
             guard.wake.notify_one();
         }
         (partial_to_delete, produced_to_delete, defer_start)
     };
+
+    let _ = persist_live_jobs(inner).await;
 
     if let Some(path) = partial_to_delete {
         remove_partial(&path).await;
@@ -335,6 +374,34 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn durable_progress_uses_segment_written_sum() {
+        use crate::download::job::Job;
+        use crate::download::segment::{Segment, SegmentMap, SegmentState};
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            std::path::PathBuf::from("file.bin"),
+            std::path::PathBuf::from("file.bin.part"),
+        );
+        job.downloaded_bytes = 5;
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 100,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 99,
+                written: 20,
+                state: SegmentState::Active,
+            }],
+            preallocated: true,
+        });
+        assert_eq!(super::durable_progress(&job), 20);
+        job.segment_map = None;
+        assert_eq!(super::durable_progress(&job), 5);
+    }
 
     #[tokio::test]
     async fn retry_delay_pause_returns_paused_without_waiting_full_delay() {

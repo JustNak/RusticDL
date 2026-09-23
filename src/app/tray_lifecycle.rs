@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use gpui::{Context, Window};
 use tokio::sync::oneshot;
 
@@ -35,7 +33,6 @@ impl DownloadApp {
         }
 
         self.flush_window_layout_now();
-        self.flush_jobs_save_if_due();
         let hwnd = main_window_hwnd(window);
         if hwnd != 0 {
             self.main_hwnd = hwnd;
@@ -97,12 +94,10 @@ impl DownloadApp {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.engine.send(EngineCommand::Drain { ack: Some(ack_tx) });
         cx.spawn(async move |this, cx| {
-            tokio::select! {
-                _ = ack_rx => {}
-                _ = cx.background_executor().timer(Duration::from_secs(2)) => {}
+            if ack_rx.await.is_err() {
+                return;
             }
             let _ = this.update(cx, |app, cx| {
-                app.flush_jobs_save_now();
                 app.stop_tray_nonblocking();
                 cx.quit();
             });
