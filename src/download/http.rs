@@ -331,7 +331,7 @@ pub async fn run_http_download_with_ctx(
                     len
                 }
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| known_total_without_content_length(&ctx.job, &validators));
 
         if let Some(total) = range_total {
             total_bytes = total;
@@ -364,11 +364,12 @@ pub async fn run_http_download_with_ctx(
                     if let Some(parent) = target_path.parent() {
                         let new_target = parent.join(&filename);
                         let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if temp_path != new_temp && temp_path.exists() {
-                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                        if adopt_renamed_partial(&temp_path, &new_temp, existing_bytes).await {
+                            target_path = new_target;
+                            temp_path = new_temp;
+                        } else {
+                            filename = ctx.job.filename.clone();
                         }
-                        target_path = new_target;
-                        temp_path = new_temp;
                     }
                 }
             } else if let Some(from_final) = filename_from_response_url(&current_url) {
@@ -377,11 +378,12 @@ pub async fn run_http_download_with_ctx(
                     if let Some(parent) = target_path.parent() {
                         let new_target = parent.join(&filename);
                         let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if temp_path != new_temp && temp_path.exists() {
-                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
+                        if adopt_renamed_partial(&temp_path, &new_temp, existing_bytes).await {
+                            target_path = new_target;
+                            temp_path = new_temp;
+                        } else {
+                            filename = ctx.job.filename.clone();
                         }
-                        target_path = new_target;
-                        temp_path = new_temp;
                     }
                 }
             }
@@ -482,14 +484,15 @@ pub async fn run_http_download_with_ctx(
         downloaded = sink.offset();
         match body_result {
             Ok(StreamEnd::Control(outcome)) => {
-                if matches!(outcome, DownloadOutcome::Paused) {
-                    let _ = sink.sync_data().await;
+                if should_sync_data_on_exit(outcome) {
+                    sink.sync_data().await?;
                 }
                 drop(sink);
                 emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                 return Ok(outcome);
             }
             Ok(StreamEnd::Exhausted { downloaded }) => {
+                sink.sync_data().await?;
                 drop(sink);
                 verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
                 let Some(final_path) = move_to_final_path_unless_discarded(
@@ -541,7 +544,7 @@ pub async fn run_http_download_with_ctx(
                         )
                     {
                         if should_sync_data_on_exit(outcome) {
-                            let _ = sink.sync_data().await;
+                            sink.sync_data().await?;
                         }
                         drop(sink);
                         emit_control_exit_progress(&on_progress, downloaded, total_bytes);
@@ -549,6 +552,9 @@ pub async fn run_http_download_with_ctx(
                     }
                 }
                 drop(sink);
+                if downloaded > existing_bytes {
+                    short_reconnects = 0;
+                }
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
@@ -627,9 +633,51 @@ async fn prepare_reconnect(
     ReconnectAction::Retry { offset }
 }
 
+fn known_total_without_content_length(job: &Job, validators: &ContentValidators) -> u64 {
+    if job.total_bytes > 0 {
+        return job.total_bytes;
+    }
+    validators
+        .expected_size
+        .filter(|size| *size > 0)
+        .unwrap_or(0)
+}
+
+/// Switch to a Content-Disposition name only after the existing partial moved,
+/// or when nothing has been written and the destination is empty.
+pub(crate) fn disposition_switch_allowed(
+    rename_ok: bool,
+    existing_bytes: u64,
+    new_file_len: Option<u64>,
+) -> bool {
+    rename_ok || (existing_bytes == 0 && new_file_len.unwrap_or(0) == 0)
+}
+
+async fn adopt_renamed_partial(temp_path: &Path, new_temp: &Path, existing_bytes: u64) -> bool {
+    if temp_path == new_temp {
+        return true;
+    }
+    let rename_ok = if super::filesystem::path_exists(temp_path) {
+        tokio::fs::rename(
+            super::filesystem::io_path(temp_path),
+            super::filesystem::io_path(new_temp),
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    let new_len = if rename_ok {
+        None
+    } else {
+        metadata_len(new_temp).await
+    };
+    disposition_switch_allowed(rename_ok, existing_bytes, new_len)
+}
+
 fn can_mid_transfer_reconnect(
     error: &DownloadError,
-    is_fetch_phase: bool,
+    _is_fetch_phase: bool,
     short_reconnects: u32,
     existing_bytes: u64,
     resume_supported: bool,
@@ -638,9 +686,6 @@ fn can_mid_transfer_reconnect(
         return false;
     }
     if !is_reconnectable_error(error) {
-        return false;
-    }
-    if is_fetch_phase && short_reconnects == 0 {
         return false;
     }
     ranges_usable_for_reconnect(existing_bytes, resume_supported)
@@ -1170,14 +1215,56 @@ mod tests {
     }
 
     #[test]
-    fn can_reconnect_fetch_only_after_prior_short_reconnect() {
+    fn missing_content_length_keeps_preflight_total() {
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            std::path::PathBuf::from("file.bin"),
+            std::path::PathBuf::from("file.bin.part"),
+        );
+        job.total_bytes = 4096;
+        assert_eq!(
+            known_total_without_content_length(&job, &ContentValidators::default()),
+            4096
+        );
+        job.total_bytes = 0;
+        let validators = ContentValidators {
+            expected_size: Some(80),
+            ..ContentValidators::default()
+        };
+        assert_eq!(known_total_without_content_length(&job, &validators), 80);
+        assert_eq!(
+            known_total_without_content_length(&job, &ContentValidators::default()),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_disposition_rename_does_not_switch_a_resumed_partial() {
+        assert!(disposition_switch_allowed(true, 100, None));
+        assert!(disposition_switch_allowed(false, 0, None));
+        assert!(disposition_switch_allowed(false, 0, Some(0)));
+        assert!(!disposition_switch_allowed(false, 100, None));
+        assert!(!disposition_switch_allowed(false, 100, Some(0)));
+        assert!(!disposition_switch_allowed(false, 0, Some(12)));
+    }
+
+    #[test]
+    fn can_reconnect_opening_get_uses_short_budget() {
         let connect = download_error(
             FailureCategory::Network,
             "Could not connect: timed out".into(),
             true,
         );
-        assert!(!can_mid_transfer_reconnect(&connect, true, 0, 50, true));
-        assert!(can_mid_transfer_reconnect(&connect, true, 1, 50, true));
+        assert!(can_mid_transfer_reconnect(&connect, true, 0, 50, true));
+        assert!(can_mid_transfer_reconnect(&connect, true, 1, 0, false));
+        assert!(!can_mid_transfer_reconnect(
+            &connect,
+            true,
+            RECONNECT_MAX,
+            0,
+            false
+        ));
     }
 
     #[test]

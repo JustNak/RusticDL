@@ -157,10 +157,14 @@ pub async fn run_multi_segment_download(
     match result {
         Ok((DownloadOutcome::Completed, map)) => finalize_completed(ctx, writer, &map).await,
         Ok((outcome, map)) => {
-            // Fsync before persisting the map so a crash cannot save written
-            // counts past durable .part bytes.
+            // Workers already fsynced. A second failure must not persist a
+            // pause as clean, and must not advance written past that sync.
             if matches!(outcome, DownloadOutcome::Paused | DownloadOutcome::Canceled) {
-                flush_writer_to_disk(&writer).await;
+                if let Err(error) = flush_writer_to_disk(&writer).await {
+                    persist_map_exit(ctx, &map, 0).await?;
+                    drop(writer);
+                    return Err(error);
+                }
             }
             persist_map_exit(ctx, &map, 0).await?;
             drop(writer);
@@ -168,7 +172,7 @@ pub async fn run_multi_segment_download(
         }
         Err((error, map)) => {
             if !may_convert_multi_to_single(&map) {
-                flush_writer_to_disk(&writer).await;
+                let _ = flush_writer_to_disk(&writer).await;
             }
             persist_map_exit(ctx, &map, 0).await?;
             if may_convert_multi_to_single(&map) {
@@ -183,9 +187,60 @@ pub async fn run_multi_segment_download(
     }
 }
 
-async fn flush_writer_to_disk(writer: &Arc<SegmentFileWriter>) {
+async fn flush_writer_to_disk(writer: &Arc<SegmentFileWriter>) -> Result<(), DownloadError> {
     let flush = writer.clone();
-    let _ = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
+    tokio::task::spawn_blocking(move || flush.flush_sync_data())
+        .await
+        .map_err(|error| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not flush download file: {error}"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not flush download file: {error}"),
+                false,
+            )
+        })
+}
+
+async fn sync_writer_or_clamp(
+    writer: &Arc<SegmentFileWriter>,
+    shared: &SharedMulti,
+) -> Result<(), DownloadError> {
+    let flush = writer.clone();
+    let synced = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
+    let io_result = match synced {
+        Ok(result) => result,
+        Err(error) => Err(std::io::Error::other(error.to_string())),
+    };
+    if let Err(error) = io_result {
+        let mut map = lock_map(&shared.map);
+        let floor = shared
+            .synced_written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        clamp_written_to_synced(&mut map, &floor);
+        return Err(download_error(
+            FailureCategory::Disk,
+            format!("Could not flush download file: {error}"),
+            false,
+        ));
+    }
+    let written: Vec<u64> = {
+        let map = lock_map(&shared.map);
+        map.segments.iter().map(|segment| segment.written).collect()
+    };
+    let mut floor = shared
+        .synced_written
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *floor = written;
+    Ok(())
 }
 
 fn known_total(job: &super::job::Job) -> Result<u64, DownloadError> {
@@ -467,9 +522,22 @@ fn fallback_reason_for(error: &DownloadError) -> &'static str {
 
 struct SharedMulti {
     map: Mutex<SegmentMap>,
+    /// `segment.written` values last confirmed by a successful `sync_data`.
+    synced_written: Mutex<Vec<u64>>,
     active: AtomicU32,
     reconnects: AtomicU32,
     window: Mutex<SpeedWindow>,
+}
+
+pub(crate) fn clamp_written_to_synced(map: &mut SegmentMap, synced: &[u64]) {
+    for (segment, durable) in map.segments.iter_mut().zip(synced.iter()) {
+        if segment.written > *durable {
+            segment.written = *durable;
+            if segment.written < segment.length() && segment.state == SegmentState::Completed {
+                segment.state = SegmentState::Active;
+            }
+        }
+    }
 }
 
 struct SpeedWindow {
@@ -542,6 +610,7 @@ async fn run_segment_workers(
     let host = host_key_for_budget(&ctx.resolved_url);
     let shared = Arc::new(SharedMulti {
         map: Mutex::new(map.clone()),
+        synced_written: Mutex::new(map.segments.iter().map(|segment| segment.written).collect()),
         active: AtomicU32::new(0),
         reconnects: AtomicU32::new(ctx.job.reconnect_count),
         window: Mutex::new(SpeedWindow {
@@ -599,6 +668,12 @@ async fn run_segment_workers(
                 }
                 set.abort_all();
             }
+        }
+    }
+
+    if let Err(error) = sync_writer_or_clamp(&writer, &shared).await {
+        if first_error.is_none() {
+            first_error = Some(error);
         }
     }
 
@@ -727,9 +802,12 @@ async fn run_segment_loop(
             return Ok(());
         }
 
-        if let Err(error) =
-            classify_segment_status(&range_status, range_start, task.validators.expected_size)
-        {
+        if let Err(error) = classify_segment_status(
+            &range_status,
+            range_start,
+            end,
+            task.validators.expected_size,
+        ) {
             if error.retryable && try_segment_reconnect(task, &error, &mut short_reconnects).await?
             {
                 continue;
@@ -752,11 +830,22 @@ async fn run_segment_loop(
                 return Ok(());
             }
             Ok(false) => return Ok(()),
-            Err(error) => match fail_or_reconnect(task, error, &mut short_reconnects).await {
-                Ok(true) => continue,
-                Ok(false) => return Ok(()),
-                Err(error) => return Err(error),
-            },
+            Err(error) => {
+                let wrote = {
+                    let map = lock_map(&task.shared.map);
+                    map.segments
+                        .get(task.index as usize)
+                        .is_some_and(|segment| segment.written > written)
+                };
+                if wrote {
+                    short_reconnects = 0;
+                }
+                match fail_or_reconnect(task, error, &mut short_reconnects).await {
+                    Ok(true) => continue,
+                    Ok(false) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
 }
@@ -820,8 +909,7 @@ async fn stream_segment(
     match result {
         Ok(StreamEnd::Control(outcome)) => {
             if matches!(outcome, DownloadOutcome::Paused) {
-                let writer = task.writer.clone();
-                let _ = tokio::task::spawn_blocking(move || writer.flush_sync_data()).await;
+                sync_writer_or_clamp(&task.writer, &task.shared).await?;
             }
             emit_progress(task, false);
             Ok(false)
@@ -1012,6 +1100,26 @@ mod tests {
             PathBuf::from("C:\\dl\\file.bin"),
             PathBuf::from("C:\\dl\\file.bin.part"),
         )
+    }
+
+    #[test]
+    fn clamp_written_drops_bytes_sync_did_not_confirm() {
+        let mut map = SegmentMap {
+            total_bytes: 100,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 99,
+                written: 40,
+                state: SegmentState::Completed,
+            }],
+            preallocated: true,
+        };
+        clamp_written_to_synced(&mut map, &[10]);
+        assert_eq!(map.segments[0].written, 10);
+        assert_eq!(map.segments[0].state, SegmentState::Active);
+        assert_eq!(map.written_sum(), 10);
     }
 
     #[test]
@@ -2131,13 +2239,17 @@ Content-Length: {}\r\n\
                 }
 
                 if matches!(mode, RangeServeMode::ForbiddenBody) {
-                    let reply = "HTTP/1.1 403 Forbidden\r\n\
+                    let range = parse_test_range(&req);
+                    let probe = range.is_some_and(|(start, end)| end == Some(start));
+                    if !probe {
+                        let reply = "HTTP/1.1 403 Forbidden\r\n\
 Connection: close\r\n\
 Content-Length: 0\r\n\
 \r\n";
-                    let _ = socket.write_all(reply.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                    continue;
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                        continue;
+                    }
                 }
 
                 let range = parse_test_range(&req);

@@ -18,7 +18,7 @@ impl SegmentFileWriter {
             .read(true)
             .write(true)
             .create(true)
-            .open(path)?;
+            .open(super::filesystem::io_path(path))?;
         Ok(Self {
             file: Mutex::new(file),
         })

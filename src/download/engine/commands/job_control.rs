@@ -8,7 +8,7 @@ use super::super::super::job::{FailureCategory, Job, JobState, WorkerControl};
 use super::super::super::multi::RESUME_RESTART_MESSAGE;
 use super::super::super::resume::{resume_oracle, FALLBACK_MAP_INCONSISTENT, FALLBACK_MAP_MISSING};
 use super::super::persist::persist_live_jobs;
-use super::super::{emit_jobs_locked, find_job_mut, EngineInner};
+use super::super::{bump_jobs, emit_jobs_locked, find_job_mut, EngineInner};
 
 /// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
 pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
@@ -32,45 +32,69 @@ pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
 }
 
 pub(super) async fn pause(inner: &Arc<Mutex<EngineInner>>, id: String) {
-    let mut guard = inner.lock().await;
-    if let Some(ctrl) = guard.controls.get(&id) {
-        store_control(ctrl, WorkerControl::Paused);
-    }
-    if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
-        if matches!(
-            job.state,
-            JobState::Queued | JobState::Starting | JobState::Downloading
-        ) {
-            if job.state == JobState::Queued {
-                job.state = JobState::Paused;
-                job.speed = 0;
-                job.eta_secs = 0;
+    let queued_paused = {
+        let mut guard = inner.lock().await;
+        if let Some(ctrl) = guard.controls.get(&id) {
+            store_control(ctrl, WorkerControl::Paused);
+        }
+        let mut queued_paused = false;
+        if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
+            if matches!(
+                job.state,
+                JobState::Queued | JobState::Starting | JobState::Downloading
+            ) {
+                if job.state == JobState::Queued {
+                    job.state = JobState::Paused;
+                    job.speed = 0;
+                    job.eta_secs = 0;
+                    queued_paused = true;
+                }
             }
         }
+        if queued_paused {
+            bump_jobs(&mut guard);
+        }
+        emit_jobs_locked(&guard);
+        queued_paused
+    };
+    if queued_paused {
+        let _ = persist_live_jobs(inner).await;
     }
-    emit_jobs_locked(&guard);
 }
 
 pub(super) async fn resume(inner: &Arc<Mutex<EngineInner>>, id: String) {
-    let mut guard = inner.lock().await;
-    if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
-        if matches!(job.state, JobState::Paused | JobState::Canceled) {
-            if fail_if_resume_map_unusable(job) {
-                emit_jobs_locked(&guard);
-                return;
-            }
-            job.state = JobState::Queued;
-            job.error = None;
-            job.failure_category = None;
-            job.clear_finished();
-            job.speed = 0;
-            if let Some(ctrl) = guard.controls.get(&id) {
-                store_control(ctrl, WorkerControl::Continue);
+    let mutated = {
+        let mut guard = inner.lock().await;
+        let mut mutated = false;
+        let mut queue = false;
+        if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
+            if matches!(job.state, JobState::Paused | JobState::Canceled) {
+                if !fail_if_resume_map_unusable(job) {
+                    job.state = JobState::Queued;
+                    job.error = None;
+                    job.failure_category = None;
+                    job.clear_finished();
+                    job.speed = 0;
+                    if let Some(ctrl) = guard.controls.get(&id) {
+                        store_control(ctrl, WorkerControl::Continue);
+                    }
+                    queue = true;
+                }
+                bump_jobs(&mut guard);
+                mutated = true;
             }
         }
+        if mutated {
+            emit_jobs_locked(&guard);
+            if queue {
+                guard.wake.notify_one();
+            }
+        }
+        mutated
+    };
+    if mutated {
+        let _ = persist_live_jobs(inner).await;
     }
-    emit_jobs_locked(&guard);
-    guard.wake.notify_one();
 }
 
 pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_partial: bool) {
@@ -130,13 +154,12 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
             }
         };
 
+        bump_jobs(&mut guard);
         emit_jobs_locked(&guard);
         immediate
     };
 
-    if delete_partial {
-        let _ = persist_live_jobs(inner).await;
-    }
+    let _ = persist_live_jobs(inner).await;
 
     if let Some(path) = immediate_partial {
         remove_partial(&path).await;
@@ -144,24 +167,37 @@ pub(super) async fn cancel(inner: &Arc<Mutex<EngineInner>>, id: String, delete_p
 }
 
 pub(super) async fn retry(inner: &Arc<Mutex<EngineInner>>, id: String) {
-    let mut guard = inner.lock().await;
-    if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
-        if matches!(job.state, JobState::Failed | JobState::Canceled) {
-            if fail_if_resume_map_unusable(job) {
-                emit_jobs_locked(&guard);
-                return;
+    let mutated = {
+        let mut guard = inner.lock().await;
+        let mut mutated = false;
+        let mut queue = false;
+        if let Some(job) = find_job_mut(&mut guard.jobs, &id) {
+            if matches!(job.state, JobState::Failed | JobState::Canceled) {
+                if !fail_if_resume_map_unusable(job) {
+                    job.state = JobState::Queued;
+                    job.error = None;
+                    job.failure_category = None;
+                    job.clear_finished();
+                    job.retry_attempts = 0;
+                    job.speed = 0;
+                    job.eta_secs = 0;
+                    queue = true;
+                }
+                bump_jobs(&mut guard);
+                mutated = true;
             }
-            job.state = JobState::Queued;
-            job.error = None;
-            job.failure_category = None;
-            job.clear_finished();
-            job.retry_attempts = 0;
-            job.speed = 0;
-            job.eta_secs = 0;
         }
+        if mutated {
+            emit_jobs_locked(&guard);
+            if queue {
+                guard.wake.notify_one();
+            }
+        }
+        mutated
+    };
+    if mutated {
+        let _ = persist_live_jobs(inner).await;
     }
-    emit_jobs_locked(&guard);
-    guard.wake.notify_one();
 }
 
 pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
@@ -205,6 +241,7 @@ pub(super) async fn restart(inner: &Arc<Mutex<EngineInner>>, id: String) {
             temp_path
         };
 
+        bump_jobs(&mut guard);
         emit_jobs_locked(&guard);
         if worker_running {
             guard.wake.notify_one();
@@ -254,12 +291,14 @@ pub(super) async fn remove(
         if worker_still_running && delete_file {
             guard.pending_final_deletes.insert(id.clone(), ());
         }
+        bump_jobs(&mut guard);
         emit_jobs_locked(&guard);
         match paths {
             Some((temp, target)) => (Some(temp), Some(target), worker_still_running),
             None => (None, None, worker_still_running),
         }
     };
+    let _ = persist_live_jobs(inner).await;
     if !worker_still_running {
         if delete_partial {
             if let Some(path) = temp_path {

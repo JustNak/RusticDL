@@ -41,7 +41,7 @@ impl AppendSink {
             .create(true)
             .write(true)
             .truncate(offset == 0)
-            .open(path)
+            .open(super::filesystem::io_path(path))
             .await
             .map_err(|error| {
                 download_error(
@@ -201,6 +201,14 @@ pub enum StreamEnd {
     Control(DownloadOutcome),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EosPolicy {
+    /// Known length, or a chunked body whose 0-chunk the decoder already required.
+    Complete,
+    /// No length and not chunked. A clean FIN is an incomplete download.
+    UnknownLength,
+}
+
 pub async fn stream_body(
     response: reqwest::Response,
     sink: &mut impl BodySink,
@@ -208,7 +216,37 @@ pub async fn stream_body(
     limiter: &GlobalBandwidthLimiter,
     on_chunk: impl FnMut(u64),
 ) -> Result<StreamEnd, DownloadError> {
-    stream_body_with_stall(response, sink, control, limiter, STALL_TIMEOUT, on_chunk).await
+    let policy = eos_policy_for_response(&response, sink.target_offset());
+    stream_body_with_stall(
+        response,
+        sink,
+        control,
+        limiter,
+        STALL_TIMEOUT,
+        policy,
+        on_chunk,
+    )
+    .await
+}
+
+fn eos_policy_for_response(response: &reqwest::Response, target: Option<u64>) -> EosPolicy {
+    if target.is_some() || response.content_length().is_some() {
+        return EosPolicy::Complete;
+    }
+    let chunked = response
+        .headers()
+        .get(reqwest::header::TRANSFER_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        });
+    if chunked {
+        EosPolicy::Complete
+    } else {
+        EosPolicy::UnknownLength
+    }
 }
 
 pub(crate) async fn stream_body_with_stall(
@@ -217,6 +255,7 @@ pub(crate) async fn stream_body_with_stall(
     control: &AtomicU8,
     limiter: &GlobalBandwidthLimiter,
     stall_timeout: Duration,
+    policy: EosPolicy,
     on_chunk: impl FnMut(u64),
 ) -> Result<StreamEnd, DownloadError> {
     let stream = response.bytes_stream().map(|item| match item {
@@ -235,7 +274,16 @@ pub(crate) async fn stream_body_with_stall(
         }
     });
     futures_util::pin_mut!(stream);
-    stream_body_loop(stream, sink, control, limiter, stall_timeout, on_chunk).await
+    stream_body_loop(
+        stream,
+        sink,
+        control,
+        limiter,
+        stall_timeout,
+        policy,
+        on_chunk,
+    )
+    .await
 }
 
 pub(crate) async fn stream_body_loop<S, B>(
@@ -244,6 +292,7 @@ pub(crate) async fn stream_body_loop<S, B>(
     control: &AtomicU8,
     limiter: &GlobalBandwidthLimiter,
     stall_timeout: Duration,
+    policy: EosPolicy,
     mut on_chunk: impl FnMut(u64),
 ) -> Result<StreamEnd, DownloadError>
 where
@@ -320,6 +369,13 @@ where
                 true,
             ));
         }
+    }
+    if policy == EosPolicy::UnknownLength && sink.target_offset().is_none() {
+        return Err(download_error(
+            FailureCategory::Network,
+            format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
+            true,
+        ));
     }
 
     Ok(StreamEnd::Exhausted { downloaded })
@@ -632,6 +688,7 @@ mod tests {
                 &control,
                 limiter.as_ref(),
                 Duration::from_millis(80),
+                EosPolicy::Complete,
                 |_| {},
             ),
         )
@@ -668,6 +725,7 @@ mod tests {
                 &control,
                 limiter.as_ref(),
                 Duration::from_millis(700),
+                EosPolicy::Complete,
                 move |n| ticks_cb.lock().unwrap().push(n),
             ),
         )
@@ -709,6 +767,7 @@ mod tests {
                 &control,
                 limiter.as_ref(),
                 Duration::from_millis(80),
+                EosPolicy::Complete,
                 |_| {},
             ),
         )
@@ -746,6 +805,7 @@ mod tests {
                 &control,
                 limiter.as_ref(),
                 Duration::from_millis(80),
+                EosPolicy::Complete,
                 |_| {},
             ),
         )
@@ -756,6 +816,34 @@ mod tests {
             StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, 128),
             StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
         }
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_length_clean_eof_is_incomplete() {
+        let stream =
+            futures_util::stream::iter([Ok::<Vec<u8>, DownloadError>(b"partial".to_vec())]);
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-unknown-eof-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap();
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let err = stream_body_loop(
+            stream,
+            &mut sink,
+            &control,
+            limiter.as_ref(),
+            Duration::from_secs(5),
+            EosPolicy::UnknownLength,
+            |_| {},
+        )
+        .await
+        .expect_err("clean EOF without a length must not complete");
+        assert!(err.retryable);
+        assert!(err.message.contains("without a length"));
+        assert_eq!(sink.offset(), b"partial".len() as u64);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -138,7 +139,10 @@ struct PersistedStateRef<'a> {
     jobs: &'a [Job],
 }
 
-pub fn load_jobs(paths: &AppPaths) -> Vec<Job> {
+/// Missing `state.json` is an empty queue. A file that exists but cannot be
+/// read or parsed is an error: callers must not treat that as `[]` and write
+/// it back.
+pub fn load_jobs(paths: &AppPaths) -> Result<Vec<Job>, String> {
     load_jobs_with_history_cap(paths, MAX_COMPLETED_HISTORY)
 }
 
@@ -146,18 +150,27 @@ pub fn save_jobs(paths: &AppPaths, jobs: &[Job]) -> Result<(), String> {
     save_jobs_with_history_cap(paths, jobs, MAX_COMPLETED_HISTORY)
 }
 
-fn load_jobs_with_history_cap(paths: &AppPaths, max_completed: usize) -> Vec<Job> {
-    let Ok(bytes) = fs::read(&paths.state) else {
-        return Vec::new();
+fn load_jobs_with_history_cap(paths: &AppPaths, max_completed: usize) -> Result<Vec<Job>, String> {
+    let bytes = match fs::read(&paths.state) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "Could not read state.json ({}). The file was left in place.",
+                error
+            ));
+        }
     };
     let jobs = serde_json::from_slice::<PersistedState>(&bytes)
-        .map(|s| s.jobs)
-        .unwrap_or_default();
+        .map(|state| state.jobs)
+        .map_err(|error| {
+            format!("Could not parse state.json ({error}). The file was left in place.")
+        })?;
     match cap_completed_history(&jobs, max_completed) {
-        Cow::Borrowed(_) => jobs,
+        Cow::Borrowed(_) => Ok(jobs),
         Cow::Owned(trimmed) => {
-            let _ = save_jobs_with_history_cap(paths, &trimmed, max_completed);
-            trimmed
+            save_jobs_with_history_cap(paths, &trimmed, max_completed)?;
+            Ok(trimmed)
         }
     }
 }
@@ -172,11 +185,27 @@ fn save_jobs_with_history_cap(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_app_dirs(paths)?;
     let jobs = cap_completed_history(jobs, max_completed);
+    if jobs.as_ref().is_empty() && state_file_unreadable(&paths.state) {
+        return Err(
+            "Refusing to replace an unreadable state.json with an empty queue.".to_string(),
+        );
+    }
     let json = serde_json::to_vec(&PersistedStateRef {
         jobs: jobs.as_ref(),
     })
     .map_err(|e| format!("Could not serialize state: {e}"))?;
     atomic_write(&paths.state, &json)
+}
+
+/// True when `state.json` exists but is empty, unreadable, or not valid JSON.
+/// A missing file is not unreadable — saving `[]` there is a real empty queue.
+fn state_file_unreadable(path: &Path) -> bool {
+    match fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(bytes) if bytes.is_empty() => true,
+        Ok(bytes) => serde_json::from_slice::<PersistedState>(&bytes).is_err(),
+    }
 }
 
 /// Keep at most `max_completed` `JobState::Completed` rows, dropping the oldest
@@ -215,11 +244,48 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .unwrap_or("data.json");
     let temp_path = parent.join(format!(".{file_name}.tmp"));
-    fs::write(&temp_path, bytes).map_err(|e| format!("Could not write temp file: {e}"))?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Could not write temp file: {e}"))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("Could not write temp file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("Could not sync temp file: {e}"))?;
+    }
+    // Durability of the temp directory entry, then of the rename itself.
+    sync_dir(parent)?;
     fs::rename(&temp_path, path).map_err(|e| {
         let _ = fs::remove_file(&temp_path);
         format!("Could not finalize write: {e}")
-    })
+    })?;
+    sync_dir(parent)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    let file = open_dir_for_sync(dir)?;
+    file.sync_all()
+        .map_err(|e| format!("Could not sync directory: {e}"))
+}
+
+#[cfg(unix)]
+fn open_dir_for_sync(dir: &Path) -> Result<File, String> {
+    File::open(dir).map_err(|e| format!("Could not open directory for sync: {e}"))
+}
+
+#[cfg(windows)]
+fn open_dir_for_sync(dir: &Path) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS — required to open a directory handle.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .map_err(|e| format!("Could not open directory for sync: {e}"))
 }
 
 #[cfg(test)]
@@ -313,7 +379,7 @@ mod tests {
             "PascalCase jobs key must not be written"
         );
 
-        let loaded = load_jobs(&paths);
+        let loaded = load_jobs(&paths).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, job_id);
         assert_eq!(loaded[0].filename, "f.bin");
@@ -419,7 +485,7 @@ mod tests {
         let before = fs::read(&paths.state).unwrap();
         assert!(before.len() > 10, "fixture must write a real state file");
 
-        let loaded = load_jobs_with_history_cap(&paths, 1);
+        let loaded = load_jobs_with_history_cap(&paths, 1).unwrap();
         assert_eq!(ids(&loaded), ["keep-active", "keep-paused", "keep-done"]);
 
         let stored: PersistedState =
@@ -445,9 +511,53 @@ mod tests {
         write_state_untrimmed(&paths, &jobs);
         let before = fs::read(&paths.state).unwrap();
 
-        let loaded = load_jobs_with_history_cap(&paths, 500);
+        let loaded = load_jobs_with_history_cap(&paths, 500).unwrap();
         assert_eq!(ids(&loaded), ["active", "done"]);
         assert_eq!(fs::read(&paths.state).unwrap(), before);
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn load_missing_state_is_empty_queue() {
+        let paths = temp_paths("load-missing");
+        ensure_app_dirs(&paths).unwrap();
+        let loaded = load_jobs(&paths).unwrap();
+        assert!(loaded.is_empty());
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn load_torn_state_is_error_and_file_stays() {
+        let paths = temp_paths("load-torn");
+        ensure_app_dirs(&paths).unwrap();
+        fs::write(&paths.state, b"{").unwrap();
+        let error = load_jobs(&paths).unwrap_err();
+        assert!(error.contains("parse"), "{error}");
+        assert_eq!(fs::read(&paths.state).unwrap(), b"{");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn save_empty_refuses_to_replace_unreadable_state() {
+        let paths = temp_paths("save-empty-guard");
+        ensure_app_dirs(&paths).unwrap();
+        fs::write(&paths.state, b"").unwrap();
+        let error = save_jobs(&paths, &[]).unwrap_err();
+        assert!(error.contains("unreadable"), "{error}");
+        assert!(
+            fs::read(&paths.state).unwrap().is_empty(),
+            "torn state.json must stay on disk"
+        );
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn save_empty_over_valid_empty_queue_is_allowed() {
+        let paths = temp_paths("save-empty-ok");
+        save_jobs(&paths, &[]).unwrap();
+        save_jobs(&paths, &[]).unwrap();
+        let loaded = load_jobs(&paths).unwrap();
+        assert!(loaded.is_empty());
         let _ = fs::remove_dir_all(&paths.root);
     }
 }

@@ -721,6 +721,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),
@@ -807,6 +808,7 @@ mod tests {
         let (persist_tx, persist_rx) = mpsc::channel(32);
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls: HashMap::new(),
             active: HashMap::new(),
             handoff_auth: HashMap::new(),
@@ -1082,6 +1084,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),
@@ -1164,6 +1167,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),
@@ -1246,6 +1250,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),
@@ -1314,6 +1319,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),
@@ -1383,6 +1389,7 @@ mod tests {
         active.insert(id.clone(), ());
         let inner = Arc::new(Mutex::new(super::super::EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls,
             active,
             handoff_auth: HashMap::new(),

@@ -43,11 +43,10 @@ impl Default for PreflightPlan {
 }
 
 /// `Accept-Ranges: none` skips Range confirmation. Otherwise GET `bytes=0-0`
-/// must be 206 to claim ranges; a 200 means the server ignored Range. When
-/// size is known, at or above `multi_min_bytes`, and greater than 1 byte,
-/// GET `bytes=1-1` must also be 206 — a 200 on either probe disables multi
-/// (single-stream can still start from zero). Other probe statuses are
-/// inconclusive and leave the HEAD / 0-0 result unchanged.
+/// must be 206 with `Content-Range` exactly that byte. When size is known, at
+/// or above `multi_min_bytes`, and greater than 1 byte, GET `bytes=1-1` must
+/// also be 206 with `Content-Range` exactly that byte. Anything else disables
+/// multi (single-stream can still start from zero).
 pub async fn run_preflight(
     client: &Client,
     job_url: &str,
@@ -169,10 +168,12 @@ pub async fn run_preflight_planned(
             .await
             {
                 resolved = mid_url;
-                if mid_response.status() == StatusCode::OK {
+                if !response_is_exact_byte(&mid_response, 1) {
                     accept_ranges = Some(false);
                 }
                 drop(mid_response);
+            } else {
+                accept_ranges = Some(false);
             }
         }
     }
@@ -196,7 +197,7 @@ fn apply_zero_range_probe(
     filename: &mut Option<String>,
 ) {
     let probe_status = probe_response.status();
-    if probe_status == StatusCode::PARTIAL_CONTENT {
+    if response_is_exact_byte(probe_response, 0) {
         *accept_ranges = Some(true);
     } else if probe_status.is_success() {
         *accept_ranges = Some(false);
@@ -263,6 +264,18 @@ fn header_string(
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+fn response_is_exact_byte(response: &reqwest::Response, byte: u64) -> bool {
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return false;
+    }
+    response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .is_some_and(|(start, end, _)| start == byte && end == byte)
 }
 
 fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -1158,7 +1171,7 @@ Content-Length: 64\r\n\
     }
 
     #[tokio::test]
-    async fn mid_probe_403_keeps_head_ranges() {
+    async fn mid_probe_403_does_not_qualify_multi() {
         let head = "HTTP/1.1 200 OK\r\n\
 Connection: close\r\n\
 Accept-Ranges: bytes\r\n\
@@ -1180,12 +1193,37 @@ Content-Length: 0\r\n\
             .expect("preflight");
         assert_eq!(
             info.accept_ranges,
-            Some(true),
-            "403 on 1-1 is inconclusive; keep 0-0 / HEAD ranges"
+            Some(false),
+            "1-1 must be 206 with Content-Range bytes 1-1; 403 does not qualify multi"
         );
         let _ = reqs.recv().await;
         let _ = reqs.recv().await;
         let mid = reqs.recv().await.expect("mid");
         assert!(mid.to_ascii_lowercase().contains("range: bytes=1-1"));
+    }
+
+    #[tokio::test]
+    async fn zero_probe_206_with_whole_object_range_disables_multi() {
+        let head = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Length: 8192\r\n\
+\r\n"
+            .to_string();
+        let probe = "HTTP/1.1 206 Partial Content\r\n\
+Connection: close\r\n\
+Content-Range: bytes 0-8191/8192\r\n\
+Content-Length: 8192\r\n\
+\r\n"
+            .to_string();
+        let (base, _reqs, _handle) = spawn_scripted_server(vec![head, probe]).await;
+        let url = format!("{base}/whole.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let info = run_preflight(&client, &url, &url, None, &control)
+            .await
+            .expect("preflight");
+        assert_eq!(info.accept_ranges, Some(false));
+        assert_eq!(info.total_bytes, Some(8192));
     }
 }

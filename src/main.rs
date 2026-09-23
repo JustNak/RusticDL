@@ -60,7 +60,13 @@ fn main() {
     // Keep the OS autostart entry aligned with saved prefs (self-heal after moves/updates).
     let _ = apply_launch_at_startup(settings.launch_at_startup, settings.startup_minimized);
     let start_hidden = launched_minimized();
-    let jobs = load_jobs(&paths);
+    let (jobs, state_load_error) = match load_jobs(&paths) {
+        Ok(jobs) => (jobs, None),
+        Err(error) => {
+            eprintln!("rusticdl: {error}");
+            (Vec::new(), Some(error))
+        }
+    };
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = runtime.enter();
@@ -126,7 +132,15 @@ fn main() {
                             apply_app_icon(window);
                             let view = cx.new(|cx| {
                                 DownloadApp::new(
-                                    jobs, settings, paths, engine, ui_rx, ipc_bridge, window, cx,
+                                    jobs,
+                                    settings,
+                                    paths,
+                                    engine,
+                                    ui_rx,
+                                    ipc_bridge,
+                                    state_load_error,
+                                    window,
+                                    cx,
                                 )
                             });
                             cx.new(|cx| Root::new(view, window, cx))

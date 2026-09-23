@@ -11,10 +11,7 @@ use crate::notifications::{
     in_app_summary_messages, linux_session_notify_at_flush, soft_os_eligible, spawn_session_notify,
     terminal_edges, InAppToastKind, PendingOsTerminal, TerminalKind,
 };
-use crate::persistence::save_jobs;
 use crate::settings::OsNotifyMode;
-
-const JOBS_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 impl DownloadApp {
     pub(crate) fn on_jobs_changed(&mut self, jobs: Arc<Vec<Job>>, cx: &mut Context<Self>) {
@@ -58,16 +55,9 @@ impl DownloadApp {
             }
         }
 
-        let force_persist = jobs_need_immediate_persist(&self.jobs, &jobs);
         self.prune_selection(&jobs);
         self.jobs = jobs;
         self.last_ui_update = Instant::now();
-        self.jobs_dirty = true;
-        if force_persist {
-            self.flush_jobs_save_now();
-        } else {
-            self.flush_jobs_save_if_due();
-        }
         self.ipc.update_jobs(Arc::clone(&self.jobs));
         self.sync_extension_settings_from_bridge(false);
         cx.notify();
@@ -104,7 +94,6 @@ impl DownloadApp {
             }
             self.flush_os_notify_if_due(cx);
             self.flush_window_layout_if_due();
-            self.flush_jobs_save_if_due();
         }
         if browser_capture::should_poll_capture_huds(self.window_hidden_to_tray) {
             self.poll_browser_capture(cx);
@@ -181,25 +170,6 @@ impl DownloadApp {
         };
         self.show_toast(message, cx);
     }
-
-    pub(crate) fn flush_jobs_save_if_due(&mut self) {
-        if !self.jobs_dirty {
-            return;
-        }
-        if self.last_jobs_save.elapsed() < JOBS_SAVE_DEBOUNCE {
-            return;
-        }
-        self.flush_jobs_save_now();
-    }
-
-    pub(crate) fn flush_jobs_save_now(&mut self) {
-        if !self.jobs_dirty {
-            return;
-        }
-        self.jobs_dirty = false;
-        self.last_jobs_save = Instant::now();
-        let _ = save_jobs(&self.paths, persist_source(&self.latest_jobs));
-    }
 }
 
 pub(crate) const SHELL_TICK_INTERVAL: Duration = Duration::from_millis(80);
@@ -259,36 +229,9 @@ fn note_jobs_changed(
     Some(jobs)
 }
 
-fn persist_source<'a>(latest_jobs: &'a [Job]) -> &'a [Job] {
-    latest_jobs
-}
-
-fn jobs_need_immediate_persist(previous: &[Job], next: &[Job]) -> bool {
-    if previous.len() != next.len() {
-        return true;
-    }
-    use std::collections::HashMap;
-    let prev: HashMap<&str, &Job> = previous.iter().map(|job| (job.id.as_str(), job)).collect();
-    for job in next {
-        match prev.get(job.id.as_str()) {
-            None => return true,
-            Some(prev_job) if prev_job.state != job.state => {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    previous
-        .iter()
-        .any(|job| !next.iter().any(|n| n.id == job.id))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        hidden_idle_tick_should_skip, jobs_need_immediate_persist, note_jobs_changed,
-        persist_source, should_park_shell_tick,
-    };
+    use super::{hidden_idle_tick_should_skip, note_jobs_changed, should_park_shell_tick};
     use crate::download::{Job, JobState};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -307,31 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_skips_pure_progress_ticks() {
-        let prev = vec![sample_job("a", JobState::Downloading)];
-        let mut next = vec![sample_job("a", JobState::Downloading)];
-        next[0].downloaded_bytes = 50;
-        next[0].progress = 5.0;
-        assert!(!jobs_need_immediate_persist(&prev, &next));
-    }
-
-    #[test]
-    fn persist_forces_on_state_change() {
-        let prev = vec![sample_job("a", JobState::Downloading)];
-        let next = vec![sample_job("a", JobState::Paused)];
-        assert!(jobs_need_immediate_persist(&prev, &next));
-    }
-
-    #[test]
-    fn persist_debounces_identity_only_changes() {
-        let prev = vec![sample_job("a", JobState::Downloading)];
-        let mut next = vec![sample_job("a", JobState::Downloading)];
-        next[0].transfer_format_version = 1;
-        assert!(!jobs_need_immediate_persist(&prev, &next));
-    }
-
-    #[test]
-    fn stale_ui_snapshot_is_not_flush_source_after_newer_jobs_changed() {
+    fn newer_jobs_changed_updates_latest_while_ui_stays_throttled() {
         let mut rendered_job = sample_job("a", JobState::Downloading);
         rendered_job.transfer_format_version = 0;
         let rendered = Arc::new(vec![rendered_job]);
@@ -349,9 +268,7 @@ mod tests {
             "same-frame JobsChanged must stay throttled"
         );
         assert!(pending.is_some());
-
-        let flushed = persist_source(&latest);
-        assert_eq!(flushed[0].transfer_format_version, 1);
+        assert_eq!(latest[0].transfer_format_version, 1);
         assert_eq!(rendered[0].transfer_format_version, 0);
     }
 
@@ -434,15 +351,5 @@ mod tests {
         assert!(!should_park_shell_tick(
             true, &completed, &completed, false, false, false, true
         ));
-    }
-
-    #[test]
-    fn persist_forces_on_membership_change() {
-        let prev = vec![sample_job("a", JobState::Queued)];
-        let next = vec![
-            sample_job("a", JobState::Queued),
-            sample_job("b", JobState::Queued),
-        ];
-        assert!(jobs_need_immediate_persist(&prev, &next));
     }
 }

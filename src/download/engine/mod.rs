@@ -144,6 +144,9 @@ impl EngineHandle {
 
 pub(super) struct EngineInner {
     jobs: Vec<Job>,
+    /// Bumped on every durable job mutation. The persist actor rewrites when
+    /// this moves during a snapshot write so a stale clone cannot land last.
+    jobs_generation: u64,
     controls: HashMap<String, Arc<AtomicU8>>,
     active: HashMap<String, ()>,
     handoff_auth: HashMap<String, HandoffAuth>,
@@ -188,6 +191,7 @@ pub fn spawn_engine(
 
     let inner = Arc::new(Mutex::new(EngineInner {
         jobs,
+        jobs_generation: 0,
         controls: HashMap::new(),
         active: HashMap::new(),
         handoff_auth: HashMap::new(),
@@ -271,6 +275,7 @@ fn reserve_startable_jobs(guard: &mut EngineInner) -> Vec<String> {
             .or_insert_with(|| Arc::new(AtomicU8::new(0)));
     }
     if !ids.is_empty() {
+        bump_jobs(guard);
         emit_jobs_locked(guard);
     }
     ids
@@ -403,6 +408,12 @@ pub(super) fn find_job_mut<'a>(jobs: &'a mut [Job], id: &str) -> Option<&'a mut 
     jobs.iter_mut().find(|j| j.id == id)
 }
 
+/// Durable queue/identity changes. Live progress ticks must not call this —
+/// a moving generation would keep the persist actor rewriting forever.
+pub(super) fn bump_jobs(guard: &mut EngineInner) {
+    guard.jobs_generation = guard.jobs_generation.wrapping_add(1);
+}
+
 pub(super) fn emit_jobs_locked(guard: &EngineInner) {
     let _ = guard
         .event_tx
@@ -488,6 +499,7 @@ mod tests {
         std::mem::forget(persist_rx);
         EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls: HashMap::new(),
             active: HashMap::new(),
             handoff_auth: HashMap::new(),
@@ -512,6 +524,7 @@ mod tests {
         let (persist_tx, persist_rx) = mpsc::channel(32);
         let inner = Arc::new(Mutex::new(EngineInner {
             jobs: vec![job],
+            jobs_generation: 0,
             controls: HashMap::new(),
             active: HashMap::new(),
             handoff_auth: HashMap::new(),

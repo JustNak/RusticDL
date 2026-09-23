@@ -146,7 +146,6 @@ pub(crate) enum TransferRequestKind {
 }
 
 pub async fn fetch_range(req: FetchRequest<'_>) -> Result<FetchOutcome, DownloadError> {
-    let requested_start = req.range.start();
     let (response, final_url) = if req.follow_redirects {
         send_following_redirects(req.url, req.control, |current| {
             let current = current.to_string();
@@ -194,7 +193,7 @@ pub async fn fetch_range(req: FetchRequest<'_>) -> Result<FetchOutcome, Download
         (response, req.url.to_string())
     };
 
-    let status = classify_range_status(&response, requested_start);
+    let status = classify_range_status(&response, req.range);
     Ok(FetchOutcome {
         response,
         final_url,
@@ -530,7 +529,12 @@ async fn send_transfer_get(
     }
 }
 
-fn classify_range_status(response: &reqwest::Response, requested_start: u64) -> RangeStatus {
+fn classify_range_status(response: &reqwest::Response, range: RangeSpec) -> RangeStatus {
+    let requested_start = range.start();
+    let closed_end = match range {
+        RangeSpec::Closed { end, .. } => Some(end),
+        RangeSpec::Open { .. } => None,
+    };
     let status = response.status();
     if status.is_redirection() {
         return RangeStatus::RedirectWhenPinned;
@@ -543,7 +547,9 @@ fn classify_range_status(response: &reqwest::Response, requested_start: u64) -> 
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return RangeStatus::AuthDenied { status };
     }
-    if status == StatusCode::OK && requested_start > 0 {
+    // A closed segment (including segment 0) is only a slice when the server
+    // answers 206. HTTP 200 is the whole entity — do not treat it as this slice.
+    if status == StatusCode::OK && (requested_start > 0 || closed_end.is_some()) {
         return RangeStatus::FullEntityWhenRangeRequested;
     }
     if status == StatusCode::PARTIAL_CONTENT {
@@ -555,16 +561,17 @@ fn classify_range_status(response: &reqwest::Response, requested_start: u64) -> 
         {
             return RangeStatus::Partial { start, end, total };
         }
-        if requested_start == 0 {
-            return RangeStatus::OkFromZero;
+        // 206 without Content-Range is fail-closed for every closed segment,
+        // including offset 0. An open GET from 0 may still be a full entity.
+        if closed_end.is_some() || requested_start > 0 {
+            return RangeStatus::Other {
+                status,
+                retryable: false,
+            };
         }
-        // 206 without Content-Range on a non-zero Range — fail-closed in callers.
-        return RangeStatus::Other {
-            status,
-            retryable: false,
-        };
+        return RangeStatus::OkFromZero;
     }
-    if status.is_success() && requested_start == 0 {
+    if status.is_success() && requested_start == 0 && closed_end.is_none() {
         return RangeStatus::OkFromZero;
     }
     RangeStatus::Other {
@@ -665,6 +672,7 @@ pub(crate) const RANGE_IGNORED_MESSAGE: &str =
 pub(crate) fn classify_segment_status(
     status: &RangeStatus,
     range_start: u64,
+    range_end: u64,
     expected_size: Option<u64>,
 ) -> Result<(), DownloadError> {
     match status {
@@ -693,7 +701,7 @@ pub(crate) fn classify_segment_status(
             false,
         )),
         RangeStatus::Other { status, retryable } => {
-            if *status == StatusCode::PARTIAL_CONTENT && range_start > 0 {
+            if *status == StatusCode::PARTIAL_CONTENT {
                 return Err(missing_content_range_error());
             }
             Err(download_error(
@@ -702,12 +710,12 @@ pub(crate) fn classify_segment_status(
                 *retryable,
             ))
         }
-        RangeStatus::Partial { start, total, .. } => {
-            if *start != range_start {
+        RangeStatus::Partial { start, end, total } => {
+            if *start != range_start || *end != range_end {
                 return Err(download_error(
                     FailureCategory::Resume,
                     format!(
-                        "Unexpected resume range (got start {start}, expected {range_start}). Use Restart."
+                        "Unexpected resume range (got {start}-{end}, expected {range_start}-{range_end}). Use Restart."
                     ),
                     false,
                 ));
@@ -723,12 +731,11 @@ pub(crate) fn classify_segment_status(
             }
             Ok(())
         }
-        RangeStatus::OkFromZero => {
-            if range_start > 0 {
-                return Err(missing_content_range_error());
-            }
-            Ok(())
-        }
+        RangeStatus::OkFromZero => Err(download_error(
+            FailureCategory::Resume,
+            RANGE_IGNORED_MESSAGE.into(),
+            false,
+        )),
     }
 }
 
@@ -1192,6 +1199,82 @@ Content-Length: 4\r\n\
         .await
         .expect("fetch");
         assert_eq!(outcome.status, RangeStatus::FullEntityWhenRangeRequested);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_closed_200_at_zero_is_not_a_slice() {
+        let body = "HTTP/1.1 200 OK\r\n\
+Connection: close\r\n\
+Content-Length: 4\r\n\
+\r\nabcd"
+            .to_string();
+        let (base, _reqs, _handle) = spawn_scripted_server(vec![body]).await;
+        let url = format!("{base}/file.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let validators = ContentValidators::default();
+        let outcome = fetch_range(fetch_req(
+            &client,
+            &url,
+            RangeSpec::Closed { start: 0, end: 1 },
+            &validators,
+            None,
+            false,
+            &control,
+        ))
+        .await
+        .expect("fetch");
+        assert_eq!(outcome.status, RangeStatus::FullEntityWhenRangeRequested);
+        let error = classify_segment_status(&outcome.status, 0, 1, None).unwrap_err();
+        assert!(!error.retryable);
+        assert_eq!(error.category, FailureCategory::Resume);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_closed_206_without_content_range_is_not_a_slice() {
+        let body = "HTTP/1.1 206 Partial Content\r\n\
+Connection: close\r\n\
+Content-Length: 2\r\n\
+\r\nab"
+            .to_string();
+        let (base, _reqs, _handle) = spawn_scripted_server(vec![body]).await;
+        let url = format!("{base}/file.bin");
+        let client = download_client().unwrap();
+        let control = AtomicU8::new(0);
+        let validators = ContentValidators::default();
+        let outcome = fetch_range(fetch_req(
+            &client,
+            &url,
+            RangeSpec::Closed { start: 0, end: 1 },
+            &validators,
+            None,
+            false,
+            &control,
+        ))
+        .await
+        .expect("fetch");
+        assert!(
+            !matches!(
+                outcome.status,
+                RangeStatus::OkFromZero | RangeStatus::Partial { .. }
+            ),
+            "segment 0 must not accept 206 without Content-Range: {:?}",
+            outcome.status
+        );
+        assert!(classify_segment_status(&outcome.status, 0, 1, None).is_err());
+    }
+
+    #[test]
+    fn segment_partial_must_match_start_and_end() {
+        let status = RangeStatus::Partial {
+            start: 0,
+            end: 99,
+            total: Some(200),
+        };
+        assert!(classify_segment_status(&status, 0, 99, Some(200)).is_ok());
+        let error = classify_segment_status(&status, 0, 49, Some(200)).unwrap_err();
+        assert_eq!(error.category, FailureCategory::Resume);
+        assert!(!error.retryable);
     }
 
     #[tokio::test]
