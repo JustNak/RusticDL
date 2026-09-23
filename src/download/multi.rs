@@ -187,59 +187,58 @@ pub async fn run_multi_segment_download(
     }
 }
 
+fn disk_flush(err: impl std::fmt::Display) -> DownloadError {
+    download_error(
+        FailureCategory::Disk,
+        format!("Could not flush download file: {err}"),
+        false,
+    )
+}
+
 async fn flush_writer_to_disk(writer: &Arc<SegmentFileWriter>) -> Result<(), DownloadError> {
     let flush = writer.clone();
     tokio::task::spawn_blocking(move || flush.flush_sync_data())
         .await
-        .map_err(|error| {
-            download_error(
-                FailureCategory::Disk,
-                format!("Could not flush download file: {error}"),
-                false,
-            )
-        })?
-        .map_err(|error| {
-            download_error(
-                FailureCategory::Disk,
-                format!("Could not flush download file: {error}"),
-                false,
-            )
-        })
+        .map_err(disk_flush)?
+        .map_err(disk_flush)
+}
+
+/// Bytes observed before `flush_sync_data` are the only ones this sync can
+/// confirm. A sibling `write_chunk` that lands after the flush must not raise
+/// the floor; a failed flush keeps the previous floor.
+fn floor_after_flush(previous: &[u64], sampled_before: &[u64], flush_ok: bool) -> Vec<u64> {
+    if flush_ok {
+        sampled_before.to_vec()
+    } else {
+        previous.to_vec()
+    }
 }
 
 async fn sync_writer_or_clamp(
     writer: &Arc<SegmentFileWriter>,
     shared: &SharedMulti,
 ) -> Result<(), DownloadError> {
-    let flush = writer.clone();
-    let synced = tokio::task::spawn_blocking(move || flush.flush_sync_data()).await;
-    let io_result = match synced {
-        Ok(result) => result,
-        Err(error) => Err(std::io::Error::other(error.to_string())),
-    };
-    if let Err(error) = io_result {
-        let mut map = lock_map(&shared.map);
-        let floor = shared
-            .synced_written
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        clamp_written_to_synced(&mut map, &floor);
-        return Err(download_error(
-            FailureCategory::Disk,
-            format!("Could not flush download file: {error}"),
-            false,
-        ));
-    }
-    let written: Vec<u64> = {
+    let sampled_before: Vec<u64> = {
         let map = lock_map(&shared.map);
         map.segments.iter().map(|segment| segment.written).collect()
     };
+    let flush_result = flush_writer_to_disk(writer).await;
+    let previous = shared
+        .synced_written
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let next = floor_after_flush(&previous, &sampled_before, flush_result.is_ok());
+    if let Err(error) = flush_result {
+        let mut map = lock_map(&shared.map);
+        clamp_written_to_synced(&mut map, &next);
+        return Err(error);
+    }
     let mut floor = shared
         .synced_written
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *floor = written;
+    *floor = next;
     Ok(())
 }
 
@@ -1100,6 +1099,20 @@ mod tests {
             PathBuf::from("C:\\dl\\file.bin"),
             PathBuf::from("C:\\dl\\file.bin.part"),
         )
+    }
+
+    #[test]
+    fn sync_floor_ignores_bytes_that_land_after_the_sample() {
+        let previous = vec![5, 5];
+        let sampled_before = vec![10, 5];
+        let raced_after_flush = vec![10, 40];
+        let confirmed = floor_after_flush(&previous, &sampled_before, true);
+        assert_eq!(confirmed, sampled_before);
+        assert_ne!(confirmed, raced_after_flush);
+        assert_eq!(
+            floor_after_flush(&previous, &sampled_before, false),
+            previous
+        );
     }
 
     #[test]

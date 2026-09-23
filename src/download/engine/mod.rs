@@ -1386,6 +1386,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn drain_does_not_ack_when_the_snapshot_write_fails() {
+        struct RejectStore;
+        impl JobStore for RejectStore {
+            fn persist_jobs(&self, _jobs: &[Job]) -> Result<(), String> {
+                Err("disk full".into())
+            }
+        }
+
+        let mut job = sample_job(JobState::Paused);
+        job.id = "paused".into();
+        let (handle, mut event_rx) = spawn_engine(
+            vec![job],
+            EngineRuntimeConfig::default(),
+            Arc::new(RejectStore),
+        );
+        let (ack_tx, ack_rx) = oneshot::channel();
+        handle.send(EngineCommand::Drain { ack: Some(ack_tx) });
+        let ack = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("drain should finish without hanging the command loop");
+        assert!(
+            ack.is_err(),
+            "quit must not be acked when the queue write fails"
+        );
+
+        let mut saw_toast = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let EngineEvent::Toast(message) = event {
+                assert!(message.contains("Could not save the queue"), "{message}");
+                saw_toast = true;
+            }
+        }
+        assert!(saw_toast, "drain must surface the failed snapshot write");
+        handle.send(EngineCommand::Shutdown);
+    }
+
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn reveal_in_folder_missing_path_opens_parent_via_that_detached() {

@@ -95,11 +95,21 @@ async fn run_attempts(
             inner: inner.clone(),
         });
 
-        let (config, conn_budget) = {
+        let (config, conn_budget, occupied_paths) = {
             let guard = inner.lock().await;
-            (guard.config.clone(), guard.conn_budget.clone())
+            let occupied_paths = guard
+                .jobs
+                .iter()
+                .filter(|job| job.id != job_id)
+                .flat_map(|job| [job.target_path.clone(), job.temp_path.clone()])
+                .collect();
+            (
+                guard.config.clone(),
+                guard.conn_budget.clone(),
+                occupied_paths,
+            )
         };
-        let ctx = TransferContext::from_runtime(
+        let mut ctx = TransferContext::from_runtime(
             attempt_job.clone(),
             control.clone(),
             on_progress.clone(),
@@ -109,6 +119,7 @@ async fn run_attempts(
             committer,
             &config,
         );
+        ctx.occupied_paths = occupied_paths;
         let attempt_result = run_transfer(ctx).await;
 
         drop(on_progress);

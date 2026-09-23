@@ -739,6 +739,13 @@ pub(crate) fn classify_segment_status(
     }
 }
 
+/// 206 whose `Content-Range` is exactly this closed slice. HTTP 200, a missing
+/// header, and a different span all fail — including a request for byte 0.
+pub(crate) fn closed_slice_matches(response: &reqwest::Response, start: u64, end: u64) -> bool {
+    let status = classify_range_status(response, RangeSpec::Closed { start, end });
+    classify_segment_status(&status, start, end, None).is_ok()
+}
+
 fn missing_content_range_error() -> DownloadError {
     download_error(
         FailureCategory::Resume,

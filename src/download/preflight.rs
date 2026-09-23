@@ -4,12 +4,12 @@ use reqwest::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED,
     LOCATION,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use std::sync::atomic::AtomicU8;
 
 use super::fetch::{
-    build_transfer_request, control_outcome, resolve_redirect_location, send_following_redirects,
-    TransferRequestKind, PREFLIGHT_TIMEOUT,
+    build_transfer_request, closed_slice_matches, control_outcome, resolve_redirect_location,
+    send_following_redirects, TransferRequestKind, PREFLIGHT_TIMEOUT,
 };
 use super::filesystem::{parse_content_disposition_filename, parse_content_range};
 use super::handoff::HandoffAuth;
@@ -168,7 +168,7 @@ pub async fn run_preflight_planned(
             .await
             {
                 resolved = mid_url;
-                if !response_is_exact_byte(&mid_response, 1) {
+                if !closed_slice_matches(&mid_response, 1, 1) {
                     accept_ranges = Some(false);
                 }
                 drop(mid_response);
@@ -197,7 +197,7 @@ fn apply_zero_range_probe(
     filename: &mut Option<String>,
 ) {
     let probe_status = probe_response.status();
-    if response_is_exact_byte(probe_response, 0) {
+    if closed_slice_matches(probe_response, 0, 0) {
         *accept_ranges = Some(true);
     } else if probe_status.is_success() {
         *accept_ranges = Some(false);
@@ -264,18 +264,6 @@ fn header_string(
         .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-}
-
-fn response_is_exact_byte(response: &reqwest::Response, byte: u64) -> bool {
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return false;
-    }
-    response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_content_range)
-        .is_some_and(|(start, end, _)| start == byte && end == byte)
 }
 
 fn content_length_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {

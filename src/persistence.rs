@@ -5,6 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 use crate::branding::APP_VERSION;
 use crate::download::{Job, JobState};
 use crate::settings::Settings;
@@ -21,6 +24,36 @@ pub const MAX_COMPLETED_HISTORY: usize = 500;
 fn write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Paths whose `state.json` failed to load in this process.
+///
+/// A later save — empty or not — must not replace that file until `load_jobs`
+/// reads a human copy successfully. A missing file is not in this set.
+fn unread_state_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    static PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_state_loaded(path: &Path) {
+    unread_state_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
+}
+
+fn mark_state_unloaded(path: &Path) {
+    unread_state_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+}
+
+fn state_load_blocked(path: &Path) -> bool {
+    unread_state_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path)
 }
 
 #[derive(Debug, Clone)]
@@ -153,23 +186,38 @@ pub fn save_jobs(paths: &AppPaths, jobs: &[Job]) -> Result<(), String> {
 fn load_jobs_with_history_cap(paths: &AppPaths, max_completed: usize) -> Result<Vec<Job>, String> {
     let bytes = match fs::read(&paths.state) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            mark_state_loaded(&paths.state);
+            return Ok(Vec::new());
+        }
         Err(error) => {
+            mark_state_unloaded(&paths.state);
             return Err(format!(
                 "Could not read state.json ({}). The file was left in place.",
                 error
             ));
         }
     };
-    let jobs = serde_json::from_slice::<PersistedState>(&bytes)
-        .map(|state| state.jobs)
-        .map_err(|error| {
-            format!("Could not parse state.json ({error}). The file was left in place.")
-        })?;
+    let jobs = match serde_json::from_slice::<PersistedState>(&bytes) {
+        Ok(state) => state.jobs,
+        Err(error) => {
+            mark_state_unloaded(&paths.state);
+            return Err(format!(
+                "Could not parse state.json ({error}). The file was left in place."
+            ));
+        }
+    };
+    // Parsed bytes are a human copy. A failed history trim must not throw
+    // them away — that boots an empty queue and the next save overwrites the file.
+    mark_state_loaded(&paths.state);
     match cap_completed_history(&jobs, max_completed) {
         Cow::Borrowed(_) => Ok(jobs),
         Cow::Owned(trimmed) => {
-            save_jobs_with_history_cap(paths, &trimmed, max_completed)?;
+            if let Err(error) = save_jobs_with_history_cap(paths, &trimmed, max_completed) {
+                eprintln!(
+                    "rusticdl: could not rewrite trimmed state.json ({error}). The loaded queue stays in memory."
+                );
+            }
             Ok(trimmed)
         }
     }
@@ -185,9 +233,11 @@ fn save_jobs_with_history_cap(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_app_dirs(paths)?;
     let jobs = cap_completed_history(jobs, max_completed);
-    if jobs.as_ref().is_empty() && state_file_unreadable(&paths.state) {
+    // A failed load latches the path for this process. Memory being non-empty,
+    // or the file parsing again later, is not permission to replace it.
+    if state_load_blocked(&paths.state) || state_file_unreadable(&paths.state) {
         return Err(
-            "Refusing to replace an unreadable state.json with an empty queue.".to_string(),
+            "Refusing to replace an unreadable state.json that was not loaded.".to_string(),
         );
     }
     let json = serde_json::to_vec(&PersistedStateRef {
@@ -256,13 +306,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.sync_all()
             .map_err(|e| format!("Could not sync temp file: {e}"))?;
     }
-    // Durability of the temp directory entry, then of the rename itself.
-    sync_dir(parent)?;
+    // The temp file is already on disk. A directory flush that this platform
+    // rejects must not skip the rename that commits state.json and settings.
+    let _ = sync_dir(parent);
     fs::rename(&temp_path, path).map_err(|e| {
         let _ = fs::remove_file(&temp_path);
         format!("Could not finalize write: {e}")
     })?;
-    sync_dir(parent)
+    let _ = sync_dir(parent);
+    Ok(())
 }
 
 fn sync_dir(dir: &Path) -> Result<(), String> {
@@ -278,11 +330,13 @@ fn open_dir_for_sync(dir: &Path) -> Result<File, String> {
 
 #[cfg(windows)]
 fn open_dir_for_sync(dir: &Path) -> Result<File, String> {
-    use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_BACKUP_SEMANTICS — required to open a directory handle.
+    // FlushFileBuffers needs write access; a read-only directory handle
+    // returns ERROR_ACCESS_DENIED and used to abort the rename.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(dir)
         .map_err(|e| format!("Could not open directory for sync: {e}"))
@@ -558,6 +612,65 @@ mod tests {
         save_jobs(&paths, &[]).unwrap();
         let loaded = load_jobs(&paths).unwrap();
         assert!(loaded.is_empty());
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn failed_load_blocks_later_saves_until_a_human_copy_loads() {
+        let paths = temp_paths("load-block");
+        ensure_app_dirs(&paths).unwrap();
+        fs::write(&paths.state, b"{not-json").unwrap();
+        let error = load_jobs(&paths).unwrap_err();
+        assert!(error.contains("parse"), "{error}");
+
+        let job = sample_job("new", JobState::Queued, 1, None);
+        let nonempty = save_jobs(&paths, std::slice::from_ref(&job)).unwrap_err();
+        assert!(nonempty.contains("unreadable"), "{nonempty}");
+        let empty = save_jobs(&paths, &[]).unwrap_err();
+        assert!(empty.contains("unreadable"), "{empty}");
+        assert_eq!(fs::read(&paths.state).unwrap(), b"{not-json");
+
+        // The file parses again (the sharing violation cleared). Memory is still
+        // the failed boot, so an empty or one-job save must not replace it.
+        let kept = sample_job("kept", JobState::Paused, 2, None);
+        let valid = serde_json::to_vec(&PersistedStateRef {
+            jobs: std::slice::from_ref(&kept),
+        })
+        .unwrap();
+        fs::write(&paths.state, &valid).unwrap();
+        assert!(save_jobs(&paths, &[]).is_err());
+        assert!(save_jobs(&paths, std::slice::from_ref(&job)).is_err());
+        assert_eq!(fs::read(&paths.state).unwrap(), valid);
+
+        let loaded = load_jobs(&paths).unwrap();
+        assert_eq!(ids(&loaded), ["kept"]);
+        save_jobs(&paths, &loaded).unwrap();
+        assert_eq!(load_jobs(&paths).unwrap()[0].id, "kept");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn load_keeps_trimmed_jobs_when_history_rewrite_fails() {
+        let paths = temp_paths("load-cap-nosave");
+        let jobs = vec![
+            sample_job("keep-active", JobState::Queued, 1, None),
+            sample_job("drop", JobState::Completed, 2, Some(10)),
+            sample_job("keep-done", JobState::Completed, 3, Some(20)),
+        ];
+        write_state_untrimmed(&paths, &jobs);
+        let before = fs::read(&paths.state).unwrap();
+        // Occupy the temp path so the trim rewrite cannot replace state.json.
+        let blocker = paths.root.join(".state.json.tmp");
+        fs::create_dir(&blocker).unwrap();
+
+        let loaded = load_jobs_with_history_cap(&paths, 1)
+            .expect("parsed jobs must survive a failed trim rewrite");
+        assert_eq!(ids(&loaded), ["keep-active", "keep-done"]);
+        assert_eq!(
+            fs::read(&paths.state).unwrap(),
+            before,
+            "failed trim must leave the original queue on disk"
+        );
         let _ = fs::remove_dir_all(&paths.root);
     }
 }

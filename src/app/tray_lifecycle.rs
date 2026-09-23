@@ -94,7 +94,9 @@ impl DownloadApp {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.engine.send(EngineCommand::Drain { ack: Some(ack_tx) });
         cx.spawn(async move |this, cx| {
-            let _ = ack_rx.await;
+            if ack_rx.await.is_err() {
+                return;
+            }
             let _ = this.update(cx, |app, cx| {
                 app.stop_tray_nonblocking();
                 cx.quit();

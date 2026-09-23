@@ -1,6 +1,6 @@
 use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
 use reqwest::StatusCode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,6 +134,8 @@ pub async fn run_http_download_with_ctx(
     let committer = ctx.committer.clone();
     let handoff_auth = ctx.handoff_auth.clone();
     let limiter = ctx.limiter.clone();
+    let occupied_paths = ctx.occupied_paths.clone();
+    let original_filename = ctx.job.filename.clone();
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
@@ -163,7 +165,6 @@ pub async fn run_http_download_with_ctx(
                 }
                 match prepare_reconnect(
                     &error,
-                    /*is_fetch_phase=*/ true,
                     short_reconnects,
                     existing_bytes,
                     resume_supported,
@@ -237,7 +238,6 @@ pub async fn run_http_download_with_ctx(
                 if *retryable {
                     match prepare_reconnect(
                         &error,
-                        /*is_fetch_phase=*/ true,
                         short_reconnects,
                         existing_bytes,
                         resume_supported,
@@ -360,31 +360,29 @@ pub async fn run_http_download_with_ctx(
                 if filename == "download.bin"
                     || filename_from_url_fallback(&job_url).as_deref() == Some(filename.as_str())
                 {
-                    filename = header_name;
-                    if let Some(parent) = target_path.parent() {
-                        let new_target = parent.join(&filename);
-                        let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if adopt_renamed_partial(&temp_path, &new_temp, existing_bytes).await {
-                            target_path = new_target;
-                            temp_path = new_temp;
-                        } else {
-                            filename = ctx.job.filename.clone();
-                        }
-                    }
+                    adopt_filename(
+                        &mut filename,
+                        header_name,
+                        &original_filename,
+                        &mut target_path,
+                        &mut temp_path,
+                        existing_bytes,
+                        &occupied_paths,
+                    )
+                    .await;
                 }
             } else if let Some(from_final) = filename_from_response_url(&current_url) {
                 if filename == "download.bin" {
-                    filename = from_final;
-                    if let Some(parent) = target_path.parent() {
-                        let new_target = parent.join(&filename);
-                        let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if adopt_renamed_partial(&temp_path, &new_temp, existing_bytes).await {
-                            target_path = new_target;
-                            temp_path = new_temp;
-                        } else {
-                            filename = ctx.job.filename.clone();
-                        }
-                    }
+                    adopt_filename(
+                        &mut filename,
+                        from_final,
+                        &original_filename,
+                        &mut target_path,
+                        &mut temp_path,
+                        existing_bytes,
+                        &occupied_paths,
+                    )
+                    .await;
                 }
             }
         }
@@ -558,7 +556,6 @@ pub async fn run_http_download_with_ctx(
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
-                    /*is_fetch_phase=*/ false,
                     short_reconnects,
                     existing_bytes,
                     resume_supported,
@@ -591,7 +588,6 @@ enum ReconnectAction {
 
 async fn prepare_reconnect(
     error: &DownloadError,
-    is_fetch_phase: bool,
     short_reconnects: u32,
     existing_bytes: u64,
     resume_supported: bool,
@@ -601,13 +597,7 @@ async fn prepare_reconnect(
     on_progress: &TransferEventCallback,
     cumulative_reconnects: &mut u32,
 ) -> ReconnectAction {
-    if !can_mid_transfer_reconnect(
-        error,
-        is_fetch_phase,
-        short_reconnects,
-        existing_bytes,
-        resume_supported,
-    ) {
+    if !can_mid_transfer_reconnect(error, short_reconnects, existing_bytes, resume_supported) {
         return ReconnectAction::GiveUp;
     }
 
@@ -644,20 +634,65 @@ fn known_total_without_content_length(job: &Job, validators: &ContentValidators)
 }
 
 /// Switch to a Content-Disposition name only after the existing partial moved,
-/// or when nothing has been written and the destination is empty.
+/// or when nothing has been written and the destination is an absent node.
+/// A failed stat is not an empty file.
 pub(crate) fn disposition_switch_allowed(
     rename_ok: bool,
     existing_bytes: u64,
     new_file_len: Option<u64>,
 ) -> bool {
-    rename_ok || (existing_bytes == 0 && new_file_len.unwrap_or(0) == 0)
+    rename_ok || (existing_bytes == 0 && new_file_len == Some(0))
 }
 
-async fn adopt_renamed_partial(temp_path: &Path, new_temp: &Path, existing_bytes: u64) -> bool {
-    if temp_path == new_temp {
+async fn adopt_filename(
+    filename: &mut String,
+    candidate: String,
+    original: &str,
+    target_path: &mut PathBuf,
+    temp_path: &mut PathBuf,
+    existing_bytes: u64,
+    occupied: &[PathBuf],
+) {
+    *filename = candidate;
+    let Some(parent) = target_path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let new_target = parent.join(filename.as_str());
+    let new_temp = super::filesystem::temp_path_for(&new_target);
+    if adopt_renamed_partial(
+        temp_path,
+        &new_temp,
+        target_path,
+        &new_target,
+        existing_bytes,
+        occupied,
+    )
+    .await
+    {
+        *target_path = new_target;
+        *temp_path = new_temp;
+    } else {
+        *filename = original.to_string();
+    }
+}
+
+async fn adopt_renamed_partial(
+    temp_path: &Path,
+    new_temp: &Path,
+    current_target: &Path,
+    new_target: &Path,
+    existing_bytes: u64,
+    occupied: &[PathBuf],
+) -> bool {
+    if !path_is_free_for_us(new_temp, temp_path, occupied).await
+        || !path_is_free_for_us(new_target, current_target, occupied).await
+    {
+        return false;
+    }
+    if super::filesystem::paths_equal_for_volume(temp_path, new_temp, cfg!(windows)) {
         return true;
     }
-    let rename_ok = if super::filesystem::path_exists(temp_path) {
+    let rename_ok = if regular_file_present(temp_path).await {
         tokio::fs::rename(
             super::filesystem::io_path(temp_path),
             super::filesystem::io_path(new_temp),
@@ -669,15 +704,42 @@ async fn adopt_renamed_partial(temp_path: &Path, new_temp: &Path, existing_bytes
     };
     let new_len = if rename_ok {
         None
+    } else if proven_absent(new_temp).await {
+        Some(0)
     } else {
-        metadata_len(new_temp).await
+        None
     };
     disposition_switch_allowed(rename_ok, existing_bytes, new_len)
 }
 
+async fn path_is_free_for_us(path: &Path, ours: &Path, occupied: &[PathBuf]) -> bool {
+    if super::filesystem::paths_equal_for_volume(path, ours, cfg!(windows)) {
+        return true;
+    }
+    if super::filesystem::path_occupied(path, occupied) {
+        return false;
+    }
+    proven_absent(path).await
+}
+
+/// `Ok` only when `symlink_metadata` reports no node. A dangling symlink, a
+/// case-variant `.part`, and any other stat failure are not absent.
+async fn proven_absent(path: &Path) -> bool {
+    match tokio::fs::symlink_metadata(super::filesystem::io_path(path)).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    }
+}
+
+async fn regular_file_present(path: &Path) -> bool {
+    match tokio::fs::symlink_metadata(super::filesystem::io_path(path)).await {
+        Ok(metadata) => metadata.is_file(),
+        Err(_) => false,
+    }
+}
+
 fn can_mid_transfer_reconnect(
     error: &DownloadError,
-    _is_fetch_phase: bool,
     short_reconnects: u32,
     existing_bytes: u64,
     resume_supported: bool,
@@ -1199,19 +1261,18 @@ mod tests {
             true,
         );
         let stalled = crate::download::body::stall_error(std::time::Duration::from_secs(30));
-        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 100, true));
-        assert!(can_mid_transfer_reconnect(&incomplete, false, 0, 100, true));
-        assert!(can_mid_transfer_reconnect(&stalled, false, 0, 100, true));
-        assert!(!can_mid_transfer_reconnect(&stalled, false, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&stalled, 0, 100, true));
+        assert!(!can_mid_transfer_reconnect(&stalled, 0, 100, false));
         assert!(!can_mid_transfer_reconnect(
             &body_err,
-            false,
             RECONNECT_MAX,
             100,
             true
         ));
-        assert!(!can_mid_transfer_reconnect(&body_err, false, 0, 100, false));
-        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 0, false));
+        assert!(!can_mid_transfer_reconnect(&body_err, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 0, false));
     }
 
     #[test]
@@ -1242,7 +1303,7 @@ mod tests {
     #[test]
     fn failed_disposition_rename_does_not_switch_a_resumed_partial() {
         assert!(disposition_switch_allowed(true, 100, None));
-        assert!(disposition_switch_allowed(false, 0, None));
+        assert!(!disposition_switch_allowed(false, 0, None));
         assert!(disposition_switch_allowed(false, 0, Some(0)));
         assert!(!disposition_switch_allowed(false, 100, None));
         assert!(!disposition_switch_allowed(false, 100, Some(0)));
@@ -1256,11 +1317,10 @@ mod tests {
             "Could not connect: timed out".into(),
             true,
         );
-        assert!(can_mid_transfer_reconnect(&connect, true, 0, 50, true));
-        assert!(can_mid_transfer_reconnect(&connect, true, 1, 0, false));
+        assert!(can_mid_transfer_reconnect(&connect, 0, 50, true));
+        assert!(can_mid_transfer_reconnect(&connect, 1, 0, false));
         assert!(!can_mid_transfer_reconnect(
             &connect,
-            true,
             RECONNECT_MAX,
             0,
             false
@@ -1275,8 +1335,8 @@ mod tests {
             false,
         );
         let disk = download_error(FailureCategory::Disk, "Could not write".into(), false);
-        assert!(!can_mid_transfer_reconnect(&resume, false, 0, 10, true));
-        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 10, true));
+        assert!(!can_mid_transfer_reconnect(&resume, 0, 10, true));
+        assert!(!can_mid_transfer_reconnect(&disk, 0, 10, true));
         assert!(!is_reconnectable_error(&resume));
         assert!(!is_reconnectable_error(&disk));
     }
@@ -1297,7 +1357,7 @@ mod tests {
             false,
         );
         assert!(!is_reconnectable_error(&disk));
-        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 100, true));
+        assert!(!can_mid_transfer_reconnect(&disk, 0, 100, true));
         assert_eq!(disk.category, FailureCategory::Disk);
         assert!(!disk.retryable);
     }
@@ -1341,7 +1401,6 @@ mod tests {
         );
         let action = prepare_reconnect(
             &err,
-            false,
             0,
             64,
             true,
@@ -1468,5 +1527,76 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn disposition_rename_does_not_replace_another_part_or_follow_a_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-disposition-adopt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let ours = dir.join("download.bin.part");
+        tokio::fs::write(&ours, b"ours").await.unwrap();
+        let other_part = dir.join("Report.pdf.part");
+        tokio::fs::write(&other_part, b"other").await.unwrap();
+        let other_target = dir.join("Report.pdf");
+        let occupied = vec![other_target.clone(), other_part.clone()];
+
+        let case_variant = dir.join("report.pdf.part");
+        let replaced = adopt_renamed_partial(
+            &ours,
+            &case_variant,
+            &dir.join("download.bin"),
+            &dir.join("report.pdf"),
+            4,
+            &occupied,
+        )
+        .await;
+        if cfg!(windows) {
+            assert!(!replaced, "Windows case-fold must refuse the other .part");
+            assert_eq!(tokio::fs::read(&ours).await.unwrap(), b"ours");
+        } else {
+            assert!(replaced, "Linux keeps byte-wise distinct case variants");
+            assert_eq!(tokio::fs::read(&case_variant).await.unwrap(), b"ours");
+            tokio::fs::write(&ours, b"ours").await.unwrap();
+        }
+        assert_eq!(tokio::fs::read(&other_part).await.unwrap(), b"other");
+
+        let exact = adopt_renamed_partial(
+            &ours,
+            &other_part,
+            &dir.join("download.bin"),
+            &other_target,
+            0,
+            &occupied,
+        )
+        .await;
+        assert!(!exact);
+        assert_eq!(tokio::fs::read(&other_part).await.unwrap(), b"other");
+        assert_eq!(tokio::fs::read(&ours).await.unwrap(), b"ours");
+
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside-target");
+            let link = dir.join("link.bin.part");
+            tokio::fs::symlink(&outside, &link).await.unwrap();
+            let followed = adopt_renamed_partial(
+                &ours,
+                &link,
+                &dir.join("download.bin"),
+                &dir.join("link.bin"),
+                0,
+                &[],
+            )
+            .await;
+            assert!(!followed, "a dangling symlink is not an empty destination");
+            assert!(
+                tokio::fs::symlink_metadata(&outside).await.is_err(),
+                "adopt must not create the symlink target"
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
-use tokio::fs::OpenOptions;
+use reqwest::Version;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, timeout};
 
@@ -37,19 +37,27 @@ pub struct AppendSink {
 
 impl AppendSink {
     pub async fn open(path: &Path, offset: u64) -> Result<Self, DownloadError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(offset == 0)
-            .open(super::filesystem::io_path(path))
-            .await
-            .map_err(|error| {
-                download_error(
-                    FailureCategory::Disk,
-                    format!("Could not open partial download file: {error}"),
-                    false,
-                )
-            })?;
+        let path = path.to_path_buf();
+        let truncate = offset == 0;
+        let file = tokio::task::spawn_blocking(move || {
+            super::filesystem::open_download_file(&path, false, true, true, truncate)
+        })
+        .await
+        .map_err(|error| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not open partial download file: {error}"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            download_error(
+                FailureCategory::Disk,
+                format!("Could not open partial download file: {error}"),
+                false,
+            )
+        })?;
+        let file = tokio::fs::File::from_std(file);
 
         let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
         if offset > 0 {
@@ -201,11 +209,11 @@ pub enum StreamEnd {
     Control(DownloadOutcome),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EosPolicy {
-    /// Known length, or a chunked body whose 0-chunk the decoder already required.
+    /// Known length, chunked HTTP/1.1, or a framed HTTP/2 or HTTP/3 end-of-stream.
     Complete,
-    /// No length and not chunked. A clean FIN is an incomplete download.
+    /// HTTP/1 close-delimited body with no length. A clean FIN is incomplete.
     UnknownLength,
 }
 
@@ -230,9 +238,6 @@ pub async fn stream_body(
 }
 
 fn eos_policy_for_response(response: &reqwest::Response, target: Option<u64>) -> EosPolicy {
-    if target.is_some() || response.content_length().is_some() {
-        return EosPolicy::Complete;
-    }
     let chunked = response
         .headers()
         .get(reqwest::header::TRANSFER_ENCODING)
@@ -242,10 +247,30 @@ fn eos_policy_for_response(response: &reqwest::Response, target: Option<u64>) ->
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
         });
-    if chunked {
-        EosPolicy::Complete
-    } else {
-        EosPolicy::UnknownLength
+    eos_policy(
+        response.version(),
+        response.content_length(),
+        chunked,
+        target,
+    )
+}
+
+/// HTTP/2 and HTTP/3 have no `Transfer-Encoding`. A body with no
+/// `Content-Length` still ends on a framed end-of-stream, which is complete.
+/// A bare HTTP/1 close with no length stays incomplete. A known length stays
+/// `Complete` so a short body still fails the sink target check.
+fn eos_policy(
+    version: Version,
+    content_length: Option<u64>,
+    chunked: bool,
+    target: Option<u64>,
+) -> EosPolicy {
+    if target.is_some() || content_length.is_some() || chunked {
+        return EosPolicy::Complete;
+    }
+    match version {
+        Version::HTTP_2 | Version::HTTP_3 => EosPolicy::Complete,
+        _ => EosPolicy::UnknownLength,
     }
 }
 
@@ -370,7 +395,7 @@ where
             ));
         }
     }
-    if policy == EosPolicy::UnknownLength && sink.target_offset().is_none() {
+    if policy == EosPolicy::UnknownLength {
         return Err(download_error(
             FailureCategory::Network,
             format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
@@ -817,6 +842,46 @@ mod tests {
             StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
         }
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn framed_http2_and_http3_end_of_stream_without_length_completes() {
+        assert_eq!(
+            eos_policy(Version::HTTP_2, None, false, None),
+            EosPolicy::Complete
+        );
+        assert_eq!(
+            eos_policy(Version::HTTP_3, None, false, None),
+            EosPolicy::Complete
+        );
+    }
+
+    #[test]
+    fn http1_close_delimited_without_length_stays_incomplete() {
+        assert_eq!(
+            eos_policy(Version::HTTP_11, None, false, None),
+            EosPolicy::UnknownLength
+        );
+        assert_eq!(
+            eos_policy(Version::HTTP_10, None, false, None),
+            EosPolicy::UnknownLength
+        );
+    }
+
+    #[test]
+    fn known_length_or_chunked_terminator_stays_complete() {
+        assert_eq!(
+            eos_policy(Version::HTTP_11, Some(10), false, None),
+            EosPolicy::Complete
+        );
+        assert_eq!(
+            eos_policy(Version::HTTP_11, None, true, None),
+            EosPolicy::Complete
+        );
+        assert_eq!(
+            eos_policy(Version::HTTP_2, None, false, Some(10)),
+            EosPolicy::Complete
+        );
     }
 
     #[tokio::test]

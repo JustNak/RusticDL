@@ -67,9 +67,19 @@ pub(super) async fn drain(inner: &Arc<Mutex<EngineInner>>, ack: Option<oneshot::
             _ = sleep(Duration::from_millis(50)) => {}
         }
     }
-    let _ = persist_live_jobs(inner).await;
-    if let Some(ack) = ack {
-        let _ = ack.send(());
+    match persist_live_jobs(inner).await {
+        Ok(()) => {
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
+        }
+        Err(error) => {
+            super::super::emit_toast(
+                inner,
+                format!("Could not save the queue ({error}). Quit was not completed."),
+            )
+            .await;
+        }
     }
 }
 
