@@ -152,6 +152,9 @@ where
 {
     let bounds = Bounds::centered(None, prompt_size, cx);
     let fallback_id = fallback_prompt_id.to_string();
+    // Clone before SharedString::from consumes the opener title; Hyprland IPC
+    // and Wayland set_window_title need the same string.
+    let title_for_hypr = title.clone();
 
     let result = cx.open_window(
         WindowOptions {
@@ -162,8 +165,8 @@ where
                 traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
             }),
             window_decorations: Some(WindowDecorations::Client),
-            // Match the intended HUD size so tiling compositors get a real min hint.
-            window_min_size: Some(prompt_size),
+            // Floor below every capture phase so fit_window_to_phase can shrink.
+            window_min_size: Some(size(px(360.0), px(160.0))),
             // Floating → xdg parent / WM_TRANSIENT_FOR so Hyprland and other
             // tiling WMs keep these at their designed size instead of tiling.
             kind: WindowKind::Floating,
@@ -194,10 +197,13 @@ where
             cx.activate(true);
             let _ = handle.update(cx, |_root, window, _cx| {
                 cascade_window(window, cascade_index);
+                // TitlebarOptions.title is not applied on Wayland; Hyprland
+                // title: matchers need the platform title set explicitly.
+                window.set_window_title(&title_for_hypr);
                 window.activate_window();
             });
             // Confirm / conflict / progress / complete all share this opener.
-            hyprland::float_capture_windows();
+            hyprland::float_capture_windows(&title_for_hypr);
             Some(handle)
         }
         Err(error) => {
@@ -228,8 +234,20 @@ mod floating_kind_tests {
             "capture HUDs must not open as a normal toplevel (tiling compositors stretch them)"
         );
         assert!(
-            opener.contains("hyprland::float_capture_windows()"),
+            opener.contains("hyprland::float_capture_windows(&title_for_hypr)"),
             "Hyprland IPC float fallback must run after every successful capture open"
+        );
+        assert!(
+            opener.contains("window.set_window_title(&title_for_hypr)"),
+            "Wayland ignores TitlebarOptions.title; Hyprland title match needs set_window_title"
+        );
+        assert!(
+            opener.contains("window_min_size: Some(size(px(360.0), px(160.0)))"),
+            "min size must stay below complete/confirm/progress so fit_window_to_phase can shrink"
+        );
+        assert!(
+            !opener.contains("window_min_size: Some(prompt_size)"),
+            "opening size as min blocks later HUD shrinks"
         );
     }
 }

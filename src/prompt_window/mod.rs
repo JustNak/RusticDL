@@ -302,6 +302,22 @@ mod tests {
     }
 
     #[test]
+    fn capture_phase_sizes_are_above_window_min_size() {
+        const MIN_W: f32 = 360.0;
+        const MIN_H: f32 = 160.0;
+        assert!(CAPTURE_WINDOW_W >= MIN_W);
+        assert!(CAPTURE_CONFLICT_W >= MIN_W);
+        assert!(CAPTURE_COMPLETE_H >= MIN_H);
+        assert!(CAPTURE_CONFIRM_H >= MIN_H);
+        assert!(CAPTURE_WINDOW_H >= MIN_H);
+        assert!(CAPTURE_CONFLICT_H >= MIN_H);
+        assert!(
+            CAPTURE_COMPLETE_H < CAPTURE_CONFIRM_H && CAPTURE_COMPLETE_H < CAPTURE_WINDOW_H,
+            "complete HUD shrinks below confirm/progress; min size must not be the opening size"
+        );
+    }
+
+    #[test]
     fn confirm_title_is_confirm_download() {
         assert_eq!(CAPTURE_CONFIRM_TITLE, "Confirm Download");
     }
