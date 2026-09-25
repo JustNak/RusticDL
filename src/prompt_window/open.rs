@@ -162,8 +162,11 @@ where
                 traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
             }),
             window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(size(px(360.0), px(160.0))),
-            kind: WindowKind::Normal,
+            // Match the intended HUD size so tiling compositors get a real min hint.
+            window_min_size: Some(prompt_size),
+            // Floating → xdg parent / WM_TRANSIENT_FOR so Hyprland and other
+            // tiling WMs keep these at their designed size instead of tiling.
+            kind: WindowKind::Floating,
             focus: true,
             show: true,
             is_resizable: false,
@@ -193,6 +196,8 @@ where
                 cascade_window(window, cascade_index);
                 window.activate_window();
             });
+            // Confirm / conflict / progress / complete all share this opener.
+            hyprland::float_capture_windows();
             Some(handle)
         }
         Err(error) => {
@@ -201,5 +206,30 @@ where
             ipc_fallback.release_progress_job(&fallback_id);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod floating_kind_tests {
+    #[test]
+    fn capture_opener_uses_floating_window_kind() {
+        // Scan only the opener body so this test module's assertions cannot match themselves.
+        let src = include_str!("open.rs");
+        let opener = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production open.rs before tests");
+        assert!(
+            opener.contains("kind: WindowKind::Floating"),
+            "capture HUDs must open as Floating so tiling compositors get a parent/transient hint"
+        );
+        assert!(
+            !opener.contains("kind: WindowKind::Normal"),
+            "capture HUDs must not open as a normal toplevel (tiling compositors stretch them)"
+        );
+        assert!(
+            opener.contains("hyprland::float_capture_windows()"),
+            "Hyprland IPC float fallback must run after every successful capture open"
+        );
     }
 }
