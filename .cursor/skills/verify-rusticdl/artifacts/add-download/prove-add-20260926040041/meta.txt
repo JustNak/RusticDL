@@ -1,0 +1,6 @@
+feature=add-download
+run_id=prove-add-20260926040041
+pid=13083
+url=https://httpbin.org/bytes/4096
+entry=Add download button + Start download (vision-typed URL)
+commands=launch.sh doctor.sh ui.sh click-add-download computerUse-type ipc.sh get_status cleanup.sh
