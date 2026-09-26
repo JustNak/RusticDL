@@ -4,6 +4,11 @@
 #   source .cursor/skills/verify-rusticdl/scripts/env.sh
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "verify-rusticdl helpers run on Linux only (Windows is not isolated)." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$ROOT"
 
@@ -24,6 +29,9 @@ export RUN_ID VERIFY_RUN_DIR VERIFY_EVIDENCE_DIR VERIFY_ARTIFACTS_DIR RUSTICDL_B
 export XDG_RUNTIME_DIR="${VERIFY_RUN_DIR}/runtime"
 export XDG_DATA_HOME="${VERIFY_RUN_DIR}/data"
 
+# Never inherit a live-app socket path; the Unix listener unlinks then binds it.
+unset RUSTICDL_PIPE_PATH
+
 export HOME="${HOME:-/home/ubuntu}"
 export XAUTHORITY="${XAUTHORITY:-${HOME}/.Xauthority}"
 export DISPLAY="${DISPLAY:-:1}"
@@ -43,3 +51,35 @@ fi
 
 IPC_SOCK="${XDG_RUNTIME_DIR}/rusticdl.v1.sock"
 export IPC_SOCK
+
+# Print the single X window titled RusticDL owned by the pidfile process.
+# Exit 1 if none, 2 if more than one (never pick by XQueryTree order).
+rusticdl_window_id() {
+  local pid w wp
+  local -a matches=()
+  if [[ ! -f "${VERIFY_RUN_DIR}/app.pid" ]]; then
+    echo "missing ${VERIFY_RUN_DIR}/app.pid" >&2
+    return 1
+  fi
+  pid="$(tr -d '[:space:]' < "${VERIFY_RUN_DIR}/app.pid")"
+  if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+    echo "invalid pid in app.pid: ${pid}" >&2
+    return 1
+  fi
+  while read -r w; do
+    [[ -n "${w}" ]] || continue
+    wp="$(xdotool getwindowpid "${w}" 2>/dev/null || true)"
+    if [[ "${wp}" == "${pid}" ]]; then
+      matches+=("${w}")
+    fi
+  done < <(xdotool search --name '^RusticDL$' 2>/dev/null || true)
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "no RusticDL window owned by pid ${pid}" >&2
+    return 1
+  fi
+  if [[ ${#matches[@]} -gt 1 ]]; then
+    echo "pid ${pid} owns ${#matches[@]} RusticDL windows (${matches[*]}); refusing to guess" >&2
+    return 2
+  fi
+  echo "${matches[0]}"
+}

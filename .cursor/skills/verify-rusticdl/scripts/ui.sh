@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Desktop UI helpers for the focused RusticDL window (xdotool geometry).
+# Desktop UI helpers for the launched pid's RusticDL window (xdotool geometry).
 # Prefer vision/computerUse label clicks when available; these coords match
 # the default 1120x720 window layout used in Linux verification.
 set -euo pipefail
@@ -9,8 +9,13 @@ source "${SCRIPT_DIR}/env.sh"
 
 wid() {
   local w
-  w="$(xdotool search --name '^RusticDL$' 2>/dev/null | head -1 || true)"
-  [[ -n "${w}" ]] || { echo "RusticDL window not found" >&2; exit 1; }
+  local rc=0
+  w="$(rusticdl_window_id)" || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    echo "pid owns more than one RusticDL window; refusing to click" >&2
+    exit 1
+  fi
+  [[ "${rc}" -eq 0 && -n "${w}" ]] || { echo "RusticDL window for launched pid not found" >&2; exit 1; }
   echo "${w}"
 }
 
@@ -65,26 +70,28 @@ case "${cmd}" in
   click-sidebar)
     label="${2:?sidebar label required}"
     geom
-    # Approximate Y positions for default sidebar density (library expanded).
+    # Brand 48 + pt_1 4; type rows 32, queue/settings rows 36, gap 2.
+    # Settings/About sit under flex_1 (bottom pad 12). Settings-sidebar
+    # Back is the first row; categories follow divider + SETTINGS header.
     case "${label}" in
-      "All downloads") ry=78 ;;
-      Video) ry=110 ;;
+      "All downloads") ry=70 ;;
+      Video) ry=106 ;;
       Audio) ry=140 ;;
-      Compressed) ry=170 ;;
-      Images) ry=200 ;;
-      Documents) ry=230 ;;
-      Programs) ry=260 ;;
-      Other) ry=290 ;;
-      Active) ry=330 ;;
-      Completed) ry=360 ;;
-      Failed) ry=390 ;;
-      Settings) ry=560 ;;
-      About) ry=595 ;;
-      General) ry=100 ;;
-      "Download Engine") ry=140 ;;
-      System) ry=180 ;;
-      Browser) ry=220 ;;
-      Appearance) ry=260 ;;
+      Compressed) ry=174 ;;
+      Images) ry=208 ;;
+      Documents) ry=242 ;;
+      Programs) ry=276 ;;
+      Other) ry=310 ;;
+      Active) ry=346 ;;
+      Completed) ry=384 ;;
+      Failed) ry=422 ;;
+      Settings) ry=$((GH - 68)) ;;
+      About) ry=$((GH - 30)) ;;
+      General) ry=145 ;;
+      "Download Engine") ry=183 ;;
+      System) ry=221 ;;
+      Browser) ry=259 ;;
+      Appearance) ry=297 ;;
       *) echo "Unknown sidebar label: ${label}" >&2; exit 1 ;;
     esac
     # Sidebar is ~220px wide; click mid-label.
@@ -99,8 +106,8 @@ case "${cmd}" in
     ;;
   leave-settings)
     geom
-    # Settings back control near top of settings sidebar.
-    rel_click 40 90
+    # Settings Back row (36px) starts at y=52.
+    rel_click 40 70
     sleep 0.5
     ;;
   focus-search)
@@ -113,22 +120,6 @@ case "${cmd}" in
     rel_click $((GW / 2)) 24
     xdotool key ctrl+a BackSpace
     sleep 0.2
-    ;;
-  type-text)
-    # GPUI does not reliably accept xdotool synthetic keystreams or clipboard
-    # paste into InputState. Prefer a vision/computerUse agent for text entry.
-    # This helper still focuses the window and attempts clipboard paste as a
-    # best-effort fallback for environments where paste works.
-    text="${2:?text required}"
-    geom
-    xdotool windowactivate --sync "${WID}"
-    sleep 0.2
-    if command -v xclip >/dev/null 2>&1; then
-      printf '%s' "${text}" | xclip -selection clipboard
-      xdotool key --clearmodifiers ctrl+v
-    else
-      xdotool type --clearmodifiers --delay 12 -- "${text}"
-    fi
     ;;
   submit-dialog)
     # Confirm dialogs accept Return when the primary action is default.
@@ -144,7 +135,7 @@ case "${cmd}" in
     sleep 0.5
     ;;
   *)
-    echo "Usage: ui.sh {focus|click-add-download|focus-add-url|click-start-download|click-sidebar <label>|click-save-settings|leave-settings|focus-search|clear-search|type-text <text>|submit-dialog|pause-selection|resume-selection}" >&2
+    echo "Usage: ui.sh {focus|click-add-download|focus-add-url|click-start-download|click-sidebar <label>|click-save-settings|leave-settings|focus-search|clear-search|submit-dialog|pause-selection|resume-selection}" >&2
     exit 1
     ;;
 esac

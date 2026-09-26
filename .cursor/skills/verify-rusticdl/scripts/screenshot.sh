@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture the RusticDL window (or full display) into the evidence directory.
+# Capture the launched pid's RusticDL window into the evidence directory.
 # Usage: screenshot.sh <filename.png>
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,22 +7,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 name="${1:?filename required}"
+case "${name}" in
+  *..*|*/*|*\\*|.*|"")
+    echo "invalid screenshot name (no slash, '..', or leading dot): ${name}" >&2
+    exit 1
+    ;;
+esac
+if [[ "${name}" != "$(basename -- "${name}")" ]]; then
+  echo "invalid screenshot name: ${name}" >&2
+  exit 1
+fi
+
 out="${VERIFY_EVIDENCE_DIR}/${name}"
 mkdir -p "${VERIFY_EVIDENCE_DIR}"
 
-WID="$(xdotool search --name '^RusticDL$' 2>/dev/null | head -1 || true)"
-if [[ -n "${WID}" ]]; then
-  xdotool windowactivate --sync "${WID}" || true
-  sleep 0.2
+wid_rc=0
+WID="$(rusticdl_window_id)" || wid_rc=$?
+if [[ "${wid_rc}" -eq 2 ]]; then
+  echo "refusing screenshot: pid owns more than one RusticDL window" >&2
+  exit 1
 fi
+[[ "${wid_rc}" -eq 0 && -n "${WID}" ]] || {
+  echo "RusticDL window for launched pid not found" >&2
+  exit 1
+}
 
-# Prefer ImageMagick import of the window; fall back to full-display scrot.
-if [[ -n "${WID}" ]] && command -v import >/dev/null 2>&1; then
-  import -window "${WID}" "${out}" || scrot "${out}"
-elif command -v scrot >/dev/null 2>&1; then
-  scrot "${out}"
-else
-  echo "No screenshot tool (import/scrot) available" >&2
+xdotool windowactivate --sync "${WID}"
+sleep 0.2
+
+if ! command -v import >/dev/null 2>&1; then
+  echo "ImageMagick import is required to capture the window (no full-display fallback)" >&2
+  exit 1
+fi
+if ! import -window "${WID}" "${out}"; then
+  echo "window capture failed for wid=${WID}" >&2
   exit 1
 fi
 

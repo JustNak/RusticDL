@@ -24,7 +24,7 @@ Preconditions:
 - Not currently in Settings (leave Settings first).
 
 - **Focus search.** Run `.cursor/skills/verify-rusticdl/scripts/ui.sh focus-search` (or press `/`). The search field is focused.
-- **Match.** Type the known filename. Run `.cursor/skills/verify-rusticdl/scripts/ui.sh type-text '4096'`. Only matching rows remain.
+- **Match.** Click the search field and type the literal query with a vision/`computerUse` agent (GPUI inputs often ignore xdotool). Example query: `4096`. Only matching rows remain.
 - **Clear.** Select all and delete, or click the clear control. Run `.cursor/skills/verify-rusticdl/scripts/ui.sh clear-search`. The full filter list returns.
 - **Proof.** Screenshot matching and cleared states into the evidence dir; note the query string in `meta.txt`.
 

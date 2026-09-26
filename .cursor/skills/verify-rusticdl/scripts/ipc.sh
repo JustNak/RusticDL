@@ -33,7 +33,7 @@ print(json.dumps({
   "payload":{
     "url":url,
     "suggestedFilename":name,
-    "source":{"entryPoint":"verify","browser":"none","extensionVersion":"0.0.0"}
+    "source":{"entryPoint":"popup","browser":"chrome","extensionVersion":"0.0.0"}
   }
 }))
 PY
@@ -48,7 +48,7 @@ print(json.dumps({
   "type":"enqueue_download",
   "payload":{
     "url":url,
-    "source":{"entryPoint":"verify","browser":"none","extensionVersion":"0.0.0"}
+    "source":{"entryPoint":"popup","browser":"chrome","extensionVersion":"0.0.0"}
   }
 }))
 PY

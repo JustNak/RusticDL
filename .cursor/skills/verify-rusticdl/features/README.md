@@ -8,9 +8,9 @@ Secondary surfaces (browser extension, native host) are noted in gotchas where t
 
 - Launch with `.cursor/skills/verify-rusticdl/scripts/launch.sh` after `source …/scripts/env.sh`.
 - Use a disposable run directory: `/tmp/rusticdl-verify-$RUN_ID` with isolated `XDG_RUNTIME_DIR` and `XDG_DATA_HOME`.
-- Run `scripts/doctor.sh` and require `ok: true`, `appState: running`, and a `RusticDL` window.
+- Run `scripts/doctor.sh` and require `ok: true`, `appState: running`, a pid-owned `RusticDL` window, and `downloadDirectory` under the run dir.
 - Never drive an instance that was not started by this verification run.
-- On Windows, do not attempt a second side-by-side instance (hard single-instance mutex).
+- Helpers exit unless the OS is Linux. Do not launch on Windows (mutex, `%APPDATA%`, and the Run key are not isolated).
 
 ## Driving conventions
 

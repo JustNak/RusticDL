@@ -15,9 +15,9 @@ Read `features/README.md` before driving. Drive one mapped feature per proof unl
 | --- | --- |
 | Surface | GPUI desktop window titled `RusticDL` (`src/main.rs`, `src/app/`). Extension + native host are opt-in handoff. |
 | Run | `cargo build -p rusticdl` then run `target/debug/rusticdl` (or `cargo run -p rusticdl`). Needs Rust **1.89+**, C++ linker (`g++` / `libstdc++`), `libxcb`, `libxkbcommon`, `libxkbcommon-x11`, a working `DISPLAY` + `XAUTHORITY`, and a Vulkan device (real GPU or Mesa **lavapipe**). |
-| Drive | `control-rusticdl` scripts in this skill: xdotool clicks/typing for UI; Unix socket / named-pipe JSON for IPC (`get_status`, `enqueue_download`, `show_window`). Prefer visible button labels (`Add download`, `Settings`, `Start download`) over coordinates when a vision agent is available. |
-| Observe | Window screenshots, IPC `get_status` JSON (`queueSummary`, `appVersion`), `$XDG_DATA_HOME/RusticDL/state.json` and `settings.json`, downloaded files under the configured download directory. |
-| Isolate | **Linux:** yes — set distinct `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` per run (lock + socket + data). **Windows:** no — hard-coded mutex `Local\RusticDL.App`; a second launch activates the first and exits. Never drive an instance you did not start. |
+| Drive | `control-rusticdl` scripts in this skill: xdotool clicks for UI; Unix socket JSON for IPC (`get_status`, `enqueue_download`, `show_window`). Prefer visible button labels (`Add download`, `Settings`, `Start download`) over coordinates when a vision agent is available. |
+| Observe | Window screenshots, IPC `get_status` JSON (`queueSummary`, `appVersion`), `$XDG_DATA_HOME/RusticDL/state.json` and `settings.json`, downloaded files under `$VERIFY_RUN_DIR/downloads`. |
+| Isolate | **Linux:** yes — distinct `XDG_RUNTIME_DIR` / `XDG_DATA_HOME`, seeded `downloadDirectory` under the run dir, clicks bound to the pidfile window. **Windows:** helpers exit immediately (mutex + `%APPDATA%` are not isolated). Never drive an instance you did not start. |
 
 ## Launch
 
@@ -33,8 +33,10 @@ source .cursor/skills/verify-rusticdl/scripts/env.sh
 Ready when:
 
 1. `scripts/launch.sh` prints `READY pid=<n> wid=<n>`
-2. `xdotool search --name '^RusticDL$'` returns a window id
-3. `scripts/doctor.sh` exits 0
+2. That pid owns exactly one window titled `RusticDL` (`xdotool getwindowpid` matches the pidfile)
+3. `scripts/doctor.sh` exits 0 (including `downloadDirectory` under `$VERIFY_RUN_DIR`)
+
+`launch.sh` refuses non-Linux hosts and refuses to start when `rusticdl-native-host` sits next to the desktop binary (that sibling rewrites browser native-messaging manifests). On any launch failure it kills the pidfile process.
 
 Teardown: `scripts/cleanup.sh` (kills only the pid in `$VERIFY_RUN_DIR/app.pid`).
 
@@ -46,7 +48,7 @@ rustup install 1.89.0 && rustup default 1.89.0
 
 # Link + capture tools (Ubuntu 24.04 example)
 sudo apt-get install -y g++ libstdc++-14-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libxcb1-dev mesa-vulkan-drivers scrot xdotool
+  libxcb1-dev mesa-vulkan-drivers imagemagick xdotool
 
 # libstdc++.so often lives only under gcc's private dir — export before cargo/link:
 export LIBRARY_PATH="/usr/lib/gcc/x86_64-linux-gnu/13${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -70,10 +72,11 @@ source .cursor/skills/verify-rusticdl/scripts/env.sh   # same RUN_ID
 Doctor requires all of:
 
 - Pidfile process still alive and is the rusticdl binary path recorded at launch
-- Window titled `RusticDL` still mapped
+- Window titled `RusticDL` still mapped and owned by that pid (zero or >1 matches is a fail)
 - IPC `get_status` returns `"ok": true`, `"appState": "running"`, and `"connectionState": "connected"`
 - Response `appVersion` is non-empty
 - Data root is under this run's `XDG_DATA_HOME` (`…/RusticDL/settings.json` exists)
+- `settings.json` `downloadDirectory` is a path under `$VERIFY_RUN_DIR` (not the user's Downloads folder)
 
 If anything looks off, run doctor before retrying a drive.
 
@@ -86,10 +89,9 @@ Harness name: **control-rusticdl** (scripts under `.cursor/skills/verify-rusticd
 .cursor/skills/verify-rusticdl/scripts/ipc.sh get_status
 .cursor/skills/verify-rusticdl/scripts/ipc.sh show_window
 
-# UI — focus window, click by label heuristics, type, screenshot
+# UI — focus window, click by label heuristics, screenshot
 .cursor/skills/verify-rusticdl/scripts/ui.sh focus
 .cursor/skills/verify-rusticdl/scripts/ui.sh click-add-download
-.cursor/skills/verify-rusticdl/scripts/ui.sh type-text 'https://httpbin.org/bytes/4096'
 .cursor/skills/verify-rusticdl/scripts/ui.sh click-start-download
 .cursor/skills/verify-rusticdl/scripts/ui.sh click-sidebar 'Settings'
 .cursor/skills/verify-rusticdl/scripts/screenshot.sh home.png
@@ -108,7 +110,7 @@ Stable handles (prefer these over raw coordinates):
 | Shortcut Ctrl+, | Open Settings |
 | IPC types `get_status`, `enqueue_download`, `prompt_download`, `show_window` | Socket/pipe |
 
-GPUI does not expose ARIA/CDP. When label hit-testing is unavailable, `ui.sh` falls back to geometry relative to the focused `RusticDL` window (documented in that script). A vision/`computerUse` agent may click by visible label instead — still record the same evidence paths.
+GPUI does not expose ARIA/CDP. When label hit-testing is unavailable, `ui.sh` falls back to geometry relative to the launched pid's `RusticDL` window (documented in that script). A vision/`computerUse` agent may click by visible label instead — still record the same evidence paths.
 
 **Text entry caveat:** GPUI `InputState` fields often ignore xdotool-typed keys and clipboard paste from automation. For Add download / Search / Settings inputs, drive typing with a vision/`computerUse` agent (click the field, type the literal string). Mouse clicks for `Add download`, `Start download`, and sidebar labels via `ui.sh` are reliable.
 
@@ -137,12 +139,14 @@ Proof standards:
 - Verify side effects: `get_status.queueSummary` and/or `state.json` and/or file on disk.
 - Record `feature-id`, `RUN_ID`, and commands used next to the artifacts (`meta.txt`).
 
-Minimum set for a UI feature:
+Minimum set for a UI feature (`scripts/prove-add-download.sh finish` requires these names):
 
-1. `before.png` or `dialog.png` — identity `RusticDL` visible
-2. `after.png` — resulting queue/settings state
-3. `status.json` — IPC `get_status` after the action
+1. `dialog-filled.png` — identity `RusticDL` visible, URL entered
+2. `queue-after.png` — resulting queue state
+3. `status-after.json` — IPC `get_status` after the action
 4. `meta.txt` — feature id, RUN_ID, pid, commands
+
+The prepare pair (captured by `prove-add-download.sh prepare`) is `dialog-open.png` and `status-before.json`.
 
 ## Cleanup
 
@@ -165,8 +169,8 @@ Rules:
 | `scripts/launch.sh` | Build if needed, start app, wait for window + socket, write pidfile |
 | `scripts/doctor.sh` | Read-only instance health |
 | `scripts/ipc.sh` | Send one IPC request; print response line |
-| `scripts/ui.sh` | Focus / click / type helpers for the desktop window |
-| `scripts/screenshot.sh` | Capture focused window or full display into evidence dir |
+| `scripts/ui.sh` | Focus / click helpers for the launched pid's desktop window |
+| `scripts/screenshot.sh` | Capture that window into the evidence dir (fails if the grab misses) |
 | `scripts/cleanup.sh` | Stop the launched pid; preserve evidence + artifacts |
 | `scripts/prove-add-download.sh` | End-to-end proof of the `add-download` feature |
 

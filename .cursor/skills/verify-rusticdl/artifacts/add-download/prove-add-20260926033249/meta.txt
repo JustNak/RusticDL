@@ -3,5 +3,5 @@ run_id=prove-add-20260926033249
 url=https://httpbin.org/bytes/4096
 entry=Add download button + Start download (vision-typed URL)
 queueSummary={"total":1,"active":0,"completed":1,"failed":0}
-evidence_named_in_skill=.cursor/skills/verify-rusticdl/artifacts/<feature-id>/<RUN_ID>/
+evidence_named_in_skill=artifacts/add-download/prove-add-20260926033249/
 commands=launch.sh doctor.sh ui.sh click-add-download computerUse-type-url click-start-download ipc.sh get_status cleanup.sh

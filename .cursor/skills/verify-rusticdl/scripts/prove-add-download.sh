@@ -1,23 +1,19 @@
 #!/usr/bin/env bash
-# End-to-end proof scaffold for features/add-download.md.
+# End-to-end proof for features/add-download.md.
 #
 # Launch + doctor + evidence dirs are fully scripted here. GPUI text entry into
 # the Add download URL field must be performed by a vision/computerUse agent
-# (see SKILL.md Drive section) between the markers below — xdotool cannot
-# reliably type into GPUI InputState.
+# (see SKILL.md Drive section) — xdotool cannot reliably type into GPUI InputState.
 #
 # Usage:
-#   Interactive/agent proof (recommended):
-#     export RUN_ID=prove-add-$(date +%Y%m%d%H%M%S)
-#     .cursor/skills/verify-rusticdl/scripts/prove-add-download.sh prepare
-#     # agent: open Add download, type https://httpbin.org/bytes/4096, Start download
-#     # agent: save dialog-filled.png + queue-after.png into $VERIFY_EVIDENCE_DIR
-#     .cursor/skills/verify-rusticdl/scripts/prove-add-download.sh finish
-#
-#   Or run with PROVE_URL_ALREADY_DONE=1 after the agent filled evidence files.
+#   export RUN_ID=prove-add-$(date +%Y%m%d%H%M%S)
+#   .cursor/skills/verify-rusticdl/scripts/prove-add-download.sh prepare
+#   # agent: open Add download, type https://httpbin.org/bytes/4096, Start download
+#   # agent: save dialog-filled.png + queue-after.png into $VERIFY_EVIDENCE_DIR
+#   .cursor/skills/verify-rusticdl/scripts/prove-add-download.sh finish
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${1:-all}"
+MODE="${1:-}"
 export RUN_ID="${RUN_ID:-prove-add-$(date +%Y%m%d%H%M%S)}"
 # shellcheck source=env.sh
 source "${SCRIPT_DIR}/env.sh"
@@ -99,11 +95,6 @@ finish() {
 case "${MODE}" in
   prepare) prepare ;;
   finish) finish ;;
-  all)
-    echo "Mode 'all' requires a vision agent for URL typing." >&2
-    echo "Run: $0 prepare   then drive per AGENT_DRIVE.txt   then $0 finish" >&2
-    exit 2
-    ;;
   *)
     echo "Usage: $0 {prepare|finish}" >&2
     exit 2
