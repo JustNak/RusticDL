@@ -1,0 +1,9 @@
+Drive steps for computerUse / vision agent:
+1. Focus the RusticDL window (dialog titled Add download should be open).
+2. Click the URL field (placeholder https://example.com/file.zip).
+3. Type exactly: https://httpbin.org/bytes/4096
+4. Save screenshot: /tmp/rusticdl-verify-prove-add-20260926040041/evidence/dialog-filled.png (URL visible).
+5. Click Start download.
+6. Wait until a queue row appears (completed is OK).
+7. Save screenshot: /tmp/rusticdl-verify-prove-add-20260926040041/evidence/queue-after.png
+Then run: RUN_ID=prove-add-20260926040041 /workspace/.cursor/skills/verify-rusticdl/scripts/prove-add-download.sh finish
