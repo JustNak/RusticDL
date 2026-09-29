@@ -72,15 +72,24 @@ fn spawn_mock_hypr(
     })
 }
 
-fn wait_for_commands(recorded: &Mutex<Vec<String>>, timeout: Duration) -> Vec<String> {
+fn wait_until_recorded(
+    recorded: &Mutex<Vec<String>>,
+    timeout: Duration,
+    ready: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
     let start = std::time::Instant::now();
     loop {
         let snapshot = recorded.lock().expect("record").clone();
-        if !snapshot.is_empty() || start.elapsed() >= timeout {
+        if ready(&snapshot) || start.elapsed() >= timeout {
             return snapshot;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn log_has_lua_center_on_new(cmds: &[String]) -> bool {
+    cmds.iter()
+        .any(|c| c.contains("hl.dsp.window.center(") && c.contains("address:0xnew"))
 }
 
 #[test]
@@ -201,31 +210,22 @@ fn float_thread_does_not_dispatch_on_older_same_title_hud() {
     };
     float_capture_windows(title, 480, 268, prior);
 
-    let start = std::time::Instant::now();
-    let mut saw_new = false;
-    while start.elapsed() < Duration::from_millis(500) {
-        let cmds = recorded.lock().expect("record").clone();
-        if cmds.iter().any(|c| c.contains("address:0xnew")) {
-            saw_new = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    let cmds = wait_for_commands(&recorded, Duration::from_millis(50));
+    // Center is the last dispatch. Do not snapshot after the first address:0xnew
+    // (float/resize can land a frame earlier).
+    let cmds = wait_until_recorded(
+        &recorded,
+        Duration::from_millis(500),
+        log_has_lua_center_on_new,
+    );
     assert!(
-        saw_new,
-        "expected dispatch on the newly mapped address, got {cmds:?}"
+        log_has_lua_center_on_new(&cmds),
+        "0.55 center fallback must be Lua center on the new address, got {cmds:?}"
     );
     assert!(
         cmds.iter().any(|c| c.contains("hl.dsp.window.resize(")
             && c.contains("address:0xnew")
             && c.contains("x = 480")),
         "0.55 size fallback must be Lua resize on the new address, got {cmds:?}"
-    );
-    assert!(
-        cmds.iter()
-            .any(|c| c.contains("hl.dsp.window.center(") && c.contains("address:0xnew")),
-        "0.55 center fallback must be Lua center on the new address, got {cmds:?}"
     );
     assert!(
         !cmds
