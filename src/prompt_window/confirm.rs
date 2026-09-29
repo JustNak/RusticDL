@@ -63,7 +63,8 @@ impl BrowserPromptWindow {
             window.dispatch_action(Box::new(SelectAll), cx);
         }
 
-        window.activate_window();
+        // Focus/raise is owned by open_capture_window (once). Extra activates
+        // here re-request attention and can surface the main queue on Hyprland.
         start_sync_timer(cx);
         let cascade_index = ipc.capture_window_count().saturating_sub(1);
 

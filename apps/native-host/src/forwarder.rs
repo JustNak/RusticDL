@@ -77,6 +77,13 @@ impl AppForwarder {
         match self.send_once_before_deadline(request, deadline) {
             Ok(response) => Ok(response),
             Err(ForwarderError::AppUnreachable) => {
+                // Health pings must not spawn the desktop app. The extension's
+                // 1-minute connection-health alarm would otherwise relaunch
+                // RusticDL (and raise its main window) whenever the socket is
+                // down — the Omarchy "app randomly pops up" report.
+                if !should_launch_app_for(&request.message_type) {
+                    return Err(ForwarderError::AppUnreachable);
+                }
                 self.launch_app()?;
 
                 for _ in 0..CONNECT_ATTEMPTS {
@@ -377,10 +384,32 @@ fn remaining_timeout(deadline: Instant) -> Option<Duration> {
     }
 }
 
+/// Whether an unreachable desktop socket should spawn `rusticdl`.
+///
+/// Status probes (`get_status`, used for extension `ping`) stay fail-closed.
+/// User-facing handoffs still auto-start the app when it is not running.
+fn should_launch_app_for(message_type: &str) -> bool {
+    match message_type {
+        "get_status" => false,
+        "show_window" | "enqueue_download" | "prompt_download" | "save_extension_settings" => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn status_probes_do_not_launch_the_desktop_app() {
+        assert!(!should_launch_app_for("get_status"));
+        assert!(should_launch_app_for("show_window"));
+        assert!(should_launch_app_for("enqueue_download"));
+        assert!(should_launch_app_for("prompt_download"));
+        assert!(should_launch_app_for("save_extension_settings"));
+        assert!(!should_launch_app_for("unknown"));
+    }
 
     #[cfg(unix)]
     #[test]
