@@ -160,7 +160,8 @@ where
 
     // Class-scoped float/size/center rules must land before map — post-map
     // setfloating alone is the tile-then-float flash on Omarchy/Hyprland.
-    hyprland::prepare_capture_window(hud_w, hud_h);
+    // Snapshot addresses now so the fallback cannot raise an older same-title HUD.
+    let prior = hyprland::prepare_capture_window(hud_w, hud_h);
 
     let result = cx.open_window(
         WindowOptions {
@@ -217,7 +218,7 @@ where
                 window.activate_window();
             });
             // Confirm / conflict / progress / complete all share this opener.
-            hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h);
+            hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h, prior);
             Some(handle)
         }
         Err(error) => {
@@ -248,11 +249,12 @@ mod floating_kind_tests {
             "capture HUDs must not open as a normal toplevel (tiling compositors stretch them)"
         );
         assert!(
-            opener.contains("hyprland::prepare_capture_window(hud_w, hud_h)"),
+            opener.contains("let prior = hyprland::prepare_capture_window(hud_w, hud_h)"),
             "Hyprland class windowrules must be installed before open_window"
         );
         assert!(
-            opener.contains("hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h)"),
+            opener
+                .contains("hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h, prior)"),
             "Hyprland IPC float fallback must run after every successful capture open"
         );
         assert!(
