@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use super::job::{download_error, DownloadError, FailureCategory};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const READ_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub const BROWSER_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",

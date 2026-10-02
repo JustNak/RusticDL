@@ -10,7 +10,7 @@ use super::context::TransferContext;
 use super::eta::EtaSmoother;
 use super::fetch::{
     classify_segment_status, control_outcome, fetch_range, sleep_interruptible, FetchRequest,
-    RangeSpec, STALL_TIMEOUT,
+    RangeSpec, RangeStatus, STALL_TIMEOUT,
 };
 use super::filesystem::{ensure_parent_directory, is_untracked_preallocate_hole, metadata_len};
 use super::http::{
@@ -820,13 +820,29 @@ async fn run_segment_loop(
             return Err(error);
         }
 
-        match stream_segment(response, task, range_start, end).await {
+        // Honor a shorter 206. The next loop requests the remainder.
+        let response_end = match range_status {
+            RangeStatus::Partial { end: got, .. } => got,
+            _ => end,
+        };
+
+        match stream_segment(response, task, range_start, response_end).await {
             Ok(true) => {
-                mark_segment(&task.shared, task.index, |s| {
-                    s.state = SegmentState::Completed;
-                });
-                emit_progress(task, false);
-                return Ok(());
+                let complete = {
+                    let map = lock_map(&task.shared.map);
+                    map.segments
+                        .get(task.index as usize)
+                        .is_some_and(|segment| segment.written >= segment.length())
+                };
+                if complete {
+                    mark_segment(&task.shared, task.index, |s| {
+                        s.state = SegmentState::Completed;
+                    });
+                    emit_progress(task, false);
+                    return Ok(());
+                }
+                short_reconnects = 0;
+                continue;
             }
             Ok(false) => return Ok(()),
             Err(error) => {
@@ -2193,6 +2209,99 @@ mod tests {
         );
         assert!(temp.exists(), "non-prefix failure must keep the .part");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shorter_206_is_a_prefix_and_segment_resumes() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let body: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let prefix_len = 8192usize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            let mut served_prefix = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let lower = req.to_ascii_lowercase();
+                let (start, end) = match parse_test_range(&lower) {
+                    Some((start, Some(end))) => (start as usize, end as usize),
+                    Some((start, None)) => (start as usize, payload.len().saturating_sub(1)),
+                    None => (0, payload.len().saturating_sub(1)),
+                };
+                let start = start.min(payload.len().saturating_sub(1));
+                let end = end.min(payload.len().saturating_sub(1)).max(start);
+                let mut slice_end = end;
+                if start >= MIN_SEGMENT_SIZE as usize && !served_prefix {
+                    served_prefix = true;
+                    slice_end = (start + prefix_len - 1).min(end);
+                }
+                let slice = &payload[start..=slice_end];
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{slice_end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    payload.len(),
+                    slice.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(slice).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-poor-prefix-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let mut part = vec![0u8; total];
+        part[..MIN_SEGMENT_SIZE as usize].copy_from_slice(&body[..MIN_SEGMENT_SIZE as usize]);
+        std::fs::write(&temp, &part).unwrap();
+
+        let url = format!("http://{addr}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        job.total_bytes = total as u64;
+        job.transfer_format_version = 1;
+        job.resume_supported = true;
+        job.validators.expected_size = Some(total as u64);
+        job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
+        job.downloaded_bytes = MIN_SEGMENT_SIZE;
+
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
+        let ctx = test_ctx(job, on_progress, None, 2);
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("a short 206 must not fail the segment");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

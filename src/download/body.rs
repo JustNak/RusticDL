@@ -10,7 +10,9 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::time::{sleep, timeout};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::fetch::{control_outcome, format_reqwest_error, CONTROL_POLL};
+use super::fetch::{
+    control_outcome, format_reqwest_error, reqwest_failure_is_retryable, CONTROL_POLL,
+};
 use super::job::{download_error, DownloadError, DownloadOutcome, FailureCategory};
 use super::segment_io::SegmentFileWriter;
 
@@ -285,18 +287,11 @@ pub(crate) async fn stream_body_with_stall(
 ) -> Result<StreamEnd, DownloadError> {
     let stream = response.bytes_stream().map(|item| match item {
         Ok(chunk) => Ok(chunk),
-        Err(error) => {
-            let retryable = error.is_timeout()
-                || error.is_connect()
-                || error.is_request()
-                || error.is_body()
-                || error.is_decode();
-            Err(download_error(
-                FailureCategory::Network,
-                format!("Download stream failed: {}", format_reqwest_error(&error)),
-                retryable,
-            ))
-        }
+        Err(error) => Err(download_error(
+            FailureCategory::Network,
+            format!("Download stream failed: {}", format_reqwest_error(&error)),
+            reqwest_failure_is_retryable(&error),
+        )),
     });
     futures_util::pin_mut!(stream);
     stream_body_loop(
@@ -346,6 +341,12 @@ where
             Ok(None) => break,
             Ok(Some(Err(error))) => {
                 sink.flush().await?;
+                // A reset after the last byte is a finished body, not a failed one.
+                if target_reached(sink) {
+                    return Ok(StreamEnd::Exhausted {
+                        downloaded: sink.offset(),
+                    });
+                }
                 return Err(error);
             }
             Ok(Some(Ok(chunk))) => {
@@ -396,14 +397,28 @@ where
         }
     }
     if policy == EosPolicy::UnknownLength {
-        return Err(download_error(
-            FailureCategory::Network,
-            format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
-            true,
-        ));
+        return Err(lengthless_eof_error(downloaded));
     }
 
     Ok(StreamEnd::Exhausted { downloaded })
+}
+
+pub(crate) fn lengthless_eof_error(downloaded: u64) -> DownloadError {
+    download_error(
+        FailureCategory::Network,
+        format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
+        true,
+    )
+}
+pub(crate) fn is_lengthless_eof(error: &DownloadError) -> bool {
+    error.message.contains("without a length")
+}
+
+fn target_reached(sink: &impl BodySink) -> bool {
+    match sink.target_offset() {
+        Some(target) if target > 0 => sink.offset() >= target,
+        _ => false,
+    }
 }
 
 fn disk_write_error(error: std::io::Error) -> DownloadError {
@@ -556,6 +571,77 @@ mod tests {
         assert_eq!(err.category, FailureCategory::Network);
         assert!(err.retryable);
         assert!(err.message.contains("Download incomplete"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_full_target_completes() {
+        let payload = b"full-body".to_vec();
+        let stream = futures_util::stream::iter([
+            Ok::<Vec<u8>, DownloadError>(payload.clone()),
+            Err(download_error(
+                FailureCategory::Network,
+                "connection reset by peer".into(),
+                true,
+            )),
+        ]);
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reset-after-end-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0)
+            .await
+            .unwrap()
+            .with_target(payload.len() as u64);
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let end = stream_body_loop(
+            stream,
+            &mut sink,
+            &control,
+            limiter.as_ref(),
+            Duration::from_secs(5),
+            EosPolicy::Complete,
+            |_| {},
+        )
+        .await
+        .expect("reset after the last byte must not fail the transfer");
+        let StreamEnd::Exhausted { downloaded } = end else {
+            panic!("unexpected {end:?}");
+        };
+        assert_eq!(downloaded, payload.len() as u64);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn stream_error_before_target_stays_retryable() {
+        let stream = futures_util::stream::iter([
+            Ok::<Vec<u8>, DownloadError>(b"partial".to_vec()),
+            Err(download_error(
+                FailureCategory::Network,
+                "connection reset by peer".into(),
+                true,
+            )),
+        ]);
+        let dir = std::env::temp_dir().join(format!("rusticdl-reset-mid-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap().with_target(100);
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let err = stream_body_loop(
+            stream,
+            &mut sink,
+            &control,
+            limiter.as_ref(),
+            Duration::from_secs(5),
+            EosPolicy::Complete,
+            |_| {},
+        )
+        .await
+        .expect_err("reset before the target must fail");
+        assert!(err.retryable);
+        assert_eq!(sink.offset(), b"partial".len() as u64);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -907,7 +993,7 @@ mod tests {
         .await
         .expect_err("clean EOF without a length must not complete");
         assert!(err.retryable);
-        assert!(err.message.contains("without a length"));
+        assert!(is_lengthless_eof(&err));
         assert_eq!(sink.offset(), b"partial".len() as u64);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

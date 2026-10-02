@@ -18,7 +18,7 @@ use super::job::{
 pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const MAX_REDIRECTS: u32 = 10;
 
-/// Shorter than the client `read_timeout` (120s) so a silent TCP/HTTP2 body
+/// Shorter than the client `read_timeout` (180s) so a silent TCP/HTTP2 body
 /// or header wait does not sit at 98% with a stale live speed.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROL_POLL: Duration = Duration::from_millis(200);
@@ -356,6 +356,7 @@ pub(crate) fn should_retry_status(status: StatusCode) -> bool {
         status,
         StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::MISDIRECTED_REQUEST
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
@@ -657,12 +658,45 @@ fn looks_like_tls_interference(chain: &str) -> bool {
             && (lower.contains("fail") || lower.contains("error") || lower.contains("handshake")))
 }
 
+/// Transport failures that should keep a download alive on a weak link.
+/// Flag checks miss some hyper/rustls resets; the message is the backup.
+pub(crate) fn reqwest_failure_is_retryable(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+        || transport_text_is_transient(&format_error_chain(error))
+}
+
+pub(crate) fn transport_text_is_transient(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "unexpected eof",
+        "unexpected end of file",
+        "incomplete message",
+        "early eof",
+        "bytes remaining",
+        "timed out",
+        "temporarily unavailable",
+        "connection refused",
+        "network is unreachable",
+        "no route to host",
+        "stream closed",
+        "goaway",
+        "reset by peer",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 fn connect_error_tcp(error: &reqwest::Error) -> DownloadError {
-    let retryable = error.is_timeout() || error.is_connect() || error.is_request();
     download_error(
         FailureCategory::Network,
         format!("Could not connect: {}", format_reqwest_error(error)),
-        retryable,
+        reqwest_failure_is_retryable(error),
     )
 }
 
@@ -711,7 +745,11 @@ pub(crate) fn classify_segment_status(
             ))
         }
         RangeStatus::Partial { start, end, total } => {
-            if *start != range_start || *end != range_end {
+            // A shorter 206 is a prefix of this slice. Some servers cap a
+            // Range response; the caller resumes the remainder. A different
+            // start, or an end past this slice, would overlap the next segment.
+            let prefix = *start == range_start && *end >= range_start && *end <= range_end;
+            if !prefix {
                 return Err(download_error(
                     FailureCategory::Resume,
                     format!(
@@ -746,23 +784,18 @@ pub(crate) fn closed_slice_matches(response: &reqwest::Response, start: u64, end
     classify_segment_status(&status, start, end, None).is_ok()
 }
 
-fn missing_content_range_error() -> DownloadError {
+pub(crate) fn missing_content_range_error() -> DownloadError {
     download_error(
-        FailureCategory::Resume,
+        FailureCategory::Http,
         "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-        false,
+        true,
     )
 }
 
 fn connect_error_tcp_and_h3(tcp: &reqwest::Error, http3: &reqwest::Error) -> DownloadError {
     let tcp_detail = format_reqwest_error(tcp);
     let h3_detail = format_reqwest_error(http3);
-    let retryable = tcp.is_timeout()
-        || tcp.is_connect()
-        || tcp.is_request()
-        || http3.is_timeout()
-        || http3.is_connect()
-        || http3.is_request();
+    let retryable = reqwest_failure_is_retryable(tcp) || reqwest_failure_is_retryable(http3);
     let message = if tcp_detail == h3_detail {
         format!("Could not connect (TCP + HTTP/3): {tcp_detail}")
     } else {
@@ -1282,6 +1315,26 @@ Content-Length: 2\r\n\
         let error = classify_segment_status(&status, 0, 49, Some(200)).unwrap_err();
         assert_eq!(error.category, FailureCategory::Resume);
         assert!(!error.retryable);
+        let prefix = RangeStatus::Partial {
+            start: 0,
+            end: 49,
+            total: Some(200),
+        };
+        assert!(
+            classify_segment_status(&prefix, 0, 99, Some(200)).is_ok(),
+            "a shorter 206 is a prefix of the requested slice"
+        );
+    }
+
+    #[test]
+    fn transport_text_treats_resets_as_transient() {
+        assert!(transport_text_is_transient("connection reset by peer"));
+        assert!(transport_text_is_transient(
+            "error decoding response body: unexpected EOF"
+        ));
+        assert!(transport_text_is_transient("incomplete message"));
+        assert!(!transport_text_is_transient("HTTP 404 not found"));
+        assert!(!transport_text_is_transient("certificate verify failed"));
     }
 
     #[tokio::test]
