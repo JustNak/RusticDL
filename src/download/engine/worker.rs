@@ -128,16 +128,36 @@ async fn run_attempts(
         match attempt_result {
             Ok(outcome) => break Ok(outcome),
             Err(error) => {
-                let (requeue, max_retry, progressed) = {
+                let (requeue, max_retry, recorded, temp_path, count_disk, downloaded, total) = {
                     let guard = inner.lock().await;
                     let requeue = guard.requeue_on_cancel.contains_key(&job_id);
-                    let progressed = guard
-                        .jobs
-                        .iter()
-                        .find(|job| job.id == job_id)
-                        .is_some_and(|job| durable_progress(job) > durable_progress(&attempt_job));
-                    (requeue, guard.config.auto_retry, progressed)
+                    let job = guard.jobs.iter().find(|job| job.id == job_id);
+                    let recorded = job.map(durable_progress).unwrap_or(0);
+                    let count_disk = job.is_some_and(single_stream_disk_counts);
+                    let temp_path = job.map(|job| job.temp_path.clone());
+                    let downloaded = job.map(|job| job.downloaded_bytes).unwrap_or(0);
+                    let total = job.map(|job| job.total_bytes).unwrap_or(0);
+                    (
+                        requeue,
+                        guard.config.auto_retry,
+                        recorded,
+                        temp_path,
+                        count_disk,
+                        downloaded,
+                        total,
+                    )
                 };
+                let on_disk = if count_disk {
+                    match temp_path.as_ref() {
+                        Some(path) => Some(metadata_len(path).await.unwrap_or(0)),
+                        None => Some(0),
+                    }
+                } else {
+                    None
+                };
+                let on_disk = on_disk.filter(|&n| !sparse_preallocate_hole(downloaded, total, n));
+                let progressed =
+                    attempt_made_progress(durable_progress(&attempt_job), recorded, on_disk);
                 if requeue {
                     break Ok(DownloadOutcome::Canceled);
                 }
@@ -196,6 +216,21 @@ fn durable_progress(job: &Job) -> u64 {
         .as_ref()
         .map(|map| map.written_sum())
         .unwrap_or(job.downloaded_bytes)
+}
+
+fn single_stream_disk_counts(job: &Job) -> bool {
+    job.segment_map.is_none() && job.transfer_format_version == 0
+}
+
+/// A multi start that `set_len`s the `.part` before the map is saved. File
+/// length is not downloaded bytes. Unknown totals are not holes.
+fn sparse_preallocate_hole(downloaded: u64, total: u64, on_disk: u64) -> bool {
+    downloaded == 0 && total > 0 && on_disk >= total
+}
+
+fn attempt_made_progress(before: u64, recorded: u64, on_disk: Option<u64>) -> bool {
+    let current = on_disk.map(|n| recorded.max(n)).unwrap_or(recorded);
+    current > before
 }
 
 /// Multi / Restart skip metadata_len so a sparse `.part` cannot lie.
@@ -374,6 +409,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn attempt_progress_counts_uncheckpointed_single_stream_bytes() {
+        assert!(!attempt_made_progress(0, 0, Some(0)));
+        assert!(attempt_made_progress(0, 0, Some(40)));
+        assert!(attempt_made_progress(10, 10, Some(25)));
+        assert!(!attempt_made_progress(25, 10, Some(25)));
+        assert!(attempt_made_progress(10, 40, None));
+        assert!(!sparse_preallocate_hole(0, 0, 100));
+        assert!(sparse_preallocate_hole(0, 100, 100));
+        assert!(!sparse_preallocate_hole(1, 100, 100));
+    }
 
     #[test]
     fn durable_progress_uses_segment_written_sum() {

@@ -32,9 +32,15 @@ use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
-pub(crate) const RECONNECT_MAX: u32 = 5;
+pub(crate) const RECONNECT_MAX: u32 = 12;
 pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
-pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(2);
+pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(8);
+/// Full-file restarts when the server rejects or ignores Range. Not reset by
+/// byte progress — a host that never honors Range must not spin forever.
+const FRESH_RESTART_MAX: u32 = 6;
+/// A single 416 is often a proxy glitch. Retry the same offset this many
+/// times before throwing away a partial.
+const RANGE_REJECT_BEFORE_RESTART: u32 = 2;
 
 const FULL_REPLACE_NOTICE: &str =
     "Remote file changed or server ignored resume; restarting download from the beginning.";
@@ -120,10 +126,12 @@ pub async fn run_http_download_with_ctx(
     let mut temp_path = ctx.job.temp_path.clone();
     let mut filename = ctx.job.filename.clone();
     let mut transfer_format_version = ctx.job.transfer_format_version;
-    let mut total_bytes: u64;
+    let mut total_bytes: u64 = ctx.job.total_bytes;
     let mut resume_supported = ctx.job.resume_supported;
 
     let mut short_reconnects: u32 = 0;
+    let mut fresh_restarts: u32 = 0;
+    let mut range_rejects: u32 = 0;
     let mut cumulative_reconnects = ctx.job.reconnect_count;
     let reconnect_baseline = ctx.job.reconnect_count;
     // One remint from job.url after a 401 on a burned Inst-FS / Drive hop.
@@ -182,7 +190,10 @@ pub async fn run_http_download_with_ctx(
                         continue;
                     }
                     ReconnectAction::Control(outcome) => return Ok(outcome),
-                    ReconnectAction::GiveUp => return Err(error),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
                 }
             }
         };
@@ -212,30 +223,85 @@ pub async fn run_http_download_with_ctx(
         let mut full_replace = false;
         let range_total = match &range_status {
             RangeStatus::RangeNotSatisfiable { at } => {
-                return Err(download_error(
-                    FailureCategory::Resume,
-                    format!(
-                        "Server rejected resume at {at} bytes. Use Restart to download from zero."
-                    ),
-                    false,
-                ));
+                // Keep the partial across a transient 416. Only discard it
+                // after the same offset has been rejected and a retry is
+                // actually starting — pause and give-up must not wipe it.
+                let keep_partial =
+                    existing_bytes > 0 && range_rejects < RANGE_REJECT_BEFORE_RESTART;
+                if keep_partial {
+                    range_rejects = range_rejects.saturating_add(1);
+                } else {
+                    fresh_restarts = fresh_restarts.saturating_add(1);
+                    if fresh_restarts > FRESH_RESTART_MAX {
+                        let error = download_error(
+                            FailureCategory::Resume,
+                            format!(
+                                "Server rejected resume at {at} bytes. Use Restart to download from zero."
+                            ),
+                            true,
+                        );
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
+                }
+                let error = download_error(
+                    FailureCategory::Http,
+                    format!("Server rejected resume at {at} bytes; retrying."),
+                    true,
+                );
+                match prepare_reconnect(
+                    &error,
+                    short_reconnects,
+                    existing_bytes,
+                    true,
+                    transfer_format_version,
+                    &temp_path,
+                    &control,
+                    &on_progress,
+                    &mut cumulative_reconnects,
+                )
+                .await
+                {
+                    ReconnectAction::Retry { offset } => {
+                        short_reconnects += 1;
+                        if keep_partial {
+                            existing_bytes = offset;
+                        } else {
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            existing_bytes = 0;
+                        }
+                        continue;
+                    }
+                    ReconnectAction::Control(outcome) => return Ok(outcome),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(download_error(
+                            FailureCategory::Resume,
+                            format!(
+                                "Server rejected resume at {at} bytes. Use Restart to download from zero."
+                            ),
+                            true,
+                        ));
+                    }
+                }
             }
             RangeStatus::AuthDenied { status } => {
                 return Err(http_status_error(*status, false));
             }
             RangeStatus::Other { status, retryable } => {
-                if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
-                    return Err(download_error(
-                        FailureCategory::Resume,
+                let error = if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
+                    download_error(
+                        FailureCategory::Http,
                         "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                        false,
-                    ));
-                }
-                let error = http_status_error(*status, *retryable);
+                        true,
+                    )
+                } else {
+                    http_status_error(*status, *retryable)
+                };
                 if let Some(outcome) = control_outcome(&control) {
                     return Ok(outcome);
                 }
-                if *retryable {
+                if error.retryable {
                     match prepare_reconnect(
                         &error,
                         short_reconnects,
@@ -255,9 +321,13 @@ pub async fn run_http_download_with_ctx(
                             continue;
                         }
                         ReconnectAction::Control(outcome) => return Ok(outcome),
-                        ReconnectAction::GiveUp => return Err(error),
+                        ReconnectAction::GiveUp => {
+                            checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                            return Err(error);
+                        }
                     }
                 }
+                checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                 return Err(error);
             }
             RangeStatus::RedirectWhenPinned => {
@@ -268,12 +338,24 @@ pub async fn run_http_download_with_ctx(
                 ));
             }
             RangeStatus::FullEntityWhenRangeRequested => {
+                fresh_restarts = fresh_restarts.saturating_add(1);
+                if fresh_restarts > FRESH_RESTART_MAX {
+                    let error = download_error(
+                        FailureCategory::Network,
+                        "Server ignored resume too many times on an unstable connection.".into(),
+                        true,
+                    );
+                    checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                    return Err(error);
+                }
                 existing_bytes = 0;
                 full_replace = true;
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 None
             }
             RangeStatus::Partial { start, total, .. } => {
+                fresh_restarts = 0;
+                range_rejects = 0;
                 if *start != existing_bytes {
                     return Err(download_error(
                         FailureCategory::Resume,
@@ -573,7 +655,10 @@ pub async fn run_http_download_with_ctx(
                         continue;
                     }
                     ReconnectAction::Control(outcome) => return Ok(outcome),
-                    ReconnectAction::GiveUp => return Err(error),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -750,7 +835,7 @@ fn can_mid_transfer_reconnect(
     if !is_reconnectable_error(error) {
         return false;
     }
-    ranges_usable_for_reconnect(existing_bytes, resume_supported)
+    ranges_usable_for_reconnect(existing_bytes, resume_supported, error)
 }
 
 fn is_reconnectable_error(error: &DownloadError) -> bool {
@@ -761,8 +846,45 @@ fn is_reconnectable_error(error: &DownloadError) -> bool {
         )
 }
 
-fn ranges_usable_for_reconnect(existing_bytes: u64, resume_supported: bool) -> bool {
-    existing_bytes == 0 || resume_supported
+/// Byte 0 can always be fetched again. A confirmed Range server can resume.
+/// Otherwise only truncation, stalls, and transient HTTP are worth a Range
+/// attempt — a clean EOF with no length must not spin.
+fn ranges_usable_for_reconnect(
+    existing_bytes: u64,
+    resume_supported: bool,
+    error: &DownloadError,
+) -> bool {
+    if existing_bytes == 0 || resume_supported {
+        return true;
+    }
+    error.retryable
+        && matches!(
+            error.category,
+            FailureCategory::Network | FailureCategory::Http
+        )
+        && !error.message.contains("without a length")
+}
+
+async fn checkpoint_partial(ctx: &mut TransferContext, downloaded: u64, total_bytes: u64) {
+    if downloaded == 0 {
+        return;
+    }
+    ctx.job.downloaded_bytes = downloaded;
+    if total_bytes > 0 {
+        ctx.job.total_bytes = total_bytes;
+    }
+    let _ = ctx
+        .committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(downloaded),
+                total_bytes: (total_bytes > 0).then_some(total_bytes),
+                progress: Some(progress_percent(downloaded, total_bytes)),
+                ..Default::default()
+            },
+        )
+        .await;
 }
 
 pub(crate) fn reconnect_backoff(attempt_1_based: u32) -> Duration {
@@ -1239,13 +1361,15 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_200ms_to_2s() {
+    fn reconnect_backoff_200ms_to_8s() {
         assert_eq!(reconnect_backoff(1), Duration::from_millis(200));
         assert_eq!(reconnect_backoff(2), Duration::from_millis(400));
         assert_eq!(reconnect_backoff(3), Duration::from_millis(800));
         assert_eq!(reconnect_backoff(4), Duration::from_millis(1600));
-        assert_eq!(reconnect_backoff(5), Duration::from_secs(2)); // 3200 capped
-        assert_eq!(reconnect_backoff(6), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(5), Duration::from_millis(3200));
+        assert_eq!(reconnect_backoff(6), Duration::from_millis(6400));
+        assert_eq!(reconnect_backoff(7), Duration::from_secs(8)); // 12800 capped
+        assert_eq!(reconnect_backoff(12), Duration::from_secs(8));
     }
 
     #[test]
@@ -1264,14 +1388,22 @@ mod tests {
         assert!(can_mid_transfer_reconnect(&body_err, 0, 100, true));
         assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, true));
         assert!(can_mid_transfer_reconnect(&stalled, 0, 100, true));
-        assert!(!can_mid_transfer_reconnect(&stalled, 0, 100, false));
+        // Unadvertised ranges still get a Range attempt after a stall or a short body.
+        assert!(can_mid_transfer_reconnect(&stalled, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 100, false));
+        let clean_eof = download_error(
+            FailureCategory::Network,
+            "Download ended without a length or chunked terminator (10 bytes).".into(),
+            true,
+        );
+        assert!(!can_mid_transfer_reconnect(&clean_eof, 0, 100, false));
         assert!(!can_mid_transfer_reconnect(
             &body_err,
             RECONNECT_MAX,
             100,
             true
         ));
-        assert!(!can_mid_transfer_reconnect(&body_err, 0, 100, false));
         assert!(can_mid_transfer_reconnect(&body_err, 0, 0, false));
     }
 
@@ -1343,10 +1475,17 @@ mod tests {
 
     #[test]
     fn ranges_usable_for_reconnect_rules() {
-        assert!(ranges_usable_for_reconnect(0, false));
-        assert!(ranges_usable_for_reconnect(0, true));
-        assert!(ranges_usable_for_reconnect(10, true));
-        assert!(!ranges_usable_for_reconnect(10, false));
+        let stall = crate::download::body::stall_error(std::time::Duration::from_secs(30));
+        let clean_eof = download_error(
+            FailureCategory::Network,
+            "Download ended without a length or chunked terminator (10 bytes).".into(),
+            true,
+        );
+        assert!(ranges_usable_for_reconnect(0, false, &stall));
+        assert!(ranges_usable_for_reconnect(0, true, &stall));
+        assert!(ranges_usable_for_reconnect(10, true, &stall));
+        assert!(ranges_usable_for_reconnect(10, false, &stall));
+        assert!(!ranges_usable_for_reconnect(10, false, &clean_eof));
     }
 
     #[test]

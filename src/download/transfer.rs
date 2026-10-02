@@ -250,6 +250,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU8;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1182,6 +1183,339 @@ Accept-Ranges: bytes\r\n\
         let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
         let ctx = test_ctx(job, on_progress);
         (dir, target, temp, ctx)
+    }
+
+    #[tokio::test]
+    async fn partial_body_without_accept_ranges_resumes_over_range() {
+        let body: Vec<u8> = (0..80u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        let _handle = tokio::spawn(async move {
+            let mut truncated = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected).into_owned();
+                seen_task.lock().unwrap().push(req.clone());
+                let lower = req.to_ascii_lowercase();
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: none\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&lower).unwrap_or(0) as usize;
+                if start == 0 && !truncated {
+                    truncated = true;
+                    let half = payload.len() / 2;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload[..half]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let slice = if start < payload.len() {
+                    &payload[start..]
+                } else {
+                    &[]
+                };
+                let end = payload.len().saturating_sub(1);
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    payload.len(),
+                    slice.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(slice).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-poor-part-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("http://{addr}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("truncated body must resume instead of failing");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|req| {
+                let lower = req.to_ascii_lowercase();
+                lower.contains("range: bytes=") && !lower.contains("range: bytes=0-0")
+            }),
+            "resume must send Range after the truncated body, got {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_503_then_success_keeps_the_download() {
+        let body = b"retry-me-please-0123456789";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.to_vec();
+        let _handle = tokio::spawn(async move {
+            let mut failures = 0u32;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if req.starts_with("GET ") && failures < 2 {
+                    failures += 1;
+                    let reply = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-poor-503-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("http://{addr}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("503 must be retried, not fail the transfer");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_416_once_keeps_partial_and_resumes() {
+        let body: Vec<u8> = (0..80u8).collect();
+        let prefix = 40usize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            let mut rejected = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0) as usize;
+                if start == prefix && !rejected {
+                    rejected = true;
+                    let reply = "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start == 0 {
+                    let wrong = vec![0xFFu8; payload.len()];
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        wrong.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&wrong).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let slice = &payload[start.min(payload.len())..];
+                let end = payload.len().saturating_sub(1);
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    payload.len(),
+                    slice.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(slice).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("rusticdl-poor-416-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        std::fs::write(&temp, &body[..prefix]).unwrap();
+        let url = format!("http://{addr}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        job.resume_supported = true;
+        job.total_bytes = body.len() as u64;
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = run_transfer(ctx)
+            .await
+            .expect("one 416 must retry the same offset");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn http_416_persistent_restarts_from_zero() {
+        let body: Vec<u8> = (0..80u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0) as usize;
+                if start > 0 {
+                    let reply = "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-poor-416-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        std::fs::write(&temp, &body[..40]).unwrap();
+        let url = format!("http://{addr}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        job.resume_supported = true;
+        job.total_bytes = body.len() as u64;
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(15), run_transfer(ctx))
+            .await
+            .expect("persistent 416 must restart from zero before the timeout")
+            .expect("transfer");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn range_start_from(lower_req: &str) -> Option<u64> {
+        let line = lower_req.lines().find(|line| line.starts_with("range:"))?;
+        let spec = line.split_once(':')?.1.trim();
+        let bytes = spec.strip_prefix("bytes=")?;
+        bytes.split(['-', ',']).next()?.parse().ok()
     }
 
     async fn spawn_scripted_server(replies: Vec<String>) -> (String, tokio::task::JoinHandle<()>) {
