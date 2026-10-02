@@ -115,7 +115,8 @@ fn failed_legacy_rule_install_retries_until_ok() {
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let handler = Arc::new(|cmd: &str| -> String {
-        if cmd.contains("windowrule[") {
+        // Reject Lua + named hyprlang so the ≤0.52 windowrulev2 path is exercised.
+        if cmd.starts_with("/eval ") || cmd.contains("windowrule[") {
             "Invalid".into()
         } else if cmd.contains("windowrulev2") || cmd == "j/clients" {
             if cmd == "j/clients" {
@@ -137,6 +138,10 @@ fn failed_legacy_rule_install_retries_until_ok() {
     );
     let first = recorded.lock().expect("record").clone();
     assert!(
+        first.iter().any(|c| c.starts_with("/eval hl.window_rule(")),
+        "Lua window_rule must be tried before hyprlang fallbacks, got {first:?}"
+    );
+    assert!(
         first.iter().any(|c| c.contains("windowrulev2 float")),
         "expected legacy float rule, got {first:?}"
     );
@@ -147,6 +152,80 @@ fn failed_legacy_rule_install_retries_until_ok() {
     assert!(
         !second.iter().any(|c| c.contains("windowrulev2")),
         "successful install must not repeat windowrulev2, got {second:?}"
+    );
+
+    stop.store(true, AtomicOrdering::SeqCst);
+    let _ = server.join();
+    unsafe {
+        match old_his {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&runtime);
+    LEGACY_CAPTURE_RULES_INSTALLED.store(false, AtomicOrdering::SeqCst);
+}
+
+#[test]
+fn prepare_installs_lua_window_rule_before_open() {
+    let _guard = env_lock();
+    LEGACY_CAPTURE_RULES_INSTALLED.store(false, AtomicOrdering::SeqCst);
+    let runtime = unique_runtime();
+    let his = "lua-rule-first";
+    let old_his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+    unsafe {
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", his);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    }
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(|cmd: &str| -> String {
+        if cmd == "j/clients" {
+            "[]".into()
+        } else {
+            "ok".into()
+        }
+    });
+    let server = spawn_mock_hypr(&runtime, his, handler, recorded.clone(), stop.clone());
+    std::thread::sleep(Duration::from_millis(20));
+
+    let _ = prepare_capture_window(540, 408);
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        cmds.iter().any(|c| {
+            c.starts_with("/eval hl.window_rule(")
+                && c.contains(r#"class = "^rusticdl-capture$""#)
+                && c.contains("float = true")
+                && c.contains("size = {540, 408}")
+                && c.contains("center = true")
+                && c.contains("no_anim = true")
+        }),
+        "Omarchy needs Lua hl.window_rule at designed size before map, got {cmds:?}"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| c.contains("windowrule[") || c.contains("windowrulev2")),
+        "successful Lua install must not fall through to hyprlang rules, got {cmds:?}"
+    );
+    assert!(
+        !LEGACY_CAPTURE_RULES_INSTALLED.load(AtomicOrdering::SeqCst),
+        "Lua success must not mark legacy rules installed"
+    );
+
+    // Refresh size for a different HUD phase (confirm → conflict).
+    recorded.lock().expect("record").clear();
+    let _ = prepare_capture_window(480, 268);
+    let refreshed = recorded.lock().expect("record").clone();
+    assert!(
+        refreshed.iter().any(|c| c.contains("size = {480, 268}")),
+        "named Lua rule must refresh size for the next HUD, got {refreshed:?}"
     );
 
     stop.store(true, AtomicOrdering::SeqCst);

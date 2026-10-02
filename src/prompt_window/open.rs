@@ -160,7 +160,9 @@ where
 
     // Class-scoped float/size/center rules must land before map — post-map
     // setfloating alone is the tile-then-float flash on Omarchy/Hyprland.
-    // Snapshot addresses now so the fallback cannot raise an older same-title HUD.
+    // On 0.55+/Omarchy this is Lua hl.window_rule; older Hyprland keeps
+    // hyprlang windowrule / windowrulev2. Snapshot addresses so the fallback
+    // cannot raise an older same-title HUD.
     let prior = hyprland::prepare_capture_window(hud_w, hud_h);
 
     let result = cx.open_window(

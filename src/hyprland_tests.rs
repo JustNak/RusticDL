@@ -152,6 +152,44 @@ fn legacy_size_command_is_exact_pixels_with_selector() {
 }
 
 #[test]
+fn lua_window_rule_command_floats_capture_class_at_size() {
+    let cmd = lua_window_rule_command(480, 268);
+    assert!(
+        cmd.starts_with("/eval hl.window_rule("),
+        "Omarchy/0.55 installs rules via Lua eval, got {cmd}"
+    );
+    assert!(
+        cmd.contains(r#"name = "rusticdl-capture""#),
+        "named rule so size can be refreshed per HUD phase, got {cmd}"
+    );
+    assert!(
+        cmd.contains(r#"match = { class = "^rusticdl-capture$" }"#),
+        "must match capture app_id only, got {cmd}"
+    );
+    assert!(
+        cmd.contains("float = true"),
+        "static float at map time, got {cmd}"
+    );
+    assert!(
+        cmd.contains("size = {480, 268}"),
+        "designed HUD size at map (Omarchy table form), got {cmd}"
+    );
+    assert!(cmd.contains("center = true"), "center at map, got {cmd}");
+    assert!(
+        cmd.contains("no_anim = true"),
+        "suppress open animation flash, got {cmd}"
+    );
+    assert!(
+        !cmd.contains("windowrule["),
+        "Lua path must not use deprecated hyprlang named keywords, got {cmd}"
+    );
+    assert!(
+        !cmd.contains("RusticDL"),
+        "must not match StartupWMClass=RusticDL, got {cmd}"
+    );
+}
+
+#[test]
 fn named_rule_keywords_target_capture_class_and_size() {
     let match_cmd = named_rule_keyword("match:class", &format!("^{}$", escape_ere(CAPTURE_APP_ID)));
     assert_eq!(
@@ -343,6 +381,18 @@ fn production_never_floats_the_focused_window() {
     assert!(
         production.contains("prepare_capture_window"),
         "pre-map rules are required to avoid tile-then-float"
+    );
+    assert!(
+        production.contains("install_lua_capture_rules"),
+        "Omarchy/0.55 needs Lua hl.window_rule before hyprlang keywords"
+    );
+    assert!(
+        production.contains("lua_window_rule_command"),
+        "Lua window_rule payload must be built for /eval"
+    );
+    assert!(
+        production.contains("/eval hl.window_rule"),
+        "0.55 pre-map install must speak /eval hl.window_rule"
     );
     assert!(
         production.contains("CAPTURE_APP_ID"),
