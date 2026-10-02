@@ -9,7 +9,7 @@ Large files can split across parallel HTTP Range connections. Smaller files, ser
 | **Map resume** | Multi jobs persist a segment map in `state.json` and resume each segment from `start + written`. After a map exists, file length is **not** treated as downloaded bytes (preallocate would look “complete”) |
 | **Global speed limit** | One process-wide budget shared by every body reader (single-stream and segments). `0` = unlimited |
 | **Fsync on pause** | Flush `.part` to disk when pausing (safer on power loss) |
-| **Reconnect** | Transient network/TLS drops, stalls, short bodies, and retryable HTTP errors (408, 421, 429, 5xx) retry the same pinned URL (per segment for multi; up to 12 times, 200 ms–8 s). A weak link keeps the offset and continues. Range is attempted even when the server did not advertise `Accept-Ranges`. A shorter 206 is a prefix, not a failed segment. A 416 retries the same offset before a from-zero restart, and a pause does not delete the partial. |
+| **Reconnect** | Transient network/TLS drops, stalls, short bodies, and retryable HTTP errors (408, 421, 429, 5xx) retry the same pinned URL (per segment for multi; up to 12 times, 200 ms–8 s). A weak link keeps the offset and continues. Range is attempted even when the server did not advertise `Accept-Ranges`; a 200 to that Range keeps the partial. A shorter 206 is a prefix, not a failed segment. A 416 retries the same offset before a from-zero restart, and that new partial gets the same 416 budget. A pause does not delete the partial. |
 
 ## Settings → Download Engine
 

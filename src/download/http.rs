@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{stream_body, AppendSink, StreamEnd};
+use super::body::{is_lengthless_eof, stream_body, AppendSink, StreamEnd};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
 use super::eta::EtaSmoother;
 use super::fetch::{
-    content_range_size_mismatch, fetch_range, sleep_interruptible, FetchRequest, RangeSpec,
-    RangeStatus, STALL_TIMEOUT,
+    content_range_size_mismatch, fetch_range, missing_content_range_error, sleep_interruptible,
+    FetchRequest, RangeSpec, RangeStatus, STALL_TIMEOUT,
 };
 use super::filesystem::{
     ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
@@ -290,11 +290,7 @@ pub async fn run_http_download_with_ctx(
             }
             RangeStatus::Other { status, retryable } => {
                 let error = if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
-                    download_error(
-                        FailureCategory::Http,
-                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                        true,
-                    )
+                    missing_content_range_error()
                 } else {
                     http_status_error(*status, *retryable)
                 };
@@ -338,6 +334,22 @@ pub async fn run_http_download_with_ctx(
                 ));
             }
             RangeStatus::FullEntityWhenRangeRequested => {
+                // A server that never advertised ranges answered the speculative
+                // Range with the whole entity. Streaming that 200 deletes the
+                // .part first; if the new body also dies, the offset is gone.
+                if !resume_supported && existing_bytes > 0 {
+                    if let Some(outcome) = control_outcome(&control) {
+                        return Ok(outcome);
+                    }
+                    let error = download_error(
+                        FailureCategory::Resume,
+                        "Server ignored Range; partial kept. Use Restart to download from zero."
+                            .into(),
+                        true,
+                    );
+                    checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                    return Err(error);
+                }
                 fresh_restarts = fresh_restarts.saturating_add(1);
                 if fresh_restarts > FRESH_RESTART_MAX {
                     let error = download_error(
@@ -378,7 +390,12 @@ pub async fn run_http_download_with_ctx(
                 }
                 *total
             }
-            RangeStatus::OkFromZero => None,
+            RangeStatus::OkFromZero => {
+                // The from-zero body is a new partial. One later 416 must not
+                // see the counter left at the discard threshold.
+                range_rejects = 0;
+                None
+            }
         };
 
         let http_status = response.status();
@@ -847,8 +864,8 @@ fn is_reconnectable_error(error: &DownloadError) -> bool {
 }
 
 /// Byte 0 can always be fetched again. A confirmed Range server can resume.
-/// Otherwise only truncation, stalls, and transient HTTP are worth a Range
-/// attempt — a clean EOF with no length must not spin.
+/// Otherwise a retryable network or HTTP error is worth a Range attempt.
+/// A clean EOF that never had a length must not spin.
 fn ranges_usable_for_reconnect(
     existing_bytes: u64,
     resume_supported: bool,
@@ -857,12 +874,7 @@ fn ranges_usable_for_reconnect(
     if existing_bytes == 0 || resume_supported {
         return true;
     }
-    error.retryable
-        && matches!(
-            error.category,
-            FailureCategory::Network | FailureCategory::Http
-        )
-        && !error.message.contains("without a length")
+    is_reconnectable_error(error) && !is_lengthless_eof(error)
 }
 
 async fn checkpoint_partial(ctx: &mut TransferContext, downloaded: u64, total_bytes: u64) {
@@ -1392,11 +1404,7 @@ mod tests {
         assert!(can_mid_transfer_reconnect(&stalled, 0, 100, false));
         assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, false));
         assert!(can_mid_transfer_reconnect(&body_err, 0, 100, false));
-        let clean_eof = download_error(
-            FailureCategory::Network,
-            "Download ended without a length or chunked terminator (10 bytes).".into(),
-            true,
-        );
+        let clean_eof = crate::download::body::lengthless_eof_error(10);
         assert!(!can_mid_transfer_reconnect(&clean_eof, 0, 100, false));
         assert!(!can_mid_transfer_reconnect(
             &body_err,
@@ -1476,11 +1484,7 @@ mod tests {
     #[test]
     fn ranges_usable_for_reconnect_rules() {
         let stall = crate::download::body::stall_error(std::time::Duration::from_secs(30));
-        let clean_eof = download_error(
-            FailureCategory::Network,
-            "Download ended without a length or chunked terminator (10 bytes).".into(),
-            true,
-        );
+        let clean_eof = crate::download::body::lengthless_eof_error(10);
         assert!(ranges_usable_for_reconnect(0, false, &stall));
         assert!(ranges_usable_for_reconnect(0, true, &stall));
         assert!(ranges_usable_for_reconnect(10, true, &stall));

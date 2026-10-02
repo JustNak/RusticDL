@@ -784,7 +784,7 @@ pub(crate) fn closed_slice_matches(response: &reqwest::Response, start: u64, end
     classify_segment_status(&status, start, end, None).is_ok()
 }
 
-fn missing_content_range_error() -> DownloadError {
+pub(crate) fn missing_content_range_error() -> DownloadError {
     download_error(
         FailureCategory::Http,
         "Missing or invalid Content-Range on partial response. Use Restart.".into(),

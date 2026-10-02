@@ -7,7 +7,9 @@ use tokio::sync::Mutex;
 use super::super::bandwidth::GlobalBandwidthLimiter;
 use super::super::context::TransferContext;
 use super::super::fetch::{sleep_interruptible, store_control};
-use super::super::filesystem::{metadata_len, reconcile_from_oracle, remove_partial};
+use super::super::filesystem::{
+    looks_like_preallocate_hole, metadata_len, reconcile_from_oracle, remove_partial,
+};
 use super::super::handoff::HandoffAuth;
 use super::super::job::{DownloadError, DownloadOutcome, Job, JobState, WorkerControl};
 use super::super::progress::{TransferEvent, TransferEventCallback};
@@ -225,7 +227,7 @@ fn single_stream_disk_counts(job: &Job) -> bool {
 /// A multi start that `set_len`s the `.part` before the map is saved. File
 /// length is not downloaded bytes. Unknown totals are not holes.
 fn sparse_preallocate_hole(downloaded: u64, total: u64, on_disk: u64) -> bool {
-    downloaded == 0 && total > 0 && on_disk >= total
+    looks_like_preallocate_hole(downloaded, on_disk, total) && total > 0
 }
 
 fn attempt_made_progress(before: u64, recorded: u64, on_disk: Option<u64>) -> bool {

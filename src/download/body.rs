@@ -397,14 +397,21 @@ where
         }
     }
     if policy == EosPolicy::UnknownLength {
-        return Err(download_error(
-            FailureCategory::Network,
-            format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
-            true,
-        ));
+        return Err(lengthless_eof_error(downloaded));
     }
 
     Ok(StreamEnd::Exhausted { downloaded })
+}
+
+pub(crate) fn lengthless_eof_error(downloaded: u64) -> DownloadError {
+    download_error(
+        FailureCategory::Network,
+        format!("Download ended without a length or chunked terminator ({downloaded} bytes)."),
+        true,
+    )
+}
+pub(crate) fn is_lengthless_eof(error: &DownloadError) -> bool {
+    error.message.contains("without a length")
 }
 
 fn target_reached(sink: &impl BodySink) -> bool {
@@ -599,12 +606,10 @@ mod tests {
         )
         .await
         .expect("reset after the last byte must not fail the transfer");
-        match end {
-            StreamEnd::Exhausted { downloaded } => {
-                assert_eq!(downloaded, payload.len() as u64);
-            }
-            StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
-        }
+        let StreamEnd::Exhausted { downloaded } = end else {
+            panic!("unexpected {end:?}");
+        };
+        assert_eq!(downloaded, payload.len() as u64);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -988,7 +993,7 @@ mod tests {
         .await
         .expect_err("clean EOF without a length must not complete");
         assert!(err.retryable);
-        assert!(err.message.contains("without a length"));
+        assert!(is_lengthless_eof(&err));
         assert_eq!(sink.offset(), b"partial".len() as u64);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
