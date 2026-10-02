@@ -3,10 +3,15 @@
 //! Detection is an env probe only (`HYPRLAND_INSTANCE_SIGNATURE`) — no HIS
 //! socket for the probe itself. Capture HUDs use a dedicated Wayland `app_id`
 //! ([`CAPTURE_APP_ID`]) so rules and IPC can target them without floating the
-//! main queue window. Pre-map `windowrule` keywords float/size/center the HUD
-//! at creation; post-map IPC remains a best-effort fallback when rules miss.
-//! Post-map dispatch targets the newly mapped surface by Hyprland address, not
-//! a shared OS title.
+//! main queue window.
+//!
+//! Pre-map rules must land before `open_window` so the HUD maps already
+//! floating at its designed size (Omarchy/Hyprland otherwise tiles for a
+//! frame, then post-map float snaps it). On Hyprland 0.55+ / Omarchy the
+//! config is Lua: install via `/eval hl.window_rule({...})`. Older sessions
+//! still get hyprlang named `windowrule[...]` or `windowrulev2`. Post-map
+//! IPC remains a best-effort fallback when rules miss, and targets the newly
+//! mapped surface by Hyprland address — not a shared OS title.
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +50,11 @@ pub fn is_hyprland() -> bool {
 /// Call **before** `open_window`. Static float/size/center rules only apply at
 /// map time; post-map `setfloating` cannot undo the first tiled frame.
 ///
+/// Preference order matches compositor generations:
+/// 1. Lua `hl.window_rule` via `/eval` (Hyprland 0.55+ / Omarchy)
+/// 2. Named hyprlang `windowrule[name]:…` (0.53–0.54)
+/// 3. Anonymous `windowrulev2` once (≤0.52)
+///
 /// Returns the current process's client addresses so the post-map fallback can
 /// target only the HUD that maps after this call.
 ///
@@ -55,7 +65,8 @@ pub fn prepare_capture_window(width: u32, height: u32) -> CaptureWindowSnapshot 
         if !is_hyprland() {
             return CaptureWindowSnapshot::default();
         }
-        if !install_named_capture_rules(width, height) {
+        if !install_lua_capture_rules(width, height) && !install_named_capture_rules(width, height)
+        {
             install_legacy_capture_rules_once();
         }
         snapshot_our_window_addresses()
@@ -192,6 +203,18 @@ fn legacy_focus_command(selector: &str) -> String {
 
 fn legacy_center_command() -> &'static str {
     "/dispatch centerwindow"
+}
+
+/// Hyprland 0.55+ Lua config: named rule so the next capture map floats at size.
+///
+/// Omarchy ships Lua-only Hyprland; hyprlang `/keyword windowrule[…]` is ignored
+/// there, which left only the post-map float path (tile-then-float flash).
+/// Re-calling with the same `name` refreshes size for the next HUD phase.
+fn lua_window_rule_command(width: u32, height: u32) -> String {
+    let class_re = lua_string_escape(&format!("^{}$", escape_ere(CAPTURE_APP_ID)));
+    format!(
+        "/eval hl.window_rule({{ name = \"{CAPTURE_RULE_NAME}\", match = {{ class = \"{class_re}\" }}, float = true, size = {{{width}, {height}}}, center = true, no_anim = true }})"
+    )
 }
 
 /// Hyprland 0.53+ named windowrule field write.
@@ -373,7 +396,19 @@ fn dispatch_size_center(selector: &str, width: u32, height: u32) {
     }
 }
 
-/// 0.53+ named rules: match capture class, float, size, center, no open anim.
+/// 0.55+ Lua `hl.window_rule` so capture HUDs map floating (Omarchy).
+///
+/// Returns `true` when `/eval` accepted the rule (`ok`).
+#[cfg(target_os = "linux")]
+fn install_lua_capture_rules(width: u32, height: u32) -> bool {
+    match hyprland_ipc(&lua_window_rule_command(width, height)) {
+        Ok(reply) if classify_dispatch_reply(&reply) == DispatchReply::Ok => true,
+        _ => false,
+    }
+}
+
+/// 0.53–0.54 named hyprlang rules: match capture class, float, size, center,
+/// no open anim.
 ///
 /// Returns `true` when the compositor accepted the named-rule syntax.
 #[cfg(target_os = "linux")]
