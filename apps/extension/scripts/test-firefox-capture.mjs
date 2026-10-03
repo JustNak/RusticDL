@@ -233,6 +233,21 @@ assert(
 );
 
 assert(
+  'rejects tiny xhr zip on a file-host CDN',
+  candidate({
+    url: 'https://store1.gofile.io/download/web/token/app.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES - 1) },
+    ],
+  }) === null,
+);
+
+assert(
   'captures large xhr zip from a file-host CDN',
   candidate({
     url: 'https://store1.gofile.io/download/web/token/app.zip',
