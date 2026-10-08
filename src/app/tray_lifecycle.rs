@@ -4,7 +4,7 @@ use tokio::sync::oneshot;
 use super::DownloadApp;
 use crate::download::{open_path, EngineCommand};
 use crate::hyprland;
-use crate::notifications::BalloonOutcome;
+use crate::notifications::{spawn_session_notify, BalloonOutcome};
 use crate::prompt_window::close_capture_window;
 use crate::settings::OsNotifyMode;
 use crate::tray::{
@@ -22,14 +22,19 @@ pub(crate) enum CloseAction {
     /// No tray to restore from: minimize (still reachable from the taskbar/dock)
     /// and keep running.
     Minimize,
+    /// Hyprland without a tray host: still hide (special workspace) and keep
+    /// running. Relaunch, the extension, and Ctrl+Q after restoring remain.
+    HideWithoutTray,
 }
 
 /// Pick the close behaviour. Pure so the platform matrix is unit-tested.
 ///
 /// A window may only vanish when something can bring it back (the tray).
 /// Without a tray, desktops with a working minimize keep the app alive in the
-/// taskbar; Hyprland has no minimize, so there the app quits rather than
-/// leaving an invisible process. Windows and macOS keep their old behaviour.
+/// taskbar. Hyprland has no minimize, so it hides to a special workspace even
+/// without a tray; a relaunch (single-instance) or an extension action that
+/// needs the UI brings the window back. Windows and macOS keep their old
+/// behaviour.
 pub(crate) fn decide_close_action(
     close_to_background: bool,
     tray_available: bool,
@@ -40,7 +45,9 @@ pub(crate) fn decide_close_action(
         CloseAction::Quit
     } else if tray_available {
         CloseAction::HideToTray
-    } else if linux && !hyprland {
+    } else if linux && hyprland {
+        CloseAction::HideWithoutTray
+    } else if linux {
         CloseAction::Minimize
     } else {
         CloseAction::Quit
@@ -105,6 +112,14 @@ impl DownloadApp {
                 self.window_hidden_to_tray = true;
                 self.close_capture_huds(cx);
             }
+            CloseAction::HideWithoutTray => {
+                self.flush_window_layout_now();
+                self.remember_main_window(window);
+                hide_main_window(window);
+                self.window_hidden_to_tray = true;
+                self.close_capture_huds(cx);
+                self.notify_hidden_without_tray();
+            }
             CloseAction::Minimize => {
                 self.flush_window_layout_now();
                 self.remember_main_window(window);
@@ -113,6 +128,19 @@ impl DownloadApp {
         }
         cx.notify();
         false
+    }
+
+    /// One desktop notification per session so a trayless hide is not a
+    /// silent disappearance. Best-effort: `notify-send` may be missing.
+    fn notify_hidden_without_tray(&mut self) {
+        if self.no_tray_hide_notified {
+            return;
+        }
+        self.no_tray_hide_notified = true;
+        spawn_session_notify(
+            "RusticDL is still running",
+            "No system tray was found. Downloads and the browser extension keep working. Launch RusticDL again to bring the window back.",
+        );
     }
 
     fn remember_main_window(&mut self, window: &Window) {
@@ -314,8 +342,16 @@ mod tests {
             decide_close_action(true, false, true, false),
             CloseAction::Minimize
         );
+    }
+
+    #[test]
+    fn hyprland_without_tray_hides_instead_of_quitting() {
         assert_eq!(
             decide_close_action(true, false, true, true),
+            CloseAction::HideWithoutTray
+        );
+        assert_eq!(
+            decide_close_action(false, false, true, true),
             CloseAction::Quit
         );
     }

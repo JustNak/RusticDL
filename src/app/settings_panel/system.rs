@@ -30,7 +30,7 @@ impl DownloadApp {
                             }
                         })
                         .hint(if cfg!(target_os = "linux") {
-                            "Keeps running in the background so the browser extension keeps working. Needs a tray for hiding; Ctrl+Q quits."
+                            "Keeps running in the background so the browser extension keeps working. Ctrl+Q quits; without a tray, relaunch the app to bring the window back."
                         } else {
                             "Hides to the tray instead of quitting."
                         }),
