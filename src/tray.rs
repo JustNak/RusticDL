@@ -1,4 +1,11 @@
-//! System tray (notification area / overflow) icon for Windows.
+//! System tray (notification area / overflow) icon.
+//!
+//! Windows uses a Win32 notification-area icon. Linux uses a
+//! StatusNotifierItem (SNI) over D-Bus via `ksni`, which Waybar (Omarchy),
+//! KDE, and GNOME's AppIndicator extension all host. When no SNI watcher or
+//! host is running, [`SystemTray::start`] returns `None` and the caller falls
+//! back instead of hiding the window with no way back.
+//!
 //! Provides a tray icon with a context menu so the user can restore the main
 //! window or fully quit while the app is hidden via "close to tray".
 //! Balloon notifications (`NIF_INFO`) are shown only on the tray message thread:
@@ -57,6 +64,8 @@ pub fn truncate_utf16_units(s: &str, max_units: usize) -> &str {
 
 /// RAII handle for the background tray icon. Dropping it removes the icon.
 pub struct SystemTray {
+    #[cfg(target_os = "linux")]
+    linux: linux_impl::LinuxTrayHandle,
     #[cfg(windows)]
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
@@ -74,11 +83,22 @@ impl SystemTray {
         {
             windows_impl::start(event_tx)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            linux_impl::start(event_tx)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = event_tx;
             None
         }
+    }
+
+    /// Whether this tray can show balloon notifications itself.
+    ///
+    /// SNI has no balloon API; Linux notifications go through `notify-send`.
+    pub fn supports_balloons(&self) -> bool {
+        cfg!(windows)
     }
 
     ///
@@ -109,6 +129,10 @@ impl SystemTray {
 
 impl Drop for SystemTray {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.linux.shutdown();
+        }
         #[cfg(windows)]
         {
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -169,7 +193,15 @@ pub fn hide_main_window(window: &gpui::Window) {
             show_hwnd(hwnd, false);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // Hyprland (and most tiling WMs) ignore minimize; a special workspace
+        // really takes the window off screen. Elsewhere minimize is honoured.
+        if !crate::hyprland::hide_main_windows() {
+            window.minimize_window();
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = window;
     }
@@ -182,6 +214,10 @@ pub fn show_main_window(window: &gpui::Window) {
         if hwnd != 0 {
             show_hwnd(hwnd, true);
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::hyprland::show_main_windows();
     }
     window.activate_window();
 }
@@ -217,6 +253,134 @@ pub fn reassert_tray_hide(hwnd: isize) {
     #[cfg(not(windows))]
     {
         let _ = hwnd;
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::{SystemTray, TrayEvent, APP_NAME};
+    use ksni::blocking::{Handle, TrayMethods};
+    use ksni::menu::StandardItem;
+    use ksni::{Category, Icon, MenuItem, ToolTip, Tray};
+
+    const TRAY_ICON_PNG: &[u8] = include_bytes!("../assets/brand/icon-64.png");
+    const ICON_NAME: &str = "rusticdl";
+
+    pub(super) type LinuxTrayHandle = Handle<LinuxTray>;
+
+    pub(super) struct LinuxTray {
+        event_tx: async_channel::Sender<TrayEvent>,
+        icon: Vec<Icon>,
+    }
+
+    impl LinuxTray {
+        fn send(&self, event: TrayEvent) {
+            let _ = self.event_tx.send_blocking(event);
+        }
+    }
+
+    impl Tray for LinuxTray {
+        fn id(&self) -> String {
+            "rusticdl".into()
+        }
+
+        fn title(&self) -> String {
+            APP_NAME.into()
+        }
+
+        fn category(&self) -> Category {
+            Category::ApplicationStatus
+        }
+
+        fn icon_name(&self) -> String {
+            ICON_NAME.into()
+        }
+
+        fn icon_pixmap(&self) -> Vec<Icon> {
+            self.icon.clone()
+        }
+
+        fn tool_tip(&self) -> ToolTip {
+            ToolTip {
+                title: APP_NAME.into(),
+                ..Default::default()
+            }
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            self.send(TrayEvent::ShowWindow);
+        }
+
+        fn menu(&self) -> Vec<MenuItem<Self>> {
+            vec![
+                StandardItem {
+                    label: format!("Show {APP_NAME}"),
+                    activate: Box::new(|this: &mut Self| this.send(TrayEvent::ShowWindow)),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                StandardItem {
+                    label: "Quit".into(),
+                    icon_name: "application-exit".into(),
+                    activate: Box::new(|this: &mut Self| this.send(TrayEvent::Exit)),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        }
+    }
+
+    /// Decode the bundled PNG into SNI's ARGB32 (network byte order) pixmap.
+    pub(super) fn argb_pixmap(png: &[u8]) -> Option<Icon> {
+        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+            .ok()?
+            .to_rgba8();
+        let (width, height) = img.dimensions();
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for px in img.pixels() {
+            let [r, g, b, a] = px.0;
+            data.extend_from_slice(&[a, r, g, b]);
+        }
+        Some(Icon {
+            width: width as i32,
+            height: height as i32,
+            data,
+        })
+    }
+
+    /// Register an SNI item. `None` when D-Bus, the watcher, or a host is
+    /// missing, so callers never hide the window behind a tray that is not there.
+    pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
+        let tray = LinuxTray {
+            event_tx,
+            icon: argb_pixmap(TRAY_ICON_PNG).into_iter().collect(),
+        };
+        match tray.spawn() {
+            Ok(handle) => Some(SystemTray { linux: handle }),
+            Err(error) => {
+                eprintln!("rusticdl: tray unavailable ({error})");
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bundled_icon_decodes_to_argb32() {
+            let icon = argb_pixmap(TRAY_ICON_PNG).expect("icon decodes");
+            assert_eq!(icon.width, 64);
+            assert_eq!(icon.height, 64);
+            assert_eq!(icon.data.len(), 64 * 64 * 4);
+        }
+
+        #[test]
+        fn garbage_png_is_rejected() {
+            assert!(argb_pixmap(b"not a png").is_none());
+        }
     }
 }
 

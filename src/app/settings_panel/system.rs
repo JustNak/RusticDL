@@ -29,7 +29,11 @@ impl DownloadApp {
                                 });
                             }
                         })
-                        .hint("Hides to the tray instead of quitting."),
+                        .hint(if cfg!(target_os = "linux") {
+                            "Keeps running in the background so the browser extension keeps working. Needs a tray for hiding; Ctrl+Q quits."
+                        } else {
+                            "Hides to the tray instead of quitting."
+                        }),
                     )
                     .child(SettingsToggleRow::new(
                         "startup",

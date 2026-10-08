@@ -495,6 +495,126 @@ fn query_new_capture_address(
     pick_new_capture_address(prior, &clients, std::process::id(), expected_title)
 }
 
+/// Special workspace that parks the hidden main window (close to background).
+#[cfg(target_os = "linux")]
+const HIDDEN_WORKSPACE: &str = "special:rusticdl";
+
+/// This process's main-window clients (capture HUDs are excluded).
+#[cfg(target_os = "linux")]
+fn main_window_clients(clients: &[HyprClient], our_pid: u32) -> Vec<&HyprClient> {
+    clients
+        .iter()
+        .filter(|c| c.pid == our_pid && c.class != CAPTURE_APP_ID)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn lua_hide_command(selector: &str) -> String {
+    format!(
+        r#"/dispatch hl.dsp.window.move({{ workspace = "{HIDDEN_WORKSPACE}", follow = false, window = "{}" }})"#,
+        lua_string_escape(selector)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_hide_command(selector: &str) -> String {
+    format!("/dispatch movetoworkspacesilent {HIDDEN_WORKSPACE},{selector}")
+}
+
+#[cfg(target_os = "linux")]
+fn lua_show_command(workspace: &str, selector: &str) -> String {
+    format!(
+        r#"/dispatch hl.dsp.window.move({{ workspace = "{}", window = "{}" }})"#,
+        lua_string_escape(workspace),
+        lua_string_escape(selector)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_show_command(workspace: &str, selector: &str) -> String {
+    format!("/dispatch movetoworkspace {workspace},{selector}")
+}
+
+#[cfg(target_os = "linux")]
+fn lua_focus_command(selector: &str) -> String {
+    format!(
+        r#"/dispatch hl.dsp.focus({{ window = "{}" }})"#,
+        lua_string_escape(selector)
+    )
+}
+
+/// Workspace to restore onto: the active one by id, or `e+0` (relative
+/// "current") when the id is unknown or a special workspace is focused.
+#[cfg(target_os = "linux")]
+fn parse_active_workspace(json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_i64()))
+        .filter(|id| *id > 0)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "e+0".to_string())
+}
+
+/// Park the main window on a special workspace so it is truly off screen.
+///
+/// Hyprland has no minimize, so this is the only way to "hide" there. Returns
+/// `false` when not on Hyprland or the compositor refused, so the caller can
+/// fall back to a plain minimize rather than assume the window is gone.
+#[cfg(target_os = "linux")]
+pub fn hide_main_windows() -> bool {
+    if !is_hyprland() {
+        return false;
+    }
+    let Some(addresses) = our_main_window_addresses() else {
+        return false;
+    };
+    let mut moved = false;
+    for address in addresses {
+        let selector = address_selector(&address);
+        moved |= dispatch_lua_then_legacy(
+            &lua_hide_command(&selector),
+            &legacy_hide_command(&selector),
+        );
+    }
+    moved
+}
+
+/// Bring the main window back to the active workspace and focus it.
+#[cfg(target_os = "linux")]
+pub fn show_main_windows() {
+    if !is_hyprland() {
+        return;
+    }
+    let Some(addresses) = our_main_window_addresses() else {
+        return;
+    };
+    let workspace = hyprland_ipc("j/activeworkspace")
+        .map(|reply| parse_active_workspace(&reply))
+        .unwrap_or_else(|_| "e+0".to_string());
+    for address in addresses {
+        let selector = address_selector(&address);
+        let _ = dispatch_lua_then_legacy(
+            &lua_show_command(&workspace, &selector),
+            &legacy_show_command(&workspace, &selector),
+        );
+        let _ = dispatch_lua_then_legacy(
+            &lua_focus_command(&selector),
+            &legacy_focus_command(&selector),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn our_main_window_addresses() -> Option<Vec<String>> {
+    let reply = hyprland_ipc("j/clients").ok()?;
+    let clients = parse_hypr_clients(&reply)?;
+    let addresses: Vec<String> = main_window_clients(&clients, std::process::id())
+        .into_iter()
+        .map(|c| c.address.clone())
+        .collect();
+    (!addresses.is_empty()).then_some(addresses)
+}
+
 #[cfg(target_os = "linux")]
 fn hyprland_ipc(command: &str) -> std::io::Result<String> {
     use std::io::{Read, Write};

@@ -437,3 +437,57 @@ fn float_and_prepare_are_noop_off_hyprland() {
     assert_eq!(prior, CaptureWindowSnapshot::default());
     float_capture_windows("RusticDL — Confirm Download", 480, 268, prior);
 }
+
+#[cfg(target_os = "linux")]
+mod close_to_background {
+    use super::*;
+
+    #[test]
+    fn main_window_clients_skip_capture_huds_and_other_pids() {
+        let clients = vec![
+            client("0x1", "RusticDL", "RusticDL", 10, false),
+            client("0x2", CAPTURE_APP_ID, "Confirm", 10, true),
+            client("0x3", "RusticDL", "RusticDL", 11, false),
+        ];
+        let main = main_window_clients(&clients, 10);
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].address, "0x1");
+    }
+
+    #[test]
+    fn hide_commands_target_special_workspace_silently() {
+        let sel = address_selector("0xabc");
+        assert_eq!(
+            legacy_hide_command(&sel),
+            "/dispatch movetoworkspacesilent special:rusticdl,address:0xabc"
+        );
+        let lua = lua_hide_command(&sel);
+        assert!(lua.contains("special:rusticdl"));
+        assert!(lua.contains("follow = false"));
+        assert!(lua.contains("address:0xabc"));
+    }
+
+    #[test]
+    fn show_commands_use_target_workspace() {
+        let sel = address_selector("0xabc");
+        assert_eq!(
+            legacy_show_command("3", &sel),
+            "/dispatch movetoworkspace 3,address:0xabc"
+        );
+        assert!(lua_show_command("3", &sel).contains(r#"workspace = "3""#));
+    }
+
+    #[test]
+    fn active_workspace_prefers_positive_id() {
+        assert_eq!(parse_active_workspace(r#"{"id":4,"name":"4"}"#), "4");
+    }
+
+    #[test]
+    fn active_workspace_falls_back_to_relative_current() {
+        assert_eq!(
+            parse_active_workspace(r#"{"id":-98,"name":"special:x"}"#),
+            "e+0"
+        );
+        assert_eq!(parse_active_workspace("garbage"), "e+0");
+    }
+}
