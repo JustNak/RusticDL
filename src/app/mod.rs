@@ -51,8 +51,7 @@ use crate::ipc::IpcBridge;
 use crate::notifications::{BalloonContextMap, OsNotifyBuffer};
 use crate::persistence::{load_pending_whats_new, AppPaths, PendingWhatsNew};
 use crate::settings::{
-    AccentPreset, OsNotifyMode, Settings, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY,
-    MAX_WINDOW_TRANSPARENCY,
+    AccentPreset, Settings, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::launched_minimized;
 use crate::tray::{main_window_hwnd, show_main_window, SystemTray, TrayEvent};
@@ -109,8 +108,12 @@ pub struct DownloadApp {
     pending_show_whats_new: bool,
     system_tray: Option<SystemTray>,
     force_quit: bool,
+    no_tray_hide_notified: bool,
     window_hidden_to_tray: bool,
     main_hwnd: isize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    main_window: Option<gpui::AnyWindowHandle>,
+    tray_retry_after: Option<Instant>,
     pending_tray_show: bool,
     pending_balloon_click: Option<u64>,
     os_notify_buffer: OsNotifyBuffer,
@@ -330,6 +333,25 @@ impl DownloadApp {
         // Settings / clear selection or stop propagation for the prompt.
         let escape_view = cx.weak_entity();
         cx.intercept_keystrokes(move |event: &KeystrokeEvent, window, cx| {
+            if tray_lifecycle::is_quit_chord(&event.keystroke) {
+                // Main window only: Ctrl+Q inside a capture HUD (Confirm
+                // download) must not silently quit the app.
+                let Some(entity) = escape_view.upgrade() else {
+                    return;
+                };
+                let handle = window.window_handle();
+                let quit = entity.update(cx, |app, cx| {
+                    let is_main = app.main_window == Some(handle);
+                    if is_main {
+                        app.force_quit_app(cx);
+                    }
+                    is_main
+                });
+                if quit {
+                    cx.stop_propagation();
+                }
+                return;
+            }
             if event.keystroke.key.as_str() != "escape" || event.keystroke.modifiers.modified() {
                 return;
             }
@@ -402,9 +424,11 @@ impl DownloadApp {
         ipc.update_jobs(Arc::clone(&jobs));
 
         let started_minimized = launched_minimized();
-        let need_tray = settings.close_to_tray
-            || started_minimized
-            || settings.os_notify_mode != OsNotifyMode::Off;
+        let need_tray = tray_lifecycle::tray_wanted(
+            settings.close_to_tray,
+            started_minimized,
+            settings.os_notify_mode,
+        );
         let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
         let system_tray = if need_tray {
             SystemTray::start(tray_tx)
@@ -412,6 +436,8 @@ impl DownloadApp {
             drop(tray_tx);
             None
         };
+        let tray_retry_after = (need_tray && system_tray.is_none())
+            .then(|| Instant::now() + tray_lifecycle::NO_TRAY_RETRY);
 
         if system_tray.is_some() {
             cx.spawn(async move |this, cx| {
@@ -480,8 +506,11 @@ impl DownloadApp {
             pending_show_whats_new: false,
             system_tray,
             force_quit: false,
+            no_tray_hide_notified: false,
             window_hidden_to_tray: started_minimized,
             main_hwnd: main_window_hwnd(window),
+            main_window: Some(window.window_handle()),
+            tray_retry_after,
             pending_tray_show: false,
             pending_balloon_click: None,
             os_notify_buffer: OsNotifyBuffer::default(),
@@ -685,9 +714,8 @@ impl Render for DownloadApp {
         self.flush_toast(cx);
         self.apply_pending_tray_actions(window, cx);
         self.apply_pending_whats_new(window, cx);
-        if self.ipc.take_show_window_request() {
+        if self.ipc.take_show_window_request() && show_main_window(window) {
             self.window_hidden_to_tray = false;
-            show_main_window(window);
         }
         if self.extension_text_inputs_stale && self.filter == FilterKind::Settings {
             self.refresh_extension_text_inputs(window, cx);

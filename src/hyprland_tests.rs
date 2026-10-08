@@ -437,3 +437,98 @@ fn float_and_prepare_are_noop_off_hyprland() {
     assert_eq!(prior, CaptureWindowSnapshot::default());
     float_capture_windows("RusticDL — Confirm Download", 480, 268, prior);
 }
+
+#[cfg(target_os = "linux")]
+mod close_to_background {
+    use super::*;
+
+    #[test]
+    fn main_window_clients_skip_capture_huds_and_other_pids() {
+        let clients = vec![
+            client("0x1", "RusticDL", "RusticDL", 10, false),
+            client("0x2", CAPTURE_APP_ID, "Confirm", 10, true),
+            client("0x3", "RusticDL", "RusticDL", 11, false),
+        ];
+        let main = main_window_clients(&clients, 10);
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].address, "0x1");
+    }
+
+    #[test]
+    fn hide_commands_target_special_workspace_silently() {
+        let sel = address_selector("0xabc");
+        assert_eq!(
+            legacy_hide_command(&sel),
+            "/dispatch movetoworkspacesilent special:rusticdl,address:0xabc"
+        );
+        let lua = lua_hide_command(&sel);
+        assert!(lua.contains("special:rusticdl"));
+        assert!(lua.contains("follow = false"));
+        assert!(lua.contains("address:0xabc"));
+    }
+
+    #[test]
+    fn show_commands_use_target_workspace() {
+        let sel = address_selector("0xabc");
+        assert_eq!(
+            legacy_show_command("3", &sel),
+            "/dispatch movetoworkspace 3,address:0xabc"
+        );
+        assert!(lua_show_command("3", &sel).contains(r#"workspace = "3""#));
+    }
+
+    #[test]
+    fn active_workspace_prefers_positive_id() {
+        assert_eq!(
+            restore_workspace_id(r#"{"id":4,"name":"4"}"#, None).as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn special_workspace_uses_focused_monitor_not_e_plus_zero() {
+        let active = r#"{"id":-98,"name":"special:rusticdl"}"#;
+        let monitors = r#"[{"id":0,"name":"DP-1","focused":false,"activeWorkspace":{"id":9,"name":"9"},"specialWorkspace":{"id":0,"name":""}},{"id":1,"name":"DP-2","focused":true,"activeWorkspace":{"id":2,"name":"2"},"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+        assert_eq!(
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("2")
+        );
+        assert_ne!(
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("e+0")
+        );
+        let target = restore_workspace_id(active, Some(monitors)).unwrap();
+        assert!(target.chars().all(|c| c.is_ascii_digit()));
+        assert!(!target.contains("special"));
+    }
+
+    #[test]
+    fn special_without_focused_flag_uses_that_monitors_workspace() {
+        let active = r#"{"id":-99,"name":"special:scratchpad"}"#;
+        let monitors = r#"[{"id":0,"activeWorkspace":{"id":3,"name":"three"},"specialWorkspace":{"id":-99,"name":"special:scratchpad"}}]"#;
+        assert_eq!(
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_does_not_dispatch_e_plus_zero() {
+        assert_eq!(restore_workspace_id("garbage", None), None);
+        assert_eq!(
+            restore_workspace_id(r#"{"id":-98,"name":"special:x"}"#, None),
+            None
+        );
+        assert_eq!(
+            restore_workspace_id(r#"{"id":-98,"name":"special:x"}"#, Some("not json")),
+            None
+        );
+    }
+
+    #[test]
+    fn move_dispatch_falls_through_on_failed_lua() {
+        assert!(!move_tries_legacy(DispatchReply::Ok));
+        assert!(move_tries_legacy(DispatchReply::WrongSyntax));
+        assert!(move_tries_legacy(DispatchReply::Failed));
+    }
+}

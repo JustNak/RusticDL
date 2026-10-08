@@ -10,6 +10,8 @@ mod extension_settings;
 mod format;
 mod hyprland;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod linux_restore;
 mod native_host_register;
 mod notifications;
 mod persistence;
@@ -24,7 +26,7 @@ mod window_placement;
 
 use app::DownloadApp;
 use assets::Assets;
-use branding::{APP_NAME, APP_USER_MODEL_ID};
+use branding::{APP_NAME, APP_USER_MODEL_ID, MAIN_WINDOW_APP_ID};
 use download::{spawn_engine, EngineRuntimeConfig, FileJobStore};
 use gpui::{
     point, px, size, App, AppContext, Application, Bounds, SharedString, WindowBounds,
@@ -125,6 +127,9 @@ fn main() {
                                 px(MIN_WINDOW_WIDTH),
                                 px(MIN_WINDOW_HEIGHT),
                             )),
+                            // Without an app id, Wayland `activate_window` skips the
+                            // xdg-activation token entirely.
+                            app_id: Some(MAIN_WINDOW_APP_ID.to_string()),
                             show: !start_hidden,
                             ..Default::default()
                         },

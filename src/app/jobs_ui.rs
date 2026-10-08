@@ -133,7 +133,11 @@ impl DownloadApp {
         };
 
         self.sync_tray_lifetime(cx);
-        if let Some(tray) = self.system_tray.as_ref() {
+        if let Some(tray) = self
+            .system_tray
+            .as_ref()
+            .filter(|tray| tray.supports_balloons())
+        {
             let context_id = self.balloon_contexts.allocate(&payload);
             tray.show_notification(&payload.title, &payload.body, payload.level, context_id);
             self.os_notify_buffer.after_flush(now);
