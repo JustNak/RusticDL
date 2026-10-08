@@ -114,7 +114,7 @@ pub(crate) fn request_compositor_unminimize() {
     // KWin executes it with session-bus access. No runtime dir, no KWin path.
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .filter(|dir| dir.is_absolute() && runtime_dir_is_private(dir))
     else {
         return;
     };
@@ -126,6 +126,19 @@ pub(crate) fn request_compositor_unminimize() {
         .spawn(move || {
             let _ = run_kwin_script(&dir, &name, &script);
         });
+}
+
+/// The runtime dir must be a directory we own that nobody else can enter,
+/// otherwise a hostile `XDG_RUNTIME_DIR` would reopen the shared-path hole.
+fn runtime_dir_is_private(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).is_ok_and(|meta| {
+        meta.is_dir() && dir_is_private(meta.uid(), meta.mode(), unsafe { libc::getuid() })
+    })
+}
+
+fn dir_is_private(owner: u32, mode: u32, our_uid: u32) -> bool {
+    owner == our_uid && mode & 0o077 == 0
 }
 
 /// Create the script file exclusively: new file only, never through a
@@ -163,15 +176,16 @@ fn kwin_method(args: &[&str], limit: Duration) -> io::Result<std::process::Outpu
     dbus_send(&full, limit)
 }
 
-fn unload_script(name_arg: &str) {
-    let _ = kwin_method(
+fn unload_script(name_arg: &str) -> bool {
+    kwin_method(
         &[
             "/Scripting",
             "org.kde.kwin.Scripting.unloadScript",
             name_arg,
         ],
         DBUS_TIMEOUT,
-    );
+    )
+    .is_ok_and(|output| output.status.success())
 }
 
 fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Result<()> {
@@ -217,9 +231,11 @@ fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Resul
         Err(io::Error::other("kwin script run failed"))
     })();
 
-    unload_script(&name_arg);
-    if result.is_err() {
-        unload_script(&name_arg);
+    // Sweep once more when the first unload failed or timed out, or when the
+    // load never confirmed (it may have landed late).
+    if (!unload_script(&name_arg) || result.is_err()) && !unload_script(&name_arg) {
+        std::thread::sleep(LATE_LOAD_GRACE);
+        let _ = unload_script(&name_arg);
     }
     let _ = std::fs::remove_file(&path);
     result
@@ -378,5 +394,13 @@ mod tests {
             parse_dbus_script_id(&String::from_utf8_lossy(&output.stdout)),
             Some(7)
         );
+    }
+
+    #[test]
+    fn runtime_dir_must_be_ours_and_private() {
+        assert!(dir_is_private(1000, 0o40700, 1000));
+        assert!(!dir_is_private(1001, 0o40700, 1000));
+        assert!(!dir_is_private(1000, 0o40755, 1000));
+        assert!(!dir_is_private(1000, 0o40710, 1000));
     }
 }

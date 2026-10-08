@@ -254,8 +254,9 @@ pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bo
     const NO_MINIMIZE: [&str; 9] = [
         "hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl", "dwm", "xmonad",
     ];
-    // Awesome, Qtile and Wayfire do implement minimize.
-    const MINIMIZE: [&str; 18] = [
+    // Awesome, Qtile and Wayfire are deliberately absent: activation there does
+    // not reliably unminimize, so the window stays visible (the safe default).
+    const MINIMIZE: [&str; 15] = [
         "gnome",
         "kde",
         "plasma",
@@ -271,9 +272,6 @@ pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bo
         "deepin",
         "dde",
         "cosmic",
-        "awesome",
-        "qtile",
-        "wayfire",
     ];
     let Some(desktop) = xdg_current_desktop else {
         return false;
@@ -1667,23 +1665,16 @@ mod linux_desktop_tests {
 
     #[test]
     fn mainstream_desktops_support_minimize() {
-        for desktop in [
-            "GNOME",
-            "KDE",
-            "ubuntu:GNOME",
-            "XFCE",
-            "X-Cinnamon",
-            "DDE",
-            "awesome",
-            "qtile",
-            "Wayfire",
-        ] {
+        for desktop in ["GNOME", "KDE", "ubuntu:GNOME", "XFCE", "X-Cinnamon", "DDE"] {
             assert!(desktop_supports_minimize(Some(desktop)), "{desktop}");
         }
     }
 
     #[test]
     fn unset_or_unknown_desktops_are_not_assumed_to_minimize() {
+        for desktop in ["awesome", "qtile", "Wayfire"] {
+            assert!(!desktop_supports_minimize(Some(desktop)), "{desktop}");
+        }
         assert!(!desktop_supports_minimize(None));
         assert!(!desktop_supports_minimize(Some("")));
         assert!(!desktop_supports_minimize(Some("SomeNewWM")));

@@ -565,7 +565,7 @@ fn workspace_target(workspace: &serde_json::Value) -> Option<String> {
         }
     }
     let name = workspace.get("name").and_then(|n| n.as_str())?.trim();
-    if name.is_empty() || name.starts_with("special") || name.contains(',') {
+    if name.is_empty() || name == "special" || name.starts_with("special:") || name.contains(',') {
         return None;
     }
     Some(format!("name:{name}"))
@@ -607,17 +607,33 @@ fn special_open_on(monitor: &serde_json::Value) -> bool {
         .is_some_and(|name| !name.is_empty())
 }
 
-/// Whether our hidden workspace is currently shown as an overlay on any monitor.
+/// Where our hidden workspace is currently shown as an overlay.
 #[cfg(target_os = "linux")]
-fn hidden_workspace_overlay_open(monitors_json: &str) -> Option<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Overlay {
+    /// Open on any monitor.
+    anywhere: bool,
+    /// Open on the focused monitor (the only place a toggle closes it).
+    on_focused: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn overlay_state(monitors_json: &str) -> Option<Overlay> {
     let value: serde_json::Value = serde_json::from_str(monitors_json).ok()?;
-    Some(value.as_array()?.iter().any(|monitor| {
+    let monitors = value.as_array()?;
+    let shows_ours = |monitor: &serde_json::Value| {
         monitor
             .get("specialWorkspace")
             .and_then(|special| special.get("name"))
             .and_then(|name| name.as_str())
             == Some(HIDDEN_WORKSPACE)
-    }))
+    };
+    Some(Overlay {
+        anywhere: monitors.iter().any(shows_ours),
+        on_focused: monitors.iter().any(|monitor| {
+            monitor.get("focused").and_then(|v| v.as_bool()) == Some(true) && shows_ours(monitor)
+        }),
+    })
 }
 
 /// Workspace to `movetoworkspace` onto. `None` means do not dispatch
@@ -633,17 +649,41 @@ fn restore_workspace_id(active_json: &str, monitors_json: Option<&str>) -> Optio
         .and_then(workspace_target)
 }
 
-/// The window really left the screen: every main window sits on the hidden
-/// workspace and that workspace is not open as an overlay.
+/// Result of checking a hide.
 #[cfg(target_os = "linux")]
-fn hidden_verified(clients: &[HyprClient], addresses: &[String], overlay_open: bool) -> bool {
-    !overlay_open
-        && !addresses.is_empty()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HideState {
+    /// On the hidden workspace and not shown as an overlay anywhere.
+    Hidden,
+    /// Parked there and shown as an overlay on the focused monitor, where a
+    /// toggle closes it. The only state in which a toggle is safe.
+    OverlayOnFocused,
+    /// Anything else, including unreadable state: do not claim hidden and do
+    /// not toggle (a toggle elsewhere would open the overlay instead).
+    NotHidden,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_hide(
+    clients: Option<&[HyprClient]>,
+    addresses: &[String],
+    overlay: Option<Overlay>,
+) -> HideState {
+    let (Some(clients), Some(overlay)) = (clients, overlay) else {
+        return HideState::NotHidden;
+    };
+    let all_parked = !addresses.is_empty()
         && addresses.iter().all(|address| {
             clients
                 .iter()
                 .any(|c| &c.address == address && c.workspace == HIDDEN_WORKSPACE)
-        })
+        });
+    match (all_parked, overlay.anywhere, overlay.on_focused) {
+        (false, _, _) => HideState::NotHidden,
+        (true, false, _) => HideState::Hidden,
+        (true, true, true) => HideState::OverlayOnFocused,
+        (true, true, false) => HideState::NotHidden,
+    }
 }
 
 /// Lua move first. A `Failed` reply (not only `Invalid` / `error:`) still
@@ -689,41 +729,54 @@ pub fn hide_main_windows() -> bool {
     if !is_hyprland() {
         return false;
     }
+    let deadline = std::time::Instant::now() + HIDE_BUDGET;
+    let in_budget = || std::time::Instant::now() < deadline;
     let Some(addresses) = our_main_window_addresses() else {
         return false;
     };
     for address in &addresses {
+        if !in_budget() {
+            return false;
+        }
         let selector = address_selector(address);
         let _ = dispatch_move_then_legacy(
             &lua_hide_command(&selector),
             &legacy_hide_command(&selector),
         );
     }
-    if verify_hidden(&addresses) {
-        return true;
+    // The move may have been refused, or the window may already be parked but
+    // visible as an overlay (a focus-only restore). Toggle only when the
+    // overlay is confirmed open on the focused monitor; re-read after each
+    // toggle instead of trusting reply text, so Lua and legacy never both fire.
+    for command in [lua_toggle_hidden_command(), legacy_toggle_hidden_command()] {
+        if !in_budget() {
+            return false;
+        }
+        match check_hidden(&addresses) {
+            HideState::Hidden => return true,
+            HideState::NotHidden => return false,
+            HideState::OverlayOnFocused => {
+                let _ = hyprland_ipc(&command);
+            }
+        }
     }
-    // Already parked there but shown as an overlay (a focus-only restore):
-    // close the overlay, then check again.
-    let _ = dispatch_move_then_legacy(
-        &lua_toggle_hidden_command(),
-        &legacy_toggle_hidden_command(),
-    );
-    verify_hidden(&addresses)
+    in_budget() && check_hidden(&addresses) == HideState::Hidden
 }
 
+/// Upper bound on time spent hiding (each IPC call adds at most its 250 ms
+/// socket timeout on top).
 #[cfg(target_os = "linux")]
-fn verify_hidden(addresses: &[String]) -> bool {
-    let Some(clients) = hyprland_ipc("j/clients")
+const HIDE_BUDGET: std::time::Duration = std::time::Duration::from_millis(600);
+
+#[cfg(target_os = "linux")]
+fn check_hidden(addresses: &[String]) -> HideState {
+    let clients = hyprland_ipc("j/clients")
         .ok()
-        .and_then(|reply| parse_hypr_clients(&reply))
-    else {
-        return false;
-    };
-    let overlay_open = hyprland_ipc("j/monitors")
+        .and_then(|reply| parse_hypr_clients(&reply));
+    let overlay = hyprland_ipc("j/monitors")
         .ok()
-        .and_then(|reply| hidden_workspace_overlay_open(&reply))
-        .unwrap_or(true);
-    hidden_verified(&clients, addresses, overlay_open)
+        .and_then(|reply| overlay_state(&reply));
+    classify_hide(clients.as_deref(), addresses, overlay)
 }
 
 #[cfg(target_os = "linux")]

@@ -565,39 +565,117 @@ mod close_to_background {
         assert_eq!(clients[0].workspace, "special:rusticdl");
     }
 
+    const GONE: Overlay = Overlay {
+        anywhere: false,
+        on_focused: false,
+    };
+
     #[test]
-    fn hide_is_verified_only_when_window_left_and_overlay_closed() {
+    fn parked_window_with_closed_overlay_is_hidden() {
         let addrs = vec!["0x1".to_string()];
-        assert!(hidden_verified(
-            &[on("0x1", "special:rusticdl")],
-            &addrs,
-            false
-        ));
-        // Moved "to the workspace it is already on" but shown as an overlay.
-        assert!(!hidden_verified(
-            &[on("0x1", "special:rusticdl")],
-            &addrs,
-            true
-        ));
-        // Move was accepted but the window did not leave.
-        assert!(!hidden_verified(&[on("0x1", "2")], &addrs, false));
-        assert!(!hidden_verified(&[], &addrs, false));
-        assert!(!hidden_verified(
-            &[on("0x1", "special:rusticdl")],
-            &[],
-            false
-        ));
+        let clients = [on("0x1", "special:rusticdl")];
+        assert_eq!(
+            classify_hide(Some(&clients), &addrs, Some(GONE)),
+            HideState::Hidden
+        );
     }
 
     #[test]
-    fn overlay_detection_reads_special_workspace_name() {
-        let open = r#"[{"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
-        let other = r#"[{"specialWorkspace":{"id":-99,"name":"special:scratchpad"}}]"#;
-        let none = r#"[{"specialWorkspace":{"id":0,"name":""}}]"#;
-        assert_eq!(hidden_workspace_overlay_open(open), Some(true));
-        assert_eq!(hidden_workspace_overlay_open(other), Some(false));
-        assert_eq!(hidden_workspace_overlay_open(none), Some(false));
-        assert_eq!(hidden_workspace_overlay_open("garbage"), None);
+    fn overlay_on_focused_monitor_is_the_only_toggle_case() {
+        let addrs = vec!["0x1".to_string()];
+        let clients = [on("0x1", "special:rusticdl")];
+        let focused = Overlay {
+            anywhere: true,
+            on_focused: true,
+        };
+        let elsewhere = Overlay {
+            anywhere: true,
+            on_focused: false,
+        };
+        assert_eq!(
+            classify_hide(Some(&clients), &addrs, Some(focused)),
+            HideState::OverlayOnFocused
+        );
+        // A toggle here would OPEN it on the focused monitor.
+        assert_eq!(
+            classify_hide(Some(&clients), &addrs, Some(elsewhere)),
+            HideState::NotHidden
+        );
+    }
+
+    #[test]
+    fn unreadable_monitors_means_no_toggle() {
+        let addrs = vec!["0x1".to_string()];
+        let clients = [on("0x1", "special:rusticdl")];
+        assert_eq!(
+            classify_hide(Some(&clients), &addrs, None),
+            HideState::NotHidden
+        );
+        assert_eq!(overlay_state("garbage"), None);
+    }
+
+    #[test]
+    fn refused_move_means_no_toggle() {
+        let addrs = vec!["0x1".to_string()];
+        let focused = Overlay {
+            anywhere: true,
+            on_focused: true,
+        };
+        // Window still on a normal workspace, even with some overlay open.
+        assert_eq!(
+            classify_hide(Some(&[on("0x1", "2")]), &addrs, Some(focused)),
+            HideState::NotHidden
+        );
+        assert_eq!(
+            classify_hide(Some(&[on("0x1", "2")]), &addrs, Some(GONE)),
+            HideState::NotHidden
+        );
+        assert_eq!(
+            classify_hide(None, &addrs, Some(GONE)),
+            HideState::NotHidden
+        );
+        assert_eq!(
+            classify_hide(Some(&[on("0x1", "special:rusticdl")]), &[], Some(GONE)),
+            HideState::NotHidden
+        );
+    }
+
+    #[test]
+    fn overlay_state_reads_focused_and_anywhere() {
+        let focused = r#"[{"focused":true,"specialWorkspace":{"name":"special:rusticdl"}}]"#;
+        let other = r#"[{"focused":true,"specialWorkspace":{"name":""}},{"focused":false,"specialWorkspace":{"name":"special:rusticdl"}}]"#;
+        let scratch = r#"[{"focused":true,"specialWorkspace":{"name":"special:scratchpad"}}]"#;
+        let no_focus_flag = r#"[{"specialWorkspace":{"name":"special:rusticdl"}}]"#;
+        assert_eq!(
+            overlay_state(focused),
+            Some(Overlay {
+                anywhere: true,
+                on_focused: true
+            })
+        );
+        assert_eq!(
+            overlay_state(other),
+            Some(Overlay {
+                anywhere: true,
+                on_focused: false
+            })
+        );
+        assert_eq!(overlay_state(scratch), Some(GONE));
+        assert_eq!(
+            overlay_state(no_focus_flag),
+            Some(Overlay {
+                anywhere: true,
+                on_focused: false
+            })
+        );
+    }
+
+    #[test]
+    fn special_name_check_is_exact() {
+        let target = |name: &str| workspace_target(&serde_json::json!({"id": -5, "name": name}));
+        assert_eq!(target("specialist").as_deref(), Some("name:specialist"));
+        assert_eq!(target("special:rusticdl"), None);
+        assert_eq!(target("special"), None);
     }
 
     #[test]
