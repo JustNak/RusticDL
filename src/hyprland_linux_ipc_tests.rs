@@ -408,7 +408,7 @@ fn hide_reports_true_when_compositor_stalls_after_accepting_the_move() {
             std::thread::sleep(Duration::from_millis(400));
         }
         match cmd {
-            "j/clients" => our_client("special:rusticdl"),
+            "j/clients" => our_client("2"),
             "j/monitors" => MONITORS_CLOSED.into(),
             _ => "ok".into(),
         }
@@ -523,4 +523,188 @@ fn ipc_deadline_bounds_a_slow_drip_reply_as_a_whole() {
     assert!(elapsed < Duration::from_millis(700), "{elapsed:?}");
     let _ = server.join();
     let _ = std::fs::remove_dir_all(&runtime);
+}
+
+const MONITORS_OVERLAY_OPEN: &str =
+    r#"[{"focused":true,"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+
+#[test]
+fn hide_reports_true_when_the_move_was_sent_but_got_no_reply() {
+    let _guard = env_lock();
+    let moved = Arc::new(AtomicBool::new(false));
+    let legacy_sent = Arc::new(AtomicBool::new(false));
+    let (m, l) = (moved.clone(), legacy_sent.clone());
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("hl.dsp.window.move") {
+            m.store(true, AtomicOrdering::SeqCst);
+            return String::new();
+        }
+        if cmd.starts_with("/dispatch movetoworkspacesilent") {
+            l.store(true, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        match cmd {
+            "j/clients" if m.load(AtomicOrdering::SeqCst) => our_client("special:rusticdl"),
+            "j/clients" => our_client("2"),
+            _ => MONITORS_CLOSED.into(),
+        }
+    });
+    let _mock = MockSession::start("hide-noreply", handler);
+    assert!(hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+    assert!(moved.load(AtomicOrdering::SeqCst));
+    assert!(
+        !legacy_sent.load(AtomicOrdering::SeqCst),
+        "an unanswered Lua move must not be repeated as a legacy move"
+    );
+}
+
+#[test]
+fn hide_reports_false_when_the_move_never_left() {
+    let _guard = env_lock();
+    let moved = Arc::new(AtomicBool::new(false));
+    let m = moved.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.starts_with("/dispatch") {
+            m.store(true, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        match cmd {
+            "j/clients" => {
+                std::thread::sleep(Duration::from_millis(150));
+                our_client("2")
+            }
+            _ => MONITORS_CLOSED.into(),
+        }
+    });
+    let _mock = MockSession::start("hide-never-sent", handler);
+    assert!(!hide_main_windows_within(
+        Duration::from_millis(100),
+        Duration::from_millis(100)
+    ));
+    assert!(!moved.load(AtomicOrdering::SeqCst));
+}
+
+#[test]
+fn expired_deadline_means_not_sent() {
+    let _guard = env_lock();
+    let handler = Arc::new(|_: &str| -> String { "ok".into() });
+    let _mock = MockSession::start("expired", handler);
+    let past = std::time::Instant::now() - Duration::from_millis(5);
+    assert_eq!(
+        dispatch_move_then_legacy("lua", "legacy", Some(past)),
+        MoveOutcome::NotSent
+    );
+}
+
+#[test]
+fn hide_toggles_once_when_already_parked_with_the_overlay_open() {
+    let _guard = env_lock();
+    let toggles = Arc::new(AtomicUsize::new(0));
+    let t = toggles.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("toggle_special") || cmd.contains("togglespecialworkspace") {
+            t.fetch_add(1, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        match cmd {
+            "j/clients" => our_client("special:rusticdl"),
+            "j/monitors" if t.load(AtomicOrdering::SeqCst) == 0 => MONITORS_OVERLAY_OPEN.into(),
+            "j/monitors" => MONITORS_CLOSED.into(),
+            _ => "ok".into(),
+        }
+    });
+    let _mock = MockSession::start("hide-parked-open", handler);
+    assert!(hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+    assert_eq!(toggles.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+fn hide_is_false_when_parked_overlay_stays_open_after_the_toggle() {
+    let _guard = env_lock();
+    let handler = Arc::new(|cmd: &str| -> String {
+        match cmd {
+            "j/clients" => our_client("special:rusticdl"),
+            "j/monitors" => MONITORS_OVERLAY_OPEN.into(),
+            _ => "ok".into(),
+        }
+    });
+    let _mock = MockSession::start("hide-parked-stuck", handler);
+    assert!(!hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+}
+
+#[test]
+fn connect_is_bounded_by_the_deadline() {
+    let _guard = env_lock();
+    let runtime = unique_runtime();
+    let his = "full-backlog";
+    let sock_dir = runtime.join("hypr").join(his);
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let sock = sock_dir.join(".socket.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    // Never accepted: fill the backlog so further connects block.
+    let mut fillers = Vec::new();
+    for _ in 0..512 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = sock.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::os::unix::net::UnixStream::connect(path));
+        });
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(stream)) => fillers.push(stream),
+            _ => break,
+        }
+    }
+    let old_his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+    unsafe {
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", his);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    }
+    let began = std::time::Instant::now();
+    let result = hyprland_call(
+        "j/clients",
+        Some(std::time::Instant::now() + Duration::from_millis(300)),
+    );
+    let elapsed = began.elapsed();
+    unsafe {
+        match old_his {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+    assert!(elapsed < Duration::from_millis(700), "{elapsed:?}");
+    assert!(!matches!(result, IpcResult::Reply(_)));
+    drop(listener);
+    drop(fillers);
+    let _ = std::fs::remove_dir_all(&runtime);
+}
+
+#[test]
+fn show_is_bounded_under_a_slow_compositor() {
+    let _guard = env_lock();
+    let handler = Arc::new(|_: &str| -> String {
+        std::thread::sleep(Duration::from_millis(400));
+        "[]".into()
+    });
+    let _mock = MockSession::start("show-slow", handler);
+    let began = std::time::Instant::now();
+    let _ = show_main_windows();
+    assert!(
+        began.elapsed() < Duration::from_millis(2000),
+        "{:?}",
+        began.elapsed()
+    );
 }

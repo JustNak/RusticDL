@@ -699,43 +699,60 @@ fn move_tries_legacy(reply: DispatchReply) -> bool {
     }
 }
 
-/// How a move dispatch ended.
+/// How a move/toggle dispatch ended. "Sent" is what matters for hiding: a
+/// command that was never written cannot have changed anything, while one that
+/// was written and went unanswered may still land.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MoveOutcome {
-    Accepted,
-    /// The compositor answered and said no.
+    /// Never written (no connection, or the deadline was already spent).
+    NotSent,
+    /// Written, and the compositor answered no.
     Refused,
-    /// Sent (or may have been) but no usable reply arrived in time, so the
-    /// move may still have landed.
+    /// Written, but the reply was missing, late or cut off.
     Unanswered,
+    Accepted,
 }
 
+#[cfg(target_os = "linux")]
+impl MoveOutcome {
+    /// The command may have changed state.
+    fn may_have_landed(self) -> bool {
+        matches!(self, MoveOutcome::Accepted | MoveOutcome::Unanswered)
+    }
+}
+
+/// Lua dispatch first. The legacy dispatcher is tried only when the compositor
+/// *answered* the Lua form with a rejection; a Lua command that was sent and
+/// got no (or a partial) reply may already have landed, so repeating it as a
+/// legacy command could apply it twice (fatal for toggles).
 #[cfg(target_os = "linux")]
 fn dispatch_move_then_legacy(
     lua_cmd: &str,
     legacy_cmd: &str,
     deadline: Option<std::time::Instant>,
 ) -> MoveOutcome {
-    match hyprland_ipc_until(lua_cmd, deadline) {
-        Ok(reply) => {
+    match hyprland_call(lua_cmd, deadline) {
+        IpcResult::NotSent => MoveOutcome::NotSent,
+        IpcResult::NoReply => MoveOutcome::Unanswered,
+        IpcResult::Reply(reply) => {
             let class = classify_dispatch_reply(&reply);
-            if move_tries_legacy(class) {
-                legacy_dispatch(legacy_cmd, deadline)
-            } else {
-                MoveOutcome::Accepted
+            if !move_tries_legacy(class) {
+                return MoveOutcome::Accepted;
+            }
+            match hyprland_call(legacy_cmd, deadline) {
+                // The Lua form was rejected and the legacy one never left.
+                IpcResult::NotSent => MoveOutcome::Refused,
+                IpcResult::NoReply => MoveOutcome::Unanswered,
+                IpcResult::Reply(reply) => {
+                    if classify_dispatch_reply(&reply) == DispatchReply::Ok {
+                        MoveOutcome::Accepted
+                    } else {
+                        MoveOutcome::Refused
+                    }
+                }
             }
         }
-        Err(_) => MoveOutcome::Unanswered,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn legacy_dispatch(cmd: &str, deadline: Option<std::time::Instant>) -> MoveOutcome {
-    match hyprland_ipc_until(cmd, deadline) {
-        Ok(reply) if classify_dispatch_reply(&reply) == DispatchReply::Ok => MoveOutcome::Accepted,
-        Ok(_) => MoveOutcome::Refused,
-        Err(_) => MoveOutcome::Unanswered,
     }
 }
 
@@ -751,20 +768,21 @@ pub fn hide_main_windows() -> bool {
 
 /// Time for the move / toggle steps, then a final check after it.
 ///
-/// Every socket call is bounded by a deadline (not just checked between
-/// steps), so the UI thread blocks for at most `steps + final` plus scheduling
-/// slack: ~700 ms by default.
+/// Every socket call (connect, write and all reads) is bounded by a deadline,
+/// so the UI thread blocks for at most `steps + final` plus scheduling slack:
+/// about 700 ms by default.
 #[cfg(target_os = "linux")]
 const HIDE_STEPS_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 #[cfg(target_os = "linux")]
 const HIDE_FINAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// What to report once the final check is in.
+/// What to report once the last check is in.
 ///
-/// A window that is confirmed parked is hidden. If the state cannot be read
-/// but a move was accepted or may have landed, say hidden: a stale hidden flag
-/// is harmless because restore clears it, while reporting "visible" for a
-/// parked window loses the HUD close and the no-tray notice.
+/// A window confirmed parked is hidden. If the state cannot be read but a move
+/// was sent and may have landed, say hidden: a stale hidden flag is harmless
+/// (restore clears it, or the next real focus does once the compositor reports
+/// it), while "visible" for a parked window loses the HUD close and the
+/// no-tray notice. A move that was never sent, or was refused, proves nothing.
 #[cfg(target_os = "linux")]
 fn hide_verdict(state: HideState, move_may_have_landed: bool) -> bool {
     match state {
@@ -784,36 +802,41 @@ fn hide_main_windows_within(steps: std::time::Duration, final_check: std::time::
     let start = Instant::now();
     let steps_deadline = start + steps;
     let final_deadline = start + steps + final_check;
-    let Some(addresses) = our_main_window_addresses(Some(steps_deadline)) else {
+    let Some(windows) = our_main_windows(Some(steps_deadline)) else {
         return false;
     };
+    let addresses: Vec<String> = windows.iter().map(|c| c.address.clone()).collect();
     let mut may_have_landed = false;
-    for address in &addresses {
-        let selector = address_selector(address);
+    for window in &windows {
+        let selector = address_selector(&window.address);
         let outcome = dispatch_move_then_legacy(
             &lua_hide_command(&selector),
             &legacy_hide_command(&selector),
             Some(steps_deadline),
         );
-        may_have_landed |= outcome != MoveOutcome::Refused;
-    }
-    // The move may have been refused, or the window may already be parked but
-    // visible as an overlay (a focus-only restore). Toggle only when the
-    // overlay is confirmed open on the focused monitor; re-read after each
-    // toggle instead of trusting reply text, so Lua and legacy never both fire.
-    for command in [lua_toggle_hidden_command(), legacy_toggle_hidden_command()] {
-        match check_hidden(&addresses, Some(steps_deadline)) {
-            HideState::OverlayOnFocused => {
-                let _ = hyprland_ipc_until(&command, Some(steps_deadline));
-                may_have_landed = true;
-            }
-            _ => break,
+        // Moving a window that already sits on the hidden workspace changes
+        // nothing, so an `ok` there says nothing about the overlay.
+        if window.workspace != HIDDEN_WORKSPACE {
+            may_have_landed |= outcome.may_have_landed();
         }
     }
-    hide_verdict(
-        check_hidden(&addresses, Some(final_deadline)),
-        may_have_landed,
-    )
+    let mut state = check_hidden(&addresses, Some(steps_deadline));
+    if state == HideState::Hidden {
+        return true;
+    }
+    if state == HideState::OverlayOnFocused {
+        // Parked but shown as an overlay on the focused monitor (a focus-only
+        // restore). One toggle: the dispatcher never repeats it as legacy
+        // after an unanswered Lua attempt.
+        let toggled = dispatch_move_then_legacy(
+            &lua_toggle_hidden_command(),
+            &legacy_toggle_hidden_command(),
+            Some(steps_deadline),
+        );
+        may_have_landed |= toggled.may_have_landed();
+    }
+    state = check_hidden(&addresses, Some(final_deadline));
+    hide_verdict(state, may_have_landed)
 }
 
 #[cfg(target_os = "linux")]
@@ -837,49 +860,56 @@ fn legacy_toggle_hidden_command() -> String {
     "/dispatch togglespecialworkspace rusticdl".to_string()
 }
 
+/// Overall bound for a restore on the UI thread.
+#[cfg(target_os = "linux")]
+const SHOW_BUDGET: std::time::Duration = std::time::Duration::from_millis(1200);
+
 /// Bring the main window back to the user's regular workspace and focus it.
 ///
 /// Returns whether a move dispatch succeeded. Focus-only (no numeric
-/// workspace, or the compositor refused the move) is `false`.
+/// workspace, or the compositor refused the move) is `false`. Every socket
+/// call shares one [`SHOW_BUDGET`] deadline.
 #[cfg(target_os = "linux")]
 pub fn show_main_windows() -> bool {
     if !is_hyprland() {
         return false;
     }
-    let Some(addresses) = our_main_window_addresses(None) else {
+    let deadline = Some(std::time::Instant::now() + SHOW_BUDGET);
+    let Some(windows) = our_main_windows(deadline) else {
         return false;
     };
-    let monitors = hyprland_ipc("j/monitors").ok();
-    let active = hyprland_ipc("j/activeworkspace").unwrap_or_default();
+    let monitors = hyprland_ipc_until("j/monitors", deadline).ok();
+    let active = hyprland_ipc_until("j/activeworkspace", deadline).unwrap_or_default();
     let workspace_id = restore_workspace_id(&active, monitors.as_deref());
     let mut moved = false;
-    for address in addresses {
-        let selector = address_selector(&address);
+    for window in windows {
+        let selector = address_selector(&window.address);
         if let Some(workspace_id) = workspace_id.as_deref() {
             moved |= dispatch_move_then_legacy(
                 &lua_show_command(workspace_id, &selector),
                 &legacy_show_command(workspace_id, &selector),
-                None,
+                deadline,
             ) == MoveOutcome::Accepted;
         }
         let _ = dispatch_move_then_legacy(
             &lua_focus_command(&selector),
             &legacy_focus_command(&selector),
-            None,
+            deadline,
         );
     }
     moved
 }
 
+/// This process's main-window clients (never capture HUDs).
 #[cfg(target_os = "linux")]
-fn our_main_window_addresses(deadline: Option<std::time::Instant>) -> Option<Vec<String>> {
+fn our_main_windows(deadline: Option<std::time::Instant>) -> Option<Vec<HyprClient>> {
     let reply = hyprland_ipc_until("j/clients", deadline).ok()?;
     let clients = parse_hypr_clients(&reply)?;
-    let addresses: Vec<String> = main_window_clients(&clients, std::process::id())
+    let windows: Vec<HyprClient> = main_window_clients(&clients, std::process::id())
         .into_iter()
-        .map(|c| c.address.clone())
+        .cloned()
         .collect();
-    (!addresses.is_empty()).then_some(addresses)
+    (!windows.is_empty()).then_some(windows)
 }
 
 #[cfg(target_os = "linux")]
@@ -887,63 +917,137 @@ fn hyprland_ipc(command: &str) -> std::io::Result<String> {
     hyprland_ipc_until(command, None)
 }
 
-/// One IPC round trip. With a `deadline` the *whole call* (write plus every
-/// read) is bounded by it, not each read separately, so a compositor that
-/// drips bytes cannot stretch it.
+/// Outcome of one socket round trip, keeping "never written" apart from
+/// "written, no usable reply".
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IpcResult {
+    /// No connection, or the deadline was already gone before the write.
+    NotSent,
+    /// The command was written but the reply was empty, late or cut off.
+    NoReply,
+    /// A complete reply (the stream ended or returned a short final read).
+    Reply(String),
+}
+
 #[cfg(target_os = "linux")]
 fn hyprland_ipc_until(
     command: &str,
     deadline: Option<std::time::Instant>,
 ) -> std::io::Result<String> {
-    use std::io::{Read, Write};
+    match hyprland_call(command, deadline) {
+        IpcResult::Reply(reply) => Ok(reply),
+        IpcResult::NoReply => Ok(String::new()),
+        IpcResult::NotSent => Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "hyprland ipc not sent",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn connect_within(
+    path: String,
+    deadline: Option<std::time::Instant>,
+) -> Option<std::os::unix::net::UnixStream> {
     use std::os::unix::net::UnixStream;
+
+    let Some(deadline) = deadline else {
+        return UnixStream::connect(path).ok();
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    // `connect` has no timeout (a full listen backlog blocks it), so run it on
+    // a helper thread and stop waiting at the deadline. The late stream, if
+    // any, is dropped unused.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("rusticdl-hypr-connect".into())
+        .spawn(move || {
+            let _ = tx.send(UnixStream::connect(path));
+        })
+        .ok()?;
+    rx.recv_timeout(remaining).ok()?.ok()
+}
+
+/// One IPC round trip. With a `deadline` the *whole call* (connect, write and
+/// every read) is bounded by it, so neither a compositor that drips bytes nor
+/// one that never accepts can stretch it.
+#[cfg(target_os = "linux")]
+fn hyprland_call(command: &str, deadline: Option<std::time::Instant>) -> IpcResult {
+    use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
     const PER_READ: Duration = Duration::from_millis(250);
-    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "hyprland ipc deadline");
-    let slice = |deadline: Option<Instant>| -> std::io::Result<Duration> {
+    let slice = |deadline: Option<Instant>| -> Option<Duration> {
         match deadline {
-            None => Ok(PER_READ),
+            None => Some(PER_READ),
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Err(timed_out())
-                } else {
-                    Ok(remaining.min(PER_READ))
-                }
+                (!remaining.is_zero()).then(|| remaining.min(PER_READ))
             }
         }
     };
 
-    let his = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+    let Ok(his) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") else {
+        return IpcResult::NotSent;
+    };
     let runtime =
         std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", unix_uid()));
     let path = format!("{runtime}/hypr/{his}/.socket.sock");
 
-    slice(deadline)?;
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_write_timeout(Some(slice(deadline)?))?;
-    stream.write_all(command.as_bytes())?;
+    let Some(mut stream) = connect_within(path, deadline) else {
+        return IpcResult::NotSent;
+    };
+    let Some(write_slice) = slice(deadline) else {
+        return IpcResult::NotSent;
+    };
+    if stream.set_write_timeout(Some(write_slice)).is_err() {
+        return IpcResult::NotSent;
+    }
+    if stream.write_all(command.as_bytes()).is_err() {
+        return IpcResult::NotSent;
+    }
 
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0_u8; 512];
+    let mut complete = false;
     loop {
-        stream.set_read_timeout(Some(slice(deadline)?))?;
+        let Some(read_slice) = slice(deadline) else {
+            break;
+        };
+        if stream.set_read_timeout(Some(read_slice)).is_err() {
+            break;
+        }
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                complete = true;
+                break;
+            }
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if n < chunk.len() {
+                    complete = true;
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(e) => return Err(e),
+            Err(_) => break,
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    if complete && !buf.is_empty() {
+        IpcResult::Reply(String::from_utf8_lossy(&buf).into_owned())
+    } else if complete {
+        // Closed without a reply: not a refusal.
+        IpcResult::NoReply
+    } else if buf.is_empty() {
+        IpcResult::NoReply
+    } else {
+        // Cut off mid-reply: surface what arrived to readers that tolerate it,
+        // but dispatchers must not treat it as a verdict.
+        IpcResult::NoReply
+    }
 }
 
 #[cfg(target_os = "linux")]
