@@ -780,8 +780,7 @@ const HIDE_FINAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 ///
 /// A window confirmed parked is hidden. If the state cannot be read but a move
 /// was sent and may have landed, say hidden: a stale hidden flag is harmless
-/// (restore clears it, or the next real focus does once the compositor reports
-/// it), while "visible" for a parked window loses the HUD close and the
+/// (restore clears it, or a later focus event does if the window gets one), while "visible" for a parked window loses the HUD close and the
 /// no-tray notice. A move that was never sent, or was refused, proves nothing.
 #[cfg(target_os = "linux")]
 fn hide_verdict(state: HideState, move_may_have_landed: bool) -> bool {
@@ -1014,10 +1013,7 @@ fn hyprland_call(command: &str, deadline: Option<std::time::Instant>) -> IpcResu
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0_u8; 512];
     let mut complete = false;
-    loop {
-        let Some(read_slice) = slice(deadline) else {
-            break;
-        };
+    while let Some(read_slice) = slice(deadline) {
         if stream.set_read_timeout(Some(read_slice)).is_err() {
             break;
         }
@@ -1038,14 +1034,8 @@ fn hyprland_call(command: &str, deadline: Option<std::time::Instant>) -> IpcResu
     }
     if complete && !buf.is_empty() {
         IpcResult::Reply(String::from_utf8_lossy(&buf).into_owned())
-    } else if complete {
-        // Closed without a reply: not a refusal.
-        IpcResult::NoReply
-    } else if buf.is_empty() {
-        IpcResult::NoReply
     } else {
-        // Cut off mid-reply: surface what arrived to readers that tolerate it,
-        // but dispatchers must not treat it as a verdict.
+        // Closed without a reply, or cut off mid-reply: never a verdict.
         IpcResult::NoReply
     }
 }

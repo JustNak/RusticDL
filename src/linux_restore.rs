@@ -131,8 +131,15 @@ pub(crate) fn request_compositor_unminimize() {
 /// The runtime dir must be a directory we own that nobody else can enter,
 /// otherwise a hostile `XDG_RUNTIME_DIR` would reopen the shared-path hole.
 fn runtime_dir_is_private(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+    // `symlink_metadata("/x/link/")` follows the link; drop trailing separators.
+    let mut bytes = dir.as_os_str().as_bytes();
+    while bytes.len() > 1 && bytes.ends_with(b"/") {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+    std::fs::symlink_metadata(&dir).is_ok_and(|meta| {
         !meta.file_type().is_symlink()
             && meta.is_dir()
             && dir_is_private(meta.uid(), meta.mode(), unsafe { libc::getuid() })
@@ -178,8 +185,10 @@ fn kwin_method(args: &[&str], limit: Duration) -> io::Result<std::process::Outpu
     dbus_send(&full, limit)
 }
 
-fn unload_script(name_arg: &str) -> bool {
-    kwin_method(
+type Bus<'a> = &'a dyn Fn(&[&str], Duration) -> io::Result<std::process::Output>;
+
+fn unload_script(bus: Bus, name_arg: &str) -> bool {
+    bus(
         &[
             "/Scripting",
             "org.kde.kwin.Scripting.unloadScript",
@@ -190,13 +199,72 @@ fn unload_script(name_arg: &str) -> bool {
     .is_ok_and(|output| output.status.success())
 }
 
+/// Object names KWin currently exposes under `/Scripting` (`Script<id>`).
+/// `None` when the bus could not be introspected.
+fn existing_script_ids(bus: Bus) -> Option<Vec<u32>> {
+    let output = bus(
+        &[
+            "/Scripting",
+            "org.freedesktop.DBus.Introspectable.Introspect",
+        ],
+        DBUS_TIMEOUT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_script_ids(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_script_ids(introspection: &str) -> Vec<u32> {
+    introspection
+        .split("node name=\"")
+        .skip(1)
+        .filter_map(|rest| {
+            let name = rest.split('"').next()?;
+            name.strip_prefix("Script")?.parse().ok()
+        })
+        .collect()
+}
+
+fn script_is_loaded(bus: Bus, name_arg: &str) -> bool {
+    bus(
+        &[
+            "/Scripting",
+            "org.kde.kwin.Scripting.isScriptLoaded",
+            name_arg,
+        ],
+        DBUS_TIMEOUT,
+    )
+    .is_ok_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("boolean true")
+    })
+}
+
 fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Result<()> {
+    run_kwin_script_with(&kwin_method, dir, name, script)
+}
+
+/// KWin hands out script ids as `scripts.size()`, so after any lower-numbered
+/// script was unloaded the next id equals a live script's. Our
+/// `/Scripting/Script<id>` object then never registers and `Script.run` on that
+/// path would run (and "succeed" on) the other script. When the id was already
+/// taken, start the loaded-but-idle scripts through the `Scripting` interface
+/// instead, which does not depend on the id, and only report success if our
+/// script is confirmed loaded.
+fn run_kwin_script_with(
+    bus: Bus,
+    dir: &std::path::Path,
+    name: &str,
+    script: &str,
+) -> io::Result<()> {
     let path = write_script_file(dir, name, script)?;
     let path_arg = format!("string:{}", path.display());
     let name_arg = format!("string:{name}");
+    let taken = existing_script_ids(bus);
 
     let result = (|| {
-        let output = match kwin_method(
+        let output = match bus(
             &[
                 "/Scripting",
                 "org.kde.kwin.Scripting.loadScript",
@@ -219,12 +287,22 @@ fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Resul
         let reply = String::from_utf8_lossy(&output.stdout);
         let id = parse_dbus_script_id(&reply)
             .ok_or_else(|| io::Error::other("kwin loadScript returned no id"))?;
+        let collides = taken.as_ref().is_none_or(|ids| ids.contains(&id));
+        if collides {
+            let started = bus(&["/Scripting", "org.kde.kwin.Scripting.start"], RUN_TIMEOUT)
+                .is_ok_and(|output| output.status.success());
+            return if started && script_is_loaded(bus, &name_arg) {
+                Ok(())
+            } else {
+                Err(io::Error::other("kwin script id collided and start failed"))
+            };
+        }
         // KWin 6 exposes the script at /Scripting/Script<id>; KWin 5 used /<id>.
         // `run` must be a real method call (a signal is silently ignored) and
         // its reply arrives once the script has been evaluated, so the file
         // is not removed underneath it.
         for object in [format!("/Scripting/Script{id}"), format!("/{id}")] {
-            if let Ok(output) = kwin_method(&[&object, "org.kde.kwin.Script.run"], RUN_TIMEOUT) {
+            if let Ok(output) = bus(&[&object, "org.kde.kwin.Script.run"], RUN_TIMEOUT) {
                 if output.status.success() {
                     return Ok(());
                 }
@@ -235,9 +313,9 @@ fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Resul
 
     // Sweep once more when the first unload failed or timed out, or when the
     // load never confirmed (it may have landed late).
-    if (!unload_script(&name_arg) || result.is_err()) && !unload_script(&name_arg) {
+    if (!unload_script(bus, &name_arg) || result.is_err()) && !unload_script(bus, &name_arg) {
         std::thread::sleep(LATE_LOAD_GRACE);
-        let _ = unload_script(&name_arg);
+        let _ = unload_script(bus, &name_arg);
     }
     let _ = std::fs::remove_file(&path);
     result
@@ -407,6 +485,9 @@ mod tests {
         let link = dir.with_extension("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(!runtime_dir_is_private(&link));
+        let mut slashed = link.clone().into_os_string();
+        slashed.push("/");
+        assert!(!runtime_dir_is_private(std::path::Path::new(&slashed)));
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -417,5 +498,88 @@ mod tests {
         assert!(!dir_is_private(1001, 0o40700, 1000));
         assert!(!dir_is_private(1000, 0o40755, 1000));
         assert!(!dir_is_private(1000, 0o40710, 1000));
+    }
+
+    type Calls = std::sync::Mutex<Vec<String>>;
+
+    fn ok(stdout: &str) -> io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn fake_bus<'a>(
+        calls: &'a Calls,
+        existing: &str,
+        new_id: u32,
+        started_ok: bool,
+    ) -> impl Fn(&[&str], Duration) -> io::Result<std::process::Output> + 'a {
+        let existing = existing.to_string();
+        move |args: &[&str], _| {
+            let method = args.get(1).copied().unwrap_or("");
+            calls
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", args[0], method));
+            match method {
+                "org.freedesktop.DBus.Introspectable.Introspect" => ok(&existing),
+                "org.kde.kwin.Scripting.loadScript" => ok(&format!("   int32 {new_id}\n")),
+                "org.kde.kwin.Scripting.isScriptLoaded" => ok("   boolean true\n"),
+                "org.kde.kwin.Scripting.start" if !started_ok => {
+                    Err(io::Error::other("start failed"))
+                }
+                _ => ok(""),
+            }
+        }
+    }
+
+    #[test]
+    fn introspection_lists_script_ids() {
+        let xml =
+            r#"<node><node name="Script0"/><node name="Script3"/><node name="other"/></node>"#;
+        assert_eq!(parse_script_ids(xml), vec![0, 3]);
+    }
+
+    #[test]
+    fn fresh_id_runs_the_script_object() {
+        let dir = scratch_dir("fresh");
+        let calls = Calls::default();
+        let bus = fake_bus(&calls, r#"<node><node name="Script0"/></node>"#, 1, true);
+        assert!(run_kwin_script_with(&bus, &dir, "n1", "x").is_ok());
+        let log = calls.lock().unwrap().join("\n");
+        assert!(log.contains("/Scripting/Script1 org.kde.kwin.Script.run"));
+        assert!(!log.contains("Scripting.start"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn colliding_id_never_runs_the_other_script() {
+        let dir = scratch_dir("collide");
+        let calls = Calls::default();
+        // Script0 was unloaded, so KWin hands out id 1 again while Script1 lives.
+        let bus = fake_bus(
+            &calls,
+            r#"<node><node name="Script1"/><node name="Script2"/></node>"#,
+            1,
+            true,
+        );
+        assert!(run_kwin_script_with(&bus, &dir, "n2", "x").is_ok());
+        let log = calls.lock().unwrap().join("\n");
+        assert!(!log.contains("Script.run"), "{log}");
+        assert!(log.contains("Scripting.start"));
+        assert!(log.contains("unloadScript"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collision_with_failed_start_is_an_error() {
+        let dir = scratch_dir("collide-fail");
+        let calls = Calls::default();
+        let bus = fake_bus(&calls, r#"<node><node name="Script1"/></node>"#, 1, false);
+        assert!(run_kwin_script_with(&bus, &dir, "n3", "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
