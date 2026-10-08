@@ -68,7 +68,7 @@ pub struct SystemTray {
     linux: linux_impl::LinuxTrayHandle,
     /// Cleared while the StatusNotifierWatcher is gone (see `watcher_offline`).
     #[cfg(target_os = "linux")]
-    online: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    online: linux_impl::Liveness,
     #[cfg(windows)]
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
@@ -105,7 +105,7 @@ impl SystemTray {
     pub fn is_online(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            self.online.load(std::sync::atomic::Ordering::SeqCst) && !self.linux.is_closed()
+            self.online.is_visible() && !self.linux.is_closed()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -150,6 +150,7 @@ impl Drop for SystemTray {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         {
+            self.online.stop_monitor();
             let _ = self.linux.shutdown();
         }
         #[cfg(windows)]
@@ -240,19 +241,48 @@ pub fn hide_main_window(window: &gpui::Window) -> bool {
     }
 }
 
-/// Whether the session's compositor honours minimize requests.
+/// Whether the session's compositor is known to honour minimize requests.
 ///
 /// Tiling compositors have no minimized state, so `minimize_window` is a
-/// silent no-op there and the window would stay on screen.
+/// silent no-op there and the window would stay on screen. Unknown or unset
+/// desktops are treated as unsupported: leaving a window visible is safe,
+/// marking a visible window hidden (and dismissing its pop-ups) is not.
 #[cfg(target_os = "linux")]
 pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bool {
-    const NO_MINIMIZE: [&str; 7] = ["hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl"];
+    const NO_MINIMIZE: [&str; 12] = [
+        "hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl", "dwm", "xmonad", "awesome",
+        "qtile", "wayfire",
+    ];
+    const MINIMIZE: [&str; 14] = [
+        "gnome",
+        "kde",
+        "plasma",
+        "xfce",
+        "x-cinnamon",
+        "cinnamon",
+        "mate",
+        "lxqt",
+        "lxde",
+        "budgie",
+        "pantheon",
+        "unity",
+        "deepin",
+        "cosmic",
+    ];
     let Some(desktop) = xdg_current_desktop else {
-        return true;
+        return false;
     };
-    !desktop
-        .split(':')
-        .any(|part| NO_MINIMIZE.iter().any(|d| part.eq_ignore_ascii_case(d)))
+    let parts: Vec<&str> = desktop
+        .split([':', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let matches = |list: &[&str]| {
+        parts
+            .iter()
+            .any(|part| list.iter().any(|d| part.eq_ignore_ascii_case(d)))
+    };
+    !matches(&NO_MINIMIZE) && matches(&MINIMIZE)
 }
 
 pub fn show_main_window(window: &gpui::Window) {
@@ -311,7 +341,7 @@ mod linux_impl {
     use ksni::menu::StandardItem;
     use ksni::{Category, Icon, MenuItem, OfflineReason, ToolTip, Tray};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     /// Upper bound on the D-Bus registration. zbus has no handshake timeout,
@@ -323,10 +353,91 @@ mod linux_impl {
 
     pub(super) type LinuxTrayHandle = Handle<LinuxTray>;
 
+    const WATCHER_DEST: &str = "org.kde.StatusNotifierWatcher";
+    const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+    const HOST_PROPERTY: &str = "IsStatusNotifierHostRegistered";
+    const HOST_POLL: Duration = Duration::from_secs(1);
+
+    /// Whether the icon can currently be seen: the watcher owns its bus name
+    /// *and* it reports a registered host. A standalone watcher keeps running
+    /// after its host dies, so ownership alone is not enough.
+    #[derive(Clone)]
+    pub(super) struct Liveness {
+        watcher_up: Arc<AtomicBool>,
+        host_up: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Liveness {
+        fn new() -> Self {
+            Self {
+                watcher_up: Arc::new(AtomicBool::new(true)),
+                host_up: Arc::new(AtomicBool::new(true)),
+                stop: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        pub(super) fn is_visible(&self) -> bool {
+            visible(
+                self.watcher_up.load(Ordering::SeqCst),
+                self.host_up.load(Ordering::SeqCst),
+            )
+        }
+
+        pub(super) fn stop_monitor(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+
+        /// Follow `IsStatusNotifierHostRegistered` on the watcher. Failures
+        /// (no property, call error) leave the last value; watcher loss is
+        /// reported separately through `watcher_offline`. KDE and GNOME
+        /// hard-code the property to true, so they never flip.
+        fn spawn_host_monitor(&self) {
+            let live = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("rusticdl-tray-host".into())
+                .spawn(move || {
+                    let Ok(conn) = zbus::blocking::Connection::session() else {
+                        return;
+                    };
+                    let Ok(proxy) =
+                        zbus::blocking::proxy::Builder::<'_, zbus::blocking::Proxy>::new(&conn)
+                            .destination(WATCHER_DEST)
+                            .and_then(|b| b.path(WATCHER_PATH))
+                            .and_then(|b| b.interface(WATCHER_DEST))
+                            .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+                            .and_then(|b| b.build())
+                    else {
+                        return;
+                    };
+                    while !live.stop.load(Ordering::SeqCst) {
+                        if let Ok(registered) = proxy.get_property::<bool>(HOST_PROPERTY) {
+                            live.host_up.store(registered, Ordering::SeqCst);
+                        }
+                        let mut waited = Duration::ZERO;
+                        while waited < HOST_POLL && !live.stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(100));
+                            waited += Duration::from_millis(100);
+                        }
+                    }
+                });
+        }
+    }
+
+    pub(super) fn visible(watcher_up: bool, host_up: bool) -> bool {
+        watcher_up && host_up
+    }
+
+    enum StartSlot {
+        Pending,
+        Done(Result<LinuxTrayHandle, ksni::Error>),
+        Abandoned,
+    }
+
     pub(super) struct LinuxTray {
         event_tx: async_channel::Sender<TrayEvent>,
         icon: Vec<Icon>,
-        online: Arc<AtomicBool>,
+        online: Liveness,
     }
 
     impl LinuxTray {
@@ -364,11 +475,11 @@ mod linux_impl {
         }
 
         fn watcher_online(&self) {
-            self.online.store(true, Ordering::SeqCst);
+            self.online.watcher_up.store(true, Ordering::SeqCst);
         }
 
         fn watcher_offline(&self, _reason: OfflineReason) -> bool {
-            self.online.store(false, Ordering::SeqCst);
+            self.online.watcher_up.store(false, Ordering::SeqCst);
             // Keep the service alive: ksni re-registers when a watcher returns.
             true
         }
@@ -419,34 +530,54 @@ mod linux_impl {
     /// missing (or answers too slowly), so callers never hide the window behind
     /// a tray that is not there.
     pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
-        let online = Arc::new(AtomicBool::new(true));
+        let online = Liveness::new();
         let tray = LinuxTray {
             event_tx,
             icon: argb_pixmap(TRAY_ICON_PNG).into_iter().collect(),
-            online: Arc::clone(&online),
+            online: online.clone(),
         };
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let slot = Arc::new((Mutex::new(StartSlot::Pending), Condvar::new()));
+        let helper_slot = Arc::clone(&slot);
         let spawned = std::thread::Builder::new()
             .name("rusticdl-tray-start".into())
             .spawn(move || {
-                if let Err(std::sync::mpsc::SendError(Ok(handle))) = result_tx.send(tray.spawn()) {
-                    // The caller gave up waiting; do not leave an orphan icon.
-                    let _ = handle.shutdown();
+                let result = tray.spawn();
+                let (lock, cvar) = &*helper_slot;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                match (&*state, result) {
+                    (StartSlot::Abandoned, Ok(handle)) => {
+                        // The caller timed out; do not leave an orphan icon.
+                        let _ = handle.shutdown();
+                    }
+                    (StartSlot::Abandoned, Err(_)) => {}
+                    (_, result) => {
+                        *state = StartSlot::Done(result);
+                        cvar.notify_all();
+                    }
                 }
             });
         if spawned.is_err() {
             return None;
         }
-        match result_rx.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(handle)) => Some(SystemTray {
-                linux: handle,
-                online,
-            }),
-            Ok(Err(error)) => {
+
+        let (lock, cvar) = &*slot;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut state, _) = cvar
+            .wait_timeout_while(guard, START_TIMEOUT, |s| matches!(s, StartSlot::Pending))
+            .unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *state, StartSlot::Abandoned) {
+            StartSlot::Done(Ok(handle)) => {
+                online.spawn_host_monitor();
+                Some(SystemTray {
+                    linux: handle,
+                    online,
+                })
+            }
+            StartSlot::Done(Err(error)) => {
                 eprintln!("rusticdl: tray unavailable ({error})");
                 None
             }
-            Err(_) => {
+            StartSlot::Pending | StartSlot::Abandoned => {
                 eprintln!("rusticdl: tray unavailable (session bus did not answer)");
                 None
             }
@@ -468,16 +599,52 @@ mod linux_impl {
         #[test]
         fn watcher_loss_marks_tray_offline_and_recovery_restores_it() {
             let (event_tx, _event_rx) = async_channel::unbounded();
-            let online = Arc::new(AtomicBool::new(true));
+            let online = Liveness::new();
             let tray = LinuxTray {
                 event_tx,
                 icon: Vec::new(),
-                online: Arc::clone(&online),
+                online: online.clone(),
             };
             assert!(tray.watcher_offline(OfflineReason::No));
-            assert!(!online.load(Ordering::SeqCst));
+            assert!(!online.is_visible());
             tray.watcher_online();
-            assert!(online.load(Ordering::SeqCst));
+            assert!(online.is_visible());
+        }
+
+        #[test]
+        fn tray_is_visible_only_with_watcher_and_host() {
+            assert!(visible(true, true));
+            assert!(!visible(false, true));
+            assert!(!visible(true, false));
+            assert!(!visible(false, false));
+        }
+
+        #[test]
+        fn host_loss_marks_tray_invisible_until_host_returns() {
+            let online = Liveness::new();
+            online.host_up.store(false, Ordering::SeqCst);
+            assert!(!online.is_visible());
+            online.host_up.store(true, Ordering::SeqCst);
+            assert!(online.is_visible());
+        }
+
+        struct BusAddressGuard(Option<std::ffi::OsString>);
+
+        impl BusAddressGuard {
+            fn set(value: &str) -> Self {
+                let previous = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+                std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value);
+                Self(previous)
+            }
+        }
+
+        impl Drop for BusAddressGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value),
+                    None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+                }
+            }
         }
 
         #[test]
@@ -492,18 +659,11 @@ mod linux_impl {
                 std::thread::sleep(Duration::from_secs(8));
                 drop(conns);
             });
-            // SAFETY: no other test in this binary reads the session bus address.
-            unsafe {
-                std::env::set_var(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    format!("unix:path={}", path.display()),
-                );
-            }
+            let _bus = BusAddressGuard::set(&format!("unix:path={}", path.display()));
             let (event_tx, _event_rx) = async_channel::unbounded();
             let began = std::time::Instant::now();
             assert!(start(event_tx).is_none());
             assert!(began.elapsed() < START_TIMEOUT + Duration::from_secs(2));
-            unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") };
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1440,7 +1600,17 @@ mod linux_desktop_tests {
 
     #[test]
     fn tiling_compositors_do_not_support_minimize() {
-        for desktop in ["Hyprland", "sway", "niri", "river", "i3", "sway:wlroots"] {
+        for desktop in [
+            "Hyprland",
+            "sway",
+            "niri",
+            "river",
+            "i3",
+            "sway:wlroots",
+            "sway;wlroots",
+            "dwm",
+            "xmonad",
+        ] {
             assert!(!desktop_supports_minimize(Some(desktop)), "{desktop}");
         }
     }
@@ -1450,6 +1620,13 @@ mod linux_desktop_tests {
         for desktop in ["GNOME", "KDE", "ubuntu:GNOME", "XFCE", "X-Cinnamon"] {
             assert!(desktop_supports_minimize(Some(desktop)), "{desktop}");
         }
-        assert!(desktop_supports_minimize(None));
+    }
+
+    #[test]
+    fn unset_or_unknown_desktops_are_not_assumed_to_minimize() {
+        assert!(!desktop_supports_minimize(None));
+        assert!(!desktop_supports_minimize(Some("")));
+        assert!(!desktop_supports_minimize(Some("SomeNewWM")));
+        assert!(!desktop_supports_minimize(Some("GNOME:sway")));
     }
 }
