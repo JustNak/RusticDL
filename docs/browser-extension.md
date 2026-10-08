@@ -108,6 +108,15 @@ cargo build -p rusticdl-native-host
 
 4. Start the desktop app (`cargo run`). On Linux it listens on `$XDG_RUNTIME_DIR/rusticdl.v1.sock` and rewrites native-messaging manifests when a sibling host binary exists.
 
+## Closing the window on Linux
+
+The extension needs the desktop app running, so with "Close to tray" on (the default) closing the window keeps the app alive:
+
+- **Tray present** (Waybar, KDE, GNOME with the AppIndicator extension): the window hides and the tray icon restores it (Show) or quits (Quit). If the tray host disappears later, the app notices and treats it as "no tray".
+- **Hyprland**: the window moves to the `special:rusticdl` workspace. Without a tray, launching RusticDL again (or an extension action that needs the UI) brings it back, and a one-time notification explains this.
+- **GNOME / KDE / X11 without a tray**: the window is minimized; use the taskbar or dock to get it back. On Wayland, the tray, a relaunch and the extension cannot always un-minimize or raise the window because the toolkit does not accept an external activation token; the taskbar is the reliable way back.
+- **sway, niri, river, i3 and other tiling compositors**: there is no minimize, so closing leaves the window visible while the app keeps running. Quit with Ctrl+Q (main window) or the tray menu.
+
 ## Environment overrides (native host)
 
 | Variable | Purpose |

@@ -66,6 +66,9 @@ pub fn truncate_utf16_units(s: &str, max_units: usize) -> &str {
 pub struct SystemTray {
     #[cfg(target_os = "linux")]
     linux: linux_impl::LinuxTrayHandle,
+    /// Cleared while the StatusNotifierWatcher is gone (see `watcher_offline`).
+    #[cfg(target_os = "linux")]
+    online: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(windows)]
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
@@ -91,6 +94,22 @@ impl SystemTray {
         {
             let _ = event_tx;
             None
+        }
+    }
+
+    /// Whether the icon can currently be seen and clicked.
+    ///
+    /// On Linux the SNI item outlives its watcher: when the bar or watcher
+    /// goes away the handle stays open but nothing displays the icon. Callers
+    /// must not treat such a tray as a way to restore a hidden window.
+    pub fn is_online(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.online.load(std::sync::atomic::Ordering::SeqCst) && !self.linux.is_closed()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
         }
     }
 
@@ -185,26 +204,55 @@ pub fn main_window_hwnd(window: &gpui::Window) -> isize {
 }
 
 /// Hide a GPUI window from the taskbar (true tray hide).
-pub fn hide_main_window(window: &gpui::Window) {
+///
+/// Returns whether the window actually left the screen (or was minimized
+/// somewhere that honours it). `false` means it is still visible, so callers
+/// must not record it as hidden or tell the user it is gone.
+pub fn hide_main_window(window: &gpui::Window) -> bool {
     #[cfg(windows)]
     {
         let hwnd = main_window_hwnd(window);
         if hwnd != 0 {
             show_hwnd(hwnd, false);
+            return true;
         }
+        false
     }
     #[cfg(target_os = "linux")]
     {
-        // Hyprland (and most tiling WMs) ignore minimize; a special workspace
-        // really takes the window off screen. Elsewhere minimize is honoured.
-        if !crate::hyprland::hide_main_windows() {
-            window.minimize_window();
+        // Hyprland ignores minimize; a special workspace really takes the
+        // window off screen. Elsewhere minimize works only on desktops that
+        // implement it (tiling compositors silently drop the request).
+        if crate::hyprland::hide_main_windows() {
+            return true;
         }
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+        if desktop_supports_minimize(desktop.as_deref()) {
+            window.minimize_window();
+            return true;
+        }
+        false
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = window;
+        false
     }
+}
+
+/// Whether the session's compositor honours minimize requests.
+///
+/// Tiling compositors have no minimized state, so `minimize_window` is a
+/// silent no-op there and the window would stay on screen.
+#[cfg(target_os = "linux")]
+pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bool {
+    const NO_MINIMIZE: [&str; 7] = ["hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl"];
+    let Some(desktop) = xdg_current_desktop else {
+        return true;
+    };
+    !desktop
+        .split(':')
+        .any(|part| NO_MINIMIZE.iter().any(|d| part.eq_ignore_ascii_case(d)))
 }
 
 pub fn show_main_window(window: &gpui::Window) {
@@ -261,7 +309,14 @@ mod linux_impl {
     use super::{SystemTray, TrayEvent, APP_NAME};
     use ksni::blocking::{Handle, TrayMethods};
     use ksni::menu::StandardItem;
-    use ksni::{Category, Icon, MenuItem, ToolTip, Tray};
+    use ksni::{Category, Icon, MenuItem, OfflineReason, ToolTip, Tray};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Upper bound on the D-Bus registration. zbus has no handshake timeout,
+    /// so a bus that accepts but never answers would otherwise hang the UI.
+    const START_TIMEOUT: Duration = Duration::from_millis(1500);
 
     const TRAY_ICON_PNG: &[u8] = include_bytes!("../assets/brand/icon-64.png");
     const ICON_NAME: &str = "rusticdl";
@@ -271,6 +326,7 @@ mod linux_impl {
     pub(super) struct LinuxTray {
         event_tx: async_channel::Sender<TrayEvent>,
         icon: Vec<Icon>,
+        online: Arc<AtomicBool>,
     }
 
     impl LinuxTray {
@@ -305,6 +361,16 @@ mod linux_impl {
                 title: APP_NAME.into(),
                 ..Default::default()
             }
+        }
+
+        fn watcher_online(&self) {
+            self.online.store(true, Ordering::SeqCst);
+        }
+
+        fn watcher_offline(&self, _reason: OfflineReason) -> bool {
+            self.online.store(false, Ordering::SeqCst);
+            // Keep the service alive: ksni re-registers when a watcher returns.
+            true
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
@@ -350,16 +416,38 @@ mod linux_impl {
     }
 
     /// Register an SNI item. `None` when D-Bus, the watcher, or a host is
-    /// missing, so callers never hide the window behind a tray that is not there.
+    /// missing (or answers too slowly), so callers never hide the window behind
+    /// a tray that is not there.
     pub(super) fn start(event_tx: async_channel::Sender<TrayEvent>) -> Option<SystemTray> {
+        let online = Arc::new(AtomicBool::new(true));
         let tray = LinuxTray {
             event_tx,
             icon: argb_pixmap(TRAY_ICON_PNG).into_iter().collect(),
+            online: Arc::clone(&online),
         };
-        match tray.spawn() {
-            Ok(handle) => Some(SystemTray { linux: handle }),
-            Err(error) => {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("rusticdl-tray-start".into())
+            .spawn(move || {
+                if let Err(std::sync::mpsc::SendError(Ok(handle))) = result_tx.send(tray.spawn()) {
+                    // The caller gave up waiting; do not leave an orphan icon.
+                    let _ = handle.shutdown();
+                }
+            });
+        if spawned.is_err() {
+            return None;
+        }
+        match result_rx.recv_timeout(START_TIMEOUT) {
+            Ok(Ok(handle)) => Some(SystemTray {
+                linux: handle,
+                online,
+            }),
+            Ok(Err(error)) => {
                 eprintln!("rusticdl: tray unavailable ({error})");
+                None
+            }
+            Err(_) => {
+                eprintln!("rusticdl: tray unavailable (session bus did not answer)");
                 None
             }
         }
@@ -375,6 +463,48 @@ mod linux_impl {
             assert_eq!(icon.width, 64);
             assert_eq!(icon.height, 64);
             assert_eq!(icon.data.len(), 64 * 64 * 4);
+        }
+
+        #[test]
+        fn watcher_loss_marks_tray_offline_and_recovery_restores_it() {
+            let (event_tx, _event_rx) = async_channel::unbounded();
+            let online = Arc::new(AtomicBool::new(true));
+            let tray = LinuxTray {
+                event_tx,
+                icon: Vec::new(),
+                online: Arc::clone(&online),
+            };
+            assert!(tray.watcher_offline(OfflineReason::No));
+            assert!(!online.load(Ordering::SeqCst));
+            tray.watcher_online();
+            assert!(online.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn start_returns_within_bound_when_session_bus_never_answers() {
+            let dir =
+                std::env::temp_dir().join(format!("rusticdl-hung-bus-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let path = dir.join("bus");
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+            let _holder = std::thread::spawn(move || {
+                let conns: Vec<_> = listener.incoming().take(4).flatten().collect();
+                std::thread::sleep(Duration::from_secs(8));
+                drop(conns);
+            });
+            // SAFETY: no other test in this binary reads the session bus address.
+            unsafe {
+                std::env::set_var(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", path.display()),
+                );
+            }
+            let (event_tx, _event_rx) = async_channel::unbounded();
+            let began = std::time::Instant::now();
+            assert!(start(event_tx).is_none());
+            assert!(began.elapsed() < START_TIMEOUT + Duration::from_secs(2));
+            unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") };
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
@@ -1301,5 +1431,25 @@ mod tests {
     #[test]
     fn truncate_zero_is_empty() {
         assert_eq!(truncate_utf16_units("abc", 0), "");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_desktop_tests {
+    use super::desktop_supports_minimize;
+
+    #[test]
+    fn tiling_compositors_do_not_support_minimize() {
+        for desktop in ["Hyprland", "sway", "niri", "river", "i3", "sway:wlroots"] {
+            assert!(!desktop_supports_minimize(Some(desktop)), "{desktop}");
+        }
+    }
+
+    #[test]
+    fn mainstream_desktops_support_minimize() {
+        for desktop in ["GNOME", "KDE", "ubuntu:GNOME", "XFCE", "X-Cinnamon"] {
+            assert!(desktop_supports_minimize(Some(desktop)), "{desktop}");
+        }
+        assert!(desktop_supports_minimize(None));
     }
 }

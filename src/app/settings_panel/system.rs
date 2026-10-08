@@ -30,7 +30,7 @@ impl DownloadApp {
                             }
                         })
                         .hint(if cfg!(target_os = "linux") {
-                            "Keeps running in the background so the browser extension keeps working. Ctrl+Q quits; without a tray, relaunch the app to bring the window back."
+                            "Keeps running in the background for the browser extension. Ctrl+Q quits."
                         } else {
                             "Hides to the tray instead of quitting."
                         }),
@@ -99,7 +99,11 @@ impl DownloadApp {
                                 }
                             },
                         )
-                        .hint("Uses the tray icon even if Close to tray is Off."),
+                        .hint(if cfg!(target_os = "linux") {
+                            "Shown with notify-send."
+                        } else {
+                            "Uses the tray icon even if Close to tray is Off."
+                        }),
                     )
                     .child(SettingsToggleRow::new(
                         "notify-complete",

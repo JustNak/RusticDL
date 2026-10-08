@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use gpui::{Context, Window};
 use tokio::sync::oneshot;
 
@@ -54,6 +56,15 @@ pub(crate) fn decide_close_action(
     }
 }
 
+/// How long a failed tray registration is remembered before trying again, so
+/// desktops without a tray host are not probed on every close or notification.
+pub(crate) const NO_TRAY_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether a (re)start of the tray should be attempted now.
+pub(crate) fn should_attempt_tray_start(retry_after: Option<Instant>, now: Instant) -> bool {
+    retry_after.is_none_or(|deadline| now >= deadline)
+}
+
 /// Ctrl+Q quits on Linux, the one place a hidden or tray-less app needs an
 /// in-app way out. Other platforms already have the tray menu / OS conventions.
 pub(crate) fn is_quit_chord(keystroke: &gpui::Keystroke) -> bool {
@@ -96,38 +107,35 @@ impl DownloadApp {
 
         let action = decide_close_action(
             self.settings.close_to_tray,
-            self.system_tray.is_some(),
+            self.tray_usable(),
             cfg!(target_os = "linux"),
             hyprland::is_hyprland(),
         );
-        match action {
-            CloseAction::Quit => {
-                self.force_quit_app(cx);
-                return false;
-            }
-            CloseAction::HideToTray => {
-                self.flush_window_layout_now();
-                self.remember_main_window(window);
-                hide_main_window(window);
-                self.window_hidden_to_tray = true;
-                self.close_capture_huds(cx);
-            }
-            CloseAction::HideWithoutTray => {
-                self.flush_window_layout_now();
-                self.remember_main_window(window);
-                hide_main_window(window);
-                self.window_hidden_to_tray = true;
-                self.close_capture_huds(cx);
+        if action == CloseAction::Quit {
+            self.force_quit_app(cx);
+            return false;
+        }
+
+        self.flush_window_layout_now();
+        self.remember_main_window(window);
+        // A failed hide (stale compositor socket, no minimize support) leaves
+        // the window on screen: do not record it as hidden or tell the user it
+        // is gone.
+        if hide_main_window(window) {
+            self.window_hidden_to_tray = true;
+            self.close_capture_huds(cx);
+            if action == CloseAction::HideWithoutTray {
                 self.notify_hidden_without_tray();
-            }
-            CloseAction::Minimize => {
-                self.flush_window_layout_now();
-                self.remember_main_window(window);
-                window.minimize_window();
             }
         }
         cx.notify();
         false
+    }
+
+    /// A tray that exists *and* is currently displayed. A Linux SNI item whose
+    /// watcher vanished is still `Some` but cannot restore a hidden window.
+    fn tray_usable(&self) -> bool {
+        self.system_tray.as_ref().is_some_and(|t| t.is_online())
     }
 
     /// One desktop notification per session so a trayless hide is not a
@@ -160,14 +168,17 @@ impl DownloadApp {
     }
 
     fn ensure_tray(&mut self, cx: &mut Context<Self>) {
-        if self.system_tray.is_some() {
+        let now = Instant::now();
+        if self.system_tray.is_some() || !should_attempt_tray_start(self.tray_retry_after, now) {
             return;
         }
         let (tray_tx, tray_rx) = async_channel::unbounded::<TrayEvent>();
         self.system_tray = SystemTray::start(tray_tx);
         if self.system_tray.is_none() {
+            self.tray_retry_after = Some(now + NO_TRAY_RETRY);
             return;
         }
+        self.tray_retry_after = None;
         cx.spawn(async move |this, cx| {
             while let Ok(event) = tray_rx.recv().await {
                 let result = this.update(cx, |app, cx| app.handle_tray_event(event, cx));
@@ -362,6 +373,33 @@ mod tests {
             decide_close_action(true, false, false, false),
             CloseAction::Quit
         );
+    }
+
+    #[test]
+    fn offline_tray_is_treated_like_no_tray() {
+        // `tray_usable()` is false for a tray whose watcher disappeared, so
+        // the decision must match the no-tray rows.
+        assert_eq!(
+            decide_close_action(true, false, true, true),
+            CloseAction::HideWithoutTray
+        );
+        assert_eq!(
+            decide_close_action(true, false, true, false),
+            CloseAction::Minimize
+        );
+    }
+
+    #[test]
+    fn failed_tray_start_is_cached_until_deadline() {
+        let now = Instant::now();
+        assert!(should_attempt_tray_start(None, now));
+        let deadline = now + NO_TRAY_RETRY;
+        assert!(!should_attempt_tray_start(Some(deadline), now));
+        assert!(!should_attempt_tray_start(
+            Some(deadline),
+            deadline - Duration::from_millis(1)
+        ));
+        assert!(should_attempt_tray_start(Some(deadline), deadline));
     }
 
     #[test]
