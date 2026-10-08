@@ -1084,10 +1084,10 @@ fn unix_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     DIALECT.store(DIALECT_UNKNOWN, Ordering::SeqCst);
