@@ -14,6 +14,8 @@
 //! in the shared queue (never only in a discarded PostMessage `LPARAM`).
 
 use crate::branding::APP_NAME;
+#[cfg(target_os = "linux")]
+use crate::linux_restore;
 
 /// Severity icon for a tray balloon (`NIIF_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,19 +287,34 @@ pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bo
     !matches(&NO_MINIMIZE) && matches(&MINIMIZE)
 }
 
-pub fn show_main_window(window: &gpui::Window) {
+/// Show the main window.
+///
+/// Returns whether the window is back on screen. Wayland `activate` does not
+/// clear minimized, so that session returns `false` unless Hyprland actually
+/// moved the window; the hidden flag then stays set until the compositor
+/// reports activation.
+pub fn show_main_window(window: &mut gpui::Window) -> bool {
     #[cfg(windows)]
     {
         let hwnd = main_window_hwnd(window);
         if hwnd != 0 {
             show_hwnd(hwnd, true);
         }
+        window.activate_window();
+        return hwnd != 0;
     }
     #[cfg(target_os = "linux")]
     {
-        crate::hyprland::show_main_windows();
+        let moved = crate::hyprland::show_main_windows();
+        linux_restore::request_compositor_unminimize();
+        linux_restore::activate_for_restore(window);
+        return linux_restore::restore_clears_hidden_flag(moved, linux_restore::wayland_session());
     }
-    window.activate_window();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        window.activate_window();
+        true
+    }
 }
 
 /// Restore/show a main window by raw HWND (safe without a GPUI `Window`).

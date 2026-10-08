@@ -6,6 +6,8 @@ use tokio::sync::oneshot;
 use super::DownloadApp;
 use crate::download::{open_path, EngineCommand};
 use crate::hyprland;
+#[cfg(target_os = "linux")]
+use crate::linux_restore;
 use crate::notifications::{spawn_session_notify, BalloonOutcome};
 use crate::prompt_window::close_capture_window;
 use crate::settings::OsNotifyMode;
@@ -31,12 +33,10 @@ pub(crate) enum CloseAction {
 
 /// Pick the close behaviour. Pure so the platform matrix is unit-tested.
 ///
-/// A window may only vanish when something can bring it back (the tray).
-/// Without a tray, desktops with a working minimize keep the app alive in the
-/// taskbar. Hyprland has no minimize, so it hides to a special workspace even
-/// without a tray; a relaunch (single-instance) or an extension action that
-/// needs the UI brings the window back. Windows and macOS keep their old
-/// behaviour.
+/// With close-to-background on, the window may hide behind a tray, move to a
+/// Hyprland special workspace even when no tray exists (a relaunch or the
+/// extension brings it back), or minimize on other Linux desktops that honour
+/// minimize. The setting off, and Windows or macOS without a tray, quit.
 pub(crate) fn decide_close_action(
     close_to_background: bool,
     tray_available: bool,
@@ -259,21 +259,32 @@ impl DownloadApp {
     /// often stops painting. Windows uses the cached HWND; Linux asks Hyprland
     /// to pull the window back and activates it through the stored GPUI handle.
     fn restore_main_window_now(&mut self, cx: &mut Context<Self>) {
-        self.window_hidden_to_tray = false;
         if self.main_hwnd != 0 {
             show_main_window_hwnd(self.main_hwnd);
         }
+        #[cfg(not(target_os = "linux"))]
+        let shown = {
+            let _ = cx;
+            self.main_hwnd != 0
+        };
         #[cfg(target_os = "linux")]
-        {
-            hyprland::show_main_windows();
+        let shown = {
+            let moved = hyprland::show_main_windows();
+            linux_restore::request_compositor_unminimize();
             if let Some(handle) = self.main_window {
                 cx.defer(move |cx| {
-                    let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    let _ = handle.update(cx, |_, window, _| {
+                        linux_restore::activate_for_restore(window);
+                    });
                 });
             }
+            // Wayland activate does not unminimize. A failed or non-Hyprland
+            // show leaves the hidden flag set until the compositor activates.
+            linux_restore::restore_clears_hidden_flag(moved, linux_restore::wayland_session())
+        };
+        if shown {
+            self.window_hidden_to_tray = false;
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = cx;
     }
 
     pub(crate) fn poll_hidden_window_actions(&mut self, cx: &mut Context<Self>) {
@@ -295,8 +306,9 @@ impl DownloadApp {
         }
         if self.pending_tray_show {
             self.pending_tray_show = false;
-            self.window_hidden_to_tray = false;
-            show_main_window(window);
+            if show_main_window(window) {
+                self.window_hidden_to_tray = false;
+            }
         } else if self.window_hidden_to_tray {
             reassert_tray_hide(self.main_hwnd);
         }

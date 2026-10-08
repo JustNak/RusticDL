@@ -543,16 +543,92 @@ fn lua_focus_command(selector: &str) -> String {
     )
 }
 
-/// Workspace to restore onto: the active one by id, or `e+0` (relative
-/// "current") when the id is unknown or a special workspace is focused.
+/// Positive workspace id from `j/activeworkspace`. Special workspaces are
+/// negative and are not a restore target (`e+0` wraps to the last regular
+/// workspace when the focused one is special).
 #[cfg(target_os = "linux")]
-fn parse_active_workspace(json: &str) -> String {
+fn positive_workspace_id(json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|v| v.get("id").and_then(|id| id.as_i64()))
         .filter(|id| *id > 0)
         .map(|id| id.to_string())
-        .unwrap_or_else(|| "e+0".to_string())
+}
+
+/// Regular workspace on the monitor the user is looking at.
+///
+/// `j/monitors[].activeWorkspace.id` stays positive while a special is
+/// focused. The workspace name is never used.
+#[cfg(target_os = "linux")]
+fn monitor_regular_workspace(monitor: &serde_json::Value) -> Option<String> {
+    let id = monitor.get("activeWorkspace")?.get("id")?.as_i64()?;
+    (id > 0).then(|| id.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn focused_monitor_workspace(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let monitors = value.as_array()?;
+    let focused = monitors
+        .iter()
+        .find(|monitor| monitor.get("focused").and_then(|v| v.as_bool()) == Some(true));
+    if let Some(id) = focused.and_then(monitor_regular_workspace) {
+        return Some(id);
+    }
+    let special_open = monitors.iter().find(|monitor| {
+        monitor
+            .get("specialWorkspace")
+            .and_then(|special| special.get("id"))
+            .and_then(|id| id.as_i64())
+            .is_some_and(|id| id != 0)
+    });
+    if let Some(id) = special_open.and_then(monitor_regular_workspace) {
+        return Some(id);
+    }
+    monitors.iter().find_map(monitor_regular_workspace)
+}
+
+/// Workspace id to `movetoworkspace` onto. `None` means do not dispatch
+/// (never `e+0`, never a workspace name).
+#[cfg(target_os = "linux")]
+fn restore_workspace_id(active_json: &str, monitors_json: Option<&str>) -> Option<String> {
+    if let Some(id) = positive_workspace_id(active_json) {
+        return Some(id);
+    }
+    monitors_json.and_then(focused_monitor_workspace)
+}
+
+/// Lua move first. A `Failed` reply (not only `Invalid` / `error:`) still
+/// tries the legacy dispatcher. A socket error does not: legacy cannot
+/// connect either.
+#[cfg(target_os = "linux")]
+fn move_tries_legacy(reply: DispatchReply) -> bool {
+    match reply {
+        DispatchReply::Ok => false,
+        DispatchReply::WrongSyntax | DispatchReply::Failed => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_move_then_legacy(lua_cmd: &str, legacy_cmd: &str) -> bool {
+    match hyprland_ipc(lua_cmd) {
+        Ok(reply) => {
+            let class = classify_dispatch_reply(&reply);
+            if move_tries_legacy(class) {
+                legacy_dispatch_ok(legacy_cmd)
+            } else {
+                true
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_dispatch_ok(cmd: &str) -> bool {
+    hyprland_ipc(cmd)
+        .map(|reply| classify_dispatch_reply(&reply) == DispatchReply::Ok)
+        .unwrap_or(false)
 }
 
 /// Park the main window on a special workspace so it is truly off screen.
@@ -571,7 +647,7 @@ pub fn hide_main_windows() -> bool {
     let mut moved = false;
     for address in addresses {
         let selector = address_selector(&address);
-        moved |= dispatch_lua_then_legacy(
+        moved |= dispatch_move_then_legacy(
             &lua_hide_command(&selector),
             &legacy_hide_command(&selector),
         );
@@ -579,29 +655,40 @@ pub fn hide_main_windows() -> bool {
     moved
 }
 
-/// Bring the main window back to the active workspace and focus it.
+/// Bring the main window back to the user's regular workspace and focus it.
+///
+/// Returns whether a move dispatch succeeded. Focus-only (no numeric
+/// workspace, or the compositor refused the move) is `false`.
 #[cfg(target_os = "linux")]
-pub fn show_main_windows() {
+pub fn show_main_windows() -> bool {
     if !is_hyprland() {
-        return;
+        return false;
     }
     let Some(addresses) = our_main_window_addresses() else {
-        return;
+        return false;
     };
-    let workspace = hyprland_ipc("j/activeworkspace")
-        .map(|reply| parse_active_workspace(&reply))
-        .unwrap_or_else(|_| "e+0".to_string());
+    let active = hyprland_ipc("j/activeworkspace").unwrap_or_default();
+    let monitors = if positive_workspace_id(&active).is_none() {
+        hyprland_ipc("j/monitors").ok()
+    } else {
+        None
+    };
+    let workspace_id = restore_workspace_id(&active, monitors.as_deref());
+    let mut moved = false;
     for address in addresses {
         let selector = address_selector(&address);
-        let _ = dispatch_lua_then_legacy(
-            &lua_show_command(&workspace, &selector),
-            &legacy_show_command(&workspace, &selector),
-        );
-        let _ = dispatch_lua_then_legacy(
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            moved |= dispatch_move_then_legacy(
+                &lua_show_command(workspace_id, &selector),
+                &legacy_show_command(workspace_id, &selector),
+            );
+        }
+        let _ = dispatch_move_then_legacy(
             &lua_focus_command(&selector),
             &legacy_focus_command(&selector),
         );
     }
+    moved
 }
 
 #[cfg(target_os = "linux")]

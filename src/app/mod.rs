@@ -714,9 +714,8 @@ impl Render for DownloadApp {
         self.flush_toast(cx);
         self.apply_pending_tray_actions(window, cx);
         self.apply_pending_whats_new(window, cx);
-        if self.ipc.take_show_window_request() {
+        if self.ipc.take_show_window_request() && show_main_window(window) {
             self.window_hidden_to_tray = false;
-            show_main_window(window);
         }
         if self.extension_text_inputs_stale && self.filter == FilterKind::Settings {
             self.refresh_extension_text_inputs(window, cx);

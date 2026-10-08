@@ -479,15 +479,56 @@ mod close_to_background {
 
     #[test]
     fn active_workspace_prefers_positive_id() {
-        assert_eq!(parse_active_workspace(r#"{"id":4,"name":"4"}"#), "4");
+        assert_eq!(
+            restore_workspace_id(r#"{"id":4,"name":"4"}"#, None).as_deref(),
+            Some("4")
+        );
     }
 
     #[test]
-    fn active_workspace_falls_back_to_relative_current() {
+    fn special_workspace_uses_focused_monitor_not_e_plus_zero() {
+        let active = r#"{"id":-98,"name":"special:rusticdl"}"#;
+        let monitors = r#"[{"id":0,"name":"DP-1","focused":false,"activeWorkspace":{"id":9,"name":"9"},"specialWorkspace":{"id":0,"name":""}},{"id":1,"name":"DP-2","focused":true,"activeWorkspace":{"id":2,"name":"2"},"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
         assert_eq!(
-            parse_active_workspace(r#"{"id":-98,"name":"special:x"}"#),
-            "e+0"
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("2")
         );
-        assert_eq!(parse_active_workspace("garbage"), "e+0");
+        assert_ne!(
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("e+0")
+        );
+        let target = restore_workspace_id(active, Some(monitors)).unwrap();
+        assert!(target.chars().all(|c| c.is_ascii_digit()));
+        assert!(!target.contains("special"));
+    }
+
+    #[test]
+    fn special_without_focused_flag_uses_that_monitors_workspace() {
+        let active = r#"{"id":-99,"name":"special:scratchpad"}"#;
+        let monitors = r#"[{"id":0,"activeWorkspace":{"id":3,"name":"three"},"specialWorkspace":{"id":-99,"name":"special:scratchpad"}}]"#;
+        assert_eq!(
+            restore_workspace_id(active, Some(monitors)).as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_does_not_dispatch_e_plus_zero() {
+        assert_eq!(restore_workspace_id("garbage", None), None);
+        assert_eq!(
+            restore_workspace_id(r#"{"id":-98,"name":"special:x"}"#, None),
+            None
+        );
+        assert_eq!(
+            restore_workspace_id(r#"{"id":-98,"name":"special:x"}"#, Some("not json")),
+            None
+        );
+    }
+
+    #[test]
+    fn move_dispatch_falls_through_on_failed_lua() {
+        assert!(!move_tries_legacy(DispatchReply::Ok));
+        assert!(move_tries_legacy(DispatchReply::WrongSyntax));
+        assert!(move_tries_legacy(DispatchReply::Failed));
     }
 }
