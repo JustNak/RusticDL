@@ -114,7 +114,8 @@ pub(crate) fn request_compositor_unminimize() {
     // KWin executes it with session-bus access. No runtime dir, no KWin path.
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_absolute() && runtime_dir_is_private(dir))
+        .and_then(|dir| normalized_runtime_dir(&dir))
+        .filter(|dir| runtime_dir_is_private(dir))
     else {
         return;
     };
@@ -128,17 +129,31 @@ pub(crate) fn request_compositor_unminimize() {
         });
 }
 
+/// Lexically clean an absolute path: `.` and trailing separators go, and any
+/// `..` rejects it (so `<symlink>/.` and `<symlink>/` cannot dodge the checks).
+fn normalized_runtime_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    if !dir.is_absolute() {
+        return None;
+    }
+    let mut clean = std::path::PathBuf::new();
+    for component in dir.components() {
+        match component {
+            Component::ParentDir => return None,
+            Component::CurDir => {}
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    Some(clean)
+}
+
 /// The runtime dir must be a directory we own that nobody else can enter,
 /// otherwise a hostile `XDG_RUNTIME_DIR` would reopen the shared-path hole.
 fn runtime_dir_is_private(dir: &std::path::Path) -> bool {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::MetadataExt;
-    // `symlink_metadata("/x/link/")` follows the link; drop trailing separators.
-    let mut bytes = dir.as_os_str().as_bytes();
-    while bytes.len() > 1 && bytes.ends_with(b"/") {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    let dir = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+    let Some(dir) = normalized_runtime_dir(dir) else {
+        return false;
+    };
     std::fs::symlink_metadata(&dir).is_ok_and(|meta| {
         !meta.file_type().is_symlink()
             && meta.is_dir()
@@ -199,71 +214,86 @@ fn unload_script(bus: Bus, name_arg: &str) -> bool {
     .is_ok_and(|output| output.status.success())
 }
 
-/// Object names KWin currently exposes under `/Scripting` (`Script<id>`).
-/// `None` when the bus could not be introspected.
-fn existing_script_ids(bus: Bus) -> Option<Vec<u32>> {
-    let output = bus(
-        &[
-            "/Scripting",
-            "org.freedesktop.DBus.Introspectable.Introspect",
-        ],
-        DBUS_TIMEOUT,
-    )
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(parse_script_ids(&String::from_utf8_lossy(&output.stdout)))
+/// Ids KWin already exposes as script objects, on either path layout: KWin 6
+/// registers `/Scripting/Script<id>`, KWin 5 registers `/<id>`. `None` when
+/// either introspection fails (the caller must then not run anything).
+fn taken_script_ids(bus: Bus) -> Option<Vec<u32>> {
+    let introspect = |object: &str| {
+        let output = bus(
+            &[object, "org.freedesktop.DBus.Introspectable.Introspect"],
+            DBUS_TIMEOUT,
+        )
+        .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut ids = parse_script_ids(&introspect("/Scripting")?);
+    ids.extend(parse_script_ids(&introspect("/")?));
+    Some(ids)
 }
 
+/// Child object names that are a script id: `Script<N>` (KWin 6) or a bare
+/// `<N>` (KWin 5).
 fn parse_script_ids(introspection: &str) -> Vec<u32> {
     introspection
         .split("node name=\"")
         .skip(1)
         .filter_map(|rest| {
             let name = rest.split('"').next()?;
-            name.strip_prefix("Script")?.parse().ok()
+            name.strip_prefix("Script").unwrap_or(name).parse().ok()
         })
         .collect()
 }
 
-fn script_is_loaded(bus: Bus, name_arg: &str) -> bool {
-    bus(
-        &[
-            "/Scripting",
-            "org.kde.kwin.Scripting.isScriptLoaded",
-            name_arg,
-        ],
-        DBUS_TIMEOUT,
-    )
-    .is_ok_and(|output| {
-        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("boolean true")
-    })
-}
+/// How many fresh names to try when the id KWin hands out is already in use.
+const MAX_LOAD_ATTEMPTS: usize = 4;
 
 fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Result<()> {
     run_kwin_script_with(&kwin_method, dir, name, script)
 }
 
-/// KWin hands out script ids as `scripts.size()`, so after any lower-numbered
-/// script was unloaded the next id equals a live script's. Our
-/// `/Scripting/Script<id>` object then never registers and `Script.run` on that
-/// path would run (and "succeed" on) the other script. When the id was already
-/// taken, start the loaded-but-idle scripts through the `Scripting` interface
-/// instead, which does not depend on the id, and only report success if our
-/// script is confirmed loaded.
+/// KWin assigns a script the id `scripts.size()`, so after a lower-numbered
+/// script was unloaded the next id equals a live script's. Our object then
+/// never registers at that path, and `Script.run` there would run (and
+/// "succeed" on) someone else's script. Never use `Scripting.start`: it
+/// re-applies the user's plugin settings and starts every other app's idle
+/// script, and it returns before our script is evaluated.
+///
+/// Instead, snapshot the ids in use (both KWin 6 and KWin 5 layouts) and keep
+/// loading under fresh names until the returned id is free; the colliding
+/// loads stay loaded meanwhile (unloading would hand out the same id again).
+/// `run` is invoked only on an id that was free, i.e. on our own object, and
+/// every name we loaded is unloaded at the end. `Ok` means that `run` call
+/// succeeded; no free id, or an unreadable bus, is an error.
 fn run_kwin_script_with(
     bus: Bus,
     dir: &std::path::Path,
-    name: &str,
+    first_name: &str,
     script: &str,
 ) -> io::Result<()> {
-    let path = write_script_file(dir, name, script)?;
-    let path_arg = format!("string:{}", path.display());
-    let name_arg = format!("string:{name}");
-    let taken = existing_script_ids(bus);
+    let taken = taken_script_ids(bus)
+        .ok_or_else(|| io::Error::other("kwin scripting objects could not be listed"))?;
 
-    let result = (|| {
+    let mut loaded: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut result = Err(io::Error::other("kwin gave no free script id"));
+    for attempt in 0..MAX_LOAD_ATTEMPTS {
+        let name = if attempt == 0 {
+            first_name.to_string()
+        } else {
+            format!("{first_name}-{attempt}")
+        };
+        let path = match write_script_file(dir, &name, script) {
+            Ok(path) => path,
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        };
+        let name_arg = format!("string:{name}");
+        loaded.push((name_arg.clone(), path.clone()));
+        let path_arg = format!("string:{}", path.display());
         let output = match bus(
             &[
                 "/Scripting",
@@ -273,51 +303,53 @@ fn run_kwin_script_with(
             ],
             DBUS_TIMEOUT,
         ) {
-            Ok(output) => output,
+            Ok(output) if output.status.success() => output,
+            Ok(_) => {
+                result = Err(io::Error::other("kwin loadScript failed"));
+                break;
+            }
             Err(error) => {
-                // The request may still have reached KWin: sweep again after
-                // it has had time to land.
+                // The request may still have reached KWin; the sweep below
+                // waits for it to land.
                 std::thread::sleep(LATE_LOAD_GRACE);
-                return Err(error);
+                result = Err(error);
+                break;
             }
         };
-        if !output.status.success() {
-            return Err(io::Error::other("kwin loadScript failed"));
+        let Some(id) = parse_dbus_script_id(&String::from_utf8_lossy(&output.stdout)) else {
+            result = Err(io::Error::other("kwin loadScript returned no id"));
+            break;
+        };
+        if taken.contains(&id) {
+            continue;
         }
-        let reply = String::from_utf8_lossy(&output.stdout);
-        let id = parse_dbus_script_id(&reply)
-            .ok_or_else(|| io::Error::other("kwin loadScript returned no id"))?;
-        let collides = taken.as_ref().is_none_or(|ids| ids.contains(&id));
-        if collides {
-            let started = bus(&["/Scripting", "org.kde.kwin.Scripting.start"], RUN_TIMEOUT)
-                .is_ok_and(|output| output.status.success());
-            return if started && script_is_loaded(bus, &name_arg) {
-                Ok(())
-            } else {
-                Err(io::Error::other("kwin script id collided and start failed"))
-            };
-        }
-        // KWin 6 exposes the script at /Scripting/Script<id>; KWin 5 used /<id>.
-        // `run` must be a real method call (a signal is silently ignored) and
-        // its reply arrives once the script has been evaluated, so the file
-        // is not removed underneath it.
+        // Whichever layout the running KWin uses, only our object lives at
+        // this id, so the other path simply does not exist.
+        result = Err(io::Error::other("kwin script run failed"));
         for object in [format!("/Scripting/Script{id}"), format!("/{id}")] {
+            // `run` must be a real method call, and its reply arrives once the
+            // script has been evaluated, so the file is not removed under it.
             if let Ok(output) = bus(&[&object, "org.kde.kwin.Script.run"], RUN_TIMEOUT) {
                 if output.status.success() {
-                    return Ok(());
+                    result = Ok(());
+                    break;
                 }
             }
         }
-        Err(io::Error::other("kwin script run failed"))
-    })();
-
-    // Sweep once more when the first unload failed or timed out, or when the
-    // load never confirmed (it may have landed late).
-    if (!unload_script(bus, &name_arg) || result.is_err()) && !unload_script(bus, &name_arg) {
-        std::thread::sleep(LATE_LOAD_GRACE);
-        let _ = unload_script(bus, &name_arg);
+        break;
     }
-    let _ = std::fs::remove_file(&path);
+
+    let mut swept_late = false;
+    for (name_arg, path) in &loaded {
+        if (!unload_script(bus, name_arg) || result.is_err()) && !unload_script(bus, name_arg) {
+            if !swept_late {
+                std::thread::sleep(LATE_LOAD_GRACE);
+                swept_late = true;
+            }
+            let _ = unload_script(bus, name_arg);
+        }
+        let _ = std::fs::remove_file(path);
+    }
     result
 }
 
@@ -488,6 +520,11 @@ mod tests {
         let mut slashed = link.clone().into_os_string();
         slashed.push("/");
         assert!(!runtime_dir_is_private(std::path::Path::new(&slashed)));
+        let dotted = link.join(".");
+        assert!(!runtime_dir_is_private(&dotted));
+        assert!(!runtime_dir_is_private(
+            &dir.join("..").join(dir.file_name().unwrap())
+        ));
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -500,7 +537,7 @@ mod tests {
         assert!(!dir_is_private(1000, 0o40710, 1000));
     }
 
-    type Calls = std::sync::Mutex<Vec<String>>;
+    use std::sync::Mutex;
 
     fn ok(stdout: &str) -> io::Result<std::process::Output> {
         use std::os::unix::process::ExitStatusExt;
@@ -511,75 +548,213 @@ mod tests {
         })
     }
 
-    fn fake_bus<'a>(
-        calls: &'a Calls,
-        existing: &str,
-        new_id: u32,
-        started_ok: bool,
-    ) -> impl Fn(&[&str], Duration) -> io::Result<std::process::Output> + 'a {
-        let existing = existing.to_string();
-        move |args: &[&str], _| {
+    /// A tiny KWin: ids are `scripts.size()`, objects register only at free
+    /// paths, `Script.run` on a path records which script it actually hit.
+    struct FakeKwin {
+        kwin5: bool,
+        introspect_fails: bool,
+        forced_ids: Mutex<Vec<u32>>,
+        /// (name, id) of every live script; ours are appended as loaded.
+        live: Mutex<Vec<(String, u32)>>,
+        /// path -> owner name
+        objects: Mutex<Vec<(String, String)>>,
+        log: Mutex<Vec<String>>,
+        ran: Mutex<Vec<String>>,
+    }
+
+    impl FakeKwin {
+        fn new(kwin5: bool, others: &[(&str, u32)]) -> Self {
+            let fake = Self {
+                kwin5,
+                introspect_fails: false,
+                forced_ids: Mutex::new(Vec::new()),
+                live: Mutex::new(Vec::new()),
+                objects: Mutex::new(Vec::new()),
+                log: Mutex::new(Vec::new()),
+                ran: Mutex::new(Vec::new()),
+            };
+            for (name, id) in others {
+                fake.register(name, *id);
+            }
+            fake
+        }
+
+        fn path(&self, id: u32) -> String {
+            if self.kwin5 {
+                format!("/{id}")
+            } else {
+                format!("/Scripting/Script{id}")
+            }
+        }
+
+        fn register(&self, name: &str, id: u32) {
+            self.live.lock().unwrap().push((name.into(), id));
+            let path = self.path(id);
+            let mut objects = self.objects.lock().unwrap();
+            if !objects.iter().any(|(p, _)| *p == path) {
+                objects.push((path, name.into()));
+            }
+        }
+
+        fn call(&self, args: &[&str]) -> io::Result<std::process::Output> {
             let method = args.get(1).copied().unwrap_or("");
-            calls
+            self.log
                 .lock()
                 .unwrap()
                 .push(format!("{} {}", args[0], method));
             match method {
-                "org.freedesktop.DBus.Introspectable.Introspect" => ok(&existing),
-                "org.kde.kwin.Scripting.loadScript" => ok(&format!("   int32 {new_id}\n")),
-                "org.kde.kwin.Scripting.isScriptLoaded" => ok("   boolean true\n"),
-                "org.kde.kwin.Scripting.start" if !started_ok => {
-                    Err(io::Error::other("start failed"))
+                "org.freedesktop.DBus.Introspectable.Introspect" if self.introspect_fails => {
+                    Err(io::Error::other("no bus"))
                 }
-                _ => ok(""),
+                "org.freedesktop.DBus.Introspectable.Introspect" => {
+                    let objects = self.objects.lock().unwrap();
+                    let nodes: String = objects
+                        .iter()
+                        .filter_map(|(path, _)| {
+                            if args[0] == "/Scripting" && path.starts_with("/Scripting/") {
+                                Some(path.trim_start_matches("/Scripting/").to_string())
+                            } else if args[0] == "/" && !path.starts_with("/Scripting") {
+                                Some(path.trim_start_matches('/').to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|n| format!("<node name=\"{n}\"/>"))
+                        .collect();
+                    ok(&format!("<node>{nodes}<node name=\"Scripting\"/></node>"))
+                }
+                "org.kde.kwin.Scripting.loadScript" => {
+                    let name = args[3].trim_start_matches("string:").to_string();
+                    let forced = {
+                        let mut forced = self.forced_ids.lock().unwrap();
+                        (!forced.is_empty()).then(|| forced.remove(0))
+                    };
+                    let id = forced.unwrap_or(self.live.lock().unwrap().len() as u32);
+                    self.register(&name, id);
+                    ok(&format!("   int32 {id}\n"))
+                }
+                "org.kde.kwin.Scripting.unloadScript" => {
+                    let name = args[2].trim_start_matches("string:");
+                    self.live.lock().unwrap().retain(|(n, _)| n != name);
+                    self.objects.lock().unwrap().retain(|(_, o)| o != name);
+                    ok("   boolean true\n")
+                }
+                "org.kde.kwin.Script.run" => {
+                    let owner = self
+                        .objects
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(p, _)| p == args[0])
+                        .map(|(_, o)| o.clone());
+                    match owner {
+                        Some(owner) => {
+                            self.ran.lock().unwrap().push(owner);
+                            ok("")
+                        }
+                        None => Err(io::Error::other("no such object")),
+                    }
+                }
+                other => panic!("unexpected KWin call: {other}"),
             }
         }
     }
 
-    #[test]
-    fn introspection_lists_script_ids() {
-        let xml =
-            r#"<node><node name="Script0"/><node name="Script3"/><node name="other"/></node>"#;
-        assert_eq!(parse_script_ids(xml), vec![0, 3]);
-    }
-
-    #[test]
-    fn fresh_id_runs_the_script_object() {
-        let dir = scratch_dir("fresh");
-        let calls = Calls::default();
-        let bus = fake_bus(&calls, r#"<node><node name="Script0"/></node>"#, 1, true);
-        assert!(run_kwin_script_with(&bus, &dir, "n1", "x").is_ok());
-        let log = calls.lock().unwrap().join("\n");
-        assert!(log.contains("/Scripting/Script1 org.kde.kwin.Script.run"));
-        assert!(!log.contains("Scripting.start"));
+    fn run_fake(fake: &FakeKwin, name: &str) -> io::Result<()> {
+        let dir = scratch_dir(name);
+        let bus = |args: &[&str], _: Duration| fake.call(args);
+        let result = run_kwin_script_with(&bus, &dir, name, "x");
         let _ = std::fs::remove_dir_all(&dir);
+        result
     }
 
-    #[test]
-    fn colliding_id_never_runs_the_other_script() {
-        let dir = scratch_dir("collide");
-        let calls = Calls::default();
-        // Script0 was unloaded, so KWin hands out id 1 again while Script1 lives.
-        let bus = fake_bus(
-            &calls,
-            r#"<node><node name="Script1"/><node name="Script2"/></node>"#,
-            1,
-            true,
+    fn only_ours_ran(fake: &FakeKwin, prefix: &str) {
+        let ran = fake.ran.lock().unwrap();
+        assert!(!ran.is_empty());
+        assert!(ran.iter().all(|owner| owner.starts_with(prefix)), "{ran:?}");
+        let log = fake.log.lock().unwrap().join("\n");
+        assert!(!log.contains("Scripting.start"), "{log}");
+        assert!(
+            fake.live
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(n, _)| !n.starts_with(prefix)),
+            "every name we loaded is unloaded"
         );
-        assert!(run_kwin_script_with(&bus, &dir, "n2", "x").is_ok());
-        let log = calls.lock().unwrap().join("\n");
-        assert!(!log.contains("Script.run"), "{log}");
-        assert!(log.contains("Scripting.start"));
-        assert!(log.contains("unloadScript"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn collision_with_failed_start_is_an_error() {
-        let dir = scratch_dir("collide-fail");
-        let calls = Calls::default();
-        let bus = fake_bus(&calls, r#"<node><node name="Script1"/></node>"#, 1, false);
-        assert!(run_kwin_script_with(&bus, &dir, "n3", "x").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn introspection_lists_script_ids_in_both_layouts() {
+        let xml = r#"<node><node name="Script0"/><node name="Script3"/><node name="7"/><node name="other"/></node>"#;
+        assert_eq!(parse_script_ids(xml), vec![0, 3, 7]);
+    }
+
+    #[test]
+    fn fresh_id_runs_our_object() {
+        let fake = FakeKwin::new(false, &[("a", 0)]);
+        assert!(run_fake(&fake, "n1").is_ok());
+        only_ours_ran(&fake, "n1");
+    }
+
+    #[test]
+    fn colliding_id_reloads_under_a_fresh_name_and_runs_only_ours() {
+        // Script0 was unloaded; the next id (2) equals live Script2.
+        let fake = FakeKwin::new(false, &[("o1", 1), ("o2", 2)]);
+        assert!(run_fake(&fake, "n2").is_ok());
+        only_ours_ran(&fake, "n2");
+        assert!(!fake.ran.lock().unwrap().iter().any(|o| o == "o2"));
+    }
+
+    #[test]
+    fn kwin5_layout_collision_is_detected_on_the_bare_id_path() {
+        let fake = FakeKwin::new(true, &[("o1", 1), ("o2", 2)]);
+        assert!(run_fake(&fake, "n5").is_ok());
+        only_ours_ran(&fake, "n5");
+        assert!(!fake.ran.lock().unwrap().iter().any(|o| o == "o2"));
+    }
+
+    #[test]
+    fn kwin5_fresh_id_runs_on_the_bare_id_path() {
+        let fake = FakeKwin::new(true, &[("o0", 0)]);
+        assert!(run_fake(&fake, "n6").is_ok());
+        only_ours_ran(&fake, "n6");
+        assert!(fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l == "/1 org.kde.kwin.Script.run"));
+    }
+
+    #[test]
+    fn no_free_id_is_an_error_and_nothing_runs() {
+        let fake = FakeKwin::new(false, &[("o1", 1), ("o2", 2)]);
+        *fake.forced_ids.lock().unwrap() = vec![1, 2, 1, 2, 1, 2];
+        assert!(run_fake(&fake, "n7").is_err());
+        assert!(fake.ran.lock().unwrap().is_empty());
+        assert!(fake
+            .live
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(n, _)| !n.starts_with("n7")));
+        let loads = fake
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.ends_with(" org.kde.kwin.Scripting.loadScript"))
+            .count();
+        assert_eq!(loads, MAX_LOAD_ATTEMPTS);
+    }
+
+    #[test]
+    fn unreadable_bus_is_an_error_before_anything_is_loaded() {
+        let mut fake = FakeKwin::new(false, &[]);
+        fake.introspect_fails = true;
+        assert!(run_fake(&fake, "n8").is_err());
+        let log = fake.log.lock().unwrap().join("\n");
+        assert!(!log.contains("loadScript"));
     }
 }

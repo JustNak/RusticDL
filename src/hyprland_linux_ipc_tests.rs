@@ -708,3 +708,84 @@ fn show_is_bounded_under_a_slow_compositor() {
         began.elapsed()
     );
 }
+
+#[test]
+fn known_legacy_compositor_gets_only_legacy_commands() {
+    let _guard = env_lock();
+    DIALECT.store(DIALECT_LEGACY, AtomicOrdering::SeqCst);
+    let lua_seen = Arc::new(AtomicBool::new(false));
+    let moved = Arc::new(AtomicBool::new(false));
+    let (l, m) = (lua_seen.clone(), moved.clone());
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("hl.dsp") {
+            l.store(true, AtomicOrdering::SeqCst);
+            return String::new();
+        }
+        if cmd.starts_with("/dispatch movetoworkspacesilent") {
+            m.store(true, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        match cmd {
+            "j/clients" if m.load(AtomicOrdering::SeqCst) => our_client("special:rusticdl"),
+            "j/clients" => our_client("2"),
+            _ => MONITORS_CLOSED.into(),
+        }
+    });
+    let _mock = MockSession::start("known-legacy", handler);
+    assert!(hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+    assert!(!lua_seen.load(AtomicOrdering::SeqCst));
+}
+
+#[test]
+fn known_legacy_refusal_is_not_counted_as_landed() {
+    let _guard = env_lock();
+    DIALECT.store(DIALECT_LEGACY, AtomicOrdering::SeqCst);
+    let lua_seen = Arc::new(AtomicBool::new(false));
+    let l = lua_seen.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("hl.dsp") {
+            l.store(true, AtomicOrdering::SeqCst);
+            return String::new();
+        }
+        if cmd.starts_with("/dispatch") {
+            return "error: refused".into();
+        }
+        match cmd {
+            "j/clients" => our_client("2"),
+            _ => MONITORS_CLOSED.into(),
+        }
+    });
+    let _mock = MockSession::start("known-legacy-refused", handler);
+    assert!(!hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+    assert!(!lua_seen.load(AtomicOrdering::SeqCst));
+}
+
+#[test]
+fn unanswered_lua_toggle_is_not_repeated_as_legacy() {
+    let _guard = env_lock();
+    let legacy_toggle = Arc::new(AtomicBool::new(false));
+    let lt = legacy_toggle.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("toggle_special") {
+            return String::new();
+        }
+        if cmd.contains("togglespecialworkspace") {
+            lt.store(true, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        match cmd {
+            "j/clients" => our_client("special:rusticdl"),
+            "j/monitors" => MONITORS_OVERLAY_OPEN.into(),
+            _ => "ok".into(),
+        }
+    });
+    let _mock = MockSession::start("unanswered-toggle", handler);
+    let _ = hide_main_windows_within(Duration::from_millis(400), Duration::from_millis(300));
+    assert!(!legacy_toggle.load(AtomicOrdering::SeqCst));
+}

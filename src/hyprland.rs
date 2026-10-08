@@ -38,6 +38,21 @@ pub struct CaptureWindowSnapshot {
 
 #[cfg(target_os = "linux")]
 static LEGACY_CAPTURE_RULES_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// What dispatcher syntax the running compositor has been seen to accept.
+#[cfg(target_os = "linux")]
+static DIALECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(DIALECT_UNKNOWN);
+#[cfg(target_os = "linux")]
+const DIALECT_UNKNOWN: u8 = 0;
+#[cfg(target_os = "linux")]
+const DIALECT_LUA: u8 = 1;
+#[cfg(target_os = "linux")]
+const DIALECT_LEGACY: u8 = 2;
+
+#[cfg(target_os = "linux")]
+fn compositor_is_known_legacy() -> bool {
+    DIALECT.load(Ordering::SeqCst) == DIALECT_LEGACY
+        || LEGACY_CAPTURE_RULES_INSTALLED.load(Ordering::SeqCst)
+}
 
 /// `true` when `HYPRLAND_INSTANCE_SIGNATURE` is set in the environment.
 pub fn is_hyprland() -> bool {
@@ -732,25 +747,36 @@ fn dispatch_move_then_legacy(
     legacy_cmd: &str,
     deadline: Option<std::time::Instant>,
 ) -> MoveOutcome {
+    let legacy_call = |deadline| match hyprland_call(legacy_cmd, deadline) {
+        IpcResult::NotSent => MoveOutcome::NotSent,
+        IpcResult::NoReply => MoveOutcome::Unanswered,
+        IpcResult::Reply(reply) => {
+            if classify_dispatch_reply(&reply) == DispatchReply::Ok {
+                DIALECT.store(DIALECT_LEGACY, Ordering::SeqCst);
+                MoveOutcome::Accepted
+            } else {
+                MoveOutcome::Refused
+            }
+        }
+    };
+    // A compositor already seen to reject Lua is spoken to in legacy only, so
+    // an unanswered command is the one that can actually land.
+    if compositor_is_known_legacy() {
+        return legacy_call(deadline);
+    }
     match hyprland_call(lua_cmd, deadline) {
         IpcResult::NotSent => MoveOutcome::NotSent,
         IpcResult::NoReply => MoveOutcome::Unanswered,
         IpcResult::Reply(reply) => {
             let class = classify_dispatch_reply(&reply);
             if !move_tries_legacy(class) {
+                DIALECT.store(DIALECT_LUA, Ordering::SeqCst);
                 return MoveOutcome::Accepted;
             }
-            match hyprland_call(legacy_cmd, deadline) {
+            match legacy_call(deadline) {
                 // The Lua form was rejected and the legacy one never left.
-                IpcResult::NotSent => MoveOutcome::Refused,
-                IpcResult::NoReply => MoveOutcome::Unanswered,
-                IpcResult::Reply(reply) => {
-                    if classify_dispatch_reply(&reply) == DispatchReply::Ok {
-                        MoveOutcome::Accepted
-                    } else {
-                        MoveOutcome::Refused
-                    }
-                }
+                MoveOutcome::NotSent => MoveOutcome::Refused,
+                outcome => outcome,
             }
         }
     }
@@ -961,13 +987,26 @@ fn connect_within(
     // `connect` has no timeout (a full listen backlog blocks it), so run it on
     // a helper thread and stop waiting at the deadline. The late stream, if
     // any, is dropped unused.
+    // Parked helpers (one per blocked connect) are capped so a wedged
+    // compositor cannot accumulate threads.
+    const MAX_PARKED: usize = 4;
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_PARKED {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("rusticdl-hypr-connect".into())
         .spawn(move || {
-            let _ = tx.send(UnixStream::connect(path));
-        })
-        .ok()?;
+            let result = UnixStream::connect(path);
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(result);
+        });
+    if spawned.is_err() {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
     rx.recv_timeout(remaining).ok()?.ok()
 }
 
@@ -1050,7 +1089,10 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    DIALECT.store(DIALECT_UNKNOWN, Ordering::SeqCst);
+    LEGACY_CAPTURE_RULES_INSTALLED.store(false, Ordering::SeqCst);
+    guard
 }
 
 #[cfg(test)]
