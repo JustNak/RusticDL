@@ -132,8 +132,10 @@ pub(crate) fn request_compositor_unminimize() {
 /// otherwise a hostile `XDG_RUNTIME_DIR` would reopen the shared-path hole.
 fn runtime_dir_is_private(dir: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(dir).is_ok_and(|meta| {
-        meta.is_dir() && dir_is_private(meta.uid(), meta.mode(), unsafe { libc::getuid() })
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        !meta.file_type().is_symlink()
+            && meta.is_dir()
+            && dir_is_private(meta.uid(), meta.mode(), unsafe { libc::getuid() })
     })
 }
 
@@ -394,6 +396,19 @@ mod tests {
             parse_dbus_script_id(&String::from_utf8_lossy(&output.stdout)),
             Some(7)
         );
+    }
+
+    #[test]
+    fn runtime_dir_symlink_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("rt");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runtime_dir_is_private(&dir));
+        let link = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!runtime_dir_is_private(&link));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

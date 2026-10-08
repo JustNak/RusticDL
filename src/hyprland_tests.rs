@@ -609,8 +609,9 @@ mod close_to_background {
         let clients = [on("0x1", "special:rusticdl")];
         assert_eq!(
             classify_hide(Some(&clients), &addrs, None),
-            HideState::NotHidden
+            HideState::Unknown
         );
+        assert_eq!(classify_hide(None, &addrs, Some(GONE)), HideState::Unknown);
         assert_eq!(overlay_state("garbage"), None);
     }
 
@@ -631,13 +632,18 @@ mod close_to_background {
             HideState::NotHidden
         );
         assert_eq!(
-            classify_hide(None, &addrs, Some(GONE)),
-            HideState::NotHidden
-        );
-        assert_eq!(
             classify_hide(Some(&[on("0x1", "special:rusticdl")]), &[], Some(GONE)),
             HideState::NotHidden
         );
+    }
+
+    #[test]
+    fn verdict_prefers_true_when_a_move_may_have_landed() {
+        assert!(hide_verdict(HideState::Hidden, false));
+        assert!(hide_verdict(HideState::Unknown, true));
+        assert!(!hide_verdict(HideState::Unknown, false));
+        assert!(!hide_verdict(HideState::NotHidden, true));
+        assert!(!hide_verdict(HideState::OverlayOnFocused, true));
     }
 
     #[test]

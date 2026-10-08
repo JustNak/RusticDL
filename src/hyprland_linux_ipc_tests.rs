@@ -327,3 +327,200 @@ fn float_thread_does_not_dispatch_on_older_same_title_hud() {
     }
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+struct MockSession {
+    runtime: PathBuf,
+    stop: Arc<AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
+    old_his: Option<std::ffi::OsString>,
+    old_xdg: Option<std::ffi::OsString>,
+}
+
+impl MockSession {
+    fn start(his: &str, handler: Arc<dyn Fn(&str) -> String + Send + Sync>) -> Self {
+        let runtime = unique_runtime();
+        let old_his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+        let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", his);
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_mock_hypr(
+            &runtime,
+            his,
+            handler,
+            Arc::new(Mutex::new(Vec::new())),
+            stop.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        Self {
+            runtime,
+            stop,
+            server: Some(server),
+            old_his,
+            old_xdg,
+        }
+    }
+}
+
+impl Drop for MockSession {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::SeqCst);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        unsafe {
+            match self.old_his.take() {
+                Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+                None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+            }
+            match self.old_xdg.take() {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.runtime);
+    }
+}
+
+fn our_client(workspace: &str) -> String {
+    format!(
+        r#"[{{"address":"0x1","class":"RusticDL","title":"t","pid":{},"workspace":{{"id":-98,"name":"{workspace}"}}}}]"#,
+        std::process::id()
+    )
+}
+
+const MONITORS_CLOSED: &str = r#"[{"focused":true,"specialWorkspace":{"id":0,"name":""}}]"#;
+
+#[test]
+fn hide_reports_true_when_compositor_stalls_after_accepting_the_move() {
+    let _guard = env_lock();
+    let seen_move = Arc::new(AtomicBool::new(false));
+    let seen = seen_move.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.contains("hl.dsp.window.move") {
+            seen.store(true, AtomicOrdering::SeqCst);
+            return "ok".into();
+        }
+        if seen.load(AtomicOrdering::SeqCst) {
+            // Every read after the move outlasts the whole budget.
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        match cmd {
+            "j/clients" => our_client("special:rusticdl"),
+            "j/monitors" => MONITORS_CLOSED.into(),
+            _ => "ok".into(),
+        }
+    });
+    let _mock = MockSession::start("hide-stall", handler);
+    let began = std::time::Instant::now();
+    let hidden = hide_main_windows_within(Duration::from_millis(300), Duration::from_millis(200));
+    assert!(
+        hidden,
+        "an accepted move that cannot be re-read still counts as hidden"
+    );
+    assert!(seen_move.load(AtomicOrdering::SeqCst));
+    assert!(
+        began.elapsed() < Duration::from_millis(1200),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
+#[test]
+fn hide_survives_a_single_read_hiccup() {
+    let _guard = env_lock();
+    let clients_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = clients_calls.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        match cmd {
+            "j/clients" => {
+                if calls.fetch_add(1, AtomicOrdering::SeqCst) == 1 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                our_client("special:rusticdl")
+            }
+            "j/monitors" => MONITORS_CLOSED.into(),
+            _ => "ok".into(),
+        }
+    });
+    let _mock = MockSession::start("hide-hiccup", handler);
+    assert!(hide_main_windows_within(
+        Duration::from_millis(400),
+        Duration::from_millis(300)
+    ));
+}
+
+#[test]
+fn hide_reports_false_when_the_move_is_refused_and_state_is_unreadable() {
+    let _guard = env_lock();
+    let refused = Arc::new(AtomicBool::new(false));
+    let flag = refused.clone();
+    let handler = Arc::new(move |cmd: &str| -> String {
+        if cmd.starts_with("/dispatch") {
+            flag.store(true, AtomicOrdering::SeqCst);
+            return "error: refused".into();
+        }
+        if flag.load(AtomicOrdering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        match cmd {
+            "j/clients" => our_client("2"),
+            _ => MONITORS_CLOSED.into(),
+        }
+    });
+    let _mock = MockSession::start("hide-refused", handler);
+    assert!(!hide_main_windows_within(
+        Duration::from_millis(300),
+        Duration::from_millis(200)
+    ));
+}
+
+#[test]
+fn ipc_deadline_bounds_a_slow_drip_reply_as_a_whole() {
+    let _guard = env_lock();
+    let runtime = unique_runtime();
+    let his = "slow-drip";
+    let sock_dir = runtime.join("hypr").join(his);
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let listener = UnixListener::bind(sock_dir.join(".socket.sock")).unwrap();
+    let old_his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+    let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+    unsafe {
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", his);
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    }
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 64];
+            let _ = stream.read(&mut buf);
+            // Full 512-byte chunks keep the client's read loop going.
+            for _ in 0..40 {
+                if stream.write_all(&[b'x'; 512]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    let began = std::time::Instant::now();
+    let _ = hyprland_ipc_until(
+        "j/clients",
+        Some(std::time::Instant::now() + Duration::from_millis(300)),
+    );
+    let elapsed = began.elapsed();
+    unsafe {
+        match old_his {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+    assert!(elapsed < Duration::from_millis(700), "{elapsed:?}");
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&runtime);
+}
