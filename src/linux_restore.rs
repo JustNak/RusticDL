@@ -60,8 +60,8 @@ pub(crate) fn kwin_unminimize_script(pid: u32) -> String {
             w.minimized = false;
             if (workspace.activateWindow) {{
                 workspace.activateWindow(w);
-            }} else if (workspace.activateClient) {{
-                workspace.activateClient(w);
+            }} else if (workspace.activeClient !== undefined) {{
+                workspace.activeClient = w;
             }} else {{
                 workspace.activeWindow = w;
             }}
@@ -72,7 +72,9 @@ pub(crate) fn kwin_unminimize_script(pid: u32) -> String {
     )
 }
 
-pub(crate) fn kwin_script_name(pid: u32, nonce: u64) -> String {
+/// Unique per request (random), so concurrent or repeated Shows can never
+/// unload each other's script.
+pub(crate) fn kwin_script_name(pid: u32, nonce: &str) -> String {
     format!("rusticdl-show-{pid}-{nonce}")
 }
 
@@ -93,104 +95,134 @@ pub(crate) fn activate_for_restore(window: &mut gpui::Window) {
     window.activate_window();
 }
 
+const DBUS_TIMEOUT: Duration = Duration::from_millis(1000);
+const RUN_TIMEOUT: Duration = Duration::from_millis(2000);
+/// How long to wait for a `loadScript` that timed out to land before the
+/// second unload sweep.
+const LATE_LOAD_GRACE: Duration = Duration::from_millis(750);
+
 /// Ask KWin to unminimize this process's windows. No-op on any other desktop.
+///
+/// Call once per Show (see `DownloadApp::restore_main_window_now`).
 pub(crate) fn request_compositor_unminimize() {
     let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
     let session = std::env::var("XDG_SESSION_DESKTOP").ok();
     if !desktop_is_kde(current.as_deref()) && !desktop_is_kde(session.as_deref()) {
         return;
     }
+    // The script file must live somewhere only this user can write, because
+    // KWin executes it with session-bus access. No runtime dir, no KWin path.
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+    else {
+        return;
+    };
     let pid = std::process::id();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let name = kwin_script_name(pid, &uuid::Uuid::new_v4().simple().to_string());
     let script = kwin_unminimize_script(pid);
-    let name = kwin_script_name(pid, nonce);
     let _ = std::thread::Builder::new()
         .name("rusticdl-kwin-show".into())
         .spawn(move || {
-            let _ = run_kwin_script(&name, &script);
+            let _ = run_kwin_script(&dir, &name, &script);
         });
 }
 
-fn run_kwin_script(name: &str, script: &str) -> io::Result<()> {
-    let path = std::env::temp_dir().join(format!("{name}.js"));
-    std::fs::write(&path, script)?;
-    let path_arg = format!("string:{}", path.display());
-    let name_arg = format!("string:{name}");
-    let loaded = dbus_send(
-        &[
-            "--session",
-            "--print-reply",
-            "--dest=org.kde.KWin",
-            "/Scripting",
-            "org.kde.kwin.Scripting.loadScript",
-            &path_arg,
-            &name_arg,
-        ],
-        Duration::from_millis(1000),
-    );
-    let output = match loaded {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-    };
-    if !output.status.success() {
+/// Create the script file exclusively: new file only, never through a
+/// symlink, owner-only.
+fn write_script_file(
+    dir: &std::path::Path,
+    name: &str,
+    script: &str,
+) -> io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = dir.join(format!("{name}.js"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    if let Err(error) = file.write_all(script.as_bytes()) {
         let _ = std::fs::remove_file(&path);
-        return Err(io::Error::other("kwin loadScript failed"));
+        return Err(error);
     }
-    let reply = String::from_utf8_lossy(&output.stdout);
-    let Some(id) = parse_dbus_script_id(&reply) else {
-        let _ = dbus_send(
-            &[
-                "--session",
-                "--dest=org.kde.KWin",
-                "/Scripting",
-                "org.kde.kwin.Scripting.unloadScript",
-                &name_arg,
-            ],
-            Duration::from_millis(1000),
-        );
-        let _ = std::fs::remove_file(&path);
-        return Err(io::Error::other("kwin loadScript returned no id"));
-    };
-    let id = id.to_string();
-    // KWin 6 exposes the script at /Scripting/Script<id>; KWin 5 used /<id>.
-    let kwin6_path = format!("/Scripting/Script{id}");
-    let kwin5_path = format!("/{id}");
-    let _ = dbus_send(
+    Ok(path)
+}
+
+fn kwin_method(args: &[&str], limit: Duration) -> io::Result<std::process::Output> {
+    let mut full = vec![
+        "--session",
+        "--type=method_call",
+        "--print-reply",
+        "--dest=org.kde.KWin",
+    ];
+    full.extend_from_slice(args);
+    dbus_send(&full, limit)
+}
+
+fn unload_script(name_arg: &str) {
+    let _ = kwin_method(
         &[
-            "--session",
-            "--dest=org.kde.KWin",
-            &kwin6_path,
-            "org.kde.kwin.Script.run",
-        ],
-        Duration::from_millis(1000),
-    );
-    let _ = dbus_send(
-        &[
-            "--session",
-            "--dest=org.kde.KWin",
-            &kwin5_path,
-            "org.kde.kwin.Script.run",
-        ],
-        Duration::from_millis(1000),
-    );
-    let _ = dbus_send(
-        &[
-            "--session",
-            "--dest=org.kde.KWin",
             "/Scripting",
             "org.kde.kwin.Scripting.unloadScript",
-            &name_arg,
+            name_arg,
         ],
-        Duration::from_millis(1000),
+        DBUS_TIMEOUT,
     );
+}
+
+fn run_kwin_script(dir: &std::path::Path, name: &str, script: &str) -> io::Result<()> {
+    let path = write_script_file(dir, name, script)?;
+    let path_arg = format!("string:{}", path.display());
+    let name_arg = format!("string:{name}");
+
+    let result = (|| {
+        let output = match kwin_method(
+            &[
+                "/Scripting",
+                "org.kde.kwin.Scripting.loadScript",
+                &path_arg,
+                &name_arg,
+            ],
+            DBUS_TIMEOUT,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                // The request may still have reached KWin: sweep again after
+                // it has had time to land.
+                std::thread::sleep(LATE_LOAD_GRACE);
+                return Err(error);
+            }
+        };
+        if !output.status.success() {
+            return Err(io::Error::other("kwin loadScript failed"));
+        }
+        let reply = String::from_utf8_lossy(&output.stdout);
+        let id = parse_dbus_script_id(&reply)
+            .ok_or_else(|| io::Error::other("kwin loadScript returned no id"))?;
+        // KWin 6 exposes the script at /Scripting/Script<id>; KWin 5 used /<id>.
+        // `run` must be a real method call (a signal is silently ignored) and
+        // its reply arrives once the script has been evaluated, so the file
+        // is not removed underneath it.
+        for object in [format!("/Scripting/Script{id}"), format!("/{id}")] {
+            if let Ok(output) = kwin_method(&[&object, "org.kde.kwin.Script.run"], RUN_TIMEOUT) {
+                if output.status.success() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(io::Error::other("kwin script run failed"))
+    })();
+
+    unload_script(&name_arg);
+    if result.is_err() {
+        unload_script(&name_arg);
+    }
     let _ = std::fs::remove_file(&path);
-    Ok(())
+    result
 }
 
 fn dbus_send(args: &[&str], limit: Duration) -> io::Result<std::process::Output> {
@@ -202,22 +234,31 @@ fn dbus_send(args: &[&str], limit: Duration) -> io::Result<std::process::Output>
     output_with_timeout(command, limit)
 }
 
+/// Run `command`, killing the child through its handle on timeout (never by
+/// raw pid, which could have been reused).
 fn output_with_timeout(mut command: Command, limit: Duration) -> io::Result<std::process::Output> {
-    let child = command.spawn()?;
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(limit) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-            Err(io::Error::new(ErrorKind::TimedOut, "dbus-send timed out"))
+    use std::io::Read;
+
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_end(&mut stdout);
+            }
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            });
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("dbus-send waiter exited"))
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(ErrorKind::TimedOut, "dbus-send timed out"));
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -256,11 +297,13 @@ mod tests {
         assert_eq!(script.matches("4242").count(), 1);
         assert!(script.contains("w.minimized = false"));
         assert!(script.contains("workspace.activateWindow"));
+        assert!(script.contains("workspace.activeClient = w"));
+        assert!(!script.contains("activateClient"));
         assert!(!script.contains("e+0"));
         assert!(!script.contains("special:"));
         assert!(!script.contains("{pid}"));
-        let name = kwin_script_name(4242, 9);
-        assert_eq!(name, "rusticdl-show-4242-9");
+        let name = kwin_script_name(4242, "ab12");
+        assert_eq!(name, "rusticdl-show-4242-ab12");
         assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
@@ -270,5 +313,70 @@ mod tests {
         assert_eq!(parse_dbus_script_id(reply), Some(7));
         assert_eq!(parse_dbus_script_id("no id here"), None);
         assert_eq!(parse_dbus_script_id(""), None);
+    }
+
+    #[test]
+    fn script_names_are_unique_per_request() {
+        let a = kwin_script_name(1, &uuid::Uuid::new_v4().simple().to_string());
+        let b = kwin_script_name(1, &uuid::Uuid::new_v4().simple().to_string());
+        assert_ne!(a, b);
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-restore-test-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn script_file_is_new_private_and_refuses_existing_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("new");
+        let path = write_script_file(&dir, "s1", "x").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // An existing file is never overwritten.
+        assert!(write_script_file(&dir, "s1", "y").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_file_does_not_follow_planted_symlinks() {
+        let dir = scratch_dir("link");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("s2.js")).unwrap();
+        assert!(write_script_file(&dir, "s2", "evil").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timed_out_child_is_killed_through_its_handle() {
+        let mut command = Command::new("sleep");
+        command.arg("30").stdout(Stdio::piped());
+        let began = std::time::Instant::now();
+        let error = output_with_timeout(command, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(began.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn finished_child_output_is_returned() {
+        let mut command = Command::new("echo");
+        command.arg("int32 7").stdout(Stdio::piped());
+        let output = output_with_timeout(command, Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            parse_dbus_script_id(&String::from_utf8_lossy(&output.stdout)),
+            Some(7)
+        );
     }
 }

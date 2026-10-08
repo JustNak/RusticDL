@@ -11,6 +11,7 @@ fn client(address: &str, class: &str, title: &str, pid: u32, floating: bool) -> 
         title: title.to_string(),
         pid,
         floating,
+        workspace: String::new(),
     }
 }
 
@@ -503,12 +504,38 @@ mod close_to_background {
     }
 
     #[test]
-    fn special_without_focused_flag_uses_that_monitors_workspace() {
+    fn special_open_monitor_is_used_when_no_focused_flag() {
         let active = r#"{"id":-99,"name":"special:scratchpad"}"#;
-        let monitors = r#"[{"id":0,"activeWorkspace":{"id":3,"name":"three"},"specialWorkspace":{"id":-99,"name":"special:scratchpad"}}]"#;
+        let monitors = r#"[{"id":0,"activeWorkspace":{"id":3,"name":"three"},"specialWorkspace":{"id":-99,"name":"special:scratchpad"}},{"id":1,"activeWorkspace":{"id":8,"name":"8"},"specialWorkspace":{"id":0,"name":""}}]"#;
         assert_eq!(
             restore_workspace_id(active, Some(monitors)).as_deref(),
             Some("3")
+        );
+    }
+
+    #[test]
+    fn ambiguous_monitors_do_not_pick_a_foreign_workspace() {
+        let active = r#"{"id":-99,"name":"special:x"}"#;
+        let monitors = r#"[{"id":0,"activeWorkspace":{"id":3,"name":"3"},"specialWorkspace":{"id":0,"name":""}},{"id":1,"activeWorkspace":{"id":8,"name":"8"},"specialWorkspace":{"id":0,"name":""}}]"#;
+        assert_eq!(restore_workspace_id(active, Some(monitors)), None);
+    }
+
+    #[test]
+    fn named_workspace_is_addressed_by_name() {
+        let monitors = r#"[{"id":0,"focused":true,"activeWorkspace":{"id":-1337,"name":"web"},"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+        assert_eq!(
+            restore_workspace_id("garbage", Some(monitors)).as_deref(),
+            Some("name:web")
+        );
+        // 0.56-dev: no id at all.
+        assert_eq!(
+            restore_workspace_id(r#"{"name":"web"}"#, None).as_deref(),
+            Some("name:web")
+        );
+        let sel = address_selector("0xabc");
+        assert_eq!(
+            legacy_show_command("name:web", &sel),
+            "/dispatch movetoworkspace name:web,address:0xabc"
         );
     }
 
@@ -523,6 +550,54 @@ mod close_to_background {
             restore_workspace_id(r#"{"id":-98,"name":"special:x"}"#, Some("not json")),
             None
         );
+    }
+
+    fn on(address: &str, workspace: &str) -> HyprClient {
+        let mut c = client(address, "RusticDL", "RusticDL", 1, false);
+        c.workspace = workspace.to_string();
+        c
+    }
+
+    #[test]
+    fn parse_clients_reads_workspace_name() {
+        let json = r#"[{"address":"0x1","class":"RusticDL","title":"t","pid":1,"workspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+        let clients = parse_hypr_clients(json).unwrap();
+        assert_eq!(clients[0].workspace, "special:rusticdl");
+    }
+
+    #[test]
+    fn hide_is_verified_only_when_window_left_and_overlay_closed() {
+        let addrs = vec!["0x1".to_string()];
+        assert!(hidden_verified(
+            &[on("0x1", "special:rusticdl")],
+            &addrs,
+            false
+        ));
+        // Moved "to the workspace it is already on" but shown as an overlay.
+        assert!(!hidden_verified(
+            &[on("0x1", "special:rusticdl")],
+            &addrs,
+            true
+        ));
+        // Move was accepted but the window did not leave.
+        assert!(!hidden_verified(&[on("0x1", "2")], &addrs, false));
+        assert!(!hidden_verified(&[], &addrs, false));
+        assert!(!hidden_verified(
+            &[on("0x1", "special:rusticdl")],
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn overlay_detection_reads_special_workspace_name() {
+        let open = r#"[{"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+        let other = r#"[{"specialWorkspace":{"id":-99,"name":"special:scratchpad"}}]"#;
+        let none = r#"[{"specialWorkspace":{"id":0,"name":""}}]"#;
+        assert_eq!(hidden_workspace_overlay_open(open), Some(true));
+        assert_eq!(hidden_workspace_overlay_open(other), Some(false));
+        assert_eq!(hidden_workspace_overlay_open(none), Some(false));
+        assert_eq!(hidden_workspace_overlay_open("garbage"), None);
     }
 
     #[test]

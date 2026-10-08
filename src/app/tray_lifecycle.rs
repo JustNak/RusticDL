@@ -258,7 +258,7 @@ impl DownloadApp {
     /// Restore the main window without waiting for a render: a hidden window
     /// often stops painting. Windows uses the cached HWND; Linux asks Hyprland
     /// to pull the window back and activates it through the stored GPUI handle.
-    fn restore_main_window_now(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restore_main_window_now(&mut self, cx: &mut Context<Self>) {
         if self.main_hwnd != 0 {
             show_main_window_hwnd(self.main_hwnd);
         }

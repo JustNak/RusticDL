@@ -263,6 +263,8 @@ struct HyprClient {
     title: String,
     pid: u32,
     floating: bool,
+    /// `workspace.name` (e.g. `3`, `web`, `special:rusticdl`); empty if absent.
+    workspace: String,
 }
 
 fn parse_hypr_clients(json: &str) -> Option<Vec<HyprClient>> {
@@ -289,12 +291,19 @@ fn parse_hypr_clients(json: &str) -> Option<Vec<HyprClient>> {
             .get("floating")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let workspace = item
+            .get("workspace")
+            .and_then(|w| w.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         out.push(HyprClient {
             address,
             class,
             title,
             pid,
             floating,
+            workspace,
         });
     }
     Some(out)
@@ -543,59 +552,98 @@ fn lua_focus_command(selector: &str) -> String {
     )
 }
 
-/// Positive workspace id from `j/activeworkspace`. Special workspaces are
-/// negative and are not a restore target (`e+0` wraps to the last regular
-/// workspace when the focused one is special).
+/// `movetoworkspace` argument for a workspace object (`{id, name}`).
+///
+/// Regular numbered workspaces have positive ids. Named workspaces have
+/// negative ids (or none on newer Hyprland) and must be addressed as
+/// `name:<name>`. Special workspaces are never a restore target.
 #[cfg(target_os = "linux")]
-fn positive_workspace_id(json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| v.get("id").and_then(|id| id.as_i64()))
-        .filter(|id| *id > 0)
-        .map(|id| id.to_string())
+fn workspace_target(workspace: &serde_json::Value) -> Option<String> {
+    if let Some(id) = workspace.get("id").and_then(|id| id.as_i64()) {
+        if id > 0 {
+            return Some(id.to_string());
+        }
+    }
+    let name = workspace.get("name").and_then(|n| n.as_str())?.trim();
+    if name.is_empty() || name.starts_with("special") || name.contains(',') {
+        return None;
+    }
+    Some(format!("name:{name}"))
 }
 
 /// Regular workspace on the monitor the user is looking at.
 ///
-/// `j/monitors[].activeWorkspace.id` stays positive while a special is
-/// focused. The workspace name is never used.
-#[cfg(target_os = "linux")]
-fn monitor_regular_workspace(monitor: &serde_json::Value) -> Option<String> {
-    let id = monitor.get("activeWorkspace")?.get("id")?.as_i64()?;
-    (id > 0).then(|| id.to_string())
-}
-
+/// `j/monitors[].activeWorkspace` stays the regular workspace while a special
+/// is focused. Prefers the focused monitor; another monitor is used only when
+/// it is the one showing our special workspace or the only monitor.
 #[cfg(target_os = "linux")]
 fn focused_monitor_workspace(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let monitors = value.as_array()?;
+    let regular =
+        |monitor: &serde_json::Value| monitor.get("activeWorkspace").and_then(workspace_target);
     let focused = monitors
         .iter()
         .find(|monitor| monitor.get("focused").and_then(|v| v.as_bool()) == Some(true));
-    if let Some(id) = focused.and_then(monitor_regular_workspace) {
-        return Some(id);
+    if let Some(target) = focused.and_then(regular) {
+        return Some(target);
     }
-    let special_open = monitors.iter().find(|monitor| {
-        monitor
-            .get("specialWorkspace")
-            .and_then(|special| special.get("id"))
-            .and_then(|id| id.as_i64())
-            .is_some_and(|id| id != 0)
-    });
-    if let Some(id) = special_open.and_then(monitor_regular_workspace) {
-        return Some(id);
+    let special_open = monitors.iter().find(|monitor| special_open_on(monitor));
+    if let Some(target) = special_open.and_then(regular) {
+        return Some(target);
     }
-    monitors.iter().find_map(monitor_regular_workspace)
+    match monitors.as_slice() {
+        [only] => regular(only),
+        _ => None,
+    }
 }
 
-/// Workspace id to `movetoworkspace` onto. `None` means do not dispatch
-/// (never `e+0`, never a workspace name).
+#[cfg(target_os = "linux")]
+fn special_open_on(monitor: &serde_json::Value) -> bool {
+    monitor
+        .get("specialWorkspace")
+        .and_then(|special| special.get("name"))
+        .and_then(|name| name.as_str())
+        .is_some_and(|name| !name.is_empty())
+}
+
+/// Whether our hidden workspace is currently shown as an overlay on any monitor.
+#[cfg(target_os = "linux")]
+fn hidden_workspace_overlay_open(monitors_json: &str) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(monitors_json).ok()?;
+    Some(value.as_array()?.iter().any(|monitor| {
+        monitor
+            .get("specialWorkspace")
+            .and_then(|special| special.get("name"))
+            .and_then(|name| name.as_str())
+            == Some(HIDDEN_WORKSPACE)
+    }))
+}
+
+/// Workspace to `movetoworkspace` onto. `None` means do not dispatch
+/// (never `e+0`, never a special workspace).
 #[cfg(target_os = "linux")]
 fn restore_workspace_id(active_json: &str, monitors_json: Option<&str>) -> Option<String> {
-    if let Some(id) = positive_workspace_id(active_json) {
-        return Some(id);
+    if let Some(target) = monitors_json.and_then(focused_monitor_workspace) {
+        return Some(target);
     }
-    monitors_json.and_then(focused_monitor_workspace)
+    serde_json::from_str::<serde_json::Value>(active_json)
+        .ok()
+        .as_ref()
+        .and_then(workspace_target)
+}
+
+/// The window really left the screen: every main window sits on the hidden
+/// workspace and that workspace is not open as an overlay.
+#[cfg(target_os = "linux")]
+fn hidden_verified(clients: &[HyprClient], addresses: &[String], overlay_open: bool) -> bool {
+    !overlay_open
+        && !addresses.is_empty()
+        && addresses.iter().all(|address| {
+            clients
+                .iter()
+                .any(|c| &c.address == address && c.workspace == HIDDEN_WORKSPACE)
+        })
 }
 
 /// Lua move first. A `Failed` reply (not only `Invalid` / `error:`) still
@@ -644,15 +692,48 @@ pub fn hide_main_windows() -> bool {
     let Some(addresses) = our_main_window_addresses() else {
         return false;
     };
-    let mut moved = false;
-    for address in addresses {
-        let selector = address_selector(&address);
-        moved |= dispatch_move_then_legacy(
+    for address in &addresses {
+        let selector = address_selector(address);
+        let _ = dispatch_move_then_legacy(
             &lua_hide_command(&selector),
             &legacy_hide_command(&selector),
         );
     }
-    moved
+    if verify_hidden(&addresses) {
+        return true;
+    }
+    // Already parked there but shown as an overlay (a focus-only restore):
+    // close the overlay, then check again.
+    let _ = dispatch_move_then_legacy(
+        &lua_toggle_hidden_command(),
+        &legacy_toggle_hidden_command(),
+    );
+    verify_hidden(&addresses)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_hidden(addresses: &[String]) -> bool {
+    let Some(clients) = hyprland_ipc("j/clients")
+        .ok()
+        .and_then(|reply| parse_hypr_clients(&reply))
+    else {
+        return false;
+    };
+    let overlay_open = hyprland_ipc("j/monitors")
+        .ok()
+        .and_then(|reply| hidden_workspace_overlay_open(&reply))
+        .unwrap_or(true);
+    hidden_verified(&clients, addresses, overlay_open)
+}
+
+#[cfg(target_os = "linux")]
+fn lua_toggle_hidden_command() -> String {
+    r#"/dispatch hl.dsp.workspace.toggle_special("rusticdl")"#.to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_toggle_hidden_command() -> String {
+    "/dispatch togglespecialworkspace rusticdl".to_string()
 }
 
 /// Bring the main window back to the user's regular workspace and focus it.
@@ -667,12 +748,8 @@ pub fn show_main_windows() -> bool {
     let Some(addresses) = our_main_window_addresses() else {
         return false;
     };
+    let monitors = hyprland_ipc("j/monitors").ok();
     let active = hyprland_ipc("j/activeworkspace").unwrap_or_default();
-    let monitors = if positive_workspace_id(&active).is_none() {
-        hyprland_ipc("j/monitors").ok()
-    } else {
-        None
-    };
     let workspace_id = restore_workspace_id(&active, monitors.as_deref());
     let mut moved = false;
     for address in addresses {
