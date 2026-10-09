@@ -251,11 +251,12 @@ pub fn hide_main_window(window: &gpui::Window) -> bool {
 /// marking a visible window hidden (and dismissing its pop-ups) is not.
 #[cfg(target_os = "linux")]
 pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bool {
-    const NO_MINIMIZE: [&str; 12] = [
-        "hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl", "dwm", "xmonad", "awesome",
-        "qtile", "wayfire",
+    const NO_MINIMIZE: [&str; 9] = [
+        "hyprland", "sway", "niri", "river", "i3", "bspwm", "dwl", "dwm", "xmonad",
     ];
-    const MINIMIZE: [&str; 14] = [
+    // Awesome, Qtile and Wayfire are deliberately absent: activation there does
+    // not reliably unminimize, so the window stays visible (the safe default).
+    const MINIMIZE: [&str; 15] = [
         "gnome",
         "kde",
         "plasma",
@@ -269,6 +270,7 @@ pub(crate) fn desktop_supports_minimize(xdg_current_desktop: Option<&str>) -> bo
         "pantheon",
         "unity",
         "deepin",
+        "dde",
         "cosmic",
     ];
     let Some(desktop) = xdg_current_desktop else {
@@ -305,10 +307,11 @@ pub fn show_main_window(window: &mut gpui::Window) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        let moved = crate::hyprland::show_main_windows();
-        linux_restore::request_compositor_unminimize();
+        // Compositor-side restore (Hyprland move, KWin unminimize) runs exactly
+        // once per Show, in `DownloadApp::restore_main_window_now`. This render
+        // path only activates; the hidden flag is owned by that restore.
         linux_restore::activate_for_restore(window);
-        return linux_restore::restore_clears_hidden_flag(moved, linux_restore::wayland_session());
+        return false;
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -374,6 +377,7 @@ mod linux_impl {
     const WATCHER_PATH: &str = "/StatusNotifierWatcher";
     const HOST_PROPERTY: &str = "IsStatusNotifierHostRegistered";
     const HOST_POLL: Duration = Duration::from_secs(1);
+    const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Whether the icon can currently be seen: the watcher owns its bus name
     /// *and* it reports a registered host. A standalone watcher keeps running
@@ -382,7 +386,8 @@ mod linux_impl {
     pub(super) struct Liveness {
         watcher_up: Arc<AtomicBool>,
         host_up: Arc<AtomicBool>,
-        stop: Arc<AtomicBool>,
+        /// Monitor shutdown: flag + condvar so the poll wait ends immediately.
+        stop: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl Liveness {
@@ -390,7 +395,7 @@ mod linux_impl {
             Self {
                 watcher_up: Arc::new(AtomicBool::new(true)),
                 host_up: Arc::new(AtomicBool::new(true)),
-                stop: Arc::new(AtomicBool::new(false)),
+                stop: Arc::new((Mutex::new(false), Condvar::new())),
             }
         }
 
@@ -402,7 +407,19 @@ mod linux_impl {
         }
 
         pub(super) fn stop_monitor(&self) {
-            self.stop.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &*self.stop;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
+        }
+
+        /// Sleep up to `HOST_POLL`; returns `true` when asked to stop.
+        fn wait_or_stop(&self) -> bool {
+            let (lock, cvar) = &*self.stop;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (guard, _) = cvar
+                .wait_timeout_while(guard, HOST_POLL, |stopped| !*stopped)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard
         }
 
         /// Follow `IsStatusNotifierHostRegistered` on the watcher. Failures
@@ -414,7 +431,11 @@ mod linux_impl {
             let _ = std::thread::Builder::new()
                 .name("rusticdl-tray-host".into())
                 .spawn(move || {
-                    let Ok(conn) = zbus::blocking::Connection::session() else {
+                    // A hung watcher must not wedge this thread: bound each call.
+                    let Ok(conn) = zbus::blocking::connection::Builder::session()
+                        .map(|b| b.method_timeout(METHOD_TIMEOUT))
+                        .and_then(|b| b.build())
+                    else {
                         return;
                     };
                     let Ok(proxy) =
@@ -427,14 +448,12 @@ mod linux_impl {
                     else {
                         return;
                     };
-                    while !live.stop.load(Ordering::SeqCst) {
+                    loop {
                         if let Ok(registered) = proxy.get_property::<bool>(HOST_PROPERTY) {
                             live.host_up.store(registered, Ordering::SeqCst);
                         }
-                        let mut waited = Duration::ZERO;
-                        while waited < HOST_POLL && !live.stop.load(Ordering::SeqCst) {
-                            std::thread::sleep(Duration::from_millis(100));
-                            waited += Duration::from_millis(100);
+                        if live.wait_or_stop() {
+                            break;
                         }
                     }
                 });
@@ -634,6 +653,18 @@ mod linux_impl {
             assert!(!visible(false, true));
             assert!(!visible(true, false));
             assert!(!visible(false, false));
+        }
+
+        #[test]
+        fn stopping_the_monitor_wakes_the_wait_immediately() {
+            let online = Liveness::new();
+            let waiter = online.clone();
+            let began = std::time::Instant::now();
+            let handle = std::thread::spawn(move || waiter.wait_or_stop());
+            std::thread::sleep(Duration::from_millis(50));
+            online.stop_monitor();
+            assert!(handle.join().unwrap());
+            assert!(began.elapsed() < HOST_POLL);
         }
 
         #[test]
@@ -1634,13 +1665,16 @@ mod linux_desktop_tests {
 
     #[test]
     fn mainstream_desktops_support_minimize() {
-        for desktop in ["GNOME", "KDE", "ubuntu:GNOME", "XFCE", "X-Cinnamon"] {
+        for desktop in ["GNOME", "KDE", "ubuntu:GNOME", "XFCE", "X-Cinnamon", "DDE"] {
             assert!(desktop_supports_minimize(Some(desktop)), "{desktop}");
         }
     }
 
     #[test]
     fn unset_or_unknown_desktops_are_not_assumed_to_minimize() {
+        for desktop in ["awesome", "qtile", "Wayfire"] {
+            assert!(!desktop_supports_minimize(Some(desktop)), "{desktop}");
+        }
         assert!(!desktop_supports_minimize(None));
         assert!(!desktop_supports_minimize(Some("")));
         assert!(!desktop_supports_minimize(Some("SomeNewWM")));

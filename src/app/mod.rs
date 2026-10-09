@@ -54,7 +54,9 @@ use crate::settings::{
     AccentPreset, Settings, MAX_NOISE_INTENSITY, MAX_VIGNETTE_INTENSITY, MAX_WINDOW_TRANSPARENCY,
 };
 use crate::startup::launched_minimized;
-use crate::tray::{main_window_hwnd, show_main_window, SystemTray, TrayEvent};
+#[cfg(not(target_os = "linux"))]
+use crate::tray::show_main_window;
+use crate::tray::{main_window_hwnd, SystemTray, TrayEvent};
 use crate::updater::UpdateInfo;
 use toast::Toast;
 use widgets::render_vignette_overlay;
@@ -714,8 +716,13 @@ impl Render for DownloadApp {
         self.flush_toast(cx);
         self.apply_pending_tray_actions(window, cx);
         self.apply_pending_whats_new(window, cx);
-        if self.ipc.take_show_window_request() && show_main_window(window) {
-            self.window_hidden_to_tray = false;
+        if self.ipc.take_show_window_request() {
+            #[cfg(target_os = "linux")]
+            self.restore_main_window_now(cx);
+            #[cfg(not(target_os = "linux"))]
+            if show_main_window(window) {
+                self.window_hidden_to_tray = false;
+            }
         }
         if self.extension_text_inputs_stale && self.filter == FilterKind::Settings {
             self.refresh_extension_text_inputs(window, cx);
