@@ -1,4 +1,4 @@
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED};
 use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
@@ -135,6 +135,9 @@ pub async fn run_http_download_with_ctx(
     let mut short_reconnects: u32 = 0;
     let mut fresh_restarts: u32 = 0;
     let mut range_rejects: u32 = 0;
+    // Set when ETag or Last-Modified changes and the new response has no size.
+    // The previous entity length must not cap or reject the replacement.
+    let mut known_size_retired = false;
     let mut cumulative_reconnects = ctx.job.reconnect_count;
     let reconnect_baseline = ctx.job.reconnect_count;
     // One remint from job.url after a 401 on a burned Inst-FS / Drive hop.
@@ -226,6 +229,23 @@ pub async fn run_http_download_with_ctx(
         let mut full_replace = false;
         let range_total = match &range_status {
             RangeStatus::RangeNotSatisfiable { at } => {
+                // The replacement had no length, and this 416 names the bytes
+                // already on disk. That is the end of the new resource.
+                if known_size_retired {
+                    if let Some(total) = unsatisfied_content_range_total(response.headers()) {
+                        if total == existing_bytes && existing_bytes > 0 {
+                            return finish_downloaded_entity(
+                                ctx,
+                                &temp_path,
+                                &target_path,
+                                existing_bytes,
+                                existing_bytes,
+                                resume_supported,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 // Keep the partial across a transient 416. Only discard it
                 // after the same offset has been rejected and a retry is
                 // actually starting — pause and give-up must not wipe it.
@@ -461,16 +481,26 @@ pub async fn run_http_download_with_ctx(
                     len
                 }
             })
-            .unwrap_or_else(|| known_total_without_content_length(&ctx.job, &validators));
+            .unwrap_or_else(|| {
+                known_total_without_content_length(&ctx.job, &validators, known_size_retired)
+            });
 
         if let Some(total) = range_total {
             total_bytes = total;
         }
-        // A changed resource with no Content-Length does not have the old size.
-        // Clear it before the new validators are stored so a reconnect does not
-        // compare the new entity against the size we just retired.
+        // A declared length belongs to the response in hand. Forget the retirement
+        // and use that length. A changed resource with no length has no size yet:
+        // clear the job and the saved total so a reconnect cannot bring the old
+        // one back.
+        if announced_length.is_some() || range_total.is_some() {
+            known_size_retired = false;
+        }
         if accept_new_size && announced_length.is_none() && range_total.is_none() {
             total_bytes = 0;
+            ctx.job.total_bytes = 0;
+            ctx.job.validators.expected_size = None;
+            validators.expected_size = None;
+            known_size_retired = true;
         }
 
         // Capture validators for this response; keep local copy for reconnect If-Range.
@@ -573,12 +603,14 @@ pub async fn run_http_download_with_ctx(
             .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
         // A changed resource with no Content-Length has no declared size, so
-        // the body is the entity. Every other response stops at the known size.
-        let write_limit = if accept_new_size && announced_length.is_none() {
+        // the body is the entity. A retired size must not cap the follow-up
+        // either. Every other response stops at the known size.
+        let write_limit = if announced_length.is_none() && (accept_new_size || known_size_retired) {
             0
         } else {
             total_bytes
         };
+        let body_start = existing_bytes;
         let mut sink = AppendSink::open(&temp_path, existing_bytes)
             .await?
             .with_target(write_limit);
@@ -644,46 +676,15 @@ pub async fn run_http_download_with_ctx(
                     discard_rejected_partial(ctx, &temp_path).await;
                     return Err(remote_size_changed_error(actual, expected));
                 }
-                verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
-                let Some(final_path) = move_to_final_path_unless_discarded(
-                    ctx.committer.as_ref(),
-                    &ctx.job.id,
+                return finish_downloaded_entity(
+                    ctx,
                     &temp_path,
                     &target_path,
-                    ctx.job.replace_existing,
+                    downloaded,
+                    total_bytes,
+                    resume_supported,
                 )
-                .await?
-                else {
-                    return Ok(DownloadOutcome::Canceled);
-                };
-                committer
-                    .commit(
-                        &mut ctx.job,
-                        CommitIdentity {
-                            downloaded_bytes: Some(downloaded),
-                            total_bytes: Some(if total_bytes == 0 {
-                                downloaded
-                            } else {
-                                total_bytes
-                            }),
-                            progress: Some(100.0),
-                            filename: final_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|s| s.to_string()),
-                            target_path: Some(final_path.clone()),
-                            temp_path: Some(temp_path.clone()),
-                            resume_supported: Some(resume_supported),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
-                if committer.output_discarded(&ctx.job.id).await {
-                    remove_and_forget_produced(committer.as_ref(), &ctx.job.id, &final_path).await;
-                    return Ok(DownloadOutcome::Canceled);
-                }
-                return Ok(DownloadOutcome::Completed);
+                .await;
             }
             Err(error) => {
                 if let Some(outcome) = control_outcome(&control) {
@@ -701,7 +702,28 @@ pub async fn run_http_download_with_ctx(
                         return Ok(outcome);
                     }
                 }
+                // The first lengthless body after a validator change reconnects.
+                // A later clean close, once the old size is gone, is the new file.
+                let closed_new_entity = is_lengthless_eof(&error)
+                    && known_size_retired
+                    && !accept_new_size
+                    && body_start == 0
+                    && downloaded > 0;
+                if known_size_retired && is_lengthless_eof(&error) {
+                    sink.sync_data().await?;
+                }
                 drop(sink);
+                if closed_new_entity {
+                    return finish_downloaded_entity(
+                        ctx,
+                        &temp_path,
+                        &target_path,
+                        downloaded,
+                        downloaded,
+                        resume_supported,
+                    )
+                    .await;
+                }
                 if is_remote_size_mismatch(&error) {
                     discard_rejected_partial(ctx, &temp_path).await;
                     return Err(error);
@@ -844,7 +866,14 @@ fn is_clean_short_body(error: &DownloadError) -> bool {
     is_incomplete_download(error) || is_lengthless_eof(error)
 }
 
-fn known_total_without_content_length(job: &Job, validators: &ContentValidators) -> u64 {
+fn known_total_without_content_length(
+    job: &Job,
+    validators: &ContentValidators,
+    size_retired: bool,
+) -> u64 {
+    if size_retired {
+        return 0;
+    }
     if job.total_bytes > 0 {
         return job.total_bytes;
     }
@@ -852,6 +881,76 @@ fn known_total_without_content_length(job: &Job, validators: &ContentValidators)
         .expected_size
         .filter(|size| *size > 0)
         .unwrap_or(0)
+}
+
+/// `416` with `Content-Range: bytes */N` — the total of a range the server
+/// could not satisfy. `parse_content_range` rejects this form.
+fn unsatisfied_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?.trim();
+    let (unit, rest) = value.split_once(char::is_whitespace)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim().split_once('/')?;
+    if range.trim() != "*" {
+        return None;
+    }
+    let total = total.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok().filter(|total| *total > 0)
+}
+
+async fn finish_downloaded_entity(
+    ctx: &mut TransferContext,
+    temp_path: &Path,
+    target_path: &Path,
+    downloaded: u64,
+    total_bytes: u64,
+    resume_supported: bool,
+) -> Result<DownloadOutcome, DownloadError> {
+    verify_sha256_if_expected(temp_path, ctx.job.expected_sha256.as_deref()).await?;
+    let Some(final_path) = move_to_final_path_unless_discarded(
+        ctx.committer.as_ref(),
+        &ctx.job.id,
+        temp_path,
+        target_path,
+        ctx.job.replace_existing,
+    )
+    .await?
+    else {
+        return Ok(DownloadOutcome::Canceled);
+    };
+    let total = if total_bytes == 0 {
+        downloaded
+    } else {
+        total_bytes
+    };
+    ctx.committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(downloaded),
+                total_bytes: Some(total),
+                progress: Some(100.0),
+                filename: final_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string()),
+                target_path: Some(final_path.clone()),
+                temp_path: Some(temp_path.to_path_buf()),
+                resume_supported: Some(resume_supported),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+    if ctx.committer.output_discarded(&ctx.job.id).await {
+        remove_and_forget_produced(ctx.committer.as_ref(), &ctx.job.id, &final_path).await;
+        return Ok(DownloadOutcome::Canceled);
+    }
+    Ok(DownloadOutcome::Completed)
 }
 
 /// Switch to a Content-Disposition name only after the existing partial moved,
@@ -1632,7 +1731,7 @@ mod tests {
         );
         job.total_bytes = 4096;
         assert_eq!(
-            known_total_without_content_length(&job, &ContentValidators::default()),
+            known_total_without_content_length(&job, &ContentValidators::default(), false),
             4096
         );
         job.total_bytes = 0;
@@ -1640,11 +1739,29 @@ mod tests {
             expected_size: Some(80),
             ..ContentValidators::default()
         };
-        assert_eq!(known_total_without_content_length(&job, &validators), 80);
         assert_eq!(
-            known_total_without_content_length(&job, &ContentValidators::default()),
+            known_total_without_content_length(&job, &validators, false),
+            80
+        );
+        assert_eq!(
+            known_total_without_content_length(&job, &ContentValidators::default(), false),
             0
         );
+        job.total_bytes = 262_144;
+        assert_eq!(
+            known_total_without_content_length(&job, &validators, true),
+            0,
+            "a retired size must not come back from the job or its validators"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_content_range_total_reads_star_form() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes */270336".parse().unwrap());
+        assert_eq!(unsatisfied_content_range_total(&headers), Some(270_336));
+        headers.insert(CONTENT_RANGE, "bytes 0-1/10".parse().unwrap());
+        assert_eq!(unsatisfied_content_range_total(&headers), None);
     }
 
     #[test]

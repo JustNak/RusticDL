@@ -1164,6 +1164,204 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn etag_change_range_ignored_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::RangeIgnored).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'N'));
+    }
+
+    #[tokio::test]
+    async fn etag_change_if_range_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::Standards).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'N'));
+    }
+
+    #[tokio::test]
+    async fn last_modified_change_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::LastModifiedOnly).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'L'));
+    }
+
+    const OLD_ENTITY_LEN: u64 = 262_144;
+    const NEW_ENTITY_LEN: usize = 270_336;
+
+    #[derive(Clone, Copy)]
+    enum ChangedEntityFollowup {
+        /// Every ranged GET is a full 200. The server never honors Range.
+        RangeIgnored,
+        /// If-Range mismatch is a 200 of the new file. A matching Range is 206 or 416.
+        Standards,
+        /// Same as standards, but only Last-Modified changes.
+        LastModifiedOnly,
+    }
+
+    /// HEAD advertises the old size. The first body drops, forcing a Range
+    /// reconnect. The resource has changed and the replacement 200 has no
+    /// Content-Length. Later requests keep answering for the whole reconnect
+    /// loop: ignored ranges, or 206/416 after the validator matches.
+    async fn changed_entity_through_reconnect(followup: ChangedEntityFollowup) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let new_body = match followup {
+            ChangedEntityFollowup::LastModifiedOnly => vec![b'L'; NEW_ENTITY_LEN],
+            _ => vec![b'N'; NEW_ENTITY_LEN],
+        };
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if let Ok(mut guard) = requests.lock() {
+                    guard.push(req.clone());
+                }
+                if req.starts_with("HEAD ") {
+                    let reply = head_for(followup);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let lower = req.to_ascii_lowercase();
+                let start = range_start_from(&lower).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {OLD_ENTITY_LEN}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'o'; 100_000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let if_range = header_value(&lower, "if-range");
+                let validator_matches = followup_validator_matches(followup, if_range.as_deref());
+                let send_full = match followup {
+                    ChangedEntityFollowup::RangeIgnored => true,
+                    ChangedEntityFollowup::Standards | ChangedEntityFollowup::LastModifiedOnly => {
+                        start == 0 || !validator_matches
+                    }
+                };
+                if send_full {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{}\r\n\r\n",
+                        current_validator(followup)
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&new_body).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start as usize >= new_body.len() {
+                    let reply = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                        new_body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let suffix = &new_body[start as usize..];
+                let end = new_body.len() - 1;
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{}\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    current_validator(followup),
+                    new_body.len(),
+                    suffix.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(suffix).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(45), run_transfer(ctx)).await;
+        let file = match outcome {
+            Ok(Ok(DownloadOutcome::Completed)) => std::fs::read(&target).unwrap_or_default(),
+            Ok(Ok(other)) => panic!("download ended as {other:?}"),
+            Ok(Err(err)) => {
+                let seen = recorded.lock().unwrap().len();
+                panic!("changed entity failed after {seen} requests: {err:?}")
+            }
+            Err(_) => {
+                let seen = recorded.lock().unwrap().len();
+                panic!("changed entity timed out after {seen} requests")
+            }
+        };
+        let range_gets = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|req| {
+                let lower = req.to_ascii_lowercase();
+                lower.starts_with("get ") && range_start_from(&lower).is_some()
+            })
+            .count();
+        assert!(
+            range_gets >= 2,
+            "the changed body must reconnect before the new file is finished, saw {range_gets} range GETs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        file
+    }
+
+    fn head_for(followup: ChangedEntityFollowup) -> String {
+        let identity = match followup {
+            ChangedEntityFollowup::LastModifiedOnly => {
+                "Last-Modified: Wed, 01 Jan 2020 00:00:00 GMT"
+            }
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                "ETag: \"v1\""
+            }
+        };
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{identity}\r\nContent-Length: {OLD_ENTITY_LEN}\r\n\r\n"
+        )
+    }
+
+    fn current_validator(followup: ChangedEntityFollowup) -> &'static str {
+        match followup {
+            ChangedEntityFollowup::LastModifiedOnly => {
+                "Last-Modified: Thu, 02 Jan 2020 00:00:00 GMT"
+            }
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                "ETag: \"v2\""
+            }
+        }
+    }
+
+    fn followup_validator_matches(followup: ChangedEntityFollowup, if_range: Option<&str>) -> bool {
+        let Some(value) = if_range else {
+            return false;
+        };
+        match followup {
+            ChangedEntityFollowup::LastModifiedOnly => value.contains("02 jan 2020"),
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                value.contains("\"v2\"")
+            }
+        }
+    }
+
+    fn header_value(lower_req: &str, name: &str) -> Option<String> {
+        let prefix = format!("{name}:");
+        lower_req
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .map(|line| line[prefix.len()..].trim().to_string())
+    }
+
     fn response_200(content_length: Option<u64>, accept_ranges: bool) -> String {
         let mut response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
         if accept_ranges {
