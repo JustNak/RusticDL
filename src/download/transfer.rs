@@ -252,7 +252,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn sample_job() -> Job {
         Job::new(
@@ -693,7 +693,7 @@ Connection: close\r\n\
 Accept-Ranges: none\r\n\
 Content-Length: {}\r\n\
 \r\n",
-            8 * 1024 * 1024
+            body.len()
         );
         let get = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -712,12 +712,11 @@ Content-Length: {}\r\n\
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
         let progress = TestProgress::new();
-        let ctx = test_ctx_commit(
-            job,
-            progress.callback(),
-            EngineRuntimeConfig::default(),
-            progress.identity.clone(),
-        );
+        let config = EngineRuntimeConfig {
+            multi_min_bytes: body.len() as u64,
+            ..EngineRuntimeConfig::default()
+        };
+        let ctx = test_ctx_commit(job, progress.callback(), config, progress.identity.clone());
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -748,7 +747,7 @@ Connection: close\r\n\
 Accept-Ranges: none\r\n\
 Content-Length: {}\r\n\
 \r\n",
-            8 * 1024 * 1024
+            body.len()
         );
         let get = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -768,12 +767,11 @@ Content-Length: {}\r\n\
         job.fallback_reason = Some("ranges_unsupported".into());
 
         let progress = TestProgress::new();
-        let ctx = test_ctx_commit(
-            job,
-            progress.callback(),
-            EngineRuntimeConfig::default(),
-            progress.identity.clone(),
-        );
+        let config = EngineRuntimeConfig {
+            multi_min_bytes: body.len() as u64,
+            ..EngineRuntimeConfig::default()
+        };
+        let ctx = test_ctx_commit(job, progress.callback(), config, progress.identity.clone());
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -790,6 +788,236 @@ Content-Length: {}\r\n\
             .any(|job| job.fallback_reason.as_deref() == Some("ranges_unsupported")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_shorter_than_head_content_length_is_size_mismatch() {
+        let body = vec![b'a'; 4096];
+        let err = head_then_get_error(65_536, Some(body.len() as u64), &body).await;
+        assert_size_mismatch(&err, body.len() as u64, 65_536);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_larger_than_head_content_length_is_size_mismatch() {
+        let body = vec![b'b'; 65_536];
+        let err = head_then_get_error(4096, Some(body.len() as u64), &body).await;
+        assert_size_mismatch(&err, body.len() as u64, 4096);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_matching_head_content_length_completes() {
+        let body = vec![b'c'; 4096];
+        let (dir, target, outcome) =
+            head_then_get(body.len() as u64, Some(body.len() as u64), &body).await;
+        let outcome = outcome.expect("matching Content-Length must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stored_expected_size_rejects_shorter_200_content_length() {
+        let body = vec![b'd'; 4096];
+        let get = response_200(Some(body.len() as u64), false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![get], body.clone()).await;
+        let (dir, target, _temp, mut job) = download_paths(&base);
+        job.validators.expected_size = Some(65_536);
+        let progress = TestProgress::new();
+        let mut ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        ctx.preflight_done = true;
+
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("stored expected_size must reject a shorter 200");
+        assert_size_mismatch(&err, body.len() as u64, 65_536);
+        assert!(
+            !target.exists(),
+            "a conflicting 200 must not be renamed to the finished file"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                job.total_bytes != body.len() as u64
+                    && job.validators.expected_size != Some(body.len() as u64)
+            }),
+            "must not overwrite the stored size with the shorter Content-Length"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_without_content_length_short_of_known_size_is_not_completed() {
+        let head_len = 65_536u64;
+        let body = vec![b'e'; 4096];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = response_200(Some(head_len), true);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else if req.starts_with("GET ") {
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a short body with no Content-Length must not complete");
+        assert_size_mismatch(&err, body.len() as u64, head_len);
+        assert!(
+            !target.exists(),
+            "short body must not become the finished file"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| job.progress < 100.0),
+            "short body must not be committed as finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_without_content_length_matching_known_size_completes() {
+        let body = vec![b'f'; 4096];
+        let head = response_200(Some(body.len() as u64), true);
+        let get = response_200(None, false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![head, get], body.clone()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a body that matches the known size must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn response_200(content_length: Option<u64>, accept_ranges: bool) -> String {
+        let mut response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+        if accept_ranges {
+            response.push_str("Accept-Ranges: bytes\r\n");
+        }
+        if let Some(len) = content_length {
+            response.push_str(&format!("Content-Length: {len}\r\n"));
+        }
+        response.push_str("\r\n");
+        response
+    }
+
+    fn download_paths(base: &str) -> (PathBuf, PathBuf, PathBuf, Job) {
+        let dir = std::env::temp_dir().join(format!("rusticdl-size-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        (dir, target, temp, job)
+    }
+
+    async fn head_then_get(
+        head_len: u64,
+        get_len: Option<u64>,
+        body: &[u8],
+    ) -> (PathBuf, PathBuf, Result<DownloadOutcome, DownloadError>) {
+        let head = response_200(Some(head_len), true);
+        let get = response_200(get_len, false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![head, get], body.to_vec()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let outcome = transfer_within(ctx).await;
+        if matches!(&outcome, Ok(DownloadOutcome::Completed)) {
+            return (dir, target, outcome);
+        }
+        assert!(
+            !target.exists(),
+            "a rejected download must not be renamed to the finished file"
+        );
+        let wrong = get_len.filter(|len| *len != head_len);
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                wrong.is_none_or(|len| {
+                    job.total_bytes != len && job.validators.expected_size != Some(len)
+                })
+            }),
+            "must not overwrite the known size with a conflicting Content-Length: {:?}",
+            progress.snapshots()
+        );
+        (dir, target, outcome)
+    }
+
+    async fn head_then_get_error(
+        head_len: u64,
+        get_len: Option<u64>,
+        body: &[u8],
+    ) -> DownloadError {
+        let (dir, _target, outcome) = head_then_get(head_len, get_len, body).await;
+        let err = outcome.expect_err("conflicting 200 must fail the job");
+        let _ = std::fs::remove_dir_all(&dir);
+        err
+    }
+
+    async fn transfer_within(ctx: TransferContext) -> Result<DownloadOutcome, DownloadError> {
+        tokio::time::timeout(Duration::from_secs(8), run_transfer(ctx))
+            .await
+            .expect("download must settle without exhausting the reconnect budget")
+    }
+
+    fn assert_size_mismatch(err: &DownloadError, actual: u64, expected: u64) {
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "size mismatch must not be retried: {err:?}");
+        assert!(
+            err.message.contains(&actual.to_string())
+                && err.message.contains(&expected.to_string())
+                && err.message.to_ascii_lowercase().contains("size"),
+            "expected a size-mismatch error naming {actual} vs {expected}, got {err:?}"
+        );
+    }
+
+    async fn read_http_headers(socket: &mut TcpStream) -> String {
+        let mut buf = vec![0u8; 8192];
+        let mut collected = Vec::new();
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            collected.extend_from_slice(&buf[..n]);
+            if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&collected).into_owned()
     }
 
     #[tokio::test]

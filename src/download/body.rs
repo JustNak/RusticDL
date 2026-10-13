@@ -414,6 +414,10 @@ pub(crate) fn is_lengthless_eof(error: &DownloadError) -> bool {
     error.message.contains("without a length")
 }
 
+pub(crate) fn is_incomplete_download(error: &DownloadError) -> bool {
+    error.message.starts_with("Download incomplete (")
+}
+
 fn target_reached(sink: &impl BodySink) -> bool {
     match sink.target_offset() {
         Some(target) if target > 0 => sink.offset() >= target,

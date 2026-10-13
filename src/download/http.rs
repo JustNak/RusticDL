@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{is_lengthless_eof, stream_body, AppendSink, StreamEnd};
+use super::body::{is_incomplete_download, is_lengthless_eof, stream_body, AppendSink, StreamEnd};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
@@ -407,22 +407,25 @@ pub async fn run_http_download_with_ctx(
                 .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
             || resume_supported;
 
+        // Captured before Content-Length is allowed to replace the running total.
+        // HEAD and a stored expected_size both land here; a later 200 must not
+        // quietly adopt a different entity size.
+        let announced_length = response.content_length();
+        let expected_size = known_expected_size(total_bytes, &validators);
         if !full_replace {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)
             {
-                return Err(download_error(
-                    FailureCategory::Resume,
-                    format!(
-                        "Remote size changed ({total} bytes vs expected {expected}). Use Restart."
-                    ),
-                    false,
-                ));
+                return Err(remote_size_changed_error(total, expected));
+            }
+            if let Some((actual, expected)) =
+                content_length_size_mismatch(http_status, announced_length, expected_size)
+            {
+                return Err(remote_size_changed_error(actual, expected));
             }
         }
 
-        total_bytes = response
-            .content_length()
+        total_bytes = announced_length
             .map(|len| {
                 if http_status == StatusCode::PARTIAL_CONTENT {
                     existing_bytes.saturating_add(len)
@@ -591,6 +594,12 @@ pub async fn run_http_download_with_ctx(
             Ok(StreamEnd::Exhausted { downloaded }) => {
                 sink.sync_data().await?;
                 drop(sink);
+                if let Some((actual, expected)) =
+                    clean_shortfall(full_replace, announced_length, expected_size, downloaded)
+                {
+                    checkpoint_partial(ctx, actual, expected).await;
+                    return Err(remote_size_changed_error(actual, expected));
+                }
                 verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
                 let Some(final_path) = move_to_final_path_unless_discarded(
                     ctx.committer.as_ref(),
@@ -649,6 +658,14 @@ pub async fn run_http_download_with_ctx(
                     }
                 }
                 drop(sink);
+                if is_clean_short_body(&error) {
+                    if let Some((actual, expected)) =
+                        clean_shortfall(full_replace, announced_length, expected_size, downloaded)
+                    {
+                        checkpoint_partial(ctx, actual, expected).await;
+                        return Err(remote_size_changed_error(actual, expected));
+                    }
+                }
                 if downloaded > existing_bytes {
                     short_reconnects = 0;
                 }
@@ -723,6 +740,64 @@ async fn prepare_reconnect(
     let offset = refresh_reconnect_offset(transfer_format_version, existing_bytes, temp_path).await;
 
     ReconnectAction::Retry { offset }
+}
+
+fn remote_size_changed_error(actual: u64, expected: u64) -> DownloadError {
+    download_error(
+        FailureCategory::Resume,
+        format!("Remote size changed ({actual} bytes vs expected {expected}). Use Restart."),
+        false,
+    )
+}
+
+/// Size already known from HEAD, a previous response, or `validators.expected_size`.
+fn known_expected_size(total_bytes: u64, validators: &ContentValidators) -> Option<u64> {
+    validators
+        .expected_size
+        .filter(|size| *size > 0)
+        .or_else(|| (total_bytes > 0).then_some(total_bytes))
+}
+
+/// A fresh 200's Content-Length is the whole entity. Partial responses carry
+/// only the slice length, so they are compared via Content-Range instead.
+fn content_length_size_mismatch(
+    status: StatusCode,
+    content_length: Option<u64>,
+    expected_size: Option<u64>,
+) -> Option<(u64, u64)> {
+    if status != StatusCode::OK {
+        return None;
+    }
+    match (content_length, expected_size.filter(|size| *size > 0)) {
+        (Some(len), Some(expected)) if len != expected => Some((len, expected)),
+        _ => None,
+    }
+}
+
+fn short_of_known_size(downloaded: u64, expected_size: Option<u64>) -> Option<(u64, u64)> {
+    match expected_size.filter(|size| *size > 0) {
+        Some(expected) if downloaded < expected => Some((downloaded, expected)),
+        _ => None,
+    }
+}
+
+/// Clean end of a 200 that never declared Content-Length, short of a size we
+/// already know. A ranged restart (`full_replace`) and a truncated
+/// Content-Length body stay on the existing resume path.
+fn clean_shortfall(
+    full_replace: bool,
+    announced_length: Option<u64>,
+    expected_size: Option<u64>,
+    downloaded: u64,
+) -> Option<(u64, u64)> {
+    if full_replace || announced_length.is_some() {
+        return None;
+    }
+    short_of_known_size(downloaded, expected_size)
+}
+
+fn is_clean_short_body(error: &DownloadError) -> bool {
+    is_incomplete_download(error) || is_lengthless_eof(error)
 }
 
 fn known_total_without_content_length(job: &Job, validators: &ContentValidators) -> u64 {
@@ -1413,6 +1488,64 @@ mod tests {
             true
         ));
         assert!(can_mid_transfer_reconnect(&body_err, 0, 0, false));
+    }
+
+    #[test]
+    fn content_length_mismatch_rejects_fresh_200_only() {
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), Some(65_536)),
+            Some((4096, 65_536))
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(65_536), Some(4096)),
+            Some((65_536, 4096))
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), Some(4096)),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, None, Some(65_536)),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), None),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::PARTIAL_CONTENT, Some(48), Some(64)),
+            None,
+            "206 Content-Length is the slice, not the entity size"
+        );
+    }
+
+    #[test]
+    fn known_expected_size_prefers_validator_then_running_total() {
+        let validators = ContentValidators {
+            expected_size: Some(80),
+            ..ContentValidators::default()
+        };
+        assert_eq!(known_expected_size(0, &validators), Some(80));
+        assert_eq!(known_expected_size(4096, &validators), Some(80));
+        assert_eq!(
+            known_expected_size(4096, &ContentValidators::default()),
+            Some(4096)
+        );
+        assert_eq!(known_expected_size(0, &ContentValidators::default()), None);
+    }
+
+    #[test]
+    fn clean_shortfall_ignores_ranged_restart_and_declared_length() {
+        assert_eq!(
+            clean_shortfall(false, None, Some(65_536), 4096),
+            Some((4096, 65_536))
+        );
+        assert_eq!(clean_shortfall(false, None, Some(4096), 4096), None);
+        assert_eq!(clean_shortfall(true, None, Some(65_536), 4096), None);
+        assert_eq!(
+            clean_shortfall(false, Some(65_536), Some(65_536), 4096),
+            None
+        );
     }
 
     #[test]
