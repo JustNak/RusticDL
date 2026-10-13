@@ -1185,6 +1185,158 @@ Content-Length: {}\r\n\
         assert!(file.iter().all(|byte| *byte == b'L'));
     }
 
+    /// HEAD 262144 e1, the first body drops, then Range gets e2 with no length and
+    /// the full 524288-byte file. A later Range is a 200 with the same e2, no
+    /// length, and only 1000 bytes. That follow-up must not replace the file.
+    #[tokio::test]
+    async fn truncated_unchanged_etag_after_lengthless_change_is_not_the_file() {
+        let full_len = 524_288usize;
+        let full = vec![b'N'; full_len];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = full.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_changed = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 262144\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 262144\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 100_000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_changed {
+                    sent_changed = true;
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let trap = vec![b'X'; 1000];
+                let reply =
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&trap).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("the changed body's clean close is the file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), full);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 416 `bytes */N` for a short partial must not finish the job when the
+    /// changed response never closed cleanly.
+    #[tokio::test]
+    async fn early_416_of_short_partial_does_not_complete() {
+        let full = vec![b'N'; 8192];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = full.clone();
+        let saw_416 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_416_task = saw_416.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_prefix = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 4000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start > 0 && !sent_prefix {
+                    sent_prefix = true;
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'X'; 1000]).await;
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Abort so the short body is a reset, not a clean close.
+                    #[allow(deprecated)]
+                    let _ = socket.set_linger(Some(Duration::from_secs(0)));
+                    continue;
+                }
+                if start > 0 {
+                    saw_416_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{start}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("416 of a short partial must settle");
+        let outcome = outcome.expect("restart after the 416 downloads the real file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        let file = std::fs::read(&target).expect("final file");
+        assert_eq!(file, full, "a 416 of the short prefix must not be the file");
+        assert!(
+            saw_416.load(std::sync::atomic::Ordering::SeqCst),
+            "the short prefix must be answered with 416 before the real file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const OLD_ENTITY_LEN: u64 = 262_144;
     const NEW_ENTITY_LEN: usize = 270_336;
 
@@ -1309,9 +1461,9 @@ Content-Length: {}\r\n\
                 lower.starts_with("get ") && range_start_from(&lower).is_some()
             })
             .count();
-        assert!(
-            range_gets >= 2,
-            "the changed body must reconnect before the new file is finished, saw {range_gets} range GETs"
+        assert_eq!(
+            range_gets, 1,
+            "the changed response's clean close must finish the file, saw {range_gets} range GETs"
         );
         let _ = std::fs::remove_dir_all(&dir);
         file

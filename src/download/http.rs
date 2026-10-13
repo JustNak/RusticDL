@@ -1,4 +1,4 @@
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
 use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
@@ -229,23 +229,6 @@ pub async fn run_http_download_with_ctx(
         let mut full_replace = false;
         let range_total = match &range_status {
             RangeStatus::RangeNotSatisfiable { at } => {
-                // The replacement had no length, and this 416 names the bytes
-                // already on disk. That is the end of the new resource.
-                if known_size_retired {
-                    if let Some(total) = unsatisfied_content_range_total(response.headers()) {
-                        if total == existing_bytes && existing_bytes > 0 {
-                            return finish_downloaded_entity(
-                                ctx,
-                                &temp_path,
-                                &target_path,
-                                existing_bytes,
-                                existing_bytes,
-                                resume_supported,
-                            )
-                            .await;
-                        }
-                    }
-                }
                 // Keep the partial across a transient 416. Only discard it
                 // after the same offset has been rejected and a retry is
                 // actually starting — pause and give-up must not wipe it.
@@ -390,6 +373,21 @@ pub async fn run_http_download_with_ctx(
                     ) {
                         checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                         return Err(remote_size_changed_error(actual, expected));
+                    }
+                    // The validators already match. This 200 is not a new entity,
+                    // so it must not delete the bytes saved from the change.
+                    if known_size_retired && announced_length.is_none() {
+                        if let Some(outcome) = control_outcome(&control) {
+                            return Ok(outcome);
+                        }
+                        let error = download_error(
+                            FailureCategory::Resume,
+                            "Server ignored Range; partial kept. Use Restart to download from zero."
+                                .into(),
+                            true,
+                        );
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
                     }
                 }
                 fresh_restarts = fresh_restarts.saturating_add(1);
@@ -610,7 +608,6 @@ pub async fn run_http_download_with_ctx(
         } else {
             total_bytes
         };
-        let body_start = existing_bytes;
         let mut sink = AppendSink::open(&temp_path, existing_bytes)
             .await?
             .with_target(write_limit);
@@ -702,18 +699,13 @@ pub async fn run_http_download_with_ctx(
                         return Ok(outcome);
                     }
                 }
-                // The first lengthless body after a validator change reconnects.
-                // A later clean close, once the old size is gone, is the new file.
-                let closed_new_entity = is_lengthless_eof(&error)
-                    && known_size_retired
-                    && !accept_new_size
-                    && body_start == 0
-                    && downloaded > 0;
-                if known_size_retired && is_lengthless_eof(&error) {
-                    sink.sync_data().await?;
-                }
-                drop(sink);
+                // The response whose validators changed is the new entity. Its
+                // clean close finishes the download. A later unchanged 200 is not.
+                let closed_new_entity =
+                    is_lengthless_eof(&error) && accept_new_size && downloaded > 0;
                 if closed_new_entity {
+                    sink.sync_data().await?;
+                    drop(sink);
                     return finish_downloaded_entity(
                         ctx,
                         &temp_path,
@@ -724,6 +716,7 @@ pub async fn run_http_download_with_ctx(
                     )
                     .await;
                 }
+                drop(sink);
                 if is_remote_size_mismatch(&error) {
                     discard_rejected_partial(ctx, &temp_path).await;
                     return Err(error);
@@ -881,25 +874,6 @@ fn known_total_without_content_length(
         .expected_size
         .filter(|size| *size > 0)
         .unwrap_or(0)
-}
-
-/// `416` with `Content-Range: bytes */N` — the total of a range the server
-/// could not satisfy. `parse_content_range` rejects this form.
-fn unsatisfied_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?.trim();
-    let (unit, rest) = value.split_once(char::is_whitespace)?;
-    if !unit.eq_ignore_ascii_case("bytes") {
-        return None;
-    }
-    let (range, total) = rest.trim().split_once('/')?;
-    if range.trim() != "*" {
-        return None;
-    }
-    let total = total.trim();
-    if total == "*" {
-        return None;
-    }
-    total.parse::<u64>().ok().filter(|total| *total > 0)
 }
 
 async fn finish_downloaded_entity(
@@ -1753,15 +1727,6 @@ mod tests {
             0,
             "a retired size must not come back from the job or its validators"
         );
-    }
-
-    #[test]
-    fn unsatisfied_content_range_total_reads_star_form() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(CONTENT_RANGE, "bytes */270336".parse().unwrap());
-        assert_eq!(unsatisfied_content_range_total(&headers), Some(270_336));
-        headers.insert(CONTENT_RANGE, "bytes 0-1/10".parse().unwrap());
-        assert_eq!(unsatisfied_content_range_total(&headers), None);
     }
 
     #[test]
