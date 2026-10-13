@@ -151,6 +151,34 @@ impl BodySink for AppendSink {
     }
 }
 
+/// Counts a body without touching the `.part`. Used to compare a repeated
+/// full response with the candidate already on disk.
+pub(crate) struct CountingSink {
+    offset: u64,
+}
+
+impl CountingSink {
+    pub(crate) fn new() -> Self {
+        Self { offset: 0 }
+    }
+}
+
+#[async_trait]
+impl BodySink for CountingSink {
+    async fn write_chunk(&mut self, data: &[u8]) -> Result<usize, DownloadError> {
+        self.offset = self.offset.saturating_add(data.len() as u64);
+        Ok(data.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), DownloadError> {
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 pub struct PositionedSink {
     writer: Arc<SegmentFileWriter>,
     offset: u64,
