@@ -106,12 +106,36 @@ impl BodySink for AppendSink {
         if data.is_empty() {
             return Ok(0);
         }
-        self.writer
-            .write_all(data)
-            .await
-            .map_err(disk_write_error)?;
-        self.offset = self.offset.saturating_add(data.len() as u64);
-        Ok(data.len())
+        let Some(target) = self.target else {
+            self.writer
+                .write_all(data)
+                .await
+                .map_err(disk_write_error)?;
+            self.offset = self.offset.saturating_add(data.len() as u64);
+            return Ok(data.len());
+        };
+        let room = target.saturating_sub(self.offset);
+        if (data.len() as u64) <= room {
+            self.writer
+                .write_all(data)
+                .await
+                .map_err(disk_write_error)?;
+            self.offset = self.offset.saturating_add(data.len() as u64);
+            return Ok(data.len());
+        }
+        // A known size is a hard end. Keep the bytes that still fit, and do
+        // not let the rest of a runaway body extend the file.
+        let keep = room as usize;
+        if keep > 0 {
+            self.writer
+                .write_all(&data[..keep])
+                .await
+                .map_err(disk_write_error)?;
+            self.offset = self.offset.saturating_add(room);
+        }
+        self.writer.flush().await.map_err(disk_write_error)?;
+        let observed = self.offset.saturating_add((data.len() - keep) as u64);
+        Err(remote_size_changed_error(observed, target))
     }
 
     async fn flush(&mut self) -> Result<(), DownloadError> {
@@ -418,6 +442,14 @@ pub(crate) fn is_incomplete_download(error: &DownloadError) -> bool {
     error.message.starts_with("Download incomplete (")
 }
 
+pub(crate) fn remote_size_changed_error(actual: u64, expected: u64) -> DownloadError {
+    download_error(
+        FailureCategory::Resume,
+        format!("Remote size changed ({actual} bytes vs expected {expected}). Use Restart."),
+        false,
+    )
+}
+
 fn target_reached(sink: &impl BodySink) -> bool {
     match sink.target_offset() {
         Some(target) if target > 0 => sink.offset() >= target,
@@ -614,6 +646,39 @@ mod tests {
             panic!("unexpected {end:?}");
         };
         assert_eq!(downloaded, payload.len() as u64);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn stream_body_overrun_stops_at_known_size() {
+        let stream = futures_util::stream::iter([Ok::<Vec<u8>, DownloadError>(
+            b"0123456789abcdef".to_vec(),
+        )]);
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-overrun-cap-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("out.bin.part");
+        let mut sink = AppendSink::open(&path, 0).await.unwrap().with_target(8);
+        let control = AtomicU8::new(0);
+        let limiter = GlobalBandwidthLimiter::new(None);
+        let err = stream_body_loop(
+            stream,
+            &mut sink,
+            &control,
+            limiter.as_ref(),
+            Duration::from_secs(5),
+            EosPolicy::Complete,
+            |_| {},
+        )
+        .await
+        .expect_err("bytes past the known size must fail");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable);
+        assert!(err.message.contains('8'), "{err:?}");
+        assert!(err.message.contains("16"), "{err:?}");
+        assert_eq!(sink.offset(), 8);
+        drop(sink);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"01234567");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

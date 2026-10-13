@@ -916,6 +916,169 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn fresh_200_without_content_length_past_known_size_is_size_mismatch() {
+        let head_len = 65_536u64;
+        let body = vec![b'g'; 131_072];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = response_200(Some(head_len), true);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else if req.starts_with("GET ") {
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a body longer than the known size must not complete");
+        let observed = observed_mismatch_size(&err);
+        assert!(
+            observed > head_len,
+            "overrun must report a size past {head_len}, got {err:?}"
+        );
+        assert!(
+            err.message.contains(&head_len.to_string()),
+            "expected the known size in {err:?}"
+        );
+        assert!(
+            !target.exists(),
+            "overrun must not become the finished file"
+        );
+        assert_eq!(
+            std::fs::metadata(&temp).expect("capped partial").len(),
+            head_len,
+            "the partial must stop at the known size"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_with_same_identity_and_shorter_content_length_is_size_mismatch() {
+        let entity = 262_144u64;
+        let dropped = 100_000usize;
+        let replacement = vec![b'h'; 4096];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            entity,
+            identity,
+            dropped,
+            &format!("Content-Length: {}\r\n{identity}", replacement.len()),
+            replacement.clone(),
+        )
+        .await;
+        let (dir, target, temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a full-replace 200 must match the known size");
+        assert_size_mismatch(&err, replacement.len() as u64, entity);
+        assert!(
+            !target.exists(),
+            "short replacement must not be the finished file"
+        );
+        assert_eq!(
+            std::fs::metadata(&temp).expect("original partial").len(),
+            dropped as u64,
+            "a rejected full-replace must keep the bytes already downloaded"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                job.total_bytes != replacement.len() as u64
+                    && job.validators.expected_size != Some(replacement.len() as u64)
+            }),
+            "must not adopt the shorter Content-Length"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_without_content_length_short_of_known_size_is_size_mismatch() {
+        let entity = 262_144u64;
+        let replacement = vec![b'i'; 4096];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base =
+            serve_drop_then_range(entity, identity, 100_000, identity, replacement.clone()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a short full-replace body must not complete");
+        assert_size_mismatch(&err, replacement.len() as u64, entity);
+        assert!(
+            !target.exists(),
+            "short body must not become the finished file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_with_changed_last_modified_accepts_new_size() {
+        let entity = 262_144u64;
+        let replacement = vec![b'j'; 4096];
+        let head_identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let resume_identity = "ETag: \"v1\"\r\nLast-Modified: Thu, 02 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            entity,
+            head_identity,
+            100_000,
+            &format!("Content-Length: {}\r\n{resume_identity}", replacement.len()),
+            replacement.clone(),
+        )
+        .await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a changed Last-Modified may replace the entity");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), replacement);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_matching_known_size_completes() {
+        let body = vec![b'k'; 80];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            body.len() as u64,
+            identity,
+            40,
+            &format!("Content-Length: {}\r\n{identity}", body.len()),
+            body.clone(),
+        )
+        .await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a full-replace 200 of the known size must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn response_200(content_length: Option<u64>, accept_ranges: bool) -> String {
         let mut response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
         if accept_ranges {
@@ -1002,6 +1165,72 @@ Content-Length: {}\r\n\
                 && err.message.to_ascii_lowercase().contains("size"),
             "expected a size-mismatch error naming {actual} vs {expected}, got {err:?}"
         );
+    }
+
+    fn observed_mismatch_size(err: &DownloadError) -> u64 {
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "size mismatch must not be retried: {err:?}");
+        let rest = err
+            .message
+            .split_once("Remote size changed (")
+            .and_then(|(_, rest)| rest.split_once(" bytes"))
+            .map(|(size, _)| size)
+            .unwrap_or_else(|| panic!("expected a size-mismatch error, got {err:?}"));
+        rest.parse()
+            .unwrap_or_else(|_| panic!("expected a byte count, got {err:?}"))
+    }
+
+    /// HEAD advertises `entity_len`. The first body GET declares that length and
+    /// closes after `dropped` bytes. A later Range GET is answered with
+    /// `resume_headers` and `resume_body`.
+    async fn serve_drop_then_range(
+        entity_len: u64,
+        head_extra: &str,
+        dropped: usize,
+        resume_headers: &str,
+        resume_body: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head_extra = head_extra.to_string();
+        let resume_headers = resume_headers.to_string();
+        let filler = vec![b'p'; entity_len as usize];
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {entity_len}\r\n{head_extra}\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {entity_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let end = dropped.min(filler.len());
+                    let _ = socket.write_all(&filler[..end]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{resume_headers}\r\n");
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&resume_body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
     }
 
     async fn read_http_headers(socket: &mut TcpStream) -> String {

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{is_incomplete_download, is_lengthless_eof, stream_body, AppendSink, StreamEnd};
+use super::body::{
+    is_incomplete_download, is_lengthless_eof, remote_size_changed_error, stream_body, AppendSink,
+    StreamEnd,
+};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
@@ -350,6 +353,25 @@ pub async fn run_http_download_with_ctx(
                     checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                     return Err(error);
                 }
+                // This 200 answered a Range request. It may carry a new size only
+                // when ETag or Last-Modified says the resource changed. Reject a
+                // conflicting Content-Length before the partial is deleted.
+                let announced_length = response.content_length();
+                let expected_size = known_expected_size(total_bytes, &validators);
+                let identity_changed = resume_identity_mismatch(
+                    &validators,
+                    &content_validators_from_headers(response.headers(), 0),
+                );
+                if !identity_changed {
+                    if let Some((actual, expected)) = content_length_size_mismatch(
+                        StatusCode::OK,
+                        announced_length,
+                        expected_size,
+                    ) {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(remote_size_changed_error(actual, expected));
+                    }
+                }
                 fresh_restarts = fresh_restarts.saturating_add(1);
                 if fresh_restarts > FRESH_RESTART_MAX {
                     let error = download_error(
@@ -409,10 +431,16 @@ pub async fn run_http_download_with_ctx(
 
         // Captured before Content-Length is allowed to replace the running total.
         // HEAD and a stored expected_size both land here; a later 200 must not
-        // quietly adopt a different entity size.
+        // quietly adopt a different entity size. A ranged restart may adopt a
+        // new size only when ETag or Last-Modified says the resource changed.
         let announced_length = response.content_length();
         let expected_size = known_expected_size(total_bytes, &validators);
-        if !full_replace {
+        let accept_new_size = full_replace
+            && resume_identity_mismatch(
+                &validators,
+                &content_validators_from_headers(response.headers(), 0),
+            );
+        if !accept_new_size {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)
             {
@@ -538,9 +566,16 @@ pub async fn run_http_download_with_ctx(
             .await
             .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
+        // A changed resource with no Content-Length has no declared size, so
+        // the body is the entity. Every other response stops at the known size.
+        let write_limit = if accept_new_size && announced_length.is_none() {
+            0
+        } else {
+            total_bytes
+        };
         let mut sink = AppendSink::open(&temp_path, existing_bytes)
             .await?
-            .with_target(total_bytes);
+            .with_target(write_limit);
         let mut downloaded = existing_bytes;
         let mut last_progress = Instant::now();
         let mut window_start = Instant::now();
@@ -594,9 +629,12 @@ pub async fn run_http_download_with_ctx(
             Ok(StreamEnd::Exhausted { downloaded }) => {
                 sink.sync_data().await?;
                 drop(sink);
-                if let Some((actual, expected)) =
-                    clean_shortfall(full_replace, announced_length, expected_size, downloaded)
-                {
+                if let Some((actual, expected)) = lengthless_size_mismatch(
+                    accept_new_size,
+                    announced_length,
+                    expected_size,
+                    downloaded,
+                ) {
                     checkpoint_partial(ctx, actual, expected).await;
                     return Err(remote_size_changed_error(actual, expected));
                 }
@@ -659,9 +697,12 @@ pub async fn run_http_download_with_ctx(
                 }
                 drop(sink);
                 if is_clean_short_body(&error) {
-                    if let Some((actual, expected)) =
-                        clean_shortfall(full_replace, announced_length, expected_size, downloaded)
-                    {
+                    if let Some((actual, expected)) = lengthless_size_mismatch(
+                        accept_new_size,
+                        announced_length,
+                        expected_size,
+                        downloaded,
+                    ) {
                         checkpoint_partial(ctx, actual, expected).await;
                         return Err(remote_size_changed_error(actual, expected));
                     }
@@ -742,14 +783,6 @@ async fn prepare_reconnect(
     ReconnectAction::Retry { offset }
 }
 
-fn remote_size_changed_error(actual: u64, expected: u64) -> DownloadError {
-    download_error(
-        FailureCategory::Resume,
-        format!("Remote size changed ({actual} bytes vs expected {expected}). Use Restart."),
-        false,
-    )
-}
-
 /// Size already known from HEAD, a previous response, or `validators.expected_size`.
 fn known_expected_size(total_bytes: u64, validators: &ContentValidators) -> Option<u64> {
     validators
@@ -774,26 +807,27 @@ fn content_length_size_mismatch(
     }
 }
 
-fn short_of_known_size(downloaded: u64, expected_size: Option<u64>) -> Option<(u64, u64)> {
+fn known_size_differs(downloaded: u64, expected_size: Option<u64>) -> Option<(u64, u64)> {
     match expected_size.filter(|size| *size > 0) {
-        Some(expected) if downloaded < expected => Some((downloaded, expected)),
+        Some(expected) if downloaded != expected => Some((downloaded, expected)),
         _ => None,
     }
 }
 
-/// Clean end of a 200 that never declared Content-Length, short of a size we
-/// already know. A ranged restart (`full_replace`) and a truncated
-/// Content-Length body stay on the existing resume path.
-fn clean_shortfall(
-    full_replace: bool,
+/// Clean end of a 200 that never declared Content-Length, when the bytes
+/// received are not a size we already know. A restart that adopted a new
+/// entity (`accept_new_size`) and a truncated Content-Length body stay on
+/// the existing resume path.
+fn lengthless_size_mismatch(
+    accept_new_size: bool,
     announced_length: Option<u64>,
     expected_size: Option<u64>,
     downloaded: u64,
 ) -> Option<(u64, u64)> {
-    if full_replace || announced_length.is_some() {
+    if accept_new_size || announced_length.is_some() {
         return None;
     }
-    short_of_known_size(downloaded, expected_size)
+    known_size_differs(downloaded, expected_size)
 }
 
 fn is_clean_short_body(error: &DownloadError) -> bool {
@@ -1535,15 +1569,26 @@ mod tests {
     }
 
     #[test]
-    fn clean_shortfall_ignores_ranged_restart_and_declared_length() {
+    fn lengthless_size_mismatch_rejects_short_and_long_bodies() {
         assert_eq!(
-            clean_shortfall(false, None, Some(65_536), 4096),
+            lengthless_size_mismatch(false, None, Some(65_536), 4096),
             Some((4096, 65_536))
         );
-        assert_eq!(clean_shortfall(false, None, Some(4096), 4096), None);
-        assert_eq!(clean_shortfall(true, None, Some(65_536), 4096), None);
         assert_eq!(
-            clean_shortfall(false, Some(65_536), Some(65_536), 4096),
+            lengthless_size_mismatch(false, None, Some(65_536), 131_072),
+            Some((131_072, 65_536))
+        );
+        assert_eq!(
+            lengthless_size_mismatch(false, None, Some(4096), 4096),
+            None
+        );
+        assert_eq!(
+            lengthless_size_mismatch(true, None, Some(65_536), 131_072),
+            None,
+            "a changed resource may adopt a new length"
+        );
+        assert_eq!(
+            lengthless_size_mismatch(false, Some(65_536), Some(65_536), 4096),
             None
         );
     }
