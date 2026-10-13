@@ -960,10 +960,9 @@ Content-Length: {}\r\n\
             !target.exists(),
             "overrun must not become the finished file"
         );
-        assert_eq!(
-            std::fs::metadata(&temp).expect("capped partial").len(),
-            head_len,
-            "the partial must stop at the known size"
+        assert!(
+            !temp.exists(),
+            "rejected overrun bytes must not remain for a later Retry"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1079,6 +1078,92 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn retry_after_lengthless_overrun_does_not_keep_rejected_bytes() {
+        let head_len = 65_536u64;
+        let correct = vec![b'A'; head_len as usize];
+        let rejected = vec![b'B'; head_len as usize + 1];
+        let file = retry_after_size_mismatch(head_len, rejected, correct.clone()).await;
+        assert_eq!(file, correct, "Retry must not keep the rejected prefix");
+    }
+
+    #[tokio::test]
+    async fn retry_after_lengthless_short_body_does_not_splice() {
+        let head_len = 65_536u64;
+        let correct = vec![b'A'; head_len as usize];
+        let rejected = vec![b'B'; 4096];
+        let file = retry_after_size_mismatch(head_len, rejected, correct.clone()).await;
+        assert_eq!(
+            file, correct,
+            "Retry must not splice the rejected prefix onto the real file"
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_change_without_content_length_finishes_at_the_new_size() {
+        let old_len = 64u64;
+        let new_body: Vec<u8> = (0..96u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = new_body.clone();
+        let _handle = tokio::spawn(async move {
+            let mut saw_changed = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nContent-Length: {old_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !saw_changed {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {old_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 20]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !saw_changed {
+                    saw_changed = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"v2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"v2\"\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a changed ETag with no Content-Length must finish after reconnect");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), new_body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn response_200(content_length: Option<u64>, accept_ranges: bool) -> String {
         let mut response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
         if accept_ranges {
@@ -1178,6 +1263,128 @@ Content-Length: {}\r\n\
             .unwrap_or_else(|| panic!("expected a size-mismatch error, got {err:?}"));
         rest.parse()
             .unwrap_or_else(|_| panic!("expected a byte count, got {err:?}"))
+    }
+
+    /// First GET has no Content-Length and is the rejected body. A later Retry
+    /// must download `correct` from byte 0. A Range resume would splice.
+    async fn retry_after_size_mismatch(
+        head_len: u64,
+        rejected: Vec<u8>,
+        correct: Vec<u8>,
+    ) -> Vec<u8> {
+        assert_eq!(correct.len() as u64, head_len);
+        let base = serve_reject_then_correct(head_len, rejected, correct).await;
+        let (dir, target, temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("the rejected body must fail before Retry");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "{err:?}");
+        assert!(
+            !target.exists(),
+            "the rejected body must not be the finished file"
+        );
+        assert!(
+            !temp.exists(),
+            "rejected bytes must be dropped before Retry"
+        );
+        let job = progress
+            .snapshots()
+            .last()
+            .cloned()
+            .expect("size mismatch commits the cleared offset");
+        assert_eq!(
+            job.downloaded_bytes, 0,
+            "Retry must not resume from a rejected offset"
+        );
+
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("Retry starts clean and downloads the real file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        let file = std::fs::read(&target).expect("final file");
+        let _ = std::fs::remove_dir_all(&dir);
+        file
+    }
+
+    async fn serve_reject_then_correct(
+        head_len: u64,
+        rejected: Vec<u8>,
+        correct: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut rejected_sent = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {head_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !rejected_sent {
+                    rejected_sent = true;
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&rejected).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start > 0 {
+                    let start_us = start as usize;
+                    if start_us < correct.len() {
+                        let suffix = &correct[start_us..];
+                        let end = correct.len() - 1;
+                        let reply = format!(
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{head_len}\r\nContent-Length: {}\r\n\r\n",
+                            suffix.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        let _ = socket.write_all(suffix).await;
+                    } else {
+                        let reply = format!(
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{start}/{head_len}\r\nContent-Length: 0\r\n\r\n"
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                    correct.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&correct).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
     }
 
     /// HEAD advertises `entity_len`. The first body GET declares that length and

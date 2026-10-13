@@ -450,6 +450,10 @@ pub(crate) fn remote_size_changed_error(actual: u64, expected: u64) -> DownloadE
     )
 }
 
+pub(crate) fn is_remote_size_mismatch(error: &DownloadError) -> bool {
+    error.category == FailureCategory::Resume && error.message.starts_with("Remote size changed (")
+}
+
 fn target_reached(sink: &impl BodySink) -> bool {
     match sink.target_offset() {
         Some(target) if target > 0 => sink.offset() >= target,

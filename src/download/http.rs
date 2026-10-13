@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::body::{
-    is_incomplete_download, is_lengthless_eof, remote_size_changed_error, stream_body, AppendSink,
-    StreamEnd,
+    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch, remote_size_changed_error,
+    stream_body, AppendSink, StreamEnd,
 };
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
@@ -466,6 +466,12 @@ pub async fn run_http_download_with_ctx(
         if let Some(total) = range_total {
             total_bytes = total;
         }
+        // A changed resource with no Content-Length does not have the old size.
+        // Clear it before the new validators are stored so a reconnect does not
+        // compare the new entity against the size we just retired.
+        if accept_new_size && announced_length.is_none() && range_total.is_none() {
+            total_bytes = 0;
+        }
 
         // Capture validators for this response; keep local copy for reconnect If-Range.
         let validators_patch = if full_replace {
@@ -635,7 +641,7 @@ pub async fn run_http_download_with_ctx(
                     expected_size,
                     downloaded,
                 ) {
-                    checkpoint_partial(ctx, actual, expected).await;
+                    discard_rejected_partial(ctx, &temp_path).await;
                     return Err(remote_size_changed_error(actual, expected));
                 }
                 verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
@@ -696,6 +702,10 @@ pub async fn run_http_download_with_ctx(
                     }
                 }
                 drop(sink);
+                if is_remote_size_mismatch(&error) {
+                    discard_rejected_partial(ctx, &temp_path).await;
+                    return Err(error);
+                }
                 if is_clean_short_body(&error) {
                     if let Some((actual, expected)) = lengthless_size_mismatch(
                         accept_new_size,
@@ -703,7 +713,7 @@ pub async fn run_http_download_with_ctx(
                         expected_size,
                         downloaded,
                     ) {
-                        checkpoint_partial(ctx, actual, expected).await;
+                        discard_rejected_partial(ctx, &temp_path).await;
                         return Err(remote_size_changed_error(actual, expected));
                     }
                 }
@@ -984,6 +994,25 @@ fn ranges_usable_for_reconnect(
         return true;
     }
     is_reconnectable_error(error) && !is_lengthless_eof(error)
+}
+
+/// The bytes on disk belong to a body we rejected. Remove them and forget
+/// the offset so Retry starts clean instead of Range-resuming the mismatch.
+async fn discard_rejected_partial(ctx: &mut TransferContext, temp_path: &Path) {
+    remove_partial(temp_path).await;
+    ctx.job.downloaded_bytes = 0;
+    ctx.job.progress = 0.0;
+    let _ = ctx
+        .committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(0),
+                progress: Some(0.0),
+                ..Default::default()
+            },
+        )
+        .await;
 }
 
 async fn checkpoint_partial(ctx: &mut TransferContext, downloaded: u64, total_bytes: u64) {
