@@ -243,16 +243,17 @@ mod tests {
     use crate::download::bandwidth::GlobalBandwidthLimiter;
     use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::EngineRuntimeConfig;
+    use crate::download::fetch::CONTROL_PAUSED;
     use crate::download::job::{fallback_reason_label, FailureCategory, Job};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::progress::{NoopIdentity, TestProgress, TransferEventCallback};
     use crate::download::verify::{sha256_hex, SHA256_EMPTY};
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn sample_job() -> Job {
         Job::new(
@@ -281,9 +282,25 @@ mod tests {
         config: EngineRuntimeConfig,
         committer: Arc<dyn crate::download::progress::IdentityCommit>,
     ) -> TransferContext {
+        test_ctx_control(
+            job,
+            on_progress,
+            config,
+            committer,
+            Arc::new(AtomicU8::new(0)),
+        )
+    }
+
+    fn test_ctx_control(
+        job: Job,
+        on_progress: TransferEventCallback,
+        config: EngineRuntimeConfig,
+        committer: Arc<dyn crate::download::progress::IdentityCommit>,
+        control: Arc<AtomicU8>,
+    ) -> TransferContext {
         TransferContext::from_runtime(
             job,
-            Arc::new(AtomicU8::new(0)),
+            control,
             on_progress,
             None,
             GlobalBandwidthLimiter::new(None),
@@ -693,7 +710,7 @@ Connection: close\r\n\
 Accept-Ranges: none\r\n\
 Content-Length: {}\r\n\
 \r\n",
-            8 * 1024 * 1024
+            body.len()
         );
         let get = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -712,12 +729,11 @@ Content-Length: {}\r\n\
         let job = Job::new(url, "out.bin".into(), target.clone(), temp);
 
         let progress = TestProgress::new();
-        let ctx = test_ctx_commit(
-            job,
-            progress.callback(),
-            EngineRuntimeConfig::default(),
-            progress.identity.clone(),
-        );
+        let config = EngineRuntimeConfig {
+            multi_min_bytes: body.len() as u64,
+            ..EngineRuntimeConfig::default()
+        };
+        let ctx = test_ctx_commit(job, progress.callback(), config, progress.identity.clone());
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -748,7 +764,7 @@ Connection: close\r\n\
 Accept-Ranges: none\r\n\
 Content-Length: {}\r\n\
 \r\n",
-            8 * 1024 * 1024
+            body.len()
         );
         let get = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -768,12 +784,11 @@ Content-Length: {}\r\n\
         job.fallback_reason = Some("ranges_unsupported".into());
 
         let progress = TestProgress::new();
-        let ctx = test_ctx_commit(
-            job,
-            progress.callback(),
-            EngineRuntimeConfig::default(),
-            progress.identity.clone(),
-        );
+        let config = EngineRuntimeConfig {
+            multi_min_bytes: body.len() as u64,
+            ..EngineRuntimeConfig::default()
+        };
+        let ctx = test_ctx_commit(job, progress.callback(), config, progress.identity.clone());
         let outcome = run_transfer(ctx).await.expect("transfer");
         assert!(matches!(outcome, DownloadOutcome::Completed));
 
@@ -790,6 +805,1358 @@ Content-Length: {}\r\n\
             .any(|job| job.fallback_reason.as_deref() == Some("ranges_unsupported")));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_shorter_than_head_content_length_is_size_mismatch() {
+        let body = vec![b'a'; 4096];
+        let err = head_then_get_error(65_536, Some(body.len() as u64), &body).await;
+        assert_size_mismatch(&err, body.len() as u64, 65_536);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_larger_than_head_content_length_is_size_mismatch() {
+        let body = vec![b'b'; 65_536];
+        let err = head_then_get_error(4096, Some(body.len() as u64), &body).await;
+        assert_size_mismatch(&err, body.len() as u64, 4096);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_matching_head_content_length_completes() {
+        let body = vec![b'c'; 4096];
+        let (dir, target, outcome) =
+            head_then_get(body.len() as u64, Some(body.len() as u64), &body).await;
+        let outcome = outcome.expect("matching Content-Length must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stored_expected_size_rejects_shorter_200_content_length() {
+        let body = vec![b'd'; 4096];
+        let get = response_200(Some(body.len() as u64), false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![get], body.clone()).await;
+        let (dir, target, _temp, mut job) = download_paths(&base);
+        job.validators.expected_size = Some(65_536);
+        let progress = TestProgress::new();
+        let mut ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        ctx.preflight_done = true;
+
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("stored expected_size must reject a shorter 200");
+        assert_size_mismatch(&err, body.len() as u64, 65_536);
+        assert!(
+            !target.exists(),
+            "a conflicting 200 must not be renamed to the finished file"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                job.total_bytes != body.len() as u64
+                    && job.validators.expected_size != Some(body.len() as u64)
+            }),
+            "must not overwrite the stored size with the shorter Content-Length"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_without_content_length_short_of_known_size_is_not_completed() {
+        let head_len = 65_536u64;
+        let body = vec![b'e'; 4096];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = response_200(Some(head_len), true);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else if req.starts_with("GET ") {
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a short body with no Content-Length must not complete");
+        assert_size_mismatch(&err, body.len() as u64, head_len);
+        assert!(
+            !target.exists(),
+            "short body must not become the finished file"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| job.progress < 100.0),
+            "short body must not be committed as finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_without_content_length_matching_known_size_completes() {
+        let body = vec![b'f'; 4096];
+        let head = response_200(Some(body.len() as u64), true);
+        let get = response_200(None, false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![head, get], body.clone()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a body that matches the known size must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_200_without_content_length_past_known_size_is_size_mismatch() {
+        let head_len = 65_536u64;
+        let body = vec![b'g'; 131_072];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = body.clone();
+        let _handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = response_200(Some(head_len), true);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                } else if req.starts_with("GET ") {
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a body longer than the known size must not complete");
+        let observed = observed_mismatch_size(&err);
+        assert!(
+            observed > head_len,
+            "overrun must report a size past {head_len}, got {err:?}"
+        );
+        assert!(
+            err.message.contains(&head_len.to_string()),
+            "expected the known size in {err:?}"
+        );
+        assert!(
+            !target.exists(),
+            "overrun must not become the finished file"
+        );
+        assert!(
+            !temp.exists(),
+            "rejected overrun bytes must not remain for a later Retry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_with_same_identity_and_shorter_content_length_is_size_mismatch() {
+        let entity = 262_144u64;
+        let dropped = 100_000usize;
+        let replacement = vec![b'h'; 4096];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            entity,
+            identity,
+            dropped,
+            &format!("Content-Length: {}\r\n{identity}", replacement.len()),
+            replacement.clone(),
+        )
+        .await;
+        let (dir, target, temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a full-replace 200 must match the known size");
+        assert_size_mismatch(&err, replacement.len() as u64, entity);
+        assert!(
+            !target.exists(),
+            "short replacement must not be the finished file"
+        );
+        assert_eq!(
+            std::fs::metadata(&temp).expect("original partial").len(),
+            dropped as u64,
+            "a rejected full-replace must keep the bytes already downloaded"
+        );
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                job.total_bytes != replacement.len() as u64
+                    && job.validators.expected_size != Some(replacement.len() as u64)
+            }),
+            "must not adopt the shorter Content-Length"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_without_content_length_short_of_known_size_is_size_mismatch() {
+        let entity = 262_144u64;
+        let replacement = vec![b'i'; 4096];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base =
+            serve_drop_then_range(entity, identity, 100_000, identity, replacement.clone()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a short full-replace body must not complete");
+        assert_size_mismatch(&err, replacement.len() as u64, entity);
+        assert!(
+            !target.exists(),
+            "short body must not become the finished file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_with_changed_last_modified_accepts_new_size() {
+        let entity = 262_144u64;
+        let replacement = vec![b'j'; 4096];
+        let head_identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let resume_identity = "ETag: \"v1\"\r\nLast-Modified: Thu, 02 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            entity,
+            head_identity,
+            100_000,
+            &format!("Content-Length: {}\r\n{resume_identity}", replacement.len()),
+            replacement.clone(),
+        )
+        .await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a changed Last-Modified may replace the entity");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), replacement);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_replace_200_matching_known_size_completes() {
+        let body = vec![b'k'; 80];
+        let identity = "ETag: \"v1\"\r\nLast-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n";
+        let base = serve_drop_then_range(
+            body.len() as u64,
+            identity,
+            40,
+            &format!("Content-Length: {}\r\n{identity}", body.len()),
+            body.clone(),
+        )
+        .await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a full-replace 200 of the known size must complete");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn retry_after_lengthless_overrun_does_not_keep_rejected_bytes() {
+        let head_len = 65_536u64;
+        let correct = vec![b'A'; head_len as usize];
+        let rejected = vec![b'B'; head_len as usize + 1];
+        let file = retry_after_size_mismatch(head_len, rejected, correct.clone()).await;
+        assert_eq!(file, correct, "Retry must not keep the rejected prefix");
+    }
+
+    #[tokio::test]
+    async fn retry_after_lengthless_short_body_does_not_splice() {
+        let head_len = 65_536u64;
+        let correct = vec![b'A'; head_len as usize];
+        let rejected = vec![b'B'; 4096];
+        let file = retry_after_size_mismatch(head_len, rejected, correct.clone()).await;
+        assert_eq!(
+            file, correct,
+            "Retry must not splice the rejected prefix onto the real file"
+        );
+    }
+
+    #[tokio::test]
+    async fn etag_change_without_content_length_finishes_at_the_new_size() {
+        let old_len = 64u64;
+        let new_body: Vec<u8> = (0..96u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = new_body.clone();
+        let _handle = tokio::spawn(async move {
+            let mut saw_changed = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nContent-Length: {old_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !saw_changed {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {old_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 20]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !saw_changed {
+                    saw_changed = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"v2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"v2\"\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("a changed ETag with no Content-Length must finish after reconnect");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), new_body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn etag_change_range_ignored_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::RangeIgnored).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'N'));
+    }
+
+    #[tokio::test]
+    async fn etag_change_if_range_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::Standards).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'N'));
+    }
+
+    #[tokio::test]
+    async fn last_modified_change_without_length_finishes_new_file() {
+        let file = changed_entity_through_reconnect(ChangedEntityFollowup::LastModifiedOnly).await;
+        assert_eq!(file.len(), NEW_ENTITY_LEN);
+        assert!(file.iter().all(|byte| *byte == b'L'));
+    }
+
+    /// HEAD 262144 e1, the first body drops, then Range gets e2 with no length and
+    /// the full 524288-byte file. A later Range is a 200 with the same e2, no
+    /// length, and only 1000 bytes. That follow-up must not replace the file.
+    /// A 416 `bytes */524288` with the new ETag then confirms the saved body.
+    #[tokio::test]
+    async fn truncated_unchanged_etag_after_lengthless_change_is_not_the_file() {
+        let full_len = 524_288usize;
+        let full = vec![b'N'; full_len];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = full.clone();
+        let saw_trap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_trap_task = saw_trap.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_changed = false;
+            let mut sent_trap = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 262144\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 262144\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 100_000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_changed {
+                    sent_changed = true;
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_trap {
+                    sent_trap = true;
+                    saw_trap_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let trap = vec![b'X'; 1000];
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&trap).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nETag: \"e2\"\r\nContent-Range: bytes */{full_len}\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("the saved file must be confirmed after the short follow-up");
+        let outcome = outcome.expect("416 confirms the full body, not the 1000-byte follow-up");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), full);
+        assert!(
+            saw_trap.load(std::sync::atomic::Ordering::SeqCst),
+            "the short follow-up must be received before the file is finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 416 `bytes */N` for a short partial must not finish the job when the
+    /// changed response never closed cleanly.
+    #[tokio::test]
+    async fn early_416_of_short_partial_does_not_complete() {
+        let full = vec![b'N'; 8192];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = full.clone();
+        let saw_416 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_416_task = saw_416.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_prefix = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 4000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start > 0 && !sent_prefix {
+                    sent_prefix = true;
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'X'; 1000]).await;
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Abort so the short body is a reset, not a clean close.
+                    #[allow(deprecated)]
+                    let _ = socket.set_linger(Some(Duration::from_secs(0)));
+                    continue;
+                }
+                if start > 0 {
+                    saw_416_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{start}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("416 of a short partial must settle");
+        let outcome = outcome.expect("restart after the 416 downloads the real file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        let file = std::fs::read(&target).expect("final file");
+        assert_eq!(file, full, "a 416 of the short prefix must not be the file");
+        assert!(
+            saw_416.load(std::sync::atomic::Ordering::SeqCst),
+            "the short prefix must be answered with 416 before the real file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clean close of a short body after the validators change is not the file.
+    #[tokio::test]
+    async fn truncated_first_body_after_validator_change_does_not_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_short = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 2000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_short {
+                    sent_short = true;
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'X'; 1000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply =
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&[b'Y'; 4000]).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("a truncated changed body must settle")
+            .expect_err("a truncated changed body must not complete");
+        assert!(err.retryable, "{err:?}");
+        assert!(
+            !target.exists(),
+            "the short body must not be the finished file"
+        );
+        assert_eq!(
+            std::fs::read(&temp).expect("candidate partial"),
+            vec![b'X'; 1000],
+            "the longer follow-up must not replace or splice the partial"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the ETag changes, a server that ignores If-Range and sends the same
+    /// full body again still finishes. A different length does not.
+    #[tokio::test]
+    async fn ignored_if_range_with_changed_etag_accepts_matching_length() {
+        let new_body = vec![b'I'; 4096];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = new_body.clone();
+        let ignored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ignored_task = ignored.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let lower = req.to_ascii_lowercase();
+                let start = range_start_from(&lower).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 1000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if header_value(&lower, "if-range").is_some_and(|value| value.contains("\"e2\"")) {
+                    ignored_task.store(true, Ordering::SeqCst);
+                }
+                let reply =
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("an ignored If-Range of the same length must settle");
+        let outcome = outcome.expect("two equal full bodies finish the new file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), new_body);
+        assert!(
+            ignored.load(Ordering::SeqCst),
+            "the confirm request must carry If-Range for the new ETag"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The changed response and the confirming 416 carry only an ETag.
+    #[tokio::test]
+    async fn single_etag_lengthless_change_confirms_on_416() {
+        let new_body = vec![b'S'; 4096];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = new_body.clone();
+        let saw_416 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_416_task = saw_416.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_changed = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 8192\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 1000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_changed {
+                    sent_changed = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                saw_416_task.store(true, Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nETag: \"e2\"\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("one validator must be enough to confirm");
+        let outcome = outcome.expect("416 with the new ETag finishes the file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), new_body);
+        assert!(
+            saw_416.load(Ordering::SeqCst),
+            "the lengthless close must wait for the 416"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop after the changed body is saved, then confirm that saved job with 416.
+    #[tokio::test]
+    async fn reloaded_job_confirms_lengthless_change_on_416() {
+        let new_body = vec![b'R'; 8192];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = new_body.clone();
+        let phase = Arc::new(AtomicU8::new(0));
+        let phase_task = phase.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            let mut sent_changed = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = if phase_task.load(Ordering::SeqCst) == 0 {
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e1\"\r\nContent-Length: 4096\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n"
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: 4096\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&[b'o'; 500]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !sent_changed {
+                    sent_changed = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&payload).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if phase_task.load(Ordering::SeqCst) == 0 {
+                    let mut buf = [0u8; 8];
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(20), socket.read(&mut buf)).await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nETag: \"e2\"\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let control = Arc::new(AtomicU8::new(0));
+        let ctx = test_ctx_control(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+            control.clone(),
+        );
+        let runner = tokio::spawn(async move { run_transfer(ctx).await });
+        let saved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(job) = progress.snapshots().into_iter().rev().find(|job| {
+                    job.downloaded_bytes == new_body.len() as u64
+                        && job.total_bytes == 0
+                        && job.validators.expected_size.is_none()
+                        && job.validators.etag.as_deref() == Some("\"e2\"")
+                        && job.validators.last_modified.is_none()
+                }) {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the changed body must be saved before it is confirmed");
+        control.store(CONTROL_PAUSED, Ordering::SeqCst);
+        let paused = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("pause must settle")
+            .expect("transfer task")
+            .expect("pause is not a download error");
+        assert!(matches!(paused, DownloadOutcome::Paused));
+        assert_eq!(
+            std::fs::metadata(&temp).expect("partial").len(),
+            new_body.len() as u64
+        );
+
+        phase.store(1, Ordering::SeqCst);
+        let ctx = test_ctx(saved, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), run_transfer(ctx))
+            .await
+            .expect("the reloaded job must settle");
+        let outcome = outcome.expect("416 confirms the saved partial");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(std::fs::read(&target).expect("final file"), new_body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const OLD_ENTITY_LEN: u64 = 262_144;
+    const NEW_ENTITY_LEN: usize = 270_336;
+
+    #[derive(Clone, Copy)]
+    enum ChangedEntityFollowup {
+        /// Every ranged GET is a full 200. The server never honors Range.
+        RangeIgnored,
+        /// If-Range mismatch is a 200 of the new file. A matching Range is 206 or 416.
+        Standards,
+        /// Same as standards, but only Last-Modified changes.
+        LastModifiedOnly,
+    }
+
+    /// HEAD advertises the old size. The first body drops, forcing a Range
+    /// reconnect. The resource has changed and the replacement 200 has no
+    /// Content-Length. Later requests keep answering for the whole reconnect
+    /// loop: ignored ranges, or 206/416 after the validator matches.
+    async fn changed_entity_through_reconnect(followup: ChangedEntityFollowup) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let new_body = match followup {
+            ChangedEntityFollowup::LastModifiedOnly => vec![b'L'; NEW_ENTITY_LEN],
+            _ => vec![b'N'; NEW_ENTITY_LEN],
+        };
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            let mut dropped_original = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if let Ok(mut guard) = requests.lock() {
+                    guard.push(req.clone());
+                }
+                if req.starts_with("HEAD ") {
+                    let reply = head_for(followup);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let lower = req.to_ascii_lowercase();
+                let start = range_start_from(&lower).unwrap_or(0);
+                if start == 0 && !dropped_original {
+                    dropped_original = true;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {OLD_ENTITY_LEN}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&vec![b'o'; 100_000]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let if_range = header_value(&lower, "if-range");
+                let validator_matches = followup_validator_matches(followup, if_range.as_deref());
+                let send_full = match followup {
+                    ChangedEntityFollowup::RangeIgnored => true,
+                    ChangedEntityFollowup::Standards | ChangedEntityFollowup::LastModifiedOnly => {
+                        start == 0 || !validator_matches
+                    }
+                };
+                if send_full {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{}\r\n\r\n",
+                        current_validator(followup)
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&new_body).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start as usize >= new_body.len() {
+                    let reply = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                        new_body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let suffix = &new_body[start as usize..];
+                let end = new_body.len() - 1;
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{}\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n\r\n",
+                    current_validator(followup),
+                    new_body.len(),
+                    suffix.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(suffix).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let (dir, target, _temp, job) = download_paths(&base);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = tokio::time::timeout(Duration::from_secs(45), run_transfer(ctx)).await;
+        let file = match outcome {
+            Ok(Ok(DownloadOutcome::Completed)) => std::fs::read(&target).unwrap_or_default(),
+            Ok(Ok(other)) => panic!("download ended as {other:?}"),
+            Ok(Err(err)) => {
+                let seen = recorded.lock().unwrap().len();
+                panic!("changed entity failed after {seen} requests: {err:?}")
+            }
+            Err(_) => {
+                let seen = recorded.lock().unwrap().len();
+                panic!("changed entity timed out after {seen} requests")
+            }
+        };
+        let range_gets = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|req| {
+                let lower = req.to_ascii_lowercase();
+                lower.starts_with("get ") && range_start_from(&lower).is_some()
+            })
+            .count();
+        assert_eq!(
+            range_gets, 2,
+            "the changed body must be confirmed by one follow-up, saw {range_gets} range GETs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        file
+    }
+
+    fn head_for(followup: ChangedEntityFollowup) -> String {
+        let identity = match followup {
+            ChangedEntityFollowup::LastModifiedOnly => {
+                "Last-Modified: Wed, 01 Jan 2020 00:00:00 GMT"
+            }
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                "ETag: \"v1\""
+            }
+        };
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\n{identity}\r\nContent-Length: {OLD_ENTITY_LEN}\r\n\r\n"
+        )
+    }
+
+    fn current_validator(followup: ChangedEntityFollowup) -> &'static str {
+        match followup {
+            ChangedEntityFollowup::LastModifiedOnly => {
+                "Last-Modified: Thu, 02 Jan 2020 00:00:00 GMT"
+            }
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                "ETag: \"v2\""
+            }
+        }
+    }
+
+    fn followup_validator_matches(followup: ChangedEntityFollowup, if_range: Option<&str>) -> bool {
+        let Some(value) = if_range else {
+            return false;
+        };
+        match followup {
+            ChangedEntityFollowup::LastModifiedOnly => value.contains("02 jan 2020"),
+            ChangedEntityFollowup::RangeIgnored | ChangedEntityFollowup::Standards => {
+                value.contains("\"v2\"")
+            }
+        }
+    }
+
+    fn header_value(lower_req: &str, name: &str) -> Option<String> {
+        let prefix = format!("{name}:");
+        lower_req
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .map(|line| line[prefix.len()..].trim().to_string())
+    }
+
+    fn response_200(content_length: Option<u64>, accept_ranges: bool) -> String {
+        let mut response = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+        if accept_ranges {
+            response.push_str("Accept-Ranges: bytes\r\n");
+        }
+        if let Some(len) = content_length {
+            response.push_str(&format!("Content-Length: {len}\r\n"));
+        }
+        response.push_str("\r\n");
+        response
+    }
+
+    fn download_paths(base: &str) -> (PathBuf, PathBuf, PathBuf, Job) {
+        let dir = std::env::temp_dir().join(format!("rusticdl-size-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let url = format!("{base}/file.bin");
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        (dir, target, temp, job)
+    }
+
+    async fn head_then_get(
+        head_len: u64,
+        get_len: Option<u64>,
+        body: &[u8],
+    ) -> (PathBuf, PathBuf, Result<DownloadOutcome, DownloadError>) {
+        let head = response_200(Some(head_len), true);
+        let get = response_200(get_len, false);
+        let (base, _seen, _handle) =
+            spawn_scripted_server_recording_with_body(vec![head, get], body.to_vec()).await;
+        let (dir, target, _temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let outcome = transfer_within(ctx).await;
+        if matches!(&outcome, Ok(DownloadOutcome::Completed)) {
+            return (dir, target, outcome);
+        }
+        assert!(
+            !target.exists(),
+            "a rejected download must not be renamed to the finished file"
+        );
+        let wrong = get_len.filter(|len| *len != head_len);
+        assert!(
+            progress.snapshots().iter().all(|job| {
+                wrong.is_none_or(|len| {
+                    job.total_bytes != len && job.validators.expected_size != Some(len)
+                })
+            }),
+            "must not overwrite the known size with a conflicting Content-Length: {:?}",
+            progress.snapshots()
+        );
+        (dir, target, outcome)
+    }
+
+    async fn head_then_get_error(
+        head_len: u64,
+        get_len: Option<u64>,
+        body: &[u8],
+    ) -> DownloadError {
+        let (dir, _target, outcome) = head_then_get(head_len, get_len, body).await;
+        let err = outcome.expect_err("conflicting 200 must fail the job");
+        let _ = std::fs::remove_dir_all(&dir);
+        err
+    }
+
+    async fn transfer_within(ctx: TransferContext) -> Result<DownloadOutcome, DownloadError> {
+        tokio::time::timeout(Duration::from_secs(8), run_transfer(ctx))
+            .await
+            .expect("download must settle without exhausting the reconnect budget")
+    }
+
+    fn assert_size_mismatch(err: &DownloadError, actual: u64, expected: u64) {
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "size mismatch must not be retried: {err:?}");
+        assert!(
+            err.message.contains(&actual.to_string())
+                && err.message.contains(&expected.to_string())
+                && err.message.to_ascii_lowercase().contains("size"),
+            "expected a size-mismatch error naming {actual} vs {expected}, got {err:?}"
+        );
+    }
+
+    fn observed_mismatch_size(err: &DownloadError) -> u64 {
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "size mismatch must not be retried: {err:?}");
+        let rest = err
+            .message
+            .split_once("Remote size changed (")
+            .and_then(|(_, rest)| rest.split_once(" bytes"))
+            .map(|(size, _)| size)
+            .unwrap_or_else(|| panic!("expected a size-mismatch error, got {err:?}"));
+        rest.parse()
+            .unwrap_or_else(|_| panic!("expected a byte count, got {err:?}"))
+    }
+
+    /// First GET has no Content-Length and is the rejected body. A later Retry
+    /// must download `correct` from byte 0. A Range resume would splice.
+    async fn retry_after_size_mismatch(
+        head_len: u64,
+        rejected: Vec<u8>,
+        correct: Vec<u8>,
+    ) -> Vec<u8> {
+        assert_eq!(correct.len() as u64, head_len);
+        let base = serve_reject_then_correct(head_len, rejected, correct).await;
+        let (dir, target, temp, job) = download_paths(&base);
+        let progress = TestProgress::new();
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("the rejected body must fail before Retry");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert!(!err.retryable, "{err:?}");
+        assert!(
+            !target.exists(),
+            "the rejected body must not be the finished file"
+        );
+        assert!(
+            !temp.exists(),
+            "rejected bytes must be dropped before Retry"
+        );
+        let job = progress
+            .snapshots()
+            .last()
+            .cloned()
+            .expect("size mismatch commits the cleared offset");
+        assert_eq!(
+            job.downloaded_bytes, 0,
+            "Retry must not resume from a rejected offset"
+        );
+
+        let ctx = test_ctx_commit(
+            job,
+            progress.callback(),
+            EngineRuntimeConfig::default(),
+            progress.identity.clone(),
+        );
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("Retry starts clean and downloads the real file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        let file = std::fs::read(&target).expect("final file");
+        let _ = std::fs::remove_dir_all(&dir);
+        file
+    }
+
+    async fn serve_reject_then_correct(
+        head_len: u64,
+        rejected: Vec<u8>,
+        correct: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut rejected_sent = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {head_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !rejected_sent {
+                    rejected_sent = true;
+                    let reply = response_200(None, false);
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&rejected).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start > 0 {
+                    let start_us = start as usize;
+                    if start_us < correct.len() {
+                        let suffix = &correct[start_us..];
+                        let end = correct.len() - 1;
+                        let reply = format!(
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{head_len}\r\nContent-Length: {}\r\n\r\n",
+                            suffix.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                        let _ = socket.write_all(suffix).await;
+                    } else {
+                        let reply = format!(
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{start}/{head_len}\r\nContent-Length: 0\r\n\r\n"
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                    correct.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&correct).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// HEAD advertises `entity_len`. The first body GET declares that length and
+    /// closes after `dropped` bytes. A later Range GET is answered with
+    /// `resume_headers` and `resume_body`.
+    async fn serve_drop_then_range(
+        entity_len: u64,
+        head_extra: &str,
+        dropped: usize,
+        resume_headers: &str,
+        resume_body: Vec<u8>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head_extra = head_extra.to_string();
+        let resume_headers = resume_headers.to_string();
+        let filler = vec![b'p'; entity_len as usize];
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {entity_len}\r\n{head_extra}\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {entity_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let end = dropped.min(filler.len());
+                    let _ = socket.write_all(&filler[..end]).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{resume_headers}\r\n");
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&resume_body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn read_http_headers(socket: &mut TcpStream) -> String {
+        let mut buf = vec![0u8; 8192];
+        let mut collected = Vec::new();
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            collected.extend_from_slice(&buf[..n]);
+            if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&collected).into_owned()
     }
 
     #[tokio::test]
