@@ -515,7 +515,16 @@ pub(crate) enum RejectedPartialClear {
 /// [`Job::rejected_partial`](super::job::Job::rejected_partial): the on-disk
 /// length is not a resume offset.
 /// A finished download is not passed here: truncating that would destroy it.
+///
+/// On Windows the read-only attribute does not stop this delete: it opens
+/// the file for `DELETE` and sets the disposition flag. A handle opened
+/// without `FILE_SHARE_DELETE` and without `FILE_SHARE_WRITE` does stop
+/// both this delete and the truncate.
 pub async fn clear_rejected_partial(path: &Path) -> RejectedPartialClear {
+    // Tests lock the file here, after the writer has closed it. A
+    // FILE_SHARE_NONE handle cannot be opened while that writer is still open.
+    #[cfg(test)]
+    rejected_clear_hook::run(path);
     match fs::remove_file(io_path(path)).await {
         Ok(()) => return RejectedPartialClear::Gone,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -535,6 +544,46 @@ fn truncate_rejected_partial(path: &Path) -> io::Result<()> {
     file.set_len(0)?;
     Ok(())
 }
+
+/// Path-keyed lock installed by tests. Production builds have no hook.
+#[cfg(test)]
+mod rejected_clear_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn install(path: &Path, hook: Hook) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+        guard.push((path.to_path_buf(), hook));
+    }
+
+    pub(crate) fn remove(path: &Path) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+    }
+
+    pub(crate) fn run(path: &Path) {
+        let hook = {
+            let guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .iter()
+                .find(|(existing, _)| existing == path)
+                .map(|(_, hook)| Arc::clone(hook))
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use rejected_clear_hook::{
+    install as install_rejected_clear_hook, remove as remove_rejected_clear_hook,
+};
 
 pub fn parse_content_disposition_filename(header_value: &str) -> Option<String> {
     if let Some(encoded) = header_value
@@ -853,6 +902,8 @@ mod tests {
     use super::*;
     use crate::download::segment::{Segment, SegmentMap, SegmentState};
 
+    #[cfg(windows)]
+    use std::io::{Read, Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(windows)]
@@ -961,18 +1012,22 @@ mod tests {
         let file = dir.join("out.bin.part");
         let body = b"rejected-prefix";
         std::fs::write(&file, body).unwrap();
-        let held = std::fs::OpenOptions::new()
+        // share_mode(0) denies every later open, including the read this
+        // assertion would otherwise use. The bytes are read through the holder.
+        let mut held = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_NONE)
             .open(&file)
             .unwrap();
 
         let clear = clear_rejected_partial(&file).await;
-        let bytes = std::fs::read(&file).ok();
+        held.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).unwrap();
         drop(held);
 
         assert_eq!(clear, RejectedPartialClear::Unchanged);
-        assert_eq!(bytes.as_deref(), Some(body.as_slice()));
+        assert_eq!(bytes, body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

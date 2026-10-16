@@ -246,6 +246,8 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::io::{Read, Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(windows)]
@@ -255,7 +257,9 @@ mod tests {
     use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::EngineRuntimeConfig;
     use crate::download::fetch::CONTROL_PAUSED;
-    use crate::download::filesystem::reconcile_partial_progress;
+    use crate::download::filesystem::{
+        install_rejected_clear_hook, reconcile_partial_progress, remove_rejected_clear_hook,
+    };
     use crate::download::job::{fallback_reason_label, FailureCategory, Job};
     use crate::download::multi::RESUME_RESTART_MESSAGE;
     use crate::download::progress::{NoopIdentity, TestProgress, TransferEventCallback};
@@ -285,7 +289,7 @@ mod tests {
     }
 
     /// Undo a test lock that blocks both delete and truncate. Missing paths
-    /// are ignored so a panic during cleanup still returns the directory.
+    /// are ignored so a panic during cleanup can still delete the directory.
     fn restore_reject_lock(dir: &std::path::Path, temp: &std::path::Path) {
         #[cfg(unix)]
         {
@@ -308,6 +312,41 @@ mod tests {
                 let _ = std::fs::set_permissions(temp, perms);
             }
             let _ = dir;
+        }
+    }
+
+    fn release_rejected_lock(
+        dir: &std::path::Path,
+        temp: &std::path::Path,
+        held: &Mutex<Option<std::fs::File>>,
+    ) {
+        remove_rejected_clear_hook(temp);
+        *held.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        restore_reject_lock(dir, temp);
+    }
+
+    /// `FILE_SHARE_NONE` denies a second open, so the bytes are read through
+    /// the handle that holds the lock. A mode-0444 file can be read directly.
+    fn read_rejected_partial(
+        temp: &std::path::Path,
+        held: &Mutex<Option<std::fs::File>>,
+    ) -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            let mut guard = held.lock().unwrap_or_else(|error| error.into_inner());
+            let file = guard
+                .as_mut()
+                .expect("the sharing lock holds the rejected partial");
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            let _ = temp;
+            bytes
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = held;
+            std::fs::read(temp).expect("rejected partial")
         }
     }
 
@@ -1337,9 +1376,8 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// AppendSink flushes once its buffer is full. The first chunk is larger
-    /// than that buffer so the rejected bytes are on disk, and the server
-    /// pauses, before discard runs.
+    /// Larger than `AppendSink`'s buffer, so the rejected body is flushed
+    /// before discard closes the writer and the test locks the file.
     const SINK_FLUSH_BYTES: usize = 256 * 1024;
 
     #[derive(Clone, Copy)]
@@ -1399,21 +1437,11 @@ Content-Length: {}\r\n\
                     rejected_sent = true;
                     let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
                     let _ = socket.write_all(reply.as_bytes()).await;
-                    let first = match kind {
-                        LockedReject::Overrun => known,
-                        LockedReject::Short => SINK_FLUSH_BYTES + 64 * 1024,
+                    let payload = match kind {
+                        LockedReject::Overrun => vec![b'B'; known + 1],
+                        LockedReject::Short => vec![b'B'; kept],
                     };
-                    let _ = socket.write_all(&vec![b'B'; first]).await;
-                    let _ = socket.flush().await;
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    match kind {
-                        LockedReject::Overrun => {
-                            let _ = socket.write_all(b"B").await;
-                        }
-                        LockedReject::Short => {
-                            let _ = socket.write_all(&vec![b'B'; 64 * 1024]).await;
-                        }
-                    }
+                    let _ = socket.write_all(&payload).await;
                     let _ = socket.shutdown().await;
                     continue;
                 }
@@ -1445,51 +1473,50 @@ Content-Length: {}\r\n\
         let target = dir.join("out.bin");
         let temp = PathBuf::from(format!("{}.part", target.display()));
         let locked = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
-        let mut lock_thread = {
-            let dir = dir.clone();
-            let temp = temp.clone();
-            let locked = locked.clone();
-            let release = release.clone();
-            Some(std::thread::spawn(move || {
-                let start = std::time::Instant::now();
-                while !release.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(15)
-                {
-                    let len = std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
-                    if len > 0 && !locked.load(Ordering::Relaxed) {
-                        #[cfg(unix)]
-                        {
-                            let mut file_perms = std::fs::metadata(&temp).unwrap().permissions();
-                            file_perms.set_mode(0o444);
-                            std::fs::set_permissions(&temp, file_perms).unwrap();
-                            let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
-                            dir_perms.set_mode(0o555);
-                            std::fs::set_permissions(&dir, dir_perms).unwrap();
-                        }
-                        // A read-only file cannot be deleted or opened for
-                        // write, and an already-open handle can still write.
-                        // share_mode(0) cannot be taken while that handle is open.
-                        #[cfg(windows)]
-                        {
-                            let mut perms = std::fs::metadata(&temp).unwrap().permissions();
-                            perms.set_readonly(true);
-                            std::fs::set_permissions(&temp, perms).unwrap();
-                            let _ = dir;
-                        }
-                        locked.store(true, Ordering::Relaxed);
+        // The download handle is closed before discard. Only then can a test
+        // take the lock that blocks both delete and a later write open.
+        // On Windows that lock is FILE_SHARE_NONE. The read-only attribute
+        // does not stop Rust's delete disposition.
+        let held: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
+        install_rejected_clear_hook(
+            &temp,
+            Arc::new({
+                let dir = dir.clone();
+                let temp = temp.clone();
+                let locked = locked.clone();
+                #[cfg(windows)]
+                let held = held.clone();
+                move || {
+                    if locked.swap(true, Ordering::Relaxed) {
+                        return;
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    #[cfg(unix)]
+                    {
+                        let mut file_perms = std::fs::metadata(&temp).unwrap().permissions();
+                        file_perms.set_mode(0o444);
+                        std::fs::set_permissions(&temp, file_perms).unwrap();
+                        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+                        dir_perms.set_mode(0o555);
+                        std::fs::set_permissions(&dir, dir_perms).unwrap();
+                    }
+                    #[cfg(windows)]
+                    {
+                        let file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(0)
+                            .open(&temp)
+                            .expect("the writer is closed, so the partial can be locked");
+                        *held.lock().unwrap_or_else(|error| error.into_inner()) = Some(file);
+                        let _ = dir;
+                    }
                 }
-            }))
-        };
+            }),
+        );
         let _restore_on_drop = OnDrop::new({
             let dir = dir.clone();
             let temp = temp.clone();
-            let release = release.clone();
-            move || {
-                release.store(true, Ordering::Relaxed);
-                restore_reject_lock(&dir, &temp);
-            }
+            let held = held.clone();
+            move || release_rejected_lock(&dir, &temp, &held)
         });
 
         let url = format!("http://{addr}/file.bin");
@@ -1517,7 +1544,7 @@ Content-Length: {}\r\n\
             !target.exists(),
             "the rejected body must not be the finished file"
         );
-        let partial = std::fs::read(&temp).expect("rejected partial");
+        let partial = read_rejected_partial(&temp, &held);
         assert_eq!(
             partial,
             vec![b'B'; kept],
@@ -1539,11 +1566,7 @@ Content-Length: {}\r\n\
         assert!(saved.rejected_partial);
 
         if release_before_retry {
-            release.store(true, Ordering::Relaxed);
-            if let Some(handle) = lock_thread.take() {
-                handle.join().expect("lock thread");
-            }
-            restore_reject_lock(&dir, &temp);
+            release_rejected_lock(&dir, &temp, &held);
         }
 
         let ctx = test_ctx(saved, Arc::new(|_: TransferEvent| {}));
@@ -1553,7 +1576,7 @@ Content-Length: {}\r\n\
         if !release_before_retry {
             assert!(!target.exists(), "a held lock must not finish the file");
             assert_eq!(
-                std::fs::read(&temp).expect("rejected partial"),
+                read_rejected_partial(&temp, &held),
                 partial,
                 "a held lock must leave the rejected bytes in place"
             );
@@ -1564,13 +1587,7 @@ Content-Length: {}\r\n\
             Err(error) => Err(error),
         };
 
-        if !release_before_retry {
-            release.store(true, Ordering::Relaxed);
-            if let Some(handle) = lock_thread.take() {
-                handle.join().expect("lock thread");
-            }
-            restore_reject_lock(&dir, &temp);
-        }
+        release_rejected_lock(&dir, &temp, &held);
         let _ = std::fs::remove_dir_all(&dir);
         outcome
     }
