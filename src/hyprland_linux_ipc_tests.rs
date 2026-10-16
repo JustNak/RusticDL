@@ -1,6 +1,6 @@
 use super::*;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -764,6 +764,524 @@ fn known_legacy_refusal_is_not_counted_as_landed() {
         Duration::from_millis(300)
     ));
     assert!(!lua_seen.load(AtomicOrdering::SeqCst));
+}
+
+const MONITORS_WORKSPACE_2: &str = r#"[{"id":0,"name":"DP-1","focused":true,"activeWorkspace":{"id":2,"name":"2"},"specialWorkspace":{"id":0,"name":""}}]"#;
+
+/// Keep writing full chunks until the client drops or `max` elapses.
+///
+/// A full chunk never ends `hyprland_call`'s read, so this holds the call until
+/// its deadline.
+fn drip_until_disconnect(stream: &mut UnixStream, max: Duration) {
+    let started = std::time::Instant::now();
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    while started.elapsed() < max {
+        if stream.write_all(&[b'x'; 512]).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+type HyprHandler = Arc<dyn Fn(&str, &mut UnixStream) + Send + Sync>;
+
+struct ScriptedHypr {
+    runtime: PathBuf,
+    stop: Arc<AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
+    old_his: Option<std::ffi::OsString>,
+    old_xdg: Option<std::ffi::OsString>,
+}
+
+impl ScriptedHypr {
+    fn start(his: &str, on_cmd: HyprHandler) -> Self {
+        let runtime = unique_runtime();
+        let old_his = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+        let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe {
+            std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", his);
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        }
+        let sock_dir = runtime.join("hypr").join(his);
+        std::fs::create_dir_all(&sock_dir).expect("hypr dir");
+        let listener = UnixListener::bind(sock_dir.join(".socket.sock")).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stop_flag.load(AtomicOrdering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut buf = Vec::new();
+                        let mut chunk = [0_u8; 512];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if n < chunk.len() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let cmd = String::from_utf8_lossy(&buf).into_owned();
+                        if cmd.is_empty() {
+                            continue;
+                        }
+                        on_cmd(&cmd, &mut stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        Self {
+            runtime,
+            stop,
+            server: Some(server),
+            old_his,
+            old_xdg,
+        }
+    }
+}
+
+impl Drop for ScriptedHypr {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::SeqCst);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+        unsafe {
+            match self.old_his.take() {
+                Some(value) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", value),
+                None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+            }
+            match self.old_xdg.take() {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.runtime);
+    }
+}
+
+#[test]
+fn show_still_moves_when_the_client_read_fills_the_budget() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (log, calls) = (recorded.clone(), clients.clone());
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                // Full chunks hold the first read open for the whole Show budget.
+                drip_until_disconnect(stream, Duration::from_secs(2));
+            } else {
+                let _ = stream.write_all(our_client("2").as_bytes());
+            }
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-client-budget", handler);
+    let began = std::time::Instant::now();
+    let restored = show_main_windows();
+    let elapsed = began.elapsed();
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        restored,
+        "a client read that fills the Show budget must still restore the window, cmds={cmds:?} elapsed={elapsed:?}"
+    );
+    assert!(
+        cmds.iter().any(|cmd| {
+            cmd.contains("hl.dsp.window.move")
+                && cmd.contains(r#"workspace = "2""#)
+                && cmd.contains("class:^RusticDL$")
+        }),
+        "fallback move must target the focused workspace by class, cmds={cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|cmd| cmd.contains("movetoworkspace ")),
+        "an accepted Lua move must not be repeated, cmds={cmds:?}"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|cmd| cmd.contains("window.move") && cmd.contains("special:")),
+        "restore must not target the hidden workspace, cmds={cmds:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "Show must stay inside its budget, elapsed={elapsed:?}"
+    );
+}
+
+#[test]
+fn show_still_moves_when_an_optional_read_would_fill_the_budget() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        match cmd {
+            "j/clients" => {
+                let _ = stream.write_all(our_client("special:rusticdl").as_bytes());
+            }
+            "j/monitors" => {
+                let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            }
+            "j/activeworkspace" => drip_until_disconnect(stream, Duration::from_secs(2)),
+            _ => {
+                let _ = stream.write_all(b"ok");
+            }
+        }
+    });
+    let _session = ScriptedHypr::start("show-active-budget", handler);
+    let began = std::time::Instant::now();
+    let restored = show_main_windows();
+    let elapsed = began.elapsed();
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        restored,
+        "once the focused workspace is known, a later read must not skip the move, cmds={cmds:?} elapsed={elapsed:?}"
+    );
+    assert!(
+        cmds.iter().any(|cmd| {
+            cmd.contains("hl.dsp.window.move")
+                && cmd.contains(r#"workspace = "2""#)
+                && cmd.contains("address:0x1")
+        }),
+        "the known window must be moved by address, cmds={cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|cmd| cmd == "j/activeworkspace"),
+        "activeworkspace must not run ahead of the move, cmds={cmds:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the move must not wait out the Show budget, elapsed={elapsed:?}"
+    );
+}
+
+const MONITORS_ONLY_SPECIAL: &str = r#"[{"id":0,"name":"DP-1","focused":true,"activeWorkspace":{"id":-98,"name":"special:rusticdl"},"specialWorkspace":{"id":-98,"name":"special:rusticdl"}}]"#;
+const ACTIVE_ONLY_SPECIAL: &str = r#"{"id":-98,"name":"special:rusticdl"}"#;
+
+fn move_was_sent(cmds: &[String]) -> bool {
+    cmds.iter()
+        .any(|cmd| cmd.contains("hl.dsp.window.move") || cmd.contains("movetoworkspace "))
+}
+
+#[test]
+fn show_class_fallback_restores_when_the_client_list_never_arrives() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (log, calls) = (recorded.clone(), clients.clone());
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return;
+            }
+            let _ = stream.write_all(our_client("2").as_bytes());
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-unread-restore", handler);
+    assert!(show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        cmds.iter().any(|cmd| {
+            cmd.contains("hl.dsp.window.move")
+                && cmd.contains(r#"workspace = "2""#)
+                && cmd.contains("class:^RusticDL$")
+        }),
+        "{cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|cmd| cmd.contains("movetoworkspace ")),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn show_does_not_move_when_the_client_list_is_empty() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        let reply = if cmd == "j/clients" {
+            "[]"
+        } else {
+            MONITORS_WORKSPACE_2
+        };
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    let _session = ScriptedHypr::start("show-empty", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(!move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_does_not_move_a_capture_hud_list() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let pid = std::process::id();
+    let clients = format!(
+        r#"[{{"address":"0xhud","class":"{CAPTURE_APP_ID}","title":"c","pid":{pid},"workspace":{{"id":2,"name":"2"}}}}]"#
+    );
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        let reply = if cmd == "j/clients" {
+            clients.clone()
+        } else {
+            MONITORS_WORKSPACE_2.to_string()
+        };
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    let _session = ScriptedHypr::start("show-capture-only", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(!move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_does_not_move_when_the_client_reply_is_not_a_list() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        let reply = if cmd == "j/clients" {
+            "nope"
+        } else {
+            MONITORS_WORKSPACE_2
+        };
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    let _session = ScriptedHypr::start("show-not-a-list", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(!move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_does_not_dispatch_onto_a_special_workspace() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        let reply = match cmd {
+            "j/clients" => our_client("special:rusticdl"),
+            "j/monitors" => MONITORS_ONLY_SPECIAL.to_string(),
+            "j/activeworkspace" => ACTIVE_ONLY_SPECIAL.to_string(),
+            _ => "ok".to_string(),
+        };
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    let _session = ScriptedHypr::start("show-special-ready", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(!move_was_sent(&cmds), "{cmds:?}");
+    assert!(!cmds.iter().any(|cmd| cmd.contains("e+0")), "{cmds:?}");
+}
+
+#[test]
+fn show_class_fallback_does_not_dispatch_onto_a_special_workspace() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            return;
+        }
+        let reply = match cmd {
+            "j/monitors" => MONITORS_ONLY_SPECIAL,
+            "j/activeworkspace" => ACTIVE_ONLY_SPECIAL,
+            _ => "ok",
+        };
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    let _session = ScriptedHypr::start("show-special-unread", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(!move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_class_fallback_does_not_claim_success_when_the_window_stays_hidden() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (log, calls) = (recorded.clone(), clients.clone());
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return;
+            }
+            let _ = stream.write_all(our_client("special:rusticdl").as_bytes());
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-still-hidden", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        move_was_sent(&cmds),
+        "the move is still attempted, cmds={cmds:?}"
+    );
+}
+
+#[test]
+fn show_class_fallback_does_not_claim_success_when_no_main_window_is_listed() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (log, calls) = (recorded.clone(), clients.clone());
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return;
+            }
+            let _ = stream.write_all(b"[]");
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-confirm-empty", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_class_fallback_does_not_claim_success_without_a_follow_up_list() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-confirm-unread", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(move_was_sent(&cmds), "{cmds:?}");
+}
+
+#[test]
+fn show_class_fallback_does_not_repeat_an_unanswered_lua_move() {
+    let _guard = env_lock();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let log = recorded.clone();
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" || cmd.contains("hl.dsp.window.move") {
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-lua-noreply", handler);
+    assert!(!show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        cmds.iter().any(|cmd| cmd.contains("hl.dsp.window.move")),
+        "{cmds:?}"
+    );
+    assert!(
+        !cmds.iter().any(|cmd| cmd.contains("movetoworkspace ")),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn show_class_fallback_on_a_known_legacy_compositor_skips_lua() {
+    let _guard = env_lock();
+    DIALECT.store(DIALECT_LEGACY, AtomicOrdering::SeqCst);
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (log, calls) = (recorded.clone(), clients.clone());
+    let handler = Arc::new(move |cmd: &str, stream: &mut UnixStream| {
+        log.lock().expect("record").push(cmd.to_string());
+        if cmd == "j/clients" {
+            if calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return;
+            }
+            let _ = stream.write_all(our_client("2").as_bytes());
+            return;
+        }
+        if cmd == "j/monitors" {
+            let _ = stream.write_all(MONITORS_WORKSPACE_2.as_bytes());
+            return;
+        }
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-legacy-fallback", handler);
+    assert!(show_main_windows());
+    let cmds = recorded.lock().expect("record").clone();
+    assert!(
+        cmds.iter()
+            .any(|cmd| cmd.contains("movetoworkspace 2,class:^RusticDL$")),
+        "{cmds:?}"
+    );
+    assert!(!cmds.iter().any(|cmd| cmd.contains("hl.dsp")), "{cmds:?}");
+}
+
+#[test]
+fn show_with_no_time_left_does_not_connect() {
+    let _guard = env_lock();
+    let connected = Arc::new(AtomicBool::new(false));
+    let flag = connected.clone();
+    let handler = Arc::new(move |_cmd: &str, stream: &mut UnixStream| {
+        flag.store(true, AtomicOrdering::SeqCst);
+        let _ = stream.write_all(b"ok");
+    });
+    let _session = ScriptedHypr::start("show-expired", handler);
+    assert!(!show_main_windows_within(Duration::ZERO));
+    assert!(!connected.load(AtomicOrdering::SeqCst));
 }
 
 #[test]

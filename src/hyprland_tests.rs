@@ -540,6 +540,18 @@ mod close_to_background {
     }
 
     #[test]
+    fn restore_target_rejects_special_workspace_and_e_plus_zero() {
+        assert!(is_safe_restore_target("2"));
+        assert!(is_safe_restore_target("name:web"));
+        assert!(!is_safe_restore_target("special:rusticdl"));
+        assert!(!is_safe_restore_target("special"));
+        assert!(!is_safe_restore_target("e+0"));
+        assert!(!is_safe_restore_target(""));
+        assert!(!is_safe_restore_target("2,focus"));
+        assert!(!is_safe_restore_target("name:special:rusticdl"));
+    }
+
+    #[test]
     fn unknown_workspace_does_not_dispatch_e_plus_zero() {
         assert_eq!(restore_workspace_id("garbage", None), None);
         assert_eq!(
