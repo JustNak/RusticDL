@@ -209,6 +209,10 @@ pub struct Job {
     pub expected_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replace_existing: bool,
+    /// The `.part` still holds bytes this engine rejected, and neither delete
+    /// nor truncate could drop them. Every resume path must ignore that length.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rejected_partial: bool,
 }
 
 impl Job {
@@ -240,6 +244,7 @@ impl Job {
             fallback_reason: None,
             expected_sha256: None,
             replace_existing: false,
+            rejected_partial: false,
         }
     }
 
@@ -272,6 +277,7 @@ impl Job {
         self.transfer_format_version = 0;
         self.active_connections = 0;
         self.transfer_mode = None;
+        self.rejected_partial = false;
         self.mark_finished();
     }
 
@@ -336,6 +342,7 @@ mod tests {
         assert!(job.fallback_reason.is_none());
         assert!(job.expected_sha256.is_none());
         assert!(job.completed_at.is_none());
+        assert!(!job.rejected_partial);
     }
 
     #[test]
@@ -493,6 +500,10 @@ mod tests {
         assert!(json.contains("\"fallbackReason\":\"planner\""));
         assert!(json.contains("\"expectedSha256\""));
         assert!(json.contains("\"etag\""));
+        assert!(
+            !json.contains("rejectedPartial"),
+            "a trusted partial omits the flag"
+        );
 
         let back: Job = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.validators, job.validators);
@@ -503,6 +514,13 @@ mod tests {
         assert_eq!(back.transfer_mode, Some(TransferMode::Multi));
         assert_eq!(back.fallback_reason.as_deref(), Some("planner"));
         assert_eq!(back.expected_sha256, job.expected_sha256);
+        assert!(!back.rejected_partial);
+
+        job.rejected_partial = true;
+        let marked = serde_json::to_string(&job).expect("serialize rejected partial");
+        assert!(marked.contains("\"rejectedPartial\":true"));
+        let marked_back: Job = serde_json::from_str(&marked).expect("deserialize rejected partial");
+        assert!(marked_back.rejected_partial);
     }
 
     #[test]

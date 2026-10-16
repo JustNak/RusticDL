@@ -135,7 +135,8 @@ async fn run_attempts(
                     let requeue = guard.requeue_on_cancel.contains_key(&job_id);
                     let job = guard.jobs.iter().find(|job| job.id == job_id);
                     let recorded = job.map(durable_progress).unwrap_or(0);
-                    let count_disk = job.is_some_and(single_stream_disk_counts);
+                    let count_disk = job
+                        .is_some_and(|job| single_stream_disk_counts(job) && !job.rejected_partial);
                     let temp_path = job.map(|job| job.temp_path.clone());
                     let downloaded = job.map(|job| job.downloaded_bytes).unwrap_or(0);
                     let total = job.map(|job| job.total_bytes).unwrap_or(0);
@@ -214,6 +215,9 @@ async fn run_attempts(
 }
 
 fn durable_progress(job: &Job) -> u64 {
+    if job.rejected_partial {
+        return 0;
+    }
     job.segment_map
         .as_ref()
         .map(|map| map.written_sum())

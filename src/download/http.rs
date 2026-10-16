@@ -20,7 +20,7 @@ use super::fetch::{
 };
 use super::filesystem::{
     clear_rejected_partial, ensure_parent_directory, metadata_len, move_to_final_path,
-    parse_content_disposition_filename, remove_partial, sanitize_filename,
+    parse_content_disposition_filename, remove_partial, sanitize_filename, RejectedPartialClear,
 };
 use super::handoff::{session_url_after_auth_denied, HandoffAuth};
 use super::job::{
@@ -95,29 +95,32 @@ pub async fn run_http_download_with_ctx(
         return Ok(outcome);
     }
 
-    let mut existing_bytes = match resume_oracle(&ctx.job) {
-        // A rejected body must not survive as a length. `clear_rejected_partial`
-        // truncates when delete fails, so this offset stays 0. An uncheckpointed
-        // good partial still resumes from the file: production reconciles that
-        // length into `downloaded_bytes` before this call, and a direct transfer
-        // uses the same disk length.
-        ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
-            metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
-        }
-        ResumeOracle::Multi { .. } => {
-            return Err(download_error(
-                FailureCategory::Resume,
-                "Multi-connection partial; single-stream resume is not supported. Use Restart."
-                    .into(),
-                false,
-            ));
-        }
-        ResumeOracle::RestartRequired => {
-            return Err(download_error(
-                FailureCategory::Resume,
-                "Multi-part incomplete; Restart required.".into(),
-                false,
-            ));
+    // A rejected `.part` is not a resume point, for a single stream or a
+    // segment map. Delete and truncate can both fail and leave that length
+    // on disk; the next attempt still starts at 0 and truncates on open.
+    // A partial this engine did not reject still resumes from the file.
+    let mut existing_bytes = if ctx.job.rejected_partial {
+        0
+    } else {
+        match resume_oracle(&ctx.job) {
+            ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
+                metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
+            }
+            ResumeOracle::Multi { .. } => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    "Multi-connection partial; single-stream resume is not supported. Use Restart."
+                        .into(),
+                    false,
+                ));
+            }
+            ResumeOracle::RestartRequired => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    "Multi-part incomplete; Restart required.".into(),
+                    false,
+                ));
+            }
         }
     };
 
@@ -200,6 +203,7 @@ pub async fn run_http_download_with_ctx(
                     existing_bytes,
                     resume_supported,
                     transfer_format_version,
+                    !ctx.job.rejected_partial,
                     &temp_path,
                     &control,
                     &on_progress,
@@ -299,6 +303,7 @@ pub async fn run_http_download_with_ctx(
                     existing_bytes,
                     true,
                     transfer_format_version,
+                    !ctx.job.rejected_partial,
                     &temp_path,
                     &control,
                     &on_progress,
@@ -348,6 +353,7 @@ pub async fn run_http_download_with_ctx(
                         existing_bytes,
                         resume_supported,
                         transfer_format_version,
+                        !ctx.job.rejected_partial,
                         &temp_path,
                         &control,
                         &on_progress,
@@ -481,6 +487,7 @@ pub async fn run_http_download_with_ctx(
                                         existing_bytes,
                                         true,
                                         transfer_format_version,
+                                        !ctx.job.rejected_partial,
                                         &temp_path,
                                         &control,
                                         &on_progress,
@@ -733,9 +740,42 @@ pub async fn run_http_download_with_ctx(
         } else {
             total_bytes
         };
-        let mut sink = AppendSink::open(&temp_path, existing_bytes)
-            .await?
-            .with_target(write_limit);
+        // The open itself is the replace. Offset 0 truncates. A rejected file
+        // must not be appended to, even if an earlier reconnect copied its length.
+        if ctx.job.rejected_partial {
+            existing_bytes = 0;
+        }
+        let sink = match AppendSink::open(&temp_path, existing_bytes).await {
+            Ok(sink) => sink,
+            Err(error) if ctx.job.rejected_partial => {
+                return Err(rejected_partial_locked_error(&error));
+            }
+            Err(error) => return Err(error),
+        };
+        if ctx.job.rejected_partial {
+            // The rejected bytes are gone. Later reconnects in this attempt
+            // may trust the length of the body we are about to write.
+            ctx.job.rejected_partial = false;
+            ctx.job.segment_map = None;
+            ctx.job.transfer_format_version = 0;
+            ctx.job.downloaded_bytes = 0;
+            ctx.job.progress = 0.0;
+            let _ = ctx
+                .committer
+                .commit(
+                    &mut ctx.job,
+                    CommitIdentity {
+                        rejected_partial: Some(false),
+                        downloaded_bytes: Some(0),
+                        progress: Some(0.0),
+                        transfer_format_version: Some(0),
+                        map: MapUpdate::Clear,
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        let mut sink = sink.with_target(write_limit);
         let mut downloaded = existing_bytes;
         let mut last_progress = Instant::now();
         let mut window_start = Instant::now();
@@ -845,6 +885,7 @@ pub async fn run_http_download_with_ctx(
                         existing_bytes,
                         resume_supported,
                         transfer_format_version,
+                        !ctx.job.rejected_partial,
                         &temp_path,
                         &control,
                         &on_progress,
@@ -890,6 +931,7 @@ pub async fn run_http_download_with_ctx(
                     existing_bytes,
                     resume_supported,
                     transfer_format_version,
+                    !ctx.job.rejected_partial,
                     &temp_path,
                     &control,
                     &on_progress,
@@ -925,6 +967,7 @@ async fn prepare_reconnect(
     existing_bytes: u64,
     resume_supported: bool,
     transfer_format_version: u32,
+    trust_file_length: bool,
     temp_path: &std::path::Path,
     control: &AtomicU8,
     on_progress: &TransferEventCallback,
@@ -951,7 +994,13 @@ async fn prepare_reconnect(
         return ReconnectAction::Control(outcome);
     }
 
-    let offset = refresh_reconnect_offset(transfer_format_version, existing_bytes, temp_path).await;
+    let offset = refresh_reconnect_offset(
+        transfer_format_version,
+        existing_bytes,
+        temp_path,
+        trust_file_length,
+    )
+    .await;
 
     ReconnectAction::Retry { offset }
 }
@@ -1305,12 +1354,14 @@ fn ranges_usable_for_reconnect(
 
 /// The bytes on disk belong to a body we rejected. Remove them and forget
 /// the offset so Retry starts clean instead of Range-resuming the mismatch.
-/// `downloaded_bytes` is committed as 0 here; the file must not keep a
-/// length that a later fresh start could treat as that offset.
+/// `downloaded_bytes` is committed as 0. When the file survives both delete
+/// and truncate, `rejected_partial` is committed too: a reload must not
+/// treat that length as progress.
 async fn discard_rejected_partial(ctx: &mut TransferContext, temp_path: &Path) {
-    clear_rejected_partial(temp_path).await;
+    let untrusted = clear_rejected_partial(temp_path).await == RejectedPartialClear::Unchanged;
     ctx.job.downloaded_bytes = 0;
     ctx.job.progress = 0.0;
+    ctx.job.rejected_partial = untrusted;
     let _ = ctx
         .committer
         .commit(
@@ -1318,10 +1369,22 @@ async fn discard_rejected_partial(ctx: &mut TransferContext, temp_path: &Path) {
             CommitIdentity {
                 downloaded_bytes: Some(0),
                 progress: Some(0.0),
+                rejected_partial: Some(untrusted),
                 ..Default::default()
             },
         )
         .await;
+}
+
+fn rejected_partial_locked_error(open_error: &DownloadError) -> DownloadError {
+    download_error(
+        FailureCategory::Disk,
+        format!(
+            "Could not replace the rejected partial download because another program has the file open. Close that program and use Retry. ({})",
+            open_error.message
+        ),
+        false,
+    )
 }
 
 async fn checkpoint_partial(ctx: &mut TransferContext, downloaded: u64, total_bytes: u64) {
@@ -1356,8 +1419,10 @@ async fn refresh_reconnect_offset(
     transfer_format_version: u32,
     tracked_downloaded: u64,
     temp_path: &std::path::Path,
+    trust_file_length: bool,
 ) -> u64 {
-    if transfer_format_version >= 1 {
+    // A rejected `.part` still has a length. That length is not this offset.
+    if !trust_file_length || transfer_format_version >= 1 {
         tracked_downloaded
     } else {
         metadata_len(temp_path).await.unwrap_or(tracked_downloaded)
@@ -2143,8 +2208,9 @@ mod tests {
         let part = dir.join("f.bin.part");
         tokio::fs::write(&part, vec![0u8; 77]).await.unwrap();
 
-        assert_eq!(refresh_reconnect_offset(0, 10, &part).await, 77);
-        assert_eq!(refresh_reconnect_offset(1, 42, &part).await, 42);
+        assert_eq!(refresh_reconnect_offset(0, 10, &part, true).await, 77);
+        assert_eq!(refresh_reconnect_offset(0, 10, &part, false).await, 10);
+        assert_eq!(refresh_reconnect_offset(1, 42, &part, true).await, 42);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2176,6 +2242,7 @@ mod tests {
             64,
             true,
             0,
+            true,
             &part,
             &control,
             &on_progress,

@@ -92,6 +92,11 @@ pub(crate) fn may_convert_multi_to_single(map: &SegmentMap) -> bool {
 pub async fn run_multi_segment_download(
     ctx: &mut TransferContext,
 ) -> Result<DownloadOutcome, DownloadError> {
+    // A fully written map would finalize the file without fetching. Those
+    // bytes were rejected, so this attempt is a single download from 0.
+    if ctx.job.rejected_partial {
+        return run_http_download_with_ctx(ctx).await;
+    }
     if matches!(resume_oracle(&ctx.job), ResumeOracle::LegacySingle) {
         return fallback_to_single(ctx, FALLBACK_LEGACY_PARTIAL).await;
     }

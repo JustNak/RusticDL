@@ -12,7 +12,9 @@ use super::super::{bump_jobs, emit_jobs_locked, find_job_mut, EngineInner};
 
 /// v1 map missing/inconsistent → fail Resume immediately (do not invent ranges).
 pub(super) fn fail_if_resume_map_unusable(job: &mut Job) -> bool {
-    if !resume_oracle(job).is_resume_error() {
+    // The map counts bytes that could not be deleted. Retry replaces them
+    // from offset 0 instead of demanding Restart.
+    if job.rejected_partial || !resume_oracle(job).is_resume_error() {
         return false;
     }
     job.state = JobState::Failed;
