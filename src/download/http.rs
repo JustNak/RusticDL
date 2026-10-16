@@ -19,8 +19,8 @@ use super::fetch::{
     FetchRequest, RangeSpec, RangeStatus, STALL_TIMEOUT,
 };
 use super::filesystem::{
-    ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
-    remove_partial, sanitize_filename,
+    clear_rejected_partial, ensure_parent_directory, metadata_len, move_to_final_path,
+    parse_content_disposition_filename, remove_partial, sanitize_filename,
 };
 use super::handoff::{session_url_after_auth_denied, HandoffAuth};
 use super::job::{
@@ -96,6 +96,11 @@ pub async fn run_http_download_with_ctx(
     }
 
     let mut existing_bytes = match resume_oracle(&ctx.job) {
+        // A rejected body must not survive as a length. `clear_rejected_partial`
+        // truncates when delete fails, so this offset stays 0. An uncheckpointed
+        // good partial still resumes from the file: production reconciles that
+        // length into `downloaded_bytes` before this call, and a direct transfer
+        // uses the same disk length.
         ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
             metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
         }
@@ -242,12 +247,12 @@ pub async fn run_http_download_with_ctx(
         let range_total = match &range_status {
             RangeStatus::RangeNotSatisfiable { at } => {
                 // The candidate body closed cleanly and this 416 names that
-                // same length. Validators on the 416 must not disagree with
-                // the ones saved from the changed response.
+                // same length. The 416 must repeat every saved validator.
+                // A missing ETag or Last-Modified does not prove the bytes.
                 if lengthless_candidate == Some(existing_bytes)
                     && existing_bytes > 0
                     && unsatisfied_content_range_total(response.headers()) == Some(existing_bytes)
-                    && !resume_identity_mismatch(
+                    && validators_confirmed(
                         &validators,
                         &content_validators_from_headers(response.headers(), 0),
                     )
@@ -407,20 +412,30 @@ pub async fn run_http_download_with_ctx(
                         checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                         return Err(remote_size_changed_error(actual, expected));
                     }
-                    // The validators already match. A lengthless 200 is not a new
-                    // entity and must not delete the candidate `.part`.
+                    // Absent validators are not a mismatch, and they are not
+                    // proof either. A lengthless 200 may confirm the candidate
+                    // only when it repeats the saved validators and the length.
+                    // It must not delete the `.part`.
                     if announced_length.is_none()
                         && (known_size_retired || lengthless_candidate.is_some())
                     {
                         if lengthless_candidate == Some(existing_bytes) && existing_bytes > 0 {
-                            let decision = match confirm_repeated_lengthless_body(
-                                response,
-                                existing_bytes,
-                                &control,
-                                limiter.as_ref(),
-                            )
-                            .await
-                            {
+                            let repeated = if validators_confirmed(
+                                &validators,
+                                &content_validators_from_headers(response.headers(), 0),
+                            ) {
+                                confirm_repeated_lengthless_body(
+                                    response,
+                                    existing_bytes,
+                                    &control,
+                                    limiter.as_ref(),
+                                )
+                                .await
+                            } else {
+                                drop(response);
+                                RepeatedBody::Differs
+                            };
+                            let decision = match repeated {
                                 RepeatedBody::Matches => RepeatedDecision::Complete,
                                 RepeatedBody::Differs => {
                                     length_mismatches = length_mismatches.saturating_add(1);
@@ -1050,13 +1065,14 @@ enum RepeatedDecision {
 }
 
 /// Read a same-validator lengthless 200 without writing it over the candidate.
+/// Reading stops once the body passes `candidate`.
 async fn confirm_repeated_lengthless_body(
     response: reqwest::Response,
     candidate: u64,
     control: &AtomicU8,
     limiter: &GlobalBandwidthLimiter,
 ) -> RepeatedBody {
-    let mut sink = CountingSink::new();
+    let mut sink = CountingSink::new().stop_after(candidate);
     match stream_body(response, &mut sink, control, limiter, |_| {}).await {
         Ok(StreamEnd::Control(outcome)) => RepeatedBody::Control(outcome),
         Ok(StreamEnd::Exhausted { downloaded }) => {
@@ -1066,7 +1082,7 @@ async fn confirm_repeated_lengthless_body(
                 RepeatedBody::Differs
             }
         }
-        Err(error) if is_lengthless_eof(&error) => {
+        Err(error) if is_lengthless_eof(&error) || is_remote_size_mismatch(&error) => {
             if sink.offset() == candidate {
                 RepeatedBody::Matches
             } else {
@@ -1289,8 +1305,10 @@ fn ranges_usable_for_reconnect(
 
 /// The bytes on disk belong to a body we rejected. Remove them and forget
 /// the offset so Retry starts clean instead of Range-resuming the mismatch.
+/// `downloaded_bytes` is committed as 0 here; the file must not keep a
+/// length that a later fresh start could treat as that offset.
 async fn discard_rejected_partial(ctx: &mut TransferContext, temp_path: &Path) {
-    remove_partial(temp_path).await;
+    clear_rejected_partial(temp_path).await;
     ctx.job.downloaded_bytes = 0;
     ctx.job.progress = 0.0;
     let _ = ctx
@@ -1457,6 +1475,29 @@ pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     }
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
+/// Completion proof. Every saved ETag and Last-Modified must be present and
+/// equal. A 206 may omit them (`resume_identity_mismatch` treats that as
+/// "not a change"); a 416 or a second full body may not.
+fn validators_confirmed(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
+    fn field(stored: Option<&str>, incoming: Option<&str>) -> Option<bool> {
+        let stored = stored.map(str::trim).filter(|value| !value.is_empty())?;
+        let incoming = incoming.map(str::trim).filter(|value| !value.is_empty());
+        Some(incoming == Some(stored))
+    }
+    match (
+        field(stored.etag.as_deref(), incoming.etag.as_deref()),
+        field(
+            stored.last_modified.as_deref(),
+            incoming.last_modified.as_deref(),
+        ),
+    ) {
+        (None, None) => false,
+        (Some(etag_ok), None) => etag_ok,
+        (None, Some(lm_ok)) => lm_ok,
+        (Some(etag_ok), Some(lm_ok)) => etag_ok && lm_ok,
+    }
+}
+
 fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
     if let (Some(a), Some(b)) = (stored.etag.as_deref(), incoming.etag.as_deref()) {
         if a.trim() != b.trim() {
@@ -1772,6 +1813,51 @@ mod tests {
             expected_size: None,
         };
         assert!(resume_identity_mismatch(&stored, &lm_changed));
+    }
+
+    #[test]
+    fn validators_confirmed_requires_every_saved_field() {
+        let stored = ContentValidators {
+            etag: Some("\"a\"".into()),
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: None,
+        };
+        let both = stored.clone();
+        assert!(validators_confirmed(&stored, &both));
+        assert!(!validators_confirmed(
+            &stored,
+            &ContentValidators {
+                etag: Some("\"a\"".into()),
+                ..ContentValidators::default()
+            }
+        ));
+        assert!(!validators_confirmed(
+            &stored,
+            &ContentValidators {
+                etag: Some("\"b\"".into()),
+                last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+                expected_size: None,
+            }
+        ));
+        let etag_only = ContentValidators {
+            etag: Some(" \"a\" ".into()),
+            ..ContentValidators::default()
+        };
+        assert!(validators_confirmed(
+            &etag_only,
+            &ContentValidators {
+                etag: Some("\"a\"".into()),
+                ..ContentValidators::default()
+            }
+        ));
+        assert!(!validators_confirmed(
+            &etag_only,
+            &ContentValidators::default()
+        ));
+        assert!(!validators_confirmed(
+            &ContentValidators::default(),
+            &etag_only
+        ));
     }
 
     #[test]

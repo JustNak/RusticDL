@@ -155,19 +155,45 @@ impl BodySink for AppendSink {
 /// full response with the candidate already on disk.
 pub(crate) struct CountingSink {
     offset: u64,
+    /// Once the body passes this length, stop. The confirm path only needs
+    /// to know the repeated body is longer than the candidate.
+    limit: Option<u64>,
 }
 
 impl CountingSink {
     pub(crate) fn new() -> Self {
-        Self { offset: 0 }
+        Self {
+            offset: 0,
+            limit: None,
+        }
+    }
+
+    pub(crate) fn stop_after(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
     }
 }
 
 #[async_trait]
 impl BodySink for CountingSink {
     async fn write_chunk(&mut self, data: &[u8]) -> Result<usize, DownloadError> {
-        self.offset = self.offset.saturating_add(data.len() as u64);
-        Ok(data.len())
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let Some(limit) = self.limit else {
+            self.offset = self.offset.saturating_add(data.len() as u64);
+            return Ok(data.len());
+        };
+        let room = limit.saturating_sub(self.offset);
+        if (data.len() as u64) <= room {
+            self.offset = self.offset.saturating_add(data.len() as u64);
+            return Ok(data.len());
+        }
+        // One byte past the candidate is enough to reject the body. Do not
+        // pull the rest of a runaway confirm response.
+        let keep = (room as usize).saturating_add(1).min(data.len());
+        self.offset = self.offset.saturating_add(keep as u64);
+        Err(remote_size_changed_error(self.offset, limit))
     }
 
     async fn flush(&mut self) -> Result<(), DownloadError> {

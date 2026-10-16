@@ -240,6 +240,11 @@ pub async fn run_transfer(mut ctx: TransferContext) -> Result<DownloadOutcome, D
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
     use crate::download::bandwidth::GlobalBandwidthLimiter;
     use crate::download::conn_budget::ConnectionBudget;
     use crate::download::engine::EngineRuntimeConfig;
@@ -1116,6 +1121,130 @@ Content-Length: {}\r\n\
         );
     }
 
+    /// Delete of a rejected `.part` can fail while the file stays writable
+    /// (a mode-0555 directory, or a Windows share that denies delete). The
+    /// next attempt still trusts the on-disk length, so the rejected bytes
+    /// have to be truncated or that length is spliced onto the real file.
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn size_mismatch_truncates_partial_when_delete_fails() {
+        let head_len = 4096u64;
+        let rejected = vec![b'B'; 128];
+        let correct = vec![b'A'; head_len as usize];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rejected_body = rejected.clone();
+        let correct_body = correct.clone();
+        tokio::spawn(async move {
+            let mut rejected_sent = false;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if req.starts_with("HEAD ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {head_len}\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let start = range_start_from(&req.to_ascii_lowercase()).unwrap_or(0);
+                if start == 0 && !rejected_sent {
+                    rejected_sent = true;
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&rejected_body).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                if start > 0 {
+                    let start_us = start as usize;
+                    let suffix = &correct_body[start_us.min(correct_body.len())..];
+                    let end = correct_body.len().saturating_sub(1);
+                    let reply = format!(
+                        "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{head_len}\r\nContent-Length: {}\r\n\r\n",
+                        suffix.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(suffix).await;
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {head_len}\r\n\r\n"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&correct_body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        std::fs::write(&temp, b"").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&dir, perms).unwrap();
+        }
+        // Share read and write, but not delete. Rust's own opens share delete,
+        // so this holder is what makes `remove_file` fail while truncate still works.
+        #[cfg(windows)]
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&temp)
+            .unwrap();
+
+        let url = format!("http://{addr}/file.bin");
+        let job = Job::new(url.clone(), "out.bin".into(), target.clone(), temp.clone());
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let err = transfer_within(ctx)
+            .await
+            .expect_err("a short lengthless body must fail");
+        let len = std::fs::metadata(&temp).map(|meta| meta.len()).ok();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dir, perms).unwrap();
+        }
+        #[cfg(windows)]
+        drop(held);
+
+        assert_size_mismatch(&err, rejected.len() as u64, head_len);
+        assert_eq!(
+            len,
+            Some(0),
+            "a failed delete must truncate the rejected partial"
+        );
+        assert!(!target.exists());
+
+        let job = Job::new(url, "out.bin".into(), target.clone(), temp);
+        let ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        let outcome = transfer_within(ctx)
+            .await
+            .expect("Retry after a truncated reject downloads the real file");
+        assert!(matches!(outcome, DownloadOutcome::Completed));
+        assert_eq!(
+            std::fs::read(&target).expect("final file"),
+            correct,
+            "the rejected prefix must not be spliced onto the retry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn etag_change_without_content_length_finishes_at_the_new_size() {
         let old_len = 64u64;
@@ -1690,6 +1819,163 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn seed_lengthless_candidate(base: &str, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf, Job) {
+        let (dir, target, temp, mut job) = download_paths(base);
+        std::fs::write(&temp, bytes).unwrap();
+        job.downloaded_bytes = bytes.len() as u64;
+        job.total_bytes = 0;
+        job.resume_supported = true;
+        job.validators.etag = Some("\"e2\"".into());
+        job.validators.expected_size = None;
+        (dir, target, temp, job)
+    }
+
+    /// A 416 finishes the candidate only when it names that length and repeats
+    /// the saved validators. Anything else must leave the file unfinished.
+    #[tokio::test]
+    async fn unconfirmed_416_does_not_complete_lengthless_candidate() {
+        let cases = [
+            ("416 without validators", "bytes */100", ""),
+            (
+                "416 with a different etag",
+                "bytes */100",
+                "ETag: \"e9\"\r\n",
+            ),
+            (
+                "416 total differs from the candidate",
+                "bytes */101",
+                "ETag: \"e2\"\r\n",
+            ),
+            ("416 star total", "bytes */*", "ETag: \"e2\"\r\n"),
+            ("416 numeric range", "bytes 0-99/100", "ETag: \"e2\"\r\n"),
+        ];
+        for (label, content_range, extra) in cases {
+            let candidate = vec![b'Q'; 100];
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let range_line = content_range.to_string();
+            let extra = extra.to_string();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let req = read_http_headers(&mut socket).await;
+                    if !req.starts_with("GET ") {
+                        let _ = socket.shutdown().await;
+                        continue;
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n{extra}Content-Range: {range_line}\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+
+            let (dir, target, _temp, job) =
+                seed_lengthless_candidate(&format!("http://{addr}"), &candidate);
+            let mut ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+            ctx.preflight_done = true;
+            let outcome = tokio::time::timeout(Duration::from_secs(12), run_transfer(ctx))
+                .await
+                .unwrap_or_else(|_| panic!("{label} must settle"));
+            assert!(
+                !matches!(outcome, Ok(DownloadOutcome::Completed)),
+                "{label} must not finish the candidate, got {outcome:?}"
+            );
+            assert!(!target.exists(), "{label} must not rename the partial");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A second full body with no validators is not confirmation, even when
+    /// its length matches the candidate.
+    #[tokio::test]
+    async fn second_lengthless_body_without_validators_does_not_complete() {
+        let candidate = vec![b'Q'; 48];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let other = vec![b'Z'; candidate.len()];
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let req = read_http_headers(&mut socket).await;
+                if !req.starts_with("GET ") {
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&other).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let (dir, target, temp, job) =
+            seed_lengthless_candidate(&format!("http://{addr}"), &candidate);
+        let mut ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        ctx.preflight_done = true;
+        let err = tokio::time::timeout(Duration::from_secs(12), run_transfer(ctx))
+            .await
+            .expect("a validator-less repeat must settle")
+            .expect_err("a validator-less repeat must not complete");
+        assert!(err.retryable, "{err:?}");
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read(&temp).expect("candidate partial"),
+            candidate,
+            "the unconfirmed body must not replace the partial"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The confirm read stops once the repeated body passes the candidate.
+    /// A tail that never closes must not hold the attempt open.
+    #[tokio::test]
+    async fn confirm_body_stops_once_it_passes_the_candidate() {
+        let candidate = vec![b'C'; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let req = read_http_headers(&mut socket).await;
+                    if !req.starts_with("GET ") {
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
+                    let reply = "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"e2\"\r\n\r\n";
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let mut body = vec![b'C'; 32];
+                    body.push(b'Z');
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let (dir, target, temp, job) =
+            seed_lengthless_candidate(&format!("http://{addr}"), &candidate);
+        let mut ctx = test_ctx(job, Arc::new(|_: TransferEvent| {}));
+        ctx.preflight_done = true;
+        let err = tokio::time::timeout(Duration::from_secs(8), run_transfer(ctx))
+            .await
+            .expect("the confirm read must stop once the body passes the candidate")
+            .expect_err("a longer confirm body must not complete");
+        assert!(err.retryable, "{err:?}");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&temp).expect("candidate partial"), candidate);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const OLD_ENTITY_LEN: u64 = 262_144;
     const NEW_ENTITY_LEN: usize = 270_336;
 
@@ -1768,7 +2054,8 @@ Content-Length: {}\r\n\
                 }
                 if start as usize >= new_body.len() {
                     let reply = format!(
-                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n{}\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                        current_validator(followup),
                         new_body.len()
                     );
                     let _ = socket.write_all(reply.as_bytes()).await;

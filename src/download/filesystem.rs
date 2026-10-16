@@ -478,6 +478,24 @@ pub async fn remove_partial(path: &Path) {
     let _ = fs::remove_file(io_path(path)).await;
 }
 
+/// Drop a rejected `.part`. Delete is enough when it works. A locked file
+/// (Windows antivirus is the usual case) stays on disk, and the next fresh
+/// start must not resume its length, so the bytes are truncated in place.
+/// A finished download is not passed here: truncating that would destroy it.
+pub async fn clear_rejected_partial(path: &Path) {
+    if fs::remove_file(io_path(path)).await.is_ok() {
+        return;
+    }
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || truncate_rejected_partial(&path)).await;
+}
+
+fn truncate_rejected_partial(path: &Path) -> io::Result<()> {
+    let file = open_download_file(path, false, true, false, true)?;
+    file.set_len(0)?;
+    Ok(())
+}
+
 pub fn parse_content_disposition_filename(header_value: &str) -> Option<String> {
     if let Some(encoded) = header_value
         .split(';')
@@ -794,9 +812,69 @@ pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
     #[test]
     fn sanitizes_unsafe_names() {
         assert_eq!(sanitize_filename("a/b\\c:d?.zip"), "a_b_c_d_.zip");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_directory_is_not_writable() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert_eq!(
+            len,
+            Some(0),
+            "a failed delete must drop the rejected bytes in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_delete_is_sharing_violation() {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&file)
+            .unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+        drop(held);
+
+        assert_eq!(
+            len,
+            Some(0),
+            "a sharing violation on delete must still drop the rejected bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
