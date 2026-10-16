@@ -15,6 +15,8 @@
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 /// Wayland / X11 app id for browser capture HUDs only.
 ///
@@ -887,42 +889,239 @@ fn legacy_toggle_hidden_command() -> String {
 
 /// Overall bound for a restore on the UI thread.
 #[cfg(target_os = "linux")]
-const SHOW_BUDGET: std::time::Duration = std::time::Duration::from_millis(1200);
+const SHOW_BUDGET: Duration = Duration::from_millis(1200);
 
-/// Bring the main window back to the user's regular workspace and focus it.
+/// Time queries must leave for the restore move. A slow `j/clients` used to
+/// spend this and the move was never written.
 ///
-/// Returns whether a move dispatch succeeded. Focus-only (no numeric
-/// workspace, or the compositor refused the move) is `false`. Every socket
-/// call shares one [`SHOW_BUDGET`] deadline.
+/// Half learns the workspace; half is one dispatch. A Lua rejection that was
+/// actually answered can still try the legacy dispatcher inside that half
+/// when the workspace read was fast.
+#[cfg(target_os = "linux")]
+const SHOW_MOVE_RESERVE: Duration = Duration::from_millis(500);
+
+/// What `j/clients` told us. Nothing here is persisted.
+///
+/// * [`MainWindows::Absent`] — a complete list with no main window.
+/// * [`MainWindows::Ready`] — main windows to move by address.
+/// * [`MainWindows::Unread`] — no list (deadline, hang, or empty close). The
+///   class fallback may run; it is not success until a later list shows every
+///   main window off [`HIDDEN_WORKSPACE`].
+#[cfg(target_os = "linux")]
+enum MainWindows {
+    Absent,
+    Ready(Vec<HyprClient>),
+    Unread,
+}
+
+/// Bring the main window back to the focused monitor's regular workspace.
+///
+/// Returns `true` only when a move was accepted. If the client list never
+/// arrived, a later read must also show every main window off the hidden
+/// workspace: an `ok` dispatch does not prove a class selector matched.
+/// Every socket call stays inside [`SHOW_BUDGET`]. Queries stop
+/// [`SHOW_MOVE_RESERVE`] early so a slow read cannot skip the move. No safe
+/// workspace (missing, special, or `e+0`) means no move. An unanswered Lua
+/// command is never repeated as a legacy one.
 #[cfg(target_os = "linux")]
 pub fn show_main_windows() -> bool {
+    show_main_windows_within(SHOW_BUDGET)
+}
+
+#[cfg(target_os = "linux")]
+fn show_main_windows_within(budget: Duration) -> bool {
     if !is_hyprland() {
         return false;
     }
-    let deadline = Some(std::time::Instant::now() + SHOW_BUDGET);
-    let Some(windows) = our_main_windows(deadline) else {
-        return false;
+    let start = Instant::now();
+    let overall = start + budget;
+    let query_deadline = show_query_deadline(start, budget);
+    match read_main_windows(query_deadline) {
+        MainWindows::Absent => false,
+        MainWindows::Ready(windows) => {
+            restore_addressed_windows(&windows, query_deadline, overall, budget)
+        }
+        MainWindows::Unread => fallback_class_restore(overall, budget),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn show_reserve(budget: Duration) -> Duration {
+    SHOW_MOVE_RESERVE.min(budget / 2)
+}
+
+#[cfg(target_os = "linux")]
+fn show_query_deadline(start: Instant, budget: Duration) -> Instant {
+    start + budget.saturating_sub(show_reserve(budget))
+}
+
+/// Workspace reads stop this early so one dispatch still fits in the reserve.
+#[cfg(target_os = "linux")]
+fn deadline_leaving_room_for_move(overall: Instant, budget: Duration) -> Instant {
+    let floor = show_reserve(budget) / 2;
+    let floor = if floor.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        floor
     };
-    let monitors = hyprland_ipc_until("j/monitors", deadline).ok();
-    let active = hyprland_ipc_until("j/activeworkspace", deadline).unwrap_or_default();
-    let workspace_id = restore_workspace_id(&active, monitors.as_deref());
+    overall.checked_sub(floor).unwrap_or(overall)
+}
+
+#[cfg(target_os = "linux")]
+fn read_main_windows(deadline: Instant) -> MainWindows {
+    match hyprland_call("j/clients", Some(deadline)) {
+        IpcResult::Reply(reply) => match parse_hypr_clients(&reply) {
+            Some(clients) => {
+                let windows: Vec<HyprClient> = main_window_clients(&clients, std::process::id())
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if windows.is_empty() {
+                    MainWindows::Absent
+                } else {
+                    MainWindows::Ready(windows)
+                }
+            }
+            // A finished reply that is not a client list is not "unknown".
+            // Guessing a class move from an error string would be a false dispatch.
+            None => MainWindows::Absent,
+        },
+        IpcResult::NoReply | IpcResult::NotSent => MainWindows::Unread,
+    }
+}
+
+/// `true` for a regular workspace id or `name:<name>`.
+#[cfg(target_os = "linux")]
+fn is_safe_restore_target(workspace: &str) -> bool {
+    !workspace.is_empty()
+        && workspace != "e+0"
+        && workspace != "special"
+        && !workspace.contains("special:")
+        && !workspace.contains(',')
+}
+
+#[cfg(target_os = "linux")]
+fn learn_restore_workspace(deadline: Instant) -> Option<String> {
+    if no_time_left(deadline) {
+        return None;
+    }
+    let monitors = hyprland_ipc_until("j/monitors", Some(deadline)).ok();
+    if let Some(target) = monitors.as_deref().and_then(focused_monitor_workspace) {
+        // The focused monitor already named the target. Do not spend the
+        // reserve on `j/activeworkspace`; a slow reply there used to land
+        // after the budget and the move was never sent.
+        return Some(target);
+    }
+    if no_time_left(deadline) {
+        return None;
+    }
+    let active = hyprland_ipc_until("j/activeworkspace", Some(deadline)).unwrap_or_default();
+    restore_workspace_id(&active, None)
+}
+
+#[cfg(target_os = "linux")]
+fn no_time_left(deadline: Instant) -> bool {
+    deadline.saturating_duration_since(Instant::now()).is_zero()
+}
+
+#[cfg(target_os = "linux")]
+fn restore_addressed_windows(
+    windows: &[HyprClient],
+    query_deadline: Instant,
+    overall: Instant,
+    budget: Duration,
+) -> bool {
+    let workspace = learn_restore_workspace(query_deadline)
+        .or_else(|| learn_restore_workspace(deadline_leaving_room_for_move(overall, budget)));
     let mut moved = false;
-    for window in windows {
-        let selector = address_selector(&window.address);
-        if let Some(workspace_id) = workspace_id.as_deref() {
+    if let Some(workspace) = workspace
+        .as_deref()
+        .filter(|workspace| is_safe_restore_target(workspace))
+    {
+        for window in windows {
+            let selector = address_selector(&window.address);
             moved |= dispatch_move_then_legacy(
-                &lua_show_command(workspace_id, &selector),
-                &legacy_show_command(workspace_id, &selector),
-                deadline,
+                &lua_show_command(workspace, &selector),
+                &legacy_show_command(workspace, &selector),
+                Some(overall),
             ) == MoveOutcome::Accepted;
         }
+    }
+    // Focus after every move. Doing it per window let a slow focus spend the
+    // time the next window's move needed.
+    for window in windows {
+        if no_time_left(overall) {
+            break;
+        }
+        let selector = address_selector(&window.address);
         let _ = dispatch_move_then_legacy(
             &lua_focus_command(&selector),
             &legacy_focus_command(&selector),
-            deadline,
+            Some(overall),
         );
     }
     moved
+}
+
+#[cfg(target_os = "linux")]
+fn main_window_class_selector() -> String {
+    format!(
+        "class:^{}$",
+        escape_ere(crate::branding::MAIN_WINDOW_APP_ID)
+    )
+}
+
+/// Client list never arrived. Move `class:^RusticDL$` onto a safe workspace.
+///
+/// `true` only when that move is accepted and a follow-up list shows every
+/// main window off the hidden workspace. Ways this would be a false success,
+/// all of which return `false` and must not dispatch onto a special workspace:
+/// the move was not sent, Lua was unanswered (legacy is not repeated), the
+/// compositor said `ok` but the window is still hidden or the list is empty,
+/// or the follow-up list itself never arrives.
+#[cfg(target_os = "linux")]
+fn fallback_class_restore(overall: Instant, budget: Duration) -> bool {
+    let Some(workspace) = learn_restore_workspace(deadline_leaving_room_for_move(overall, budget))
+        .filter(|workspace| is_safe_restore_target(workspace))
+    else {
+        return false;
+    };
+    let selector = main_window_class_selector();
+    let accepted = dispatch_move_then_legacy(
+        &lua_show_command(&workspace, &selector),
+        &legacy_show_command(&workspace, &selector),
+        Some(overall),
+    ) == MoveOutcome::Accepted;
+    if !accepted || !main_windows_left_hidden(overall) {
+        return false;
+    }
+    if !no_time_left(overall) {
+        let _ = dispatch_move_then_legacy(
+            &lua_focus_command(&selector),
+            &legacy_focus_command(&selector),
+            Some(overall),
+        );
+    }
+    true
+}
+
+/// `true` when a complete client list has main windows and none are parked.
+#[cfg(target_os = "linux")]
+fn main_windows_left_hidden(deadline: Instant) -> bool {
+    if no_time_left(deadline) {
+        return false;
+    }
+    let IpcResult::Reply(reply) = hyprland_call("j/clients", Some(deadline)) else {
+        return false;
+    };
+    let Some(clients) = parse_hypr_clients(&reply) else {
+        return false;
+    };
+    let windows = main_window_clients(&clients, std::process::id());
+    !windows.is_empty()
+        && windows
+            .iter()
+            .all(|window| window.workspace != HIDDEN_WORKSPACE)
 }
 
 /// This process's main-window clients (never capture HUDs).
