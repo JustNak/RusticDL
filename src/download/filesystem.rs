@@ -336,6 +336,26 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
 
 pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileResult {
     let version_gated = job.transfer_format_version >= 1;
+    // Rejected bytes are not progress. Do not copy the file length or a
+    // segment sum that was counted from that file back into the job.
+    if job.rejected_partial {
+        let before = job.downloaded_bytes;
+        job.downloaded_bytes = 0;
+        job.progress = 0.0;
+        return ReconcileResult {
+            downloaded_bytes: 0,
+            on_disk: on_disk.unwrap_or(0),
+            changed: before != 0,
+            used_metadata_len: false,
+            version_gated,
+            used_map_sum: false,
+            map_consistent: job
+                .segment_map
+                .as_ref()
+                .is_some_and(|map| map.is_consistent()),
+            resume_required: false,
+        };
+    }
     match resume_oracle(job) {
         ResumeOracle::Multi { map } => {
             let sum = map.written_sum();
@@ -477,6 +497,93 @@ pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> 
 pub async fn remove_partial(path: &Path) {
     let _ = fs::remove_file(io_path(path)).await;
 }
+
+/// What happened to a `.part` whose bytes were rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectedPartialClear {
+    /// Unlink removed it, or it was already gone. Nothing left to resume.
+    Gone,
+    /// Delete failed and `set_len(0)` succeeded. The next offset is 0.
+    Truncated,
+    /// Delete and truncate both failed. The rejected bytes are still the file.
+    Unchanged,
+}
+
+/// Drop a rejected `.part`. Delete is enough when it works. A locked file
+/// (Windows antivirus is the usual case) stays on disk, so the bytes are
+/// truncated in place. When both fail, the caller must persist
+/// [`Job::rejected_partial`](super::job::Job::rejected_partial): the on-disk
+/// length is not a resume offset.
+/// A finished download is not passed here: truncating that would destroy it.
+///
+/// On Windows the read-only attribute does not stop this delete: it opens
+/// the file for `DELETE` and sets the disposition flag. A handle opened
+/// without `FILE_SHARE_DELETE` and without `FILE_SHARE_WRITE` does stop
+/// both this delete and the truncate.
+pub async fn clear_rejected_partial(path: &Path) -> RejectedPartialClear {
+    // Tests lock the file here, after the writer has closed it. A
+    // FILE_SHARE_NONE handle cannot be opened while that writer is still open.
+    #[cfg(test)]
+    rejected_clear_hook::run(path);
+    match fs::remove_file(io_path(path)).await {
+        Ok(()) => return RejectedPartialClear::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return RejectedPartialClear::Gone;
+        }
+        Err(_) => {}
+    }
+    let path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || truncate_rejected_partial(&path)).await {
+        Ok(Ok(())) => RejectedPartialClear::Truncated,
+        _ => RejectedPartialClear::Unchanged,
+    }
+}
+
+fn truncate_rejected_partial(path: &Path) -> io::Result<()> {
+    let file = open_download_file(path, false, true, false, true)?;
+    file.set_len(0)?;
+    Ok(())
+}
+
+/// Path-keyed lock installed by tests. Production builds have no hook.
+#[cfg(test)]
+mod rejected_clear_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn install(path: &Path, hook: Hook) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+        guard.push((path.to_path_buf(), hook));
+    }
+
+    pub(crate) fn remove(path: &Path) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+    }
+
+    pub(crate) fn run(path: &Path) {
+        let hook = {
+            let guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .iter()
+                .find(|(existing, _)| existing == path)
+                .map(|(_, hook)| Arc::clone(hook))
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use rejected_clear_hook::{
+    install as install_rejected_clear_hook, remove as remove_rejected_clear_hook,
+};
 
 pub fn parse_content_disposition_filename(header_value: &str) -> Option<String> {
     if let Some(encoded) = header_value
@@ -793,10 +900,135 @@ pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::segment::{Segment, SegmentMap, SegmentState};
+
+    #[cfg(windows)]
+    use std::io::{Read, Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
 
     #[test]
     fn sanitizes_unsafe_names() {
         assert_eq!(sanitize_filename("a/b\\c:d?.zip"), "a_b_c_d_.zip");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_directory_is_not_writable() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert_eq!(
+            len,
+            Some(0),
+            "a failed delete must drop the rejected bytes in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_rejected_partial_is_unchanged_when_truncate_also_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-both-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        let body = b"rejected-prefix";
+        std::fs::write(&file, body).unwrap();
+        let mut file_perms = std::fs::metadata(&file).unwrap().permissions();
+        file_perms.set_mode(0o444);
+        std::fs::set_permissions(&file, file_perms).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+
+        let clear = clear_rejected_partial(&file).await;
+        let bytes = std::fs::read(&file).ok();
+
+        let mut file_perms = std::fs::metadata(&file).unwrap().permissions();
+        file_perms.set_mode(0o644);
+        std::fs::set_permissions(&file, file_perms).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+
+        assert_eq!(clear, RejectedPartialClear::Unchanged);
+        assert_eq!(bytes.as_deref(), Some(body.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_delete_is_sharing_violation() {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&file)
+            .unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+        drop(held);
+
+        assert_eq!(
+            len,
+            Some(0),
+            "a sharing violation on delete must still drop the rejected bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clear_rejected_partial_is_unchanged_when_write_is_also_denied() {
+        const FILE_SHARE_NONE: u32 = 0;
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reject-share-none-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        let body = b"rejected-prefix";
+        std::fs::write(&file, body).unwrap();
+        // share_mode(0) denies every later open, including the read this
+        // assertion would otherwise use. The bytes are read through the holder.
+        let mut held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_NONE)
+            .open(&file)
+            .unwrap();
+
+        let clear = clear_rejected_partial(&file).await;
+        held.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).unwrap();
+        drop(held);
+
+        assert_eq!(clear, RejectedPartialClear::Unchanged);
+        assert_eq!(bytes, body);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
@@ -885,6 +1117,56 @@ mod tests {
         assert!(!result.changed);
         assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(result.on_disk, 8_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejected_partial_ignores_file_length_and_segment_sum() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconcile-rejected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0xFFu8; 4_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.downloaded_bytes = 4_000;
+        job.total_bytes = 4_000;
+        job.progress = 100.0;
+        job.rejected_partial = true;
+        job.transfer_format_version = 1;
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 4_000,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 3_999,
+                written: 4_000,
+                state: SegmentState::Completed,
+            }],
+            preallocated: true,
+        });
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(!result.used_metadata_len);
+        assert!(!result.used_map_sum);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(job.progress, 0.0);
+        assert!(job.rejected_partial);
+        assert!(
+            job.segment_map.is_some(),
+            "the map stays until a truncate-open"
+        );
+        assert_eq!(std::fs::metadata(&job.temp_path).unwrap().len(), 4_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -74,6 +74,9 @@ pub struct CommitIdentity {
     pub transfer_mode: Option<TransferMode>,
     pub fallback_reason: Option<String>,
     pub map: MapUpdate,
+    /// `Some(true)` marks the current `.part` as rejected bytes that could
+    /// not be removed. `Some(false)` clears that mark after a truncate-open.
+    pub rejected_partial: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +176,9 @@ pub fn apply_commit_identity(job: &mut Job, c: &CommitIdentity) {
         MapUpdate::Unchanged => {}
         MapUpdate::Set(map) => job.segment_map = Some(map.clone()),
         MapUpdate::Clear => job.segment_map = None,
+    }
+    if let Some(rejected) = c.rejected_partial {
+        job.rejected_partial = rejected;
     }
 }
 
