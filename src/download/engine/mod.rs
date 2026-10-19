@@ -19,6 +19,9 @@ mod commands;
 mod persist;
 mod worker;
 
+#[cfg(test)]
+mod content_encoding_tests;
+
 pub(crate) use persist::EngineIdentity;
 #[cfg(test)]
 pub use persist::MemoryJobStore;

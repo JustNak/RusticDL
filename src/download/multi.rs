@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::body::{stream_body, PositionedSink, StreamEnd};
+use super::body::{reject_non_identity_content_encoding, stream_body, PositionedSink, StreamEnd};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::context::TransferContext;
@@ -804,6 +804,20 @@ async fn run_segment_loop(
 
         if control_outcome(&task.control).is_some() {
             return Ok(());
+        }
+
+        // A 206 is about to be written at this offset. Name a non-identity
+        // coding before the range-size check, and before `stream_segment`.
+        if matches!(range_status, RangeStatus::Partial { .. }) {
+            if let Err(error) = reject_non_identity_content_encoding(response.headers()) {
+                if control_outcome(&task.control).is_some() {
+                    return Ok(());
+                }
+                mark_segment(&task.shared, task.index, |segment| {
+                    segment.state = SegmentState::Failed;
+                });
+                return Err(error);
+            }
         }
 
         if let Err(error) = classify_segment_status(
