@@ -1168,6 +1168,64 @@ mod tests {
         assert_capped_coding_list(&err, 40 * 1830 - CODING_LIST_MAX_NAMES);
     }
 
+    fn content_encoding_message(list: &str) -> String {
+        format!(
+            "Response is Content-Encoding: {list}; asked for identity. Use a URL that sends the decoded file."
+        )
+    }
+
+    fn reject_content_codings(tokens: &[&str]) -> DownloadError {
+        let header = tokens.join(",");
+        reject_non_identity_content_encoding(&encoding_headers(Some(header.as_bytes())))
+            .expect_err("coding list")
+    }
+
+    /// Three 32-byte tokens. The 4-name cap does not bind (only 3 names).
+    /// The joined list is 32 + 2 + 32 + 2 + 32 = 100 bytes.
+    /// Two names are 66, plus ` +1 more` (7) is 73, still over 64.
+    /// One name plus ` +2 more` is 39, which fits.
+    #[test]
+    fn coding_list_byte_cap_three_32_byte_tokens() {
+        let token = "a".repeat(32);
+        let err = reject_content_codings(&[&token, &token, &token]);
+        assert_eq!(
+            err.message,
+            content_encoding_message(&format!("{token} +2 more"))
+        );
+        assert!(!err.retryable);
+        assert_eq!(err.category, FailureCategory::Resume);
+    }
+
+    /// 32 + `, ` + 30 = 64. Both names fit, so there is no `+K more`.
+    #[test]
+    fn coding_list_byte_cap_keeps_exactly_64_bytes() {
+        let first = "a".repeat(32);
+        let second = "b".repeat(30);
+        let list = format!("{first}, {second}");
+        assert_eq!(list.len(), 64);
+        let err = reject_content_codings(&[&first, &second]);
+        assert_eq!(err.message, content_encoding_message(&list));
+        assert!(!err.retryable);
+        assert_eq!(err.category, FailureCategory::Resume);
+    }
+
+    /// 32 + `, ` + 31 = 65. That pair does not fit, so the list is the first
+    /// name plus ` +1 more` (39 bytes).
+    #[test]
+    fn coding_list_byte_cap_shrinks_at_65_bytes() {
+        let first = "a".repeat(32);
+        let second = "b".repeat(31);
+        let uncapped = format!("{first}, {second}");
+        assert_eq!(uncapped.len(), 65);
+        let err = reject_content_codings(&[&first, &second]);
+        assert_eq!(
+            err.message,
+            content_encoding_message(&format!("{first} +1 more"))
+        );
+        assert!(!err.retryable);
+        assert_eq!(err.category, FailureCategory::Resume);
+    }
+
     #[tokio::test]
     async fn stream_body_append_sink_writes_full_payload() {
         let payload = b"append-sink-payload-0123456789";

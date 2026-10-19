@@ -426,6 +426,12 @@ async fn run_case(script: Script, config: EngineRuntimeConfig, timeout: Duration
             match events.recv().await {
                 Some(EngineEvent::JobsChanged(jobs)) => {
                     if let Some(job) = jobs.iter().find(|job| job.id == job_id) {
+                        assert!(
+                            job.retry_attempts == 0,
+                            "error was retryable (retry_attempts={}, error={:?}); a non-retryable failure must finish on the first attempt",
+                            job.retry_attempts,
+                            job.error
+                        );
                         if job.state.is_terminal() {
                             break job.clone();
                         }
@@ -455,8 +461,9 @@ async fn run_case(script: Script, config: EngineRuntimeConfig, timeout: Duration
 }
 
 fn default_engine() -> EngineRuntimeConfig {
-    // Default auto_retry is 6. Leave it there so a retryable error cannot
-    // pass a retry_attempts == 0 assertion.
+    // Default auto_retry is 6. `run_case` asserts `retry_attempts == 0` on
+    // the first jobs update, so a retryable error fails that assertion
+    // instead of sleeping through the wait timeout.
     EngineRuntimeConfig::default()
 }
 
