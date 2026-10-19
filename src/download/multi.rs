@@ -2506,6 +2506,7 @@ Content-Length: {}\r\n\
         let dir =
             std::env::temp_dir().join(format!("rusticdl-multi-precheck-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TestDir(dir.clone());
         let path = dir.join("out.bin.part");
         let writer = Arc::new(SegmentFileWriter::open(&path).unwrap());
         let url = format!("http://{addr}/file.bin");
@@ -2570,6 +2571,112 @@ Content-Length: {}\r\n\
             0,
             "SegmentFileWriter::open can leave an empty file; the claim is no payload bytes"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Resume with segment 0 already written, so a bad segment cannot fall
+    /// back to single-stream. The 206 is gzip and its Content-Range would fail
+    /// `classify_segment_status`. The encoding error must be the one returned.
+    #[tokio::test]
+    async fn issue188_multi_gzip_206_resume_fails_before_classify() {
+        let total = 2 * MIN_SEGMENT_SIZE as usize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&collected);
+                let reply = if req.starts_with("HEAD ") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\n\r\n"
+                    )
+                } else if req.to_ascii_lowercase().contains("range: bytes=0-0")
+                    || req.to_ascii_lowercase().contains("range: bytes=1-1")
+                {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-0/{total}\r\nContent-Length: 1\r\n\r\nx"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+Connection: close\r\n\
+Accept-Ranges: bytes\r\n\
+Content-Encoding: gzip\r\n\
+Content-Range: bytes 1-15/{total}\r\n\
+Content-Length: 15\r\n\r\n"
+                    )
+                };
+                let _ = socket.write_all(reply.as_bytes()).await;
+                if reply.contains("Content-Encoding: gzip") {
+                    let _ = socket.write_all(&[b'Z'; 15]).await;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-multi-gzip-resume-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TestDir(dir.clone());
+        let target = dir.join("out.bin");
+        let temp = PathBuf::from(format!("{}.part", target.display()));
+        let part = vec![b'A'; total];
+        std::fs::write(&temp, &part).unwrap();
+
+        let url = format!("http://{addr}/file.bin");
+        let mut job = Job::new(url, "out.bin".into(), target.clone(), temp.clone());
+        job.total_bytes = total as u64;
+        job.transfer_format_version = 1;
+        job.resume_supported = true;
+        job.validators.expected_size = Some(total as u64);
+        job.segment_map = Some(two_seg_map(MIN_SEGMENT_SIZE, 0));
+        job.downloaded_bytes = MIN_SEGMENT_SIZE;
+
+        let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
+        let ctx = test_ctx(job, on_progress, None, 2);
+        let err = run_transfer(ctx)
+            .await
+            .expect_err("gzip 206 must fail before classify");
+        server.abort();
+
+        assert!(!err.retryable, "{err:?}");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert_eq!(
+            err.message,
+            "Response is Content-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+            "pre-check must win over classify_segment_status, which would report \
+             Unexpected resume range (got 1-15, expected {}-{}). Use Restart.",
+            MIN_SEGMENT_SIZE,
+            total as u64 - 1
+        );
+        assert!(!target.exists(), "must not complete the target");
+        assert_eq!(
+            std::fs::read(&temp).unwrap_or_default(),
+            part,
+            "the written prefix must stay byte-for-byte"
+        );
     }
 }

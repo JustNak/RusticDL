@@ -354,6 +354,9 @@ fn list_codings(
     headers: &reqwest::header::HeaderMap,
     name: reqwest::header::HeaderName,
 ) -> Result<Option<Vec<ListedCoding>>, ()> {
+    // Hyper treats a trailing empty piece as "not chunked" and reads the body
+    // raw. Dropping that piece here would accept `chunked,` as one chunked.
+    let keep_empty = name == reqwest::header::TRANSFER_ENCODING;
     let values = headers.get_all(name);
     if values.iter().next().is_none() {
         return Ok(None);
@@ -364,6 +367,9 @@ fn list_codings(
         for coding in text.split(',') {
             let coding = coding.trim();
             if coding.is_empty() {
+                if keep_empty {
+                    listed.push(ListedCoding::Other("unrecognized".to_string()));
+                }
                 continue;
             }
             listed.push(if coding.eq_ignore_ascii_case("identity") {
@@ -381,22 +387,51 @@ fn list_codings(
     Ok(Some(listed))
 }
 
+const CODING_LIST_MAX_NAMES: usize = 4;
+const CODING_LIST_MAX_BYTES: usize = 64;
+
 fn names_for_error(codings: &[ListedCoding]) -> String {
-    let foreign: Vec<&str> = codings
+    let foreign_only = codings
         .iter()
-        .filter_map(|coding| match coding {
-            ListedCoding::Other(name) => Some(name.as_str()),
-            ListedCoding::Identity | ListedCoding::Chunked => None,
-        })
-        .collect();
-    if foreign.is_empty() {
-        codings
-            .iter()
-            .map(coding_label)
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        foreign.join(", ")
+        .any(|coding| matches!(coding, ListedCoding::Other(_)));
+    let mut shown = Vec::new();
+    let mut total = 0usize;
+    for coding in codings {
+        let name = match coding {
+            ListedCoding::Other(name) => name.as_str(),
+            ListedCoding::Identity | ListedCoding::Chunked if foreign_only => continue,
+            ListedCoding::Identity | ListedCoding::Chunked => coding_label(coding),
+        };
+        total += 1;
+        if shown.len() < CODING_LIST_MAX_NAMES {
+            shown.push(name);
+        }
+    }
+    cap_coding_list(&shown, total)
+}
+
+fn cap_coding_list(names: &[&str], total: usize) -> String {
+    if total == 0 {
+        return "unrecognized".to_string();
+    }
+    let mut take = names.len().min(CODING_LIST_MAX_NAMES).min(total);
+    loop {
+        let omitted = total - take;
+        let listed = names[..take].join(", ");
+        let combined = if omitted == 0 {
+            listed
+        } else if listed.is_empty() {
+            format!("+{omitted} more")
+        } else {
+            format!("{listed} +{omitted} more")
+        };
+        if combined.len() <= CODING_LIST_MAX_BYTES {
+            return combined;
+        }
+        if take == 0 {
+            return "unrecognized".to_string();
+        }
+        take -= 1;
     }
 }
 
@@ -422,9 +457,8 @@ pub(crate) fn reject_non_identity_content_encoding(
 }
 
 /// Allow no `Transfer-Encoding`, identity only, or exactly one `chunked` as
-/// the final token (earlier tokens may only be `identity`). Hyper dechunks
-/// when the last token is `chunked`, including when `chunked` is repeated, so
-/// anything else can store framing or an encoded payload. Not retried.
+/// the final token (earlier tokens may only be `identity`). An empty token
+/// anywhere in the combined header values is rejected. Not retried.
 pub(crate) fn reject_unsupported_transfer_encoding(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), DownloadError> {
@@ -460,8 +494,8 @@ fn transfer_codings_allowed(codings: &[ListedCoding]) -> bool {
     chunked == 1 && ends_chunked && prefix_identity
 }
 
-/// True only for the one `Transfer-Encoding` shape hyper actually dechunks
-/// into the raw file: a single final `chunked`, with only `identity` before it.
+/// True only when this client treats `Transfer-Encoding` as a decoded body:
+/// a single final `chunked`, with only `identity` before it.
 pub(crate) fn transfer_encoding_is_accepted_chunked(headers: &reqwest::header::HeaderMap) -> bool {
     match list_codings(headers, reqwest::header::TRANSFER_ENCODING) {
         Ok(Some(codings)) => {
@@ -909,10 +943,14 @@ mod tests {
         }
 
         // chunked is framing only when it is the single final token.
-        for value in ["chunked, identity", "chunked, chunked"] {
+        for (value, token) in [
+            ("chunked, identity", "chunked, identity"),
+            ("chunked, chunked", "chunked, chunked"),
+        ] {
             let err =
                 reject_unsupported_transfer_encoding(&transfer_headers(Some(value.as_bytes())))
                     .expect_err(value);
+            assert_eq!(err.message, transfer_error(token), "{value}");
             assert!(!err.retryable, "{value}: {err:?}");
             assert_eq!(err.category, FailureCategory::Resume, "{value}");
         }
@@ -928,6 +966,7 @@ mod tests {
         );
         let duplicate = reject_unsupported_transfer_encoding(&duplicate_chunked)
             .expect_err("two chunked headers");
+        assert_eq!(duplicate.message, transfer_error("chunked, chunked"));
         assert!(!duplicate.retryable);
         assert_eq!(duplicate.category, FailureCategory::Resume);
 
@@ -957,6 +996,53 @@ mod tests {
             Some(b"chunked, chunked")
         )));
         assert!(!transfer_encoding_is_accepted_chunked(&duplicate_chunked));
+    }
+
+    fn transfer_error(token: &str) -> String {
+        format!(
+            "Response is Transfer-Encoding: {token}; asked for identity. Use a URL that sends the decoded file."
+        )
+    }
+
+    fn assert_empty_transfer_token(headers: reqwest::header::HeaderMap, token: &str) {
+        let err = reject_unsupported_transfer_encoding(&headers).expect_err(token);
+        assert_eq!(err.message, transfer_error(token), "{token}");
+        assert!(!err.retryable, "{token}");
+        assert_eq!(err.category, FailureCategory::Resume, "{token}");
+    }
+
+    #[test]
+    fn transfer_encoding_rejects_empty_tokens() {
+        for (value, token) in [
+            (&b"chunked,"[..], "unrecognized"),
+            (&b"chunked, "[..], "unrecognized"),
+            (&b"chunked,,"[..], "unrecognized, unrecognized"),
+            (&b"chunked\t,"[..], "unrecognized"),
+        ] {
+            assert_empty_transfer_token(transfer_headers(Some(value)), token);
+        }
+
+        let mut empty_second = reqwest::header::HeaderMap::new();
+        empty_second.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+        empty_second.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static(""),
+        );
+        assert_empty_transfer_token(empty_second, "unrecognized");
+
+        let mut comma_second = reqwest::header::HeaderMap::new();
+        comma_second.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+        comma_second.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static(","),
+        );
+        assert_empty_transfer_token(comma_second, "unrecognized, unrecognized");
     }
 
     #[test]
@@ -1014,6 +1100,72 @@ mod tests {
             capped.message
         );
         assert!(!capped.message.contains(&token_33));
+    }
+
+    fn content_encoding_error_max() -> usize {
+        "Response is Content-Encoding: ".len()
+            + CODING_LIST_MAX_BYTES
+            + "; asked for identity. Use a URL that sends the decoded file.".len()
+    }
+
+    fn assert_capped_coding_list(err: &DownloadError, omitted: usize) {
+        let cap = content_encoding_error_max();
+        let expected = format!(
+            "Response is Content-Encoding: a, a, a, a +{omitted} more; asked for identity. Use a URL that sends the decoded file."
+        );
+        assert_eq!(err.message, expected);
+        assert!(
+            err.message.len() <= cap,
+            "coding list must stay within {cap} bytes, got {}",
+            err.message.len()
+        );
+        assert!(err.message.contains(&format!("+{omitted} more")));
+        assert!(!err.retryable);
+        assert_eq!(err.category, FailureCategory::Resume);
+    }
+
+    #[test]
+    fn coding_list_is_capped_for_two_hundred_thousand_names() {
+        let header = "a,".repeat(200_000);
+        let err = reject_non_identity_content_encoding(&encoding_headers(Some(header.as_bytes())))
+            .expect_err("repeated");
+        // Trailing comma is an empty piece. Content-Encoding still skips it.
+        assert_capped_coding_list(&err, 200_000 - CODING_LIST_MAX_NAMES);
+        assert!(!err.message.contains(&"a, ".repeat(5)));
+        let notify = crate::notifications::NotifySendInvocation::from_payload(
+            "Download failed",
+            &format!("payload.bin — {}", err.message),
+        );
+        let body = notify.args.last().expect("notify body");
+        assert!(
+            body.len() <= 1024,
+            "notification body must be 1 KiB or less, got {}",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn coding_list_caps_one_thousand_tokens_in_one_header() {
+        let header = "a,".repeat(1000);
+        let err = reject_non_identity_content_encoding(&encoding_headers(Some(header.as_bytes())))
+            .expect_err("thousand");
+        assert_capped_coding_list(&err, 1000 - CODING_LIST_MAX_NAMES);
+    }
+
+    #[test]
+    fn coding_list_caps_forty_headers() {
+        // 40 headers of 1830 `a` tokens. Joined without a list cap this is the
+        // 219_688-character Content-Encoding error.
+        let value = "a,".repeat(1830);
+        let mut headers = reqwest::header::HeaderMap::new();
+        for _ in 0..40 {
+            headers.append(
+                reqwest::header::CONTENT_ENCODING,
+                reqwest::header::HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+        let err = reject_non_identity_content_encoding(&headers).expect_err("forty headers");
+        assert_capped_coding_list(&err, 40 * 1830 - CODING_LIST_MAX_NAMES);
     }
 
     #[tokio::test]
@@ -1605,20 +1757,37 @@ mod tests {
         format!("http://{addr}/file.bin")
     }
 
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     async fn stream_encoded(
         encoding: &str,
         payload: &[u8],
-    ) -> (std::path::PathBuf, Result<StreamEnd, DownloadError>) {
+    ) -> (
+        std::path::PathBuf,
+        Result<StreamEnd, DownloadError>,
+        TestDir,
+    ) {
         stream_from_url(&serve_encoded(encoding, payload).await, payload).await
     }
 
     async fn stream_from_url(
         url: &str,
         payload: &[u8],
-    ) -> (std::path::PathBuf, Result<StreamEnd, DownloadError>) {
+    ) -> (
+        std::path::PathBuf,
+        Result<StreamEnd, DownloadError>,
+        TestDir,
+    ) {
         let response = get_response(url).await;
         let dir = std::env::temp_dir().join(format!("rusticdl-ce-body-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
+        let guard = TestDir(dir.clone());
         let path = dir.join("out.bin.part");
         let mut sink = AppendSink::open(&path, 0)
             .await
@@ -1628,13 +1797,13 @@ mod tests {
         let limiter = GlobalBandwidthLimiter::new(None);
         let result = stream_body(response, &mut sink, &control, &limiter, |_| {}).await;
         drop(sink);
-        (path, result)
+        (path, result, guard)
     }
 
     #[tokio::test]
     async fn issue188_stream_body_rejects_gzip_content_encoding_before_write() {
         let payload = b"compressed-looking-bytes";
-        let (path, result) = stream_encoded("gzip", payload).await;
+        let (path, result, _dir) = stream_encoded("gzip", payload).await;
         let len = tokio::fs::metadata(&path)
             .await
             .map(|m| m.len())
@@ -1658,7 +1827,7 @@ mod tests {
     async fn issue188_stream_body_rejects_gzip_uppercase_and_list_before_write() {
         for encoding in ["GZIP", "gzip, identity"] {
             let payload = b"compressed-looking-bytes";
-            let (path, result) = stream_encoded(encoding, payload).await;
+            let (path, result, _dir) = stream_encoded(encoding, payload).await;
             let len = tokio::fs::metadata(&path)
                 .await
                 .map(|m| m.len())
@@ -1683,7 +1852,7 @@ mod tests {
     #[tokio::test]
     async fn issue188_stream_body_identity_content_encoding_still_writes() {
         let payload = b"identity-body-0123456789";
-        let (path, result) = stream_encoded("identity", payload).await;
+        let (path, result, _dir) = stream_encoded("identity", payload).await;
         let end = result.expect("identity coding is the decoded file");
         match end {
             StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, payload.len() as u64),
@@ -1698,16 +1867,20 @@ mod tests {
         let payload = b"5\r\nhello\r\n0\r\n\r\n";
         let url =
             serve_with_extra_headers("Transfer-Encoding: chunked, identity\r\n", payload).await;
-        let (path, result) = stream_from_url(&url, payload).await;
+        let (path, result, _dir) = stream_from_url(&url, payload).await;
         let len = tokio::fs::metadata(&path)
             .await
             .map(|meta| meta.len())
             .unwrap_or(0);
         match result {
             Err(err) => {
+                assert_eq!(err.message, transfer_error("chunked, identity"));
                 assert!(!err.retryable, "{err:?}");
                 assert_eq!(err.category, FailureCategory::Resume);
-                assert_eq!(len, 0, "chunk framing must not land in the .part");
+                assert_eq!(
+                    len, 0,
+                    "an empty file can exist after AppendSink::open; the claim is no payload bytes"
+                );
             }
             Ok(end) => panic!("chunk framing was written: {end:?} part_len={len}"),
         }
@@ -1718,7 +1891,7 @@ mod tests {
     async fn issue188_stream_body_rejects_gzip_transfer_encoding_before_write() {
         let payload = b"compressed-looking-bytes";
         let url = serve_with_extra_headers("Transfer-Encoding: gzip\r\n", payload).await;
-        let (path, result) = stream_from_url(&url, payload).await;
+        let (path, result, _dir) = stream_from_url(&url, payload).await;
         let len = tokio::fs::metadata(&path)
             .await
             .map(|meta| meta.len())
@@ -1746,7 +1919,7 @@ mod tests {
         let payload = b"hello";
         let chunked = b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let chunked_url = serve_raw_response(chunked).await;
-        let (path, result) = stream_from_url(&chunked_url, payload).await;
+        let (path, result, _dir) = stream_from_url(&chunked_url, payload).await;
         let end = result.expect("chunked framing is not an encoded file");
         match end {
             StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, payload.len() as u64),
@@ -1757,7 +1930,7 @@ mod tests {
 
         let identity_url =
             serve_with_extra_headers("Transfer-Encoding: identity\r\n", payload).await;
-        let (path, result) = stream_from_url(&identity_url, payload).await;
+        let (path, result, _dir) = stream_from_url(&identity_url, payload).await;
         let end = result.expect("identity transfer coding is the raw file");
         match end {
             StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, payload.len() as u64),
@@ -1801,7 +1974,7 @@ mod tests {
             payload,
         )
         .await;
-        let (path, result) = stream_from_url(&url, payload).await;
+        let (path, result, _dir) = stream_from_url(&url, payload).await;
         let len = tokio::fs::metadata(&path)
             .await
             .map(|meta| meta.len())
@@ -1823,7 +1996,7 @@ mod tests {
 
     async fn assert_stream_transfer_rejected(extra: &str, payload: &[u8]) {
         let url = serve_with_extra_headers(extra, payload).await;
-        let (path, result) = stream_from_url(&url, payload).await;
+        let (path, result, _dir) = stream_from_url(&url, payload).await;
         let len = tokio::fs::metadata(&path)
             .await
             .map(|meta| meta.len())
@@ -1869,6 +2042,74 @@ mod tests {
         assert_stream_transfer_rejected(
             "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
             b"compressed-looking-bytes",
+        )
+        .await;
+    }
+
+    async fn assert_stream_empty_transfer_rejected(extra: &str, token: &str) {
+        let payload = b"5\r\nhello\r\n0\r\n\r\n";
+        let url = serve_with_extra_headers(extra, payload).await;
+        let (path, result, _dir) = stream_from_url(&url, payload).await;
+        let len = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        match result {
+            Err(err) => {
+                assert_eq!(err.message, transfer_error(token), "{extra}");
+                assert!(!err.retryable, "{extra}: {err:?}");
+                assert_eq!(err.category, FailureCategory::Resume, "{extra}");
+                assert_eq!(
+                    len, 0,
+                    "an empty file can exist after AppendSink::open; the claim is no payload bytes"
+                );
+            }
+            Ok(end) => panic!("chunk framing was written: {end:?} part_len={len} extra={extra:?}"),
+        }
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_trailing_comma() {
+        assert_stream_empty_transfer_rejected("Transfer-Encoding: chunked,\r\n", "unrecognized")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_double_comma() {
+        assert_stream_empty_transfer_rejected(
+            "Transfer-Encoding: chunked,,\r\n",
+            "unrecognized, unrecognized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_trailing_space() {
+        assert_stream_empty_transfer_rejected("Transfer-Encoding: chunked, \r\n", "unrecognized")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_tab_comma() {
+        assert_stream_empty_transfer_rejected("Transfer-Encoding: chunked\t,\r\n", "unrecognized")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_then_empty_header() {
+        assert_stream_empty_transfer_rejected(
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: \r\n",
+            "unrecognized",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_then_comma_header() {
+        assert_stream_empty_transfer_rejected(
+            "Transfer-Encoding: chunked\r\nTransfer-Encoding: ,\r\n",
+            "unrecognized, unrecognized",
         )
         .await;
     }

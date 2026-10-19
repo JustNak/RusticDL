@@ -58,6 +58,10 @@ enum Script {
     /// First GET stores an identity prefix and closes early. The Range GET is
     /// answered `200` (the whole entity), not `206`, with `header`.
     RangeAnswered200 { header: &'static str },
+    /// HEAD has no Content-Length. A `Range: bytes=0-0` probe is an empty 200,
+    /// so it does not publish a size. The unscoped GET sends `values` as
+    /// Transfer-Encoding and the raw four-chunk framing.
+    NoSizeFramed { values: &'static [&'static str] },
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -161,6 +165,33 @@ fn chunk_encode(body: &[u8]) -> Vec<u8> {
     wire.extend_from_slice(body);
     wire.extend_from_slice(b"\r\n0\r\n\r\n");
     wire
+}
+
+/// Four `0x10000` chunks plus the terminator. 262_185 bytes, prefix `10000\r\n`.
+fn no_size_framing() -> Vec<u8> {
+    let mut wire = Vec::with_capacity(262_185);
+    let chunk = vec![b'x'; 0x1_0000];
+    for _ in 0..4 {
+        wire.extend_from_slice(b"10000\r\n");
+        wire.extend_from_slice(&chunk);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    assert_eq!(wire.len(), 262_185);
+    assert!(wire.starts_with(b"10000\r\n"));
+    wire
+}
+
+fn response_close(extra: &str) -> String {
+    let mut head = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+    if !extra.is_empty() {
+        head.push_str(extra);
+        if !extra.ends_with("\r\n") {
+            head.push_str("\r\n");
+        }
+    }
+    head.push_str("\r\n");
+    head
 }
 
 fn response_head(status: &str, extra: &str, content_length: u64) -> String {
@@ -317,6 +348,23 @@ async fn serve_one(
                     write_all_or_stop(&mut socket, head.as_bytes()).await;
                     write_all_or_stop(&mut socket, GZIP_BODY).await;
                 }
+            }
+        }
+        Script::NoSizeFramed { values } => {
+            if method == "HEAD" || request_range(&request).is_some() {
+                let head = response_close("");
+                write_all_or_stop(&mut socket, head.as_bytes()).await;
+            } else if method == "GET" {
+                let mut extra = String::new();
+                for value in *values {
+                    extra.push_str("Transfer-Encoding: ");
+                    extra.push_str(value);
+                    extra.push_str("\r\n");
+                }
+                let head = response_close(&extra);
+                write_all_or_stop(&mut socket, head.as_bytes()).await;
+                let wire = no_size_framing();
+                write_all_or_stop(&mut socket, &wire).await;
             }
         }
     }
@@ -638,6 +686,7 @@ async fn assert_transfer_framing_rejected(
     values: &'static [&'static str],
     body: &'static [u8],
     chunk_wire: bool,
+    token: &str,
 ) {
     let run = run_case(
         Script::TransferEncoded {
@@ -650,7 +699,22 @@ async fn assert_transfer_framing_rejected(
     )
     .await;
     let context = fail_context(&run.job);
+    let expected = transfer_error(token);
     assert_eq!(run.job.state, JobState::Failed, "{context}");
+    assert_eq!(
+        run.job.error.as_deref(),
+        Some(expected.as_str()),
+        "{context}"
+    );
+    assert_eq!(
+        run.job.failure_category,
+        Some(FailureCategory::Resume),
+        "{context}"
+    );
+    // `Job` does not store `DownloadError.retryable`. Default auto_retry is 6,
+    // so `retry_attempts == 0` is the engine-visible check. The flag is
+    // asserted on the `DownloadError` in
+    // `transfer_encoding_rejects_codings_other_than_chunked_and_identity`.
     assert_eq!(run.job.retry_attempts, 0, "{context}");
     assert!(
         !run.job.target_path.exists(),
@@ -664,18 +728,114 @@ async fn assert_transfer_framing_rejected(
 
 #[tokio::test]
 async fn issue188_transfer_encoding_chunked_identity_fails_closed() {
-    assert_transfer_framing_rejected(&["chunked, identity"], b"5\r\nhello\r\n0\r\n\r\n", false)
-        .await;
+    assert_transfer_framing_rejected(
+        &["chunked, identity"],
+        b"5\r\nhello\r\n0\r\n\r\n",
+        false,
+        "chunked, identity",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn issue188_transfer_encoding_chunked_chunked_fails_closed() {
-    assert_transfer_framing_rejected(&["chunked, chunked"], b"hello", true).await;
+    assert_transfer_framing_rejected(&["chunked, chunked"], b"hello", true, "chunked, chunked")
+        .await;
 }
 
 #[tokio::test]
 async fn issue188_transfer_encoding_duplicate_chunked_headers_fail_closed() {
-    assert_transfer_framing_rejected(&["chunked", "chunked"], b"hello", true).await;
+    assert_transfer_framing_rejected(&["chunked", "chunked"], b"hello", true, "chunked, chunked")
+        .await;
+}
+
+fn transfer_error(token: &str) -> String {
+    format!(
+        "Response is Transfer-Encoding: {token}; asked for identity. Use a URL that sends the decoded file."
+    )
+}
+
+async fn assert_no_size_empty_token(values: &'static [&'static str], token: &str) {
+    let run = run_case(
+        Script::NoSizeFramed { values },
+        default_engine(),
+        Duration::from_secs(20),
+    )
+    .await;
+    let context = fail_context(&run.job);
+    if run.job.state == JobState::Completed {
+        let bytes = std::fs::read(&run.job.target_path).unwrap_or_default();
+        let prefix = bytes.get(..7).unwrap_or(&bytes);
+        panic!(
+            "no-size path completed with {} bytes starting {prefix:?}: {context}",
+            bytes.len()
+        );
+    }
+    let expected = transfer_error(token);
+    assert_eq!(run.job.state, JobState::Failed, "{context}");
+    assert_eq!(
+        run.job.error.as_deref(),
+        Some(expected.as_str()),
+        "{context}"
+    );
+    assert_eq!(
+        run.job.failure_category,
+        Some(FailureCategory::Resume),
+        "{context}"
+    );
+    assert_eq!(run.job.retry_attempts, 0, "{context}");
+    assert!(
+        !run.job.target_path.exists(),
+        "nothing written as Completed: {context}"
+    );
+    assert!(
+        !run.job.temp_path.exists(),
+        "no committed temp file: {context}"
+    );
+    assert!(
+        run.requests
+            .iter()
+            .any(|line| line.starts_with("GET ") && line.contains("range=-")),
+        "the body GET must be unscoped: {:?}",
+        run.requests
+    );
+    assert!(
+        !run.requests
+            .iter()
+            .any(|line| { line.contains("range=bytes=") && !line.contains("range=bytes=0-0") }),
+        "no ranged download: {:?}",
+        run.requests
+    );
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_trailing_comma_fails_closed() {
+    assert_no_size_empty_token(&["chunked,"], "unrecognized").await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_trailing_space_fails_closed() {
+    assert_no_size_empty_token(&["chunked, "], "unrecognized").await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_double_comma_fails_closed() {
+    assert_no_size_empty_token(&["chunked,,"], "unrecognized, unrecognized").await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_tab_comma_fails_closed() {
+    assert_no_size_empty_token(&["chunked\t,"], "unrecognized").await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_then_empty_header_fails_closed() {
+    assert_no_size_empty_token(&["chunked", ""], "unrecognized").await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_then_comma_header_fails_closed() {
+    assert_no_size_empty_token(&["chunked", ","], "unrecognized, unrecognized").await;
 }
 
 #[tokio::test]
