@@ -1,0 +1,52 @@
+CASE length-mismatch
+URL http://127.0.0.1:44827/payload.bin
+driver_exit=0
+enqueue_status=queued
+job_id=c616b668-5b04-42ee-b905-c44628628968
+job_filename=payload.bin
+timed_out=false
+state=Failed
+error=Remote size changed (4096 bytes vs expected 8192). Use Restart.
+failure_category=Resume
+downloaded_bytes=0
+total_bytes=8192
+resume_supported=false
+target_path=/tmp/rusticdl-engine-engine-proof-1/length-mismatch/downloads/payload.bin
+target_exists=false
+temp_path=/tmp/rusticdl-engine-engine-proof-1/length-mismatch/downloads/payload.bin.part
+temp_exists=false
+expected_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_sha256=-
+final_len=-
+final_matches_expected=false
+wire_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_matches_wire=false
+partial_sha256=-
+partial_len=-
+partial_matches_expected=false
+partial_matches_wire=false
+MANIFEST
+{
+  "case": "length-mismatch",
+  "route": "/payload.bin",
+  "identity_len": 4096,
+  "identity_sha256": "5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af",
+  "gzip_len": 321,
+  "gzip_sha256": "0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4",
+  "wire_len": 4096,
+  "wire_sha256": "5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af",
+  "head_status": 200,
+  "head_content_encoding": null,
+  "head_content_length": 8192,
+  "head_accept_ranges": false,
+  "get_status": 200,
+  "get_content_encoding": null,
+  "get_content_length": 4096,
+  "get_accept_ranges": false,
+  "get_ranges": "ignore",
+  "get_cut_after": null
+}
+SERVER_LOG
+REQ HEAD /payload.bin range=- -> 200 encoding=- advertised_length=8192 sent=0
+REQ GET /payload.bin range=- -> 200 encoding=- advertised_length=4096 sent=4096
+CASE_END length-mismatch

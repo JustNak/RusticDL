@@ -6,7 +6,8 @@ Secondary surfaces (browser extension, native host) are noted in gotchas where t
 
 ## Baseline preconditions
 
-- Launch with `.cursor/skills/verify-rusticdl/scripts/launch.sh` after `source …/scripts/env.sh`.
+- Desktop features launch with `.cursor/skills/verify-rusticdl/scripts/launch.sh` after `source …/scripts/env.sh`.
+- The download-engine feature does not launch the app. Run `.cursor/skills/verify-rusticdl/scripts/prove-download-engine.sh` (headless, no `DISPLAY`).
 - Use a disposable run directory: `/tmp/rusticdl-verify-$RUN_ID` with isolated `XDG_RUNTIME_DIR` and `XDG_DATA_HOME`.
 - Run `scripts/doctor.sh` and require `ok: true`, `appState: running`, a pid-owned `RusticDL` window, and `downloadDirectory` under the run dir.
 - Never drive an instance that was not started by this verification run.
@@ -14,7 +15,7 @@ Secondary surfaces (browser extension, native host) are noted in gotchas where t
 
 ## Driving conventions
 
-- Start every recipe from baseline unless its preconditions say otherwise.
+- Start every desktop recipe from baseline unless its preconditions say otherwise. The download-engine recipe is the exception: it does not launch the app.
 - Prefer visible labels (`Add download`, `Settings`, `Start download`, sidebar filter names) and IPC request types over raw coordinates.
 - Treat every command as literal. Keep quoted URLs and flags unchanged.
 - Run desktop actions through `control-rusticdl` (`scripts/ui.sh`, `scripts/screenshot.sh`).
@@ -46,3 +47,5 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Search queue](./search-queue.md) — title-bar search by name, URL, or path.
 - [Settings](./settings.md) — open Settings categories and Save settings.
 - [Pause and resume](./pause-resume.md) — pause/resume a selected active job from the queue.
+- [Download engine](./download-engine.md) — headless engine run against a local HTTP fixture (identity, gzip, Content-Length, 206).
+- [Close window](./close-window.md) — caption close keeps the process; Ctrl+Q quits.

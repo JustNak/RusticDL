@@ -1,0 +1,53 @@
+CASE resume-206
+URL http://127.0.0.1:45499/payload.bin
+driver_exit=0
+enqueue_status=queued
+job_id=5491b3ed-b322-4e4c-81f6-6ce0ec675f57
+job_filename=payload.bin
+timed_out=false
+state=Completed
+error=-
+failure_category=-
+downloaded_bytes=1024
+total_bytes=4096
+resume_supported=true
+target_path=/tmp/rusticdl-engine-engine-proof-1/resume-206/downloads/payload.bin
+target_exists=true
+temp_path=/tmp/rusticdl-engine-engine-proof-1/resume-206/downloads/payload.bin.part
+temp_exists=false
+expected_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_len=4096
+final_matches_expected=true
+wire_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_matches_wire=true
+partial_sha256=-
+partial_len=-
+partial_matches_expected=false
+partial_matches_wire=false
+MANIFEST
+{
+  "case": "resume-206",
+  "route": "/payload.bin",
+  "identity_len": 4096,
+  "identity_sha256": "5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af",
+  "gzip_len": 321,
+  "gzip_sha256": "0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4",
+  "wire_len": 4096,
+  "wire_sha256": "5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af",
+  "head_status": 200,
+  "head_content_encoding": null,
+  "head_content_length": 4096,
+  "head_accept_ranges": true,
+  "get_status": 200,
+  "get_content_encoding": null,
+  "get_content_length": 4096,
+  "get_accept_ranges": true,
+  "get_ranges": "206",
+  "get_cut_after": 1024
+}
+SERVER_LOG
+REQ HEAD /payload.bin range=- -> 200 encoding=- advertised_length=4096 sent=0
+REQ GET /payload.bin range=- -> 200 encoding=- advertised_length=4096 sent=1024
+REQ GET /payload.bin range=bytes=1024- -> 206 encoding=- advertised_length=3072 sent=3072
+CASE_END resume-206

@@ -6,9 +6,9 @@ Queue filters let a user narrow the main list to All downloads (with optional fi
 
 - `filter-all` shows the full library under All downloads.
 - `filter-type` narrows to Video, Audio, Compressed, Images, Documents, Programs, or Other.
-- `filter-active` shows queued/starting/downloading jobs.
+- `filter-active` shows queued, starting, downloading, and paused jobs (`JobState::is_active` in `src/download/job.rs`, applied by `filter_jobs` in `src/format.rs`).
 - `filter-completed` shows finished jobs.
-- `filter-failed` shows failed jobs.
+- `filter-failed` shows failed and canceled jobs (`QueueFilter::Failed` in `src/format.rs`).
 
 ## How to get to it (user POV)
 
@@ -26,7 +26,7 @@ Preconditions:
 - **Open Completed.** Choose `Completed`. Run `.cursor/skills/verify-rusticdl/scripts/ui.sh click-sidebar 'Completed'`. The main list shows only completed rows; the Completed badge is highlighted.
 - **Return to All.** Choose `All downloads`. Run `.cursor/skills/verify-rusticdl/scripts/ui.sh click-sidebar 'All downloads'`. The list shows every job again.
 - **Type filter.** Choose `Other` (or the type that holds the seed file). Run `.cursor/skills/verify-rusticdl/scripts/ui.sh click-sidebar 'Other'`. Jobs of other types disappear from the list.
-- **Proof.** Screenshot before/after with `.cursor/skills/verify-rusticdl/scripts/screenshot.sh filter-completed.png`. Confirm sidebar counts match `get_status` queueSummary fields where applicable.
+- **Proof.** Screenshot before/after with `.cursor/skills/verify-rusticdl/scripts/screenshot.sh filter-completed.png`. Sidebar All, Active, and Completed counts match `queueSummary.total`, `queueSummary.active`, and `queueSummary.completed`. The Failed sidebar count also includes canceled jobs (`count_jobs` in `src/format.rs`); `queueSummary.failed` counts only `Failed`.
 
 ## Gotchas
 
