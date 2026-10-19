@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::body::{
-    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch,
-    reject_non_identity_content_encoding, remote_size_changed_error, stream_body, AppendSink,
-    BodySink, CountingSink, StreamEnd,
+    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch, reject_encoded_body,
+    remote_size_changed_error, stream_body, AppendSink, BodySink, CountingSink, StreamEnd,
 };
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
@@ -403,7 +402,7 @@ pub async fn run_http_download_with_ctx(
                 }
                 // This 200 would replace the partial. An encoded body is not
                 // that file, even when its Content-Length matches.
-                reject_non_identity_content_encoding(response.headers())?;
+                reject_encoded_body(response.headers())?;
                 // This 200 answered a Range request. It may carry a new size only
                 // when ETag or Last-Modified says the resource changed. Reject a
                 // conflicting Content-Length before the partial is deleted.
@@ -597,7 +596,7 @@ pub async fn run_http_download_with_ctx(
         // Before the size check, and before `AppendSink::open`. A gzip GET
         // whose Content-Length matches HEAD must not be stored, and a gzip
         // GET whose length disagrees must name the coding.
-        reject_non_identity_content_encoding(response.headers())?;
+        reject_encoded_body(response.headers())?;
         if !accept_new_size {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)

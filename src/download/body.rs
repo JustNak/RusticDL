@@ -327,11 +327,63 @@ pub(crate) fn reject_non_identity_content_encoding(
     Err(encoded_body_error(&offending.join(", ")))
 }
 
+/// `chunked` is framing and `identity` is the raw file. Any other coding is
+/// still encoded. Hyper delivers a non-chunked coding's bytes unchanged, and
+/// it only dechunks when `chunked` is last, leaving an earlier coding intact.
+/// Not retried.
+pub(crate) fn reject_unsupported_transfer_encoding(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), DownloadError> {
+    let values = headers.get_all(reqwest::header::TRANSFER_ENCODING);
+    if values.iter().next().is_none() {
+        return Ok(());
+    }
+    let mut offending = Vec::new();
+    for value in values {
+        let text = match value.to_str() {
+            Ok(text) => text,
+            Err(_) => return Err(transfer_encoded_body_error("unreadable")),
+        };
+        for coding in text.split(',') {
+            let coding = coding.trim();
+            if coding.is_empty()
+                || coding.eq_ignore_ascii_case("identity")
+                || coding.eq_ignore_ascii_case("chunked")
+            {
+                continue;
+            }
+            offending.push(coding.to_ascii_lowercase());
+        }
+    }
+    if offending.is_empty() {
+        return Ok(());
+    }
+    Err(transfer_encoded_body_error(&offending.join(", ")))
+}
+
+/// Content-Encoding and Transfer-Encoding both name the bytes that would be stored.
+pub(crate) fn reject_encoded_body(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), DownloadError> {
+    reject_non_identity_content_encoding(headers)?;
+    reject_unsupported_transfer_encoding(headers)
+}
+
 fn encoded_body_error(coding: &str) -> DownloadError {
     download_error(
         FailureCategory::Resume,
         format!(
             "Response is Content-Encoding: {coding}; asked for identity. Use a URL that sends the decoded file."
+        ),
+        false,
+    )
+}
+
+fn transfer_encoded_body_error(coding: &str) -> DownloadError {
+    download_error(
+        FailureCategory::Resume,
+        format!(
+            "Response is Transfer-Encoding: {coding}; asked for identity. Use a URL that sends the decoded file."
         ),
         false,
     )
@@ -346,7 +398,7 @@ pub async fn stream_body(
 ) -> Result<StreamEnd, DownloadError> {
     // Last gate for every writer (`http` single-stream, lengthless confirm,
     // and multi-segment). Headers are checked before the body is pulled.
-    reject_non_identity_content_encoding(response.headers())?;
+    reject_encoded_body(response.headers())?;
     let policy = eos_policy_for_response(&response, sink.target_offset());
     stream_body_with_stall(
         response,
@@ -700,6 +752,55 @@ mod tests {
             reqwest::header::HeaderValue::from_static("Identity"),
         );
         assert!(reject_non_identity_content_encoding(&identities).is_ok());
+    }
+
+    fn transfer_headers(value: Option<&[u8]>) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(
+                reqwest::header::TRANSFER_ENCODING,
+                reqwest::header::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn transfer_encoding_rejects_codings_other_than_chunked_and_identity() {
+        let allow = [
+            None,
+            Some(&b"chunked"[..]),
+            Some(&b"Chunked"[..]),
+            Some(&b"identity"[..]),
+            Some(&b"Identity"[..]),
+            Some(&b"identity, chunked"[..]),
+            Some(&b"chunked, identity"[..]),
+        ];
+        for value in allow {
+            assert!(
+                reject_unsupported_transfer_encoding(&transfer_headers(value)).is_ok(),
+                "{value:?}"
+            );
+        }
+
+        let exact = "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.";
+        for value in ["gzip", "GZIP", "gzip, chunked", "chunked, gzip", " gzip "] {
+            let err =
+                reject_unsupported_transfer_encoding(&transfer_headers(Some(value.as_bytes())))
+                    .expect_err(value);
+            assert_eq!(err.message, exact, "{value}");
+            assert_eq!(err.category, FailureCategory::Resume);
+            assert!(!err.retryable, "{value}");
+        }
+
+        for coding in ["deflate", "br", "zstd", "x-gzip"] {
+            let err =
+                reject_unsupported_transfer_encoding(&transfer_headers(Some(coding.as_bytes())))
+                    .expect_err(coding);
+            assert!(err.message.contains(coding), "{err:?}");
+            assert!(err.message.contains("Transfer-Encoding"), "{err:?}");
+            assert!(!err.retryable);
+        }
     }
 
     #[tokio::test]
@@ -1375,6 +1476,82 @@ mod tests {
         }
         assert_eq!(tokio::fs::read(&path).await.unwrap(), payload);
         let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_gzip_transfer_encoding_before_write() {
+        let payload = b"compressed-looking-bytes";
+        let url = serve_with_extra_headers("Transfer-Encoding: gzip\r\n", payload).await;
+        let (path, result) = stream_from_url(&url, payload).await;
+        let len = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        match result {
+            Err(err) => {
+                assert!(!err.retryable, "{err:?}");
+                assert_eq!(err.category, FailureCategory::Resume);
+                assert_eq!(
+                    err.message,
+                    "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file."
+                );
+                assert_eq!(len, 0, "transfer-encoded bytes must not land in the .part");
+            }
+            Ok(end) => panic!("gzip transfer-encoding body was written: {end:?} part_len={len}"),
+        }
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_chunked_and_identity_transfer_encoding_still_write() {
+        let payload = b"hello";
+        let chunked = b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let chunked_url = serve_raw_response(chunked).await;
+        let (path, result) = stream_from_url(&chunked_url, payload).await;
+        let end = result.expect("chunked framing is not an encoded file");
+        match end {
+            StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, payload.len() as u64),
+            StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
+        }
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), payload);
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+
+        let identity_url =
+            serve_with_extra_headers("Transfer-Encoding: identity\r\n", payload).await;
+        let (path, result) = stream_from_url(&identity_url, payload).await;
+        let end = result.expect("identity transfer coding is the raw file");
+        match end {
+            StreamEnd::Exhausted { downloaded } => assert_eq!(downloaded, payload.len() as u64),
+            StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
+        }
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), payload);
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    async fn serve_raw_response(raw: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = raw.to_vec();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let mut collected = Vec::new();
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                collected.extend_from_slice(&buf[..n]);
+                if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = socket.write_all(&raw).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/file.bin")
     }
 
     #[tokio::test]

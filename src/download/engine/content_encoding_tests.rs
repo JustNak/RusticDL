@@ -47,6 +47,11 @@ enum Script {
     ResumeGzip,
     /// Two segments. Probes stay identity. Segment bodies are gzip-labeled.
     MultiGzip { total: u64 },
+    /// HEAD and GET share a body labeled with Transfer-Encoding and no Content-Encoding.
+    TransferEncoded {
+        coding: &'static str,
+        body: &'static [u8],
+    },
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -257,6 +262,14 @@ async fn serve_one(
                 }
             }
         }
+        Script::TransferEncoded { coding, body } => {
+            let extra = format!("Transfer-Encoding: {coding}\r\n");
+            let head = response_head("200 OK", &extra, body.len() as u64);
+            write_all_or_stop(&mut socket, head.as_bytes()).await;
+            if method == "GET" {
+                write_all_or_stop(&mut socket, body).await;
+            }
+        }
     }
     let _ = socket.shutdown().await;
 }
@@ -364,10 +377,10 @@ fn fail_context(job: &Job) -> String {
     )
 }
 
-fn assert_encoding_failure(job: &Job) {
+fn assert_named_coding_failure(job: &Job, message: &str) {
     let context = fail_context(job);
     assert_eq!(job.state, JobState::Failed, "{context}");
-    assert_eq!(job.error.as_deref(), Some(ENCODING_ERROR), "{context}");
+    assert_eq!(job.error.as_deref(), Some(message), "{context}");
     assert_eq!(
         job.failure_category,
         Some(FailureCategory::Resume),
@@ -378,6 +391,10 @@ fn assert_encoding_failure(job: &Job) {
         !job.target_path.exists(),
         "finished path must stay absent: {context}"
     );
+}
+
+fn assert_encoding_failure(job: &Job) {
+    assert_named_coding_failure(job, ENCODING_ERROR);
 }
 
 async fn encoded_head_and_get(encoding: &'static str) -> Run {
@@ -533,4 +550,48 @@ async fn issue188_multi_segment_gzip_fails_closed() {
         "a segment Range must be issued: {:?}",
         run.requests
     );
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_gzip_fails_closed() {
+    let run = run_case(
+        Script::TransferEncoded {
+            coding: "gzip",
+            body: GZIP_BODY,
+        },
+        default_engine(),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_named_coding_failure(
+        &run.job,
+        "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+    );
+    assert!(
+        !run.job.temp_path.exists(),
+        "fresh failure must not leave a .part: {}",
+        fail_context(&run.job)
+    );
+    assert_ne!(
+        file_sha(&run.job.target_path),
+        GZIP_SHA,
+        "finished file must not be the gzip bytes: {}",
+        fail_context(&run.job)
+    );
+}
+
+#[tokio::test]
+async fn issue188_content_encoding_deflate_br_zstd_xgzip_fail_closed() {
+    for coding in ["deflate", "br", "zstd", "x-gzip"] {
+        let run = encoded_head_and_get(coding).await;
+        let message = format!(
+            "Response is Content-Encoding: {coding}; asked for identity. Use a URL that sends the decoded file."
+        );
+        assert_named_coding_failure(&run.job, &message);
+        assert!(
+            !run.job.temp_path.exists(),
+            "{coding}: {}",
+            fail_context(&run.job)
+        );
+    }
 }
