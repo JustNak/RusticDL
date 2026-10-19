@@ -55,6 +55,9 @@ enum Script {
         body: &'static [u8],
         chunk_wire: bool,
     },
+    /// First GET stores an identity prefix and closes early. The Range GET is
+    /// answered `200` (the whole entity), not `206`, with `header`.
+    RangeAnswered200 { header: &'static str },
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -292,6 +295,28 @@ async fn serve_one(
             write_all_or_stop(&mut socket, head.as_bytes()).await;
             if method == "GET" {
                 write_all_or_stop(&mut socket, &wire).await;
+            }
+        }
+        Script::RangeAnswered200 { header } => {
+            if method == "HEAD" {
+                let head = response_head("200 OK", "Accept-Ranges: bytes\r\n", PLAIN.len() as u64);
+                write_all_or_stop(&mut socket, head.as_bytes()).await;
+            } else if method == "GET" {
+                let start = request_range(&request).map(|(start, _)| start).unwrap_or(0);
+                let first = start == 0 && !resume_sent.swap(true, Ordering::SeqCst);
+                if first {
+                    let head =
+                        response_head("200 OK", "Accept-Ranges: bytes\r\n", PLAIN.len() as u64);
+                    write_all_or_stop(&mut socket, head.as_bytes()).await;
+                    write_all_or_stop(&mut socket, &PLAIN[..RESUME_PREFIX]).await;
+                } else {
+                    let extra = format!("{header}\r\nAccept-Ranges: bytes\r\n");
+                    // Length matches the HEAD entity so a missing encoding guard
+                    // would delete the partial and keep going, not report a size change.
+                    let head = response_head("200 OK", &extra, PLAIN.len() as u64);
+                    write_all_or_stop(&mut socket, head.as_bytes()).await;
+                    write_all_or_stop(&mut socket, GZIP_BODY).await;
+                }
             }
         }
     }
@@ -588,6 +613,10 @@ async fn issue188_transfer_encoding_gzip_fails_closed() {
         Duration::from_secs(20),
     )
     .await;
+    // `Job` stores the message and `FailureCategory`, not `DownloadError.retryable`.
+    // Default auto_retry is 6, so `retry_attempts == 0` is the engine-visible
+    // proof that the error was not retryable. The flag itself is asserted on
+    // the `DownloadError` in `issue188_stream_body_rejects_gzip_transfer_encoding_before_write`.
     assert_named_coding_failure(
         &run.job,
         "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
@@ -651,7 +680,86 @@ async fn issue188_transfer_encoding_duplicate_chunked_headers_fail_closed() {
 
 #[tokio::test]
 async fn issue188_transfer_encoding_gzip_chunked_fails_closed() {
-    assert_transfer_framing_rejected(&["gzip, chunked"], GZIP_BODY, true).await;
+    assert_named_transfer_failure(&["gzip, chunked"], GZIP_BODY, true).await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_gzip_fails_closed() {
+    assert_named_transfer_failure(&["chunked, gzip"], GZIP_BODY, false).await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_split_gzip_and_chunked_headers_fail_closed() {
+    assert_named_transfer_failure(&["gzip", "chunked"], GZIP_BODY, true).await;
+}
+
+const TRANSFER_GZIP_ERROR: &str = "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.";
+
+async fn assert_named_transfer_failure(
+    values: &'static [&'static str],
+    body: &'static [u8],
+    chunk_wire: bool,
+) {
+    let run = run_case(
+        Script::TransferEncoded {
+            values,
+            body,
+            chunk_wire,
+        },
+        default_engine(),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_named_coding_failure(&run.job, TRANSFER_GZIP_ERROR);
+    assert!(
+        !run.job.temp_path.exists(),
+        "no committed temp file: {}",
+        fail_context(&run.job)
+    );
+}
+
+async fn assert_range_200_keeps_prefix(header: &'static str, message: &'static str) {
+    let run = run_case(
+        Script::RangeAnswered200 { header },
+        default_engine(),
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_named_coding_failure(&run.job, message);
+    let partial = std::fs::read(&run.job.temp_path).unwrap_or_default();
+    assert_eq!(
+        partial,
+        PLAIN[..RESUME_PREFIX],
+        "existing .part must stay byte-for-byte untouched: {}",
+        fail_context(&run.job)
+    );
+    assert!(
+        run.requests.iter().any(|line| {
+            line.contains("range=bytes=")
+                && !line.contains("range=bytes=0-")
+                && !line.contains("range=bytes=-")
+        }),
+        "resume must send Range past the prefix: {:?}",
+        run.requests
+    );
+}
+
+#[tokio::test]
+async fn issue188_range_200_gzip_content_encoding_keeps_partial() {
+    assert_range_200_keeps_prefix(
+        "Content-Encoding: gzip",
+        "Response is Content-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn issue188_range_200_gzip_transfer_encoding_keeps_partial() {
+    assert_range_200_keeps_prefix(
+        "Transfer-Encoding: gzip",
+        "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+    )
+    .await;
 }
 
 #[tokio::test]

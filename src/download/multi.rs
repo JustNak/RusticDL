@@ -2465,4 +2465,111 @@ Content-Length: {}\r\n\
         };
         Some((start, end))
     }
+
+    /// A 206 whose Content-Range would fail `classify_segment_status` still
+    /// reports the encoding error. That is the pre-check at the segment loop:
+    /// `SegmentFileWriter::open` has already run, and the claim is no payload
+    /// bytes plus an error classify would not produce.
+    #[tokio::test]
+    async fn issue188_multi_gzip_206_rejected_before_classify_segment_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let reply = "HTTP/1.1 206 Partial Content\r\n\
+                    Connection: close\r\n\
+                    Accept-Ranges: bytes\r\n\
+                    Content-Encoding: gzip\r\n\
+                    Content-Range: bytes 1-15/16\r\n\
+                    Content-Length: 15\r\n\r\n";
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&[b'Z'; 15]).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-multi-precheck-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin.part");
+        let writer = Arc::new(SegmentFileWriter::open(&path).unwrap());
+        let url = format!("http://{addr}/file.bin");
+        let map = SegmentMap {
+            total_bytes: 16,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 15,
+                written: 0,
+                state: SegmentState::Pending,
+            }],
+            preallocated: false,
+        };
+        let shared = Arc::new(SharedMulti {
+            map: Mutex::new(map),
+            synced_written: Mutex::new(vec![0]),
+            active: AtomicU32::new(0),
+            reconnects: AtomicU32::new(0),
+            window: Mutex::new(SpeedWindow {
+                start: Instant::now(),
+                bytes: 0,
+                eta: EtaSmoother::new(),
+            }),
+        });
+        let task = SegmentTask {
+            index: 0,
+            job_url: url.clone(),
+            pinned_url: url,
+            host: host_key_for_budget("http://127.0.0.1/file.bin"),
+            control: Arc::new(AtomicU8::new(0)),
+            on_progress: Arc::new(|_: TransferEvent| {}),
+            handoff: None,
+            limiter: GlobalBandwidthLimiter::new(None),
+            budget: ConnectionBudget::new(32, 8),
+            writer,
+            shared: shared.clone(),
+            validators: ContentValidators {
+                expected_size: Some(16),
+                ..ContentValidators::default()
+            },
+        };
+        let client = download_client().expect("client");
+        let err = run_segment(client, task)
+            .await
+            .expect_err("gzip 206 must fail before classify_segment_status");
+        server.abort();
+
+        assert!(!err.retryable, "{err:?}");
+        assert_eq!(err.category, FailureCategory::Resume);
+        assert_eq!(
+            err.message,
+            "Response is Content-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+            "pre-check must win over classify_segment_status, which would report \
+             Unexpected resume range (got 1-15, expected 0-15). Use Restart."
+        );
+        let written = lock_map(&shared.map).segments[0].written;
+        assert_eq!(written, 0, "segment writer must not receive payload bytes");
+        assert_eq!(
+            std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+            0,
+            "SegmentFileWriter::open can leave an empty file; the claim is no payload bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

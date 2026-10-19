@@ -1665,11 +1665,13 @@ mod tests {
                 .unwrap_or(0);
             match result {
                 Err(err) => {
-                    assert!(
-                        err.message.contains("gzip"),
-                        "encoding {encoding:?} produced {err:?}"
+                    assert_eq!(
+                        err.message,
+                        "Response is Content-Encoding: gzip; asked for identity. Use a URL that sends the decoded file.",
+                        "{encoding}"
                     );
                     assert!(!err.retryable);
+                    assert_eq!(err.category, FailureCategory::Resume);
                     assert_eq!(len, 0, "{encoding}");
                 }
                 Ok(end) => panic!("{encoding} body was written: {end:?} part_len={len}"),
@@ -1729,7 +1731,10 @@ mod tests {
                     err.message,
                     "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file."
                 );
-                assert_eq!(len, 0, "transfer-encoded bytes must not land in the .part");
+                assert_eq!(
+                    len, 0,
+                    "an empty file can exist after AppendSink::open; the claim is no payload bytes"
+                );
             }
             Ok(end) => panic!("gzip transfer-encoding body was written: {end:?} part_len={len}"),
         }
@@ -1804,14 +1809,67 @@ mod tests {
         match result {
             Err(err) => {
                 assert!(!err.retryable, "{err:?}");
-                assert!(
-                    err.message.contains("gzip"),
-                    "a later Content-Encoding header must be named: {err:?}"
+                assert_eq!(err.category, FailureCategory::Resume);
+                assert_eq!(
+                    err.message,
+                    "Response is Content-Encoding: gzip; asked for identity. Use a URL that sends the decoded file."
                 );
                 assert_eq!(len, 0, "encoded bytes must not land in the .part");
             }
             Ok(end) => panic!("split gzip headers were written: {end:?} part_len={len}"),
         }
         let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    async fn assert_stream_transfer_rejected(extra: &str, payload: &[u8]) {
+        let url = serve_with_extra_headers(extra, payload).await;
+        let (path, result) = stream_from_url(&url, payload).await;
+        let len = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        match result {
+            Err(err) => {
+                assert!(!err.retryable, "{err:?}");
+                assert_eq!(err.category, FailureCategory::Resume);
+                assert_eq!(
+                    err.message,
+                    "Response is Transfer-Encoding: gzip; asked for identity. Use a URL that sends the decoded file."
+                );
+                assert_eq!(
+                    len, 0,
+                    "an empty file can exist after AppendSink::open; the claim is no payload bytes"
+                );
+            }
+            Ok(end) => panic!("transfer-encoded body was written: {end:?} part_len={len}"),
+        }
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_gzip_chunked_transfer_encoding() {
+        assert_stream_transfer_rejected(
+            "Transfer-Encoding: gzip, chunked\r\n",
+            b"compressed-looking-bytes",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_gzip_transfer_encoding() {
+        assert_stream_transfer_rejected(
+            "Transfer-Encoding: chunked, gzip\r\n",
+            b"compressed-looking-bytes",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_split_transfer_encoding_headers() {
+        assert_stream_transfer_rejected(
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            b"compressed-looking-bytes",
+        )
+        .await;
     }
 }
