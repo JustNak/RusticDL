@@ -595,8 +595,12 @@ pub async fn run_http_download_with_ctx(
             );
         // Before the size check, and before `AppendSink::open`. A gzip GET
         // whose Content-Length matches HEAD must not be stored, and a gzip
-        // GET whose length disagrees must name the coding.
-        reject_encoded_body(response.headers())?;
+        // GET whose length disagrees must name the coding. A 206 that already
+        // holds a prefix keeps that count, the same as the other failures here.
+        if let Err(error) = reject_encoded_body(response.headers()) {
+            checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+            return Err(error);
+        }
         if !accept_new_size {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)

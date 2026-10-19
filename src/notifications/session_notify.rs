@@ -17,6 +17,20 @@ pub struct NotifySendInvocation {
     pub args: Vec<String>,
 }
 
+/// `notify-send` bodies are markup on KDE, mako, and dunst.
+fn escape_notify_markup(body: &str) -> String {
+    let mut escaped = String::with_capacity(body.len());
+    for ch in body.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
 impl NotifySendInvocation {
     pub fn from_payload(title: &str, body: &str) -> Self {
         Self {
@@ -26,7 +40,7 @@ impl NotifySendInvocation {
                 APP_NAME.to_string(),
                 "--".to_string(),
                 title.to_string(),
-                body.to_string(),
+                escape_notify_markup(body),
             ],
         }
     }
@@ -87,6 +101,22 @@ mod tests {
         assert_eq!(inv.program, "notify-send");
         assert_ne!(inv.program, "notify-send-gtk");
         assert_ne!(inv.program, "/usr/bin/notify-send");
+    }
+
+    #[test]
+    fn session_notify_escapes_markup() {
+        let inv = NotifySendInvocation::from_payload(
+            "Download failed",
+            "file — <a href=\"http://evil.example\">x</a> & y",
+        );
+        let body = inv.args.last().expect("body");
+        assert_eq!(
+            body,
+            "file — &lt;a href=\"http://evil.example\"&gt;x&lt;/a&gt; &amp; y"
+        );
+        assert!(!body.contains("<a href"));
+        assert!(!body.contains('<'));
+        assert!(!body.contains('>'));
     }
 
     #[test]

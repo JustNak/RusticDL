@@ -48,9 +48,12 @@ enum Script {
     /// Two segments. Probes stay identity. Segment bodies are gzip-labeled.
     MultiGzip { total: u64 },
     /// HEAD and GET share a body labeled with Transfer-Encoding and no Content-Encoding.
+    /// `chunk_wire` sends `body` as one HTTP chunk; otherwise the bytes are raw.
+    /// HEAD's Content-Length is `body.len()` either way.
     TransferEncoded {
-        coding: &'static str,
+        values: &'static [&'static str],
         body: &'static [u8],
+        chunk_wire: bool,
     },
 }
 
@@ -148,6 +151,13 @@ async fn write_repeat(socket: &mut TcpStream, byte: u8, len: u64) {
         }
         left -= n as u64;
     }
+}
+
+fn chunk_encode(body: &[u8]) -> Vec<u8> {
+    let mut wire = format!("{:x}\r\n", body.len()).into_bytes();
+    wire.extend_from_slice(body);
+    wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    wire
 }
 
 fn response_head(status: &str, extra: &str, content_length: u64) -> String {
@@ -262,12 +272,26 @@ async fn serve_one(
                 }
             }
         }
-        Script::TransferEncoded { coding, body } => {
-            let extra = format!("Transfer-Encoding: {coding}\r\n");
+        Script::TransferEncoded {
+            values,
+            body,
+            chunk_wire,
+        } => {
+            let mut extra = String::new();
+            for value in *values {
+                extra.push_str("Transfer-Encoding: ");
+                extra.push_str(value);
+                extra.push_str("\r\n");
+            }
+            let wire = if *chunk_wire {
+                chunk_encode(body)
+            } else {
+                body.to_vec()
+            };
             let head = response_head("200 OK", &extra, body.len() as u64);
             write_all_or_stop(&mut socket, head.as_bytes()).await;
             if method == "GET" {
-                write_all_or_stop(&mut socket, body).await;
+                write_all_or_stop(&mut socket, &wire).await;
             }
         }
     }
@@ -556,8 +580,9 @@ async fn issue188_multi_segment_gzip_fails_closed() {
 async fn issue188_transfer_encoding_gzip_fails_closed() {
     let run = run_case(
         Script::TransferEncoded {
-            coding: "gzip",
+            values: &["gzip"],
             body: GZIP_BODY,
+            chunk_wire: false,
         },
         default_engine(),
         Duration::from_secs(20),
@@ -578,6 +603,55 @@ async fn issue188_transfer_encoding_gzip_fails_closed() {
         "finished file must not be the gzip bytes: {}",
         fail_context(&run.job)
     );
+}
+
+async fn assert_transfer_framing_rejected(
+    values: &'static [&'static str],
+    body: &'static [u8],
+    chunk_wire: bool,
+) {
+    let run = run_case(
+        Script::TransferEncoded {
+            values,
+            body,
+            chunk_wire,
+        },
+        default_engine(),
+        Duration::from_secs(20),
+    )
+    .await;
+    let context = fail_context(&run.job);
+    assert_eq!(run.job.state, JobState::Failed, "{context}");
+    assert_eq!(run.job.retry_attempts, 0, "{context}");
+    assert!(
+        !run.job.target_path.exists(),
+        "finished path must stay absent: {context}"
+    );
+    assert!(
+        !run.job.temp_path.exists(),
+        "no committed temp file: {context}"
+    );
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_identity_fails_closed() {
+    assert_transfer_framing_rejected(&["chunked, identity"], b"5\r\nhello\r\n0\r\n\r\n", false)
+        .await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_chunked_chunked_fails_closed() {
+    assert_transfer_framing_rejected(&["chunked, chunked"], b"hello", true).await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_duplicate_chunked_headers_fail_closed() {
+    assert_transfer_framing_rejected(&["chunked", "chunked"], b"hello", true).await;
+}
+
+#[tokio::test]
+async fn issue188_transfer_encoding_gzip_chunked_fails_closed() {
+    assert_transfer_framing_rejected(&["gzip, chunked"], GZIP_BODY, true).await;
 }
 
 #[tokio::test]

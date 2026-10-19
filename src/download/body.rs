@@ -297,68 +297,181 @@ pub(crate) enum EosPolicy {
     UnknownLength,
 }
 
+/// RFC 7230 `tchar`. A coding outside this set, or longer than 32 bytes, is
+/// not copied into the error string.
+fn is_rfc7230_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
+const CODING_NAME_MAX_BYTES: usize = 32;
+
+fn display_coding(coding: &str) -> String {
+    if coding.len() <= CODING_NAME_MAX_BYTES && is_rfc7230_token(coding) {
+        coding.to_ascii_lowercase()
+    } else {
+        "unrecognized".to_string()
+    }
+}
+
+enum ListedCoding {
+    Identity,
+    Chunked,
+    Other(String),
+}
+
+fn coding_label(coding: &ListedCoding) -> &str {
+    match coding {
+        ListedCoding::Identity => "identity",
+        ListedCoding::Chunked => "chunked",
+        ListedCoding::Other(name) => name,
+    }
+}
+
+fn list_codings(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Result<Option<Vec<ListedCoding>>, ()> {
+    let values = headers.get_all(name);
+    if values.iter().next().is_none() {
+        return Ok(None);
+    }
+    let mut listed = Vec::new();
+    for value in values {
+        let text = value.to_str().map_err(|_| ())?;
+        for coding in text.split(',') {
+            let coding = coding.trim();
+            if coding.is_empty() {
+                continue;
+            }
+            listed.push(if coding.eq_ignore_ascii_case("identity") {
+                ListedCoding::Identity
+            } else if coding.eq_ignore_ascii_case("chunked")
+                && coding.len() <= CODING_NAME_MAX_BYTES
+                && is_rfc7230_token(coding)
+            {
+                ListedCoding::Chunked
+            } else {
+                ListedCoding::Other(display_coding(coding))
+            });
+        }
+    }
+    Ok(Some(listed))
+}
+
+fn names_for_error(codings: &[ListedCoding]) -> String {
+    let foreign: Vec<&str> = codings
+        .iter()
+        .filter_map(|coding| match coding {
+            ListedCoding::Other(name) => Some(name.as_str()),
+            ListedCoding::Identity | ListedCoding::Chunked => None,
+        })
+        .collect();
+    if foreign.is_empty() {
+        codings
+            .iter()
+            .map(coding_label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        foreign.join(", ")
+    }
+}
+
 /// A `Content-Encoding` other than `identity` means the body is not the file.
 /// The client already asked for `identity` and does not decode. The error is
 /// not retried: another attempt would store the same encoded bytes.
 pub(crate) fn reject_non_identity_content_encoding(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), DownloadError> {
-    let values = headers.get_all(reqwest::header::CONTENT_ENCODING);
-    if values.iter().next().is_none() {
-        return Ok(());
-    }
-    let mut offending = Vec::new();
-    for value in values {
-        let text = match value.to_str() {
-            Ok(text) => text,
-            Err(_) => return Err(encoded_body_error("unreadable")),
-        };
-        for coding in text.split(',') {
-            let coding = coding.trim();
-            if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
-                continue;
-            }
-            offending.push(coding.to_ascii_lowercase());
-        }
-    }
+    let codings = match list_codings(headers, reqwest::header::CONTENT_ENCODING) {
+        Ok(Some(codings)) => codings,
+        Ok(None) => return Ok(()),
+        Err(()) => return Err(encoded_body_error("unreadable")),
+    };
+    let offending: Vec<ListedCoding> = codings
+        .into_iter()
+        .filter(|coding| !matches!(coding, ListedCoding::Identity))
+        .collect();
     if offending.is_empty() {
         return Ok(());
     }
-    Err(encoded_body_error(&offending.join(", ")))
+    Err(encoded_body_error(&names_for_error(&offending)))
 }
 
-/// `chunked` is framing and `identity` is the raw file. Any other coding is
-/// still encoded. Hyper delivers a non-chunked coding's bytes unchanged, and
-/// it only dechunks when `chunked` is last, leaving an earlier coding intact.
-/// Not retried.
+/// Allow no `Transfer-Encoding`, identity only, or exactly one `chunked` as
+/// the final token (earlier tokens may only be `identity`). Hyper dechunks
+/// when the last token is `chunked`, including when `chunked` is repeated, so
+/// anything else can store framing or an encoded payload. Not retried.
 pub(crate) fn reject_unsupported_transfer_encoding(
     headers: &reqwest::header::HeaderMap,
 ) -> Result<(), DownloadError> {
-    let values = headers.get_all(reqwest::header::TRANSFER_ENCODING);
-    if values.iter().next().is_none() {
+    let codings = match list_codings(headers, reqwest::header::TRANSFER_ENCODING) {
+        Ok(Some(codings)) => codings,
+        Ok(None) => return Ok(()),
+        Err(()) => return Err(transfer_encoded_body_error("unreadable")),
+    };
+    if transfer_codings_allowed(&codings) {
         return Ok(());
     }
-    let mut offending = Vec::new();
-    for value in values {
-        let text = match value.to_str() {
-            Ok(text) => text,
-            Err(_) => return Err(transfer_encoded_body_error("unreadable")),
-        };
-        for coding in text.split(',') {
-            let coding = coding.trim();
-            if coding.is_empty()
-                || coding.eq_ignore_ascii_case("identity")
-                || coding.eq_ignore_ascii_case("chunked")
-            {
-                continue;
-            }
-            offending.push(coding.to_ascii_lowercase());
+    Err(transfer_encoded_body_error(&names_for_error(&codings)))
+}
+
+fn transfer_codings_allowed(codings: &[ListedCoding]) -> bool {
+    if codings.is_empty()
+        || codings
+            .iter()
+            .all(|coding| matches!(coding, ListedCoding::Identity))
+    {
+        return true;
+    }
+    let chunked = codings
+        .iter()
+        .filter(|coding| matches!(coding, ListedCoding::Chunked))
+        .count();
+    let ends_chunked = matches!(codings.last(), Some(ListedCoding::Chunked));
+    let prefix_identity = codings
+        .iter()
+        .rev()
+        .skip(1)
+        .all(|coding| matches!(coding, ListedCoding::Identity));
+    chunked == 1 && ends_chunked && prefix_identity
+}
+
+/// True only for the one `Transfer-Encoding` shape hyper actually dechunks
+/// into the raw file: a single final `chunked`, with only `identity` before it.
+pub(crate) fn transfer_encoding_is_accepted_chunked(headers: &reqwest::header::HeaderMap) -> bool {
+    match list_codings(headers, reqwest::header::TRANSFER_ENCODING) {
+        Ok(Some(codings)) => {
+            transfer_codings_allowed(&codings)
+                && codings
+                    .iter()
+                    .any(|coding| matches!(coding, ListedCoding::Chunked))
         }
+        _ => false,
     }
-    if offending.is_empty() {
-        return Ok(());
-    }
-    Err(transfer_encoded_body_error(&offending.join(", ")))
 }
 
 /// Content-Encoding and Transfer-Encoding both name the bytes that would be stored.
@@ -413,15 +526,9 @@ pub async fn stream_body(
 }
 
 fn eos_policy_for_response(response: &reqwest::Response, target: Option<u64>) -> EosPolicy {
-    let chunked = response
-        .headers()
-        .get(reqwest::header::TRANSFER_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
-        });
+    // A bare close is complete only for a single final `chunked`. `chunked`
+    // earlier in the list is framing bytes, not a decoded body.
+    let chunked = transfer_encoding_is_accepted_chunked(response.headers());
     eos_policy(
         response.version(),
         response.content_length(),
@@ -774,7 +881,6 @@ mod tests {
             Some(&b"identity"[..]),
             Some(&b"Identity"[..]),
             Some(&b"identity, chunked"[..]),
-            Some(&b"chunked, identity"[..]),
         ];
         for value in allow {
             assert!(
@@ -801,6 +907,113 @@ mod tests {
             assert!(err.message.contains("Transfer-Encoding"), "{err:?}");
             assert!(!err.retryable);
         }
+
+        // chunked is framing only when it is the single final token.
+        for value in ["chunked, identity", "chunked, chunked"] {
+            let err =
+                reject_unsupported_transfer_encoding(&transfer_headers(Some(value.as_bytes())))
+                    .expect_err(value);
+            assert!(!err.retryable, "{value}: {err:?}");
+            assert_eq!(err.category, FailureCategory::Resume, "{value}");
+        }
+
+        let mut duplicate_chunked = reqwest::header::HeaderMap::new();
+        duplicate_chunked.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+        duplicate_chunked.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+        let duplicate = reject_unsupported_transfer_encoding(&duplicate_chunked)
+            .expect_err("two chunked headers");
+        assert!(!duplicate.retryable);
+        assert_eq!(duplicate.category, FailureCategory::Resume);
+
+        let mut identity_then_chunked = reqwest::header::HeaderMap::new();
+        identity_then_chunked.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+        identity_then_chunked.append(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+        assert!(reject_unsupported_transfer_encoding(&identity_then_chunked).is_ok());
+        assert!(transfer_encoding_is_accepted_chunked(
+            &identity_then_chunked
+        ));
+        assert!(transfer_encoding_is_accepted_chunked(&transfer_headers(
+            Some(b"chunked")
+        )));
+        assert!(transfer_encoding_is_accepted_chunked(&transfer_headers(
+            Some(b"identity, chunked")
+        )));
+        assert!(!transfer_encoding_is_accepted_chunked(&transfer_headers(
+            Some(b"chunked, identity")
+        )));
+        assert!(!transfer_encoding_is_accepted_chunked(&transfer_headers(
+            Some(b"chunked, chunked")
+        )));
+        assert!(!transfer_encoding_is_accepted_chunked(&duplicate_chunked));
+    }
+
+    #[test]
+    fn content_encoding_name_is_a_short_token_or_unrecognized() {
+        let huge = "A".repeat(300 * 1024);
+        let huge_err =
+            reject_non_identity_content_encoding(&encoding_headers(Some(huge.as_bytes())))
+                .expect_err("huge");
+        assert!(
+            huge_err.message.len() < 200,
+            "300 KB coding must not be stored in the error: {}",
+            huge_err.message.len()
+        );
+        assert!(
+            huge_err.message.contains("unrecognized"),
+            "{}",
+            huge_err.message
+        );
+        assert!(!huge_err.message.contains(&huge[..32]));
+        assert!(!huge_err.retryable);
+
+        let markup = "<a href=\"http://evil.example/x\">click</a>";
+        let markup_err =
+            reject_non_identity_content_encoding(&encoding_headers(Some(markup.as_bytes())))
+                .expect_err("markup");
+        assert!(
+            !markup_err.message.contains("<a href"),
+            "markup must not be echoed: {}",
+            markup_err.message
+        );
+        assert!(
+            !markup_err.message.contains("evil.example"),
+            "{}",
+            markup_err.message
+        );
+        assert!(
+            markup_err.message.contains("unrecognized"),
+            "{}",
+            markup_err.message
+        );
+
+        let token_32 = "a".repeat(32);
+        let echoed =
+            reject_non_identity_content_encoding(&encoding_headers(Some(token_32.as_bytes())))
+                .expect_err("32");
+        assert!(echoed.message.contains(&token_32), "{}", echoed.message);
+
+        let token_33 = "b".repeat(33);
+        let capped =
+            reject_non_identity_content_encoding(&encoding_headers(Some(token_33.as_bytes())))
+                .expect_err("33");
+        assert!(
+            capped.message.contains("unrecognized"),
+            "{}",
+            capped.message
+        );
+        assert!(!capped.message.contains(&token_33));
     }
 
     #[tokio::test]
@@ -1475,6 +1688,27 @@ mod tests {
             StreamEnd::Control(outcome) => panic!("unexpected control {outcome:?}"),
         }
         assert_eq!(tokio::fs::read(&path).await.unwrap(), payload);
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn issue188_stream_body_rejects_chunked_identity_before_write() {
+        let payload = b"5\r\nhello\r\n0\r\n\r\n";
+        let url =
+            serve_with_extra_headers("Transfer-Encoding: chunked, identity\r\n", payload).await;
+        let (path, result) = stream_from_url(&url, payload).await;
+        let len = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        match result {
+            Err(err) => {
+                assert!(!err.retryable, "{err:?}");
+                assert_eq!(err.category, FailureCategory::Resume);
+                assert_eq!(len, 0, "chunk framing must not land in the .part");
+            }
+            Ok(end) => panic!("chunk framing was written: {end:?} part_len={len}"),
+        }
         let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
     }
 
