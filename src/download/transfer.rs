@@ -2021,7 +2021,7 @@ Content-Length: {}\r\n\
             .await
             .expect("a truncated changed body must settle")
             .expect_err("a truncated changed body must not complete");
-        assert!(err.retryable, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
         assert!(
             !target.exists(),
             "the short body must not be the finished file"
@@ -2385,7 +2385,7 @@ Content-Length: {}\r\n\
             .await
             .expect("a validator-less repeat must settle")
             .expect_err("a validator-less repeat must not complete");
-        assert!(err.retryable, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
         assert!(!target.exists());
         assert_eq!(
             std::fs::read(&temp).expect("candidate partial"),
@@ -2433,7 +2433,7 @@ Content-Length: {}\r\n\
             .await
             .expect("the confirm read must stop once the body passes the candidate")
             .expect_err("a longer confirm body must not complete");
-        assert!(err.retryable, "{err:?}");
+        assert!(!err.retryable, "{err:?}");
         assert!(!target.exists());
         assert_eq!(std::fs::read(&temp).expect("candidate partial"), candidate);
         let _ = std::fs::remove_dir_all(&dir);
