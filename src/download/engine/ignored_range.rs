@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::MemoryJobStore;
 use super::{spawn_engine, EngineCommand, EngineEvent, EngineHandle, EngineRuntimeConfig};
-use crate::download::job::{Job, JobState};
+use crate::download::bandwidth::GlobalBandwidthLimiter;
+use crate::download::conn_budget::ConnectionBudget;
+use crate::download::context::TransferContext;
+use crate::download::http::{reconnect_backoff, RECONNECT_MAX};
+use crate::download::job::{FailureCategory, Job, JobState};
+use crate::download::progress::{NoopIdentity, TransferEvent, TransferEventCallback};
+use crate::download::transfer::run_transfer;
 use crate::download::verify::{sha256_file_hex, sha256_hex};
 
 const IGNORED_RANGE: &str =
@@ -185,6 +191,20 @@ fn engine_for(
     EngineHandle,
     UnboundedReceiver<EngineEvent>,
 ) {
+    spawn_job(url, filename, |_, _| {})
+}
+
+fn spawn_job(
+    url: &str,
+    filename: &str,
+    prepare: impl FnOnce(&std::path::Path, &mut Job),
+) -> (
+    PathBuf,
+    PathBuf,
+    String,
+    EngineHandle,
+    UnboundedReceiver<EngineEvent>,
+) {
     let dir = std::env::temp_dir().join(format!("rusticdl-range-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let target = dir.join(filename);
@@ -196,11 +216,81 @@ fn engine_for(
         temp.clone(),
     );
     job.state = JobState::Queued;
+    prepare(&temp, &mut job);
     let id = job.id.clone();
-    let mut config = EngineRuntimeConfig::default();
-    config.max_concurrent = 1;
+    let config = EngineRuntimeConfig {
+        max_concurrent: 1,
+        ..EngineRuntimeConfig::default()
+    };
     let (handle, events) = spawn_engine(vec![job], config, Arc::new(MemoryJobStore::default()));
     (target, temp, id, handle, events)
+}
+
+fn seed_lengthless(bytes: &[u8], temp: &std::path::Path, job: &mut Job) {
+    std::fs::write(temp, bytes).expect("seed partial");
+    job.downloaded_bytes = bytes.len() as u64;
+    job.total_bytes = 0;
+    job.resume_supported = true;
+    job.validators.etag = Some("\"e2\"".into());
+    job.validators.expected_size = None;
+}
+
+/// HEAD and the `bytes=0-0` probe fail, so preflight leaves a seeded
+/// lengthless candidate alone. Range GETs reset `resets_before_200` times,
+/// then answer 200 with no validators and no length.
+fn lengthless_mismatch_server(resets_before_200: u32) -> String {
+    let (base, listener) = bind_server();
+    let resets = Arc::new(AtomicU32::new(0));
+    spawn_accept(listener, move |mut stream| {
+        let request = read_headers(&mut stream);
+        if request.is_empty() {
+            return;
+        }
+        if request.starts_with("HEAD ") {
+            write_response(
+                &mut stream,
+                b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+        if !request.starts_with("GET ") {
+            return;
+        }
+        if range_start(&request).unwrap_or(0) == 0 {
+            write_response(
+                &mut stream,
+                b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+        let seen = resets.fetch_add(1, Ordering::SeqCst);
+        if seen < resets_before_200 {
+            reset_connection(stream);
+            return;
+        }
+        write_response(&mut stream, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+    });
+    base
+}
+
+fn direct_transfer(job: Job) -> TransferContext {
+    let config = EngineRuntimeConfig::default();
+    let on_progress: TransferEventCallback = Arc::new(|_: TransferEvent| {});
+    let mut ctx = TransferContext::from_runtime(
+        job,
+        Arc::new(AtomicU8::new(0)),
+        on_progress,
+        None,
+        GlobalBandwidthLimiter::new(None),
+        ConnectionBudget::new(
+            config.max_total_connections,
+            config.max_connections_per_host,
+        ),
+        Arc::new(NoopIdentity),
+        &config,
+    );
+    ctx.preflight_done = true;
+    ctx
 }
 
 async fn wait_job(
@@ -300,6 +390,7 @@ async fn no_range_pause_resume() {
         "pause must keep a partial, downloaded_bytes={}",
         paused.downloaded_bytes
     );
+    let paused_sha = sha256_file_hex(&temp).expect("paused partial");
 
     let started_at = Instant::now();
     engine.send(EngineCommand::Resume(id.clone()));
@@ -318,11 +409,15 @@ async fn no_range_pause_resume() {
             && error == IGNORED_RANGE
             && kept == paused_len
             && !target.exists()
-            && range_gets == 1,
-        "state={:?} retry_attempts={} elapsed_ms={} error={error:?} part={kept} paused={paused_len} target_exists={} range_gets={range_gets} requests={}",
+            && range_gets == 1
+            && failed.failure_category == Some(FailureCategory::Resume)
+            && sha256_file_hex(&temp).ok().as_deref() == Some(paused_sha.as_str()),
+        "state={:?} retry_attempts={} elapsed_ms={} error={error:?} category={:?} part={kept} paused={paused_len} part_sha={:?} paused_sha={paused_sha} target_exists={} range_gets={range_gets} requests={}",
         failed.state,
         failed.retry_attempts,
         elapsed.as_millis(),
+        failed.failure_category,
+        sha256_file_hex(&temp).ok(),
         target.exists(),
         seen.dump()
     );
@@ -425,6 +520,7 @@ async fn ignored_range_lengthless_second_site_does_not_retry() {
     let error = failed.error.clone().unwrap_or_default();
     let kept = part_len(&temp);
     let range_gets = seen.resume_gets();
+    let kept_sha = sha256_hex(&[b'N'; PREFIX_LEN]);
     assert!(
         failed.state == JobState::Failed
             && failed.retry_attempts == 0
@@ -432,16 +528,145 @@ async fn ignored_range_lengthless_second_site_does_not_retry() {
             && error == IGNORED_RANGE
             && kept > 0
             && !target.exists()
-            && range_gets == 2,
-        "state={:?} retry_attempts={} elapsed_ms={} error={error:?} part={kept} target_exists={} range_gets={range_gets} requests={}",
+            && range_gets == 2
+            && failed.failure_category == Some(FailureCategory::Resume)
+            && sha256_file_hex(&temp).ok().as_deref() == Some(kept_sha.as_str()),
+        "state={:?} retry_attempts={} elapsed_ms={} error={error:?} category={:?} part={kept} part_sha={:?} target_exists={} range_gets={range_gets} requests={}",
         failed.state,
         failed.retry_attempts,
         elapsed.as_millis(),
+        failed.failure_category,
+        sha256_file_hex(&temp).ok(),
         target.exists(),
         seen.dump()
     );
     engine.send(EngineCommand::Shutdown);
     let _ = std::fs::remove_dir_all(target.parent().expect("parent"));
+}
+
+/// Second lengthless mismatch stops in `ignored_range_partial_kept`. That is
+/// the same user-facing outcome as the other two ignored-Range stops, so the
+/// job category is Resume.
+#[tokio::test]
+async fn lengthless_mismatch_terminal_category_is_resume() {
+    let candidate = vec![b'Q'; 64];
+    let base = lengthless_mismatch_server(0);
+    let (target, temp, id, engine, mut events) =
+        spawn_job(&format!("{base}/file.bin"), "file.bin", |path, job| {
+            seed_lengthless(&candidate, path, job)
+        });
+    let started_at = Instant::now();
+    let failed = wait_job(&mut events, &id, Duration::from_secs(8), |job| {
+        job.state == JobState::Failed || job.retry_attempts > 0
+    })
+    .await;
+    let elapsed = started_at.elapsed();
+    let error = failed.error.clone().unwrap_or_default();
+    assert!(
+        failed.state == JobState::Failed
+            && failed.retry_attempts == 0
+            && elapsed < Duration::from_secs(5)
+            && error == IGNORED_RANGE
+            && failed.failure_category == Some(FailureCategory::Resume)
+            && sha256_file_hex(&temp).ok().as_deref() == Some(sha256_hex(&candidate).as_str())
+            && !target.exists()
+            && failed.reconnect_count == 1,
+        "state={:?} retry_attempts={} elapsed_ms={} error={error:?} category={:?} reconnects={} part_sha={:?} target_exists={}",
+        failed.state,
+        failed.retry_attempts,
+        elapsed.as_millis(),
+        failed.failure_category,
+        failed.reconnect_count,
+        sha256_file_hex(&temp).ok(),
+        target.exists()
+    );
+    engine.send(EngineCommand::Shutdown);
+    let _ = std::fs::remove_dir_all(target.parent().expect("parent"));
+}
+
+/// Twelve in-attempt reconnects are already spent when the first lengthless
+/// mismatch asks to reconnect. GiveUp must publish the terminal error:
+/// Failed, `retry_attempts == 0`, and `DownloadError.retryable == false`.
+#[tokio::test]
+async fn ignored_range_reconnect_budget_is_terminal() {
+    let candidate = vec![b'Q'; 64];
+    let expected_sha = sha256_hex(&candidate);
+    let engine_base = lengthless_mismatch_server(RECONNECT_MAX);
+    let transfer_base = lengthless_mismatch_server(RECONNECT_MAX);
+    let budget = (1..=RECONNECT_MAX).map(reconnect_backoff).sum::<Duration>();
+    // Backoff sleeps can wake a few milliseconds early. A skipped reconnect
+    // would still miss this floor by seconds.
+
+    let engine_candidate = candidate.clone();
+    let engine_run = async move {
+        let (target, temp, id, engine, mut events) = spawn_job(
+            &format!("{engine_base}/file.bin"),
+            "file.bin",
+            |path, job| seed_lengthless(&engine_candidate, path, job),
+        );
+        let started_at = Instant::now();
+        let failed = wait_job(&mut events, &id, Duration::from_secs(90), |job| {
+            job.state == JobState::Failed || job.retry_attempts > 0
+        })
+        .await;
+        let elapsed = started_at.elapsed();
+        engine.send(EngineCommand::Shutdown);
+        (target, temp, failed, elapsed)
+    };
+
+    let transfer_candidate = candidate.clone();
+    let transfer_run = async move {
+        let dir = std::env::temp_dir().join(format!("rusticdl-range-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("file.bin");
+        let temp = dir.join("file.bin.part");
+        let mut job = Job::new(
+            format!("{transfer_base}/file.bin"),
+            "file.bin".into(),
+            target.clone(),
+            temp.clone(),
+        );
+        seed_lengthless(&transfer_candidate, &temp, &mut job);
+        let result =
+            tokio::time::timeout(Duration::from_secs(90), run_transfer(direct_transfer(job))).await;
+        (dir, target, temp, result)
+    };
+
+    let ((target, temp, failed, elapsed), (dir, transfer_target, transfer_temp, transfer_result)) =
+        tokio::join!(engine_run, transfer_run);
+
+    let err = transfer_result
+        .expect("budget exhaustion must settle")
+        .expect_err("a lengthless mismatch past the reconnect budget must fail");
+    let error = failed.error.clone().unwrap_or_default();
+    assert!(
+        failed.state == JobState::Failed
+            && failed.retry_attempts == 0
+            && failed.reconnect_count == RECONNECT_MAX
+            && elapsed + Duration::from_secs(1) >= budget
+            && error == IGNORED_RANGE
+            && failed.failure_category == Some(FailureCategory::Resume)
+            && sha256_file_hex(&temp).ok().as_deref() == Some(expected_sha.as_str())
+            && !target.exists()
+            && !err.retryable
+            && err.category == FailureCategory::Resume
+            && err.message == IGNORED_RANGE
+            && sha256_file_hex(&transfer_temp).ok().as_deref() == Some(expected_sha.as_str())
+            && !transfer_target.exists(),
+        "state={:?} retry_attempts={} reconnects={} elapsed_ms={} budget_ms={} error={error:?} category={:?} part_sha={:?} retryable={} err_category={:?} err={:?}",
+        failed.state,
+        failed.retry_attempts,
+        failed.reconnect_count,
+        elapsed.as_millis(),
+        budget.as_millis(),
+        failed.failure_category,
+        sha256_file_hex(&temp).ok(),
+        err.retryable,
+        err.category,
+        err.message
+    );
+    let _ = std::fs::remove_dir_all(target.parent().expect("parent"));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A server that answers the resume with 206 still finishes the file.

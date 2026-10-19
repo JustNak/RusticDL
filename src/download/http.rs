@@ -1062,8 +1062,10 @@ fn is_clean_short_body(error: &DownloadError) -> bool {
 }
 
 fn ignored_range_partial_kept() -> DownloadError {
+    // A Range GET answered with 200, partial kept. Same stop as the other
+    // two ignored-Range sites: Resume, and not a worker retry.
     download_error(
-        FailureCategory::Network,
+        FailureCategory::Resume,
         IGNORED_RANGE_PARTIAL_KEPT.into(),
         false,
     )

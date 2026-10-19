@@ -2021,7 +2021,7 @@ Content-Length: {}\r\n\
             .await
             .expect("a truncated changed body must settle")
             .expect_err("a truncated changed body must not complete");
-        assert!(!err.retryable, "{err:?}");
+        assert_ignored_range_terminal(&err);
         assert!(
             !target.exists(),
             "the short body must not be the finished file"
@@ -2282,6 +2282,15 @@ Content-Length: {}\r\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn assert_ignored_range_terminal(err: &DownloadError) {
+        assert_eq!(err.category, FailureCategory::Resume, "{err:?}");
+        assert_eq!(
+            err.message,
+            "Server ignored Range; partial kept. Use Restart to download from zero."
+        );
+        assert!(!err.retryable, "{err:?}");
+    }
+
     fn seed_lengthless_candidate(base: &str, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf, Job) {
         let (dir, target, temp, mut job) = download_paths(base);
         std::fs::write(&temp, bytes).unwrap();
@@ -2385,7 +2394,7 @@ Content-Length: {}\r\n\
             .await
             .expect("a validator-less repeat must settle")
             .expect_err("a validator-less repeat must not complete");
-        assert!(!err.retryable, "{err:?}");
+        assert_ignored_range_terminal(&err);
         assert!(!target.exists());
         assert_eq!(
             std::fs::read(&temp).expect("candidate partial"),
@@ -2433,7 +2442,7 @@ Content-Length: {}\r\n\
             .await
             .expect("the confirm read must stop once the body passes the candidate")
             .expect_err("a longer confirm body must not complete");
-        assert!(!err.retryable, "{err:?}");
+        assert_ignored_range_terminal(&err);
         assert!(!target.exists());
         assert_eq!(std::fs::read(&temp).expect("candidate partial"), candidate);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3704,10 +3713,7 @@ Accept-Ranges: bytes\r\n\
             .await
             .expect("a 200 to a speculative Range must stop without spinning")
             .expect_err("a 200 must not replace the partial");
-        assert!(
-            err.message.contains("partial kept"),
-            "unexpected error: {err:?}"
-        );
+        assert_ignored_range_terminal(&err);
         assert_eq!(
             std::fs::read(&temp).expect("partial must stay on disk"),
             &body[..prefix]
