@@ -24,12 +24,13 @@ Preconditions:
 - Focus is on the queue (not Settings, not a dialog).
 
 - **Select job.** Click the active row. The batch action bar or selection highlight appears.
-- **Pause.** Choose Pause (batch bar or Space). Run `.cursor/skills/verify-rusticdl/scripts/ui.sh pause-selection`. The row shows a paused state; `get_status` active count drops.
+- **Pause.** Choose Pause (batch bar or Space). Run `.cursor/skills/verify-rusticdl/scripts/ui.sh pause-selection`. The row shows a paused state. `queueSummary.downloading` drops. `queueSummary.active` does not: paused jobs are counted in `queued`, and `active` is `queued + downloading` (`queue_summary` in `src/ipc/protocol.rs`).
 - **Resume.** Choose Resume (or Space again). Run `.cursor/skills/verify-rusticdl/scripts/ui.sh resume-selection`. The job returns to downloading/queued.
 - **Proof.** Screenshot paused and resumed states; save `status-paused.json` and `status-resumed.json` from `scripts/ipc.sh get_status`.
 
 ## Gotchas
 
+- The same More actions menu also has Retry all and Clear all (`queue_overflow_menu_builder` in `src/app/title_bar.rs`). This recipe does not drive those items.
 - Completed jobs cannot pause — seed a long-running download or assert at the paused state before completion.
 - Space is ignored while a text field or dialog has focus.
 - Map-authoritative resume depends on server Range support; a server without ranges may restart instead of continuing the `.part` file.

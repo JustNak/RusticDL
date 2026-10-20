@@ -33,4 +33,6 @@ Preconditions:
 
 - Reset defaults only updates the draft — Save settings is still required to persist.
 - Browser capture settings sync to the extension only when the native host is connected; desktop-only proof does not require a browser.
+- The Browser category's panel title is `Browser capture` (`SettingsCategory::panel_title` in `src/app/settings_category.rs`). The sidebar label stays `Browser`.
+- Close to tray defaults on (System category). Closing the window does not quit; see [Close window](./close-window.md). Ctrl+Q quits on Linux.
 - Do not point verification at the user's real `%APPDATA%\RusticDL` / `~/.local/share/RusticDL` — always isolate `XDG_DATA_HOME` on Linux.

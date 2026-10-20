@@ -134,8 +134,25 @@ case "${cmd}" in
     xdotool key space
     sleep 0.5
     ;;
+  click-window-close)
+    # Right-edge GPUI caption close. VERIFY_CONTROLS_LEFT=1 clicks the
+    # left-side Linux close button (46px wide, see title_bar.rs).
+    geom
+    if [[ "${VERIFY_CONTROLS_LEFT:-}" == "1" ]]; then
+      rel_click 23 24
+    else
+      rel_click $((GW - 23)) 24
+    fi
+    sleep 0.6
+    ;;
+  quit)
+    geom
+    xdotool windowactivate --sync "${WID}"
+    xdotool key --clearmodifiers ctrl+q
+    sleep 0.5
+    ;;
   *)
-    echo "Usage: ui.sh {focus|click-add-download|focus-add-url|click-start-download|click-sidebar <label>|click-save-settings|leave-settings|focus-search|clear-search|submit-dialog|pause-selection|resume-selection}" >&2
+    echo "Usage: ui.sh {focus|click-add-download|focus-add-url|click-start-download|click-sidebar <label>|click-save-settings|leave-settings|focus-search|clear-search|submit-dialog|pause-selection|resume-selection|click-window-close|quit}" >&2
     exit 1
     ;;
 esac

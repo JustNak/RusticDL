@@ -1,6 +1,6 @@
 ---
 name: verify-rusticdl
-description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup. Use when verifying queue, add-download, settings, search, or pause/resume behavior, or when a UI/IPC change needs cold-agent proof."
+description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup, plus a headless download-engine recipe against a local HTTP fixture. Use when verifying queue, add-download, settings, search, pause/resume, close-window, or download-engine behavior, or when a UI/IPC change needs cold-agent proof."
 ---
 
 # Verify RusticDL
@@ -108,9 +108,10 @@ Stable handles (prefer these over raw coordinates):
 | Search placeholder `Search name, URL, or path…` | Title bar (`/` focuses it) |
 | Shortcut Ctrl+N | Open add dialog (when no text field focused) |
 | Shortcut Ctrl+, | Open Settings |
+| Shortcut Ctrl+Q | Quit on Linux. The close button does not quit while Close to tray is on (the default). |
 | IPC types `get_status`, `enqueue_download`, `prompt_download`, `show_window` | Socket/pipe |
 
-GPUI does not expose ARIA/CDP. When label hit-testing is unavailable, `ui.sh` falls back to geometry relative to the launched pid's `RusticDL` window (documented in that script). A vision/`computerUse` agent may click by visible label instead — still record the same evidence paths.
+GPUI does not expose ARIA/CDP. When label hit-testing is unavailable, `ui.sh` falls back to geometry relative to the launched pid's `RusticDL` window (documented in that script). Those coordinates assume caption buttons on the right (the default when GTK has not put close on the left). Set `VERIFY_CONTROLS_LEFT=1` before `ui.sh click-window-close` when `sidebar_on_right()` is true (`src/app/layout.rs`). A vision/`computerUse` agent may click by visible label instead — still record the same evidence paths.
 
 **Text entry caveat:** GPUI `InputState` fields often ignore xdotool-typed keys and clipboard paste from automation. For Add download / Search / Settings inputs, drive typing with a vision/`computerUse` agent (click the field, type the literal string). Mouse clicks for `Add download`, `Start download`, and sidebar labels via `ui.sh` are reliable.
 
@@ -157,9 +158,23 @@ source .cursor/skills/verify-rusticdl/scripts/env.sh
 
 Rules:
 
+- Closing the window does not stop the process while Close to tray is on (default). `scripts/ui.sh quit` sends Ctrl+Q. `cleanup.sh` is what stops the pid if the process is still up.
 - Kill only the pid in `$VERIFY_RUN_DIR/app.pid` (never `pkill -f rusticdl` — that matches unrelated shells).
 - Copy evidence into `.cursor/skills/verify-rusticdl/artifacts/<feature-id>/<RUN_ID>/` **before** deleting any temp dirs.
 - Leave durable artifacts on disk; confirm they still exist after cleanup.
+
+## Download engine (headless)
+
+No window, no `launch.sh`. The helper compiles a small driver over the existing download modules (crates already in `Cargo.toml`; `python3` `http.server` for the fixture) and enqueues one URL through `spawn_engine` + `FileJobStore` + `EngineCommand::Add`.
+
+```bash
+.cursor/skills/verify-rusticdl/scripts/prove-download-engine.sh identity
+.cursor/skills/verify-rusticdl/scripts/prove-download-engine.sh gzip-both
+.cursor/skills/verify-rusticdl/scripts/prove-download-engine.sh length-mismatch
+.cursor/skills/verify-rusticdl/scripts/prove-download-engine.sh resume-206
+```
+
+Stdout shows the job state and `final_sha256` compared with `expected_sha256` (the identity payload) and with `wire_sha256` (the GET body). Details and the server request log are in `features/download-engine.md`.
 
 ## Helpers
 
@@ -173,6 +188,9 @@ Rules:
 | `scripts/screenshot.sh` | Capture that window into the evidence dir (fails if the grab misses) |
 | `scripts/cleanup.sh` | Stop the launched pid; preserve evidence + artifacts |
 | `scripts/prove-add-download.sh` | End-to-end proof of the `add-download` feature |
+| `scripts/prove-download-engine.sh` | Headless proof of the `download-engine` feature (local HTTP fixture) |
+| `scripts/engine_http_server.py` | Fixture server used by `prove-download-engine.sh` |
+| `scripts/engine_drive.rs` | Engine driver source compiled by `prove-download-engine.sh` |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 
