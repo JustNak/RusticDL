@@ -16,6 +16,8 @@ use super::progress::{apply_tick, ProgressTick, TransferEvent};
 use crate::settings::Settings;
 
 mod commands;
+#[cfg(test)]
+mod ignored_range;
 mod persist;
 mod worker;
 

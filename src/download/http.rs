@@ -35,6 +35,9 @@ use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
+const IGNORED_RANGE_PARTIAL_KEPT: &str =
+    "Server ignored Range; partial kept. Use Restart to download from zero.";
+
 pub(crate) const RECONNECT_MAX: u32 = 12;
 pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
 pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(8);
@@ -393,9 +396,8 @@ pub async fn run_http_download_with_ctx(
                     }
                     let error = download_error(
                         FailureCategory::Resume,
-                        "Server ignored Range; partial kept. Use Restart to download from zero."
-                            .into(),
-                        true,
+                        IGNORED_RANGE_PARTIAL_KEPT.into(),
+                        false,
                     );
                     checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                     return Err(error);
@@ -448,11 +450,15 @@ pub async fn run_http_download_with_ctx(
                                 RepeatedBody::Matches => RepeatedDecision::Complete,
                                 RepeatedBody::Differs => {
                                     length_mismatches = length_mismatches.saturating_add(1);
-                                    let error = ignored_range_partial_kept();
                                     if length_mismatches > LENGTHLESS_MISMATCH_BEFORE_GIVEUP {
-                                        RepeatedDecision::Stop(Err(error))
+                                        RepeatedDecision::Stop(Err(ignored_range_partial_kept()))
                                     } else {
-                                        RepeatedDecision::Retry(error)
+                                        // One reconnect can still confirm the candidate.
+                                        // This signal stays retryable; the worker only
+                                        // sees the terminal error below.
+                                        RepeatedDecision::Retry(
+                                            ignored_range_partial_kept_reconnect(),
+                                        )
                                     }
                                 }
                                 RepeatedBody::Control(outcome) => {
@@ -506,7 +512,7 @@ pub async fn run_http_download_with_ctx(
                                         ReconnectAction::Control(outcome) => return Ok(outcome),
                                         ReconnectAction::GiveUp => {
                                             checkpoint_partial(ctx, existing_bytes, 0).await;
-                                            return Err(error);
+                                            return Err(terminal_ignored_range(error));
                                         }
                                     }
                                 }
@@ -517,9 +523,8 @@ pub async fn run_http_download_with_ctx(
                         }
                         let error = download_error(
                             FailureCategory::Resume,
-                            "Server ignored Range; partial kept. Use Restart to download from zero."
-                                .into(),
-                            true,
+                            IGNORED_RANGE_PARTIAL_KEPT.into(),
+                            false,
                         );
                         checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                         return Err(error);
@@ -1068,11 +1073,32 @@ fn is_clean_short_body(error: &DownloadError) -> bool {
 }
 
 fn ignored_range_partial_kept() -> DownloadError {
+    // A Range GET answered with 200, partial kept. Same stop as the other
+    // two ignored-Range sites: Resume, and not a worker retry.
+    download_error(
+        FailureCategory::Resume,
+        IGNORED_RANGE_PARTIAL_KEPT.into(),
+        false,
+    )
+}
+
+/// In-attempt signal for one lengthless mismatch. Same text as the terminal
+/// error, but retryable so `prepare_reconnect` can run. GiveUp of this text
+/// becomes `ignored_range_partial_kept`.
+fn ignored_range_partial_kept_reconnect() -> DownloadError {
     download_error(
         FailureCategory::Network,
-        "Server ignored Range; partial kept. Use Restart to download from zero.".into(),
+        IGNORED_RANGE_PARTIAL_KEPT.into(),
         true,
     )
+}
+
+fn terminal_ignored_range(error: DownloadError) -> DownloadError {
+    if error.message == IGNORED_RANGE_PARTIAL_KEPT {
+        ignored_range_partial_kept()
+    } else {
+        error
+    }
 }
 
 /// A saved job whose size was cleared after a lengthless validator change.
