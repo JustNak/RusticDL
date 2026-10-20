@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
 use super::body::{
-    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch, remote_size_changed_error,
-    stream_body, AppendSink, BodySink, CountingSink, StreamEnd,
+    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch, reject_encoded_body,
+    remote_size_changed_error, stream_body, AppendSink, BodySink, CountingSink, StreamEnd,
 };
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
@@ -400,6 +400,9 @@ pub async fn run_http_download_with_ctx(
                     checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                     return Err(error);
                 }
+                // This 200 would replace the partial. An encoded body is not
+                // that file, even when its Content-Length matches.
+                reject_encoded_body(response.headers())?;
                 // This 200 answered a Range request. It may carry a new size only
                 // when ETag or Last-Modified says the resource changed. Reject a
                 // conflicting Content-Length before the partial is deleted.
@@ -590,6 +593,14 @@ pub async fn run_http_download_with_ctx(
                 &validators,
                 &content_validators_from_headers(response.headers(), 0),
             );
+        // Before the size check, and before `AppendSink::open`. A gzip GET
+        // whose Content-Length matches HEAD must not be stored, and a gzip
+        // GET whose length disagrees must name the coding. A 206 that already
+        // holds a prefix keeps that count, the same as the other failures here.
+        if let Err(error) = reject_encoded_body(response.headers()) {
+            checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+            return Err(error);
+        }
         if !accept_new_size {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)
