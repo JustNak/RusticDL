@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A local-first HTTP(S) download manager written in Rust.</strong><br>
-  Fast queueing, resume support, rich appearance controls, and optional browser handoff.
+  Queue downloads, resume interrupted transfers, and optionally hand browser downloads to the desktop app.
 </p>
 
 <p align="center">
@@ -21,162 +21,85 @@
 <p align="center">
   <a href="#download"><strong>Download</strong></a> ·
   <a href="#features"><strong>Features</strong></a> ·
-  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="#data-location"><strong>Data location</strong></a> ·
   <a href="#guides"><strong>Guides</strong></a> ·
   <a href="#license"><strong>License</strong></a>
 </p>
 
----
-
 ## Download
 
-Get the latest Windows build from GitHub Releases:
+Download the latest stable build from [GitHub Releases](https://github.com/JustNak/RusticDL/releases/latest).
 
-**[→ Download RusticDL for Windows](https://github.com/JustNak/RusticDL/releases/latest)**
-
-Linux builds ship as **`RusticDL-linux-x64.tar.gz`** on [Stable](https://github.com/JustNak/RusticDL/releases/latest) and [Nightly](https://github.com/JustNak/RusticDL/releases) (app + native host + updater).
-
-Nightly (may be unstable) is an on-demand GitHub pre-release for testing new work before a Stable cut. In the app, set **Settings → General → Update channel** to **Nightly**, or grab a build from the [releases list](https://github.com/JustNak/RusticDL/releases).
-
-| Asset | What it contains |
+| Asset | Contents |
 | --- | --- |
-| **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app + native host + browser host registration) |
-| **`RusticDL-windows-x64.zip`** | Portable desktop app (`rusticdl.exe`) |
-| **`RusticDL-full-windows-x64.zip`** | Portable app + native host + register scripts + browser extension packages |
-| **`RusticDL-linux-x64.tar.gz`** | Linux app + native host + updater + `install-linux.sh` |
-| **`extension-chromium.zip`** | Chromium / Edge / Brave unpacked extension |
+| **`RusticDL-windows-x64-setup.exe`** | **Recommended** — NSIS installer (app, native host, browser host registration) |
+| **`RusticDL-windows-x64.zip`** | Portable app (`rusticdl.exe`) |
+| **`RusticDL-full-windows-x64.zip`** | Portable app, native host, register scripts, and browser extension packages |
+| **`RusticDL-linux-x64.tar.gz`** | Linux app, native host, updater, and `install-linux.sh` |
+| **`extension-chromium.zip`** | Chromium, Edge, and Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 
-### Install (recommended)
+### Windows
 
-1. Download **`RusticDL-windows-x64-setup.exe`**.
-2. Run the installer (per-user install; **no administrator rights** required).
-3. Launch **RusticDL** from the Start Menu.
+Run **`RusticDL-windows-x64-setup.exe`**. The installer is per-user and needs no administrator rights; it installs under `%LOCALAPPDATA%\RusticDL\`, adds a Start Menu shortcut, and registers the native messaging host for Chrome, Edge, and Firefox. Uninstall from Apps & Features, with an option to remove app data.
 
-The installer places files under `%LOCALAPPDATA%\RusticDL\`, creates a Start Menu shortcut, and registers the browser **native messaging host** for Chrome, Edge, and Firefox.
+For a portable build, extract `RusticDL-windows-x64.zip` or `RusticDL-full-windows-x64.zip` and run `rusticdl.exe`.
 
-Settings and queue state live under `%APPDATA%\RusticDL\`. Uninstall via Apps & Features (optionally remove app data).
+The installer does not add browser extensions; load one from the table separately (see [Browser extension](docs/browser-extension.md)). Release installers are unsigned, so Windows may show SmartScreen or a UAC prompt.
 
-> **Note:** The installer does **not** auto-install browser extensions. Load the extension separately (see [Browser extension](docs/browser-extension.md)). GitHub Windows installers are unsigned; Windows may show SmartScreen (“Windows protected your PC”) and/or UAC. Local source builds are also unsigned.
+### Linux
 
-### Install (Linux)
-
-1. Download **`RusticDL-linux-x64.tar.gz`** from [Releases](https://github.com/JustNak/RusticDL/releases/latest).
-2. Extract and install (per-user, **no sudo**):
+Download **`RusticDL-linux-x64.tar.gz`**, then:
 
 ```bash
 tar -xzf RusticDL-linux-x64.tar.gz
 ./install-linux.sh
 ```
 
-That copies binaries to `~/.local/lib/RusticDL/`, puts `rusticdl` on `PATH` (`~/.local/bin/rusticdl`), writes a desktop entry, and registers the browser native messaging host with an absolute path.
+This installs per-user without sudo: binaries go to `~/.local/lib/RusticDL/`, `rusticdl` is placed in `~/.local/bin`, and the script adds a desktop entry and registers the browser native host.
 
-Portable (no PATH / desktop entry): extract and run `./rusticdl`. Register the host with `./scripts/register-native-host.sh` or use **Settings → Browser → Register browser host**.
+To run without installing, extract the archive and run `./rusticdl`. Register the host with `./scripts/register-native-host.sh` or **Settings → Browser → Register browser host**. In-app updates replace files in the install prefix or portable folder. Snap and Flatpak browsers may not see user-level native messaging hosts.
 
-In-app updates replace files in the install prefix (or the portable extract folder). Snap/Flatpak browsers may not see user-level native messaging hosts.
+Nightly builds are pre-releases for testing. Switch to them under **Settings → General → Update channel**, or download from the [releases list](https://github.com/JustNak/RusticDL/releases).
 
-Load the browser extension separately (see [Browser extension](docs/browser-extension.md)).
+## Features
 
-### Portable install (ZIP)
+- Add one or many HTTP/HTTPS URLs, with batch paste (one per line).
+- Filter the queue by All, Active, Completed, or Failed; search by filename, URL, or path.
+- Track live percent, size, speed, and ETA, with queue totals and aggregate speed in the status bar.
+- Open a floating progress window for active downloads.
+- Pause, resume, pause all, resume all, retry, restart, cancel, remove, or delete files (with confirmation); clear completed or failed jobs.
+- Inspect and act on any job from the detail panel: open, reveal, copy path.
+- Download in parallel Range segments with map-authoritative resume; interrupted jobs reconnect with backoff and reuse their segment map.
+- Set the download directory, concurrency, auto-retry, an optional global speed limit, and multi-segment caps.
+- Resolve same-name conflicts with rename, overwrite, or cancel; active duplicate URLs are not queued twice.
+- Get Windows notifications through the tray, OS notifications, or in-app toasts.
+- Customize appearance: light, dark, or system theme; accents, transparency, blur, film grain, density, corners, vignette, progress styles, and reduced motion.
+- Keep queue, settings, and window geometry between runs.
+- Hand downloads from Firefox or Chromium to RusticDL through the browser extension and native host; configure capture in the app.
 
-1. Download **`RusticDL-windows-x64.zip`** (or the full package if you want browser integration).
-2. Extract anywhere you like (for example `C:\Tools\RusticDL\`).
-3. Run `rusticdl.exe`.
+**Built with:** [GPUI](https://gpui.rs/) and [gpui-component](https://github.com/longbridge/gpui-component) for the UI, a multi-segment Range engine with single-stream fallback, and an HTTP client with HTTP/2 and HTTP/3 (QUIC) fallback.
 
----
+### Not included
 
-## What is RusticDL?
-
-RusticDL is a **simple, local-first download manager** focused on everyday HTTP/HTTPS files:
-
-- Queue multiple URLs and watch live progress
-- Pause / resume when the server supports byte ranges
-- Retry, restart, open files, and reveal in Explorer
-- Customize look and feel (theme, accent, transparency, density, motion)
-- Optionally hand browser downloads to the desktop app via a native messaging host
-
-**Stack**
-
-- **UI:** [GPUI](https://gpui.rs/) (Zed’s GPU-accelerated UI) + [gpui-component](https://github.com/longbridge/gpui-component)
-- **Engine:** multi-segment Range downloads with map-authoritative resume (falls back to single-stream)
-- **HTTP:** browser-like client with HTTP/2 and HTTP/3 (QUIC) fallback
-
-### Features
-
-- Add one or many URLs (batch paste, one per line) over HTTP/HTTPS
-- Queue filters: All / Active / Completed / Failed
-- Search by filename, URL, or path
-- Live progress: percent, size, speed, ETA
-- Open a floating progress window from the queue overflow menu or detail panel while a job is still downloading
-- Status bar with totals, aggregate speed, and speed limit
-- Pause / resume, pause-all / resume-all
-- Retry, restart, cancel, remove from the queue, or delete the file from disk (with confirmation)
-- Clear completed / clear failed
-- Detail panel with full job actions (open, reveal, copy path)
-- Multi-connection segmented downloads for large HTTP files (parallel Range requests)
-- Map-authoritative resume: paused or failed multi jobs reuse the same segment map
-- Mid-transfer reconnect with short backoff
-- Concurrent downloads, auto-retry with exponential backoff, optional global speed limit
-- Fsync on pause (flush `.part` to disk)
-- Nested TLS/network error details (helps diagnose flaky networks)
-- Windows completion notifications: tray balloons, OS notify mode (when hidden / always / off), and in-app terminal toasts when the window is visible
-- Unified active-URL duplicate policy: the same URL is not queued again while an active job already exists (manual Add and browser handoff share one rule)
-- Ask-mode same-name conflict popup: Rename fills `file (1).ext`, Start download stays disabled with a Duplicate Name tooltip while the typed name is taken, overwrite (replace at finalize), or cancel
-- Desktop Browser capture settings panel to configure extension capture preferences from the app
-- Settings for download dir, concurrency, retries, speed limit, multi-segment caps, appearance, and data folder
-- Appearance: light / dark / system, accents, transparency, blur, film grain, density, corners, vignette, progress styles, reduce motion
-- Persisted queue, settings, and window geometry
-- Browser extension handoff (Firefox + Chromium)
-
-### Not included (by design)
-
-- Torrents / magnets
-- Bulk archive finalize workflows
-
----
-
-## Quick start
-
-### From the installer
-
-Install via **`RusticDL-windows-x64-setup.exe`**, then open **RusticDL** from the Start Menu.
-
-### Linux tarball
-
-Download **`RusticDL-linux-x64.tar.gz`**, extract, and run `./install-linux.sh` (see [Install (Linux)](#install-linux) above).
-
-### From a portable ZIP
-
-```powershell
-# After extracting the zip
-.\rusticdl.exe
-```
-
----
+- Torrents or magnets.
+- Bulk archive finalize workflows.
 
 ## Data location
 
-Settings and queue state are stored under:
+- Windows: `%APPDATA%\RusticDL\` (`settings.json`, `state.json`)
+- Linux: `~/.local/share/RusticDL/` (`settings.json`, `state.json`)
 
-- Windows: `%APPDATA%\RusticDL\` — `settings.json`, `state.json`
-- Linux: `~/.local/share/RusticDL/` (XDG) — `settings.json`, `state.json`
-
-Partial downloads are written next to the destination as `filename.ext.part`. Multi-segment jobs also persist a segment map in `state.json` (`transfer_format_version = 1`).
-
----
+Partial downloads are written beside the destination as `filename.ext.part`. Multi-segment jobs also store their segment map in `state.json`.
 
 ## Guides
 
 - [Build from source](docs/build.md)
 - [Browser extension](docs/browser-extension.md)
 - [Download engine](docs/download-engine.md)
-- [Releases & contributing](docs/releases.md)
+- [Releases and contributing](docs/releases.md)
 - [Protocol (browser bridge)](docs/protocol.md)
-
----
 
 ## License
 
-RusticDL is released under the **[MIT License](LICENSE)**.
-
-You may use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software — including for commercial purposes — provided you include the copyright notice and permission notice in all copies or substantial portions of the Software.
+RusticDL is released under the [MIT License](LICENSE).
