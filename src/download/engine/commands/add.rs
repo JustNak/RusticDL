@@ -10,7 +10,8 @@ use super::super::super::filesystem::{
 use super::super::super::handoff::{EnqueueOutcome, EnqueueStatus, HandoffAuth};
 use super::super::super::job::Job;
 use super::super::super::urls::extract_http_urls;
-use super::super::{emit_jobs_locked, emit_toast, EngineInner};
+use super::super::persist::persist_live_jobs;
+use super::super::{bump_jobs, emit_jobs_locked, emit_toast, EngineInner};
 
 pub(super) async fn handle(
     inner: &Arc<Mutex<EngineInner>>,
@@ -169,9 +170,12 @@ pub(super) async fn handle(
             }
             guard.jobs.insert(0, job);
         }
+        bump_jobs(&mut guard);
         emit_jobs_locked(&guard);
         guard.wake.notify_one();
     }
+
+    let _ = persist_live_jobs(inner).await;
 
     if let Some(reply) = reply {
         if let Some(outcome) = first_outcome {

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ pub struct TransferContext {
     pub conn_budget: Arc<ConnectionBudget>,
     pub resolved_url: String,
     pub preflight_done: bool,
+    /// Other jobs' final paths and temps. Content-Disposition adoption must
+    /// not rename onto either, including a Windows case variant.
+    pub occupied_paths: Vec<PathBuf>,
 }
 
 impl TransferContext {
@@ -50,6 +54,7 @@ impl TransferContext {
             conn_budget,
             resolved_url,
             preflight_done: false,
+            occupied_paths: Vec::new(),
         }
     }
 }

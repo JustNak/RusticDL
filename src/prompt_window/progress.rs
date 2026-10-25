@@ -74,7 +74,7 @@ impl BrowserPromptWindow {
             }
         }
 
-        window.activate_window();
+        // Focus/raise is owned by open_capture_window (once).
         if matches!(phase, CapturePhase::Progress { .. }) {
             start_sync_timer(cx);
         }

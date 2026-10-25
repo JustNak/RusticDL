@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
@@ -14,11 +14,7 @@ pub struct SegmentFileWriter {
 
 impl SegmentFileWriter {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
+        let file = super::filesystem::open_download_file(path, true, true, true, false)?;
         Ok(Self {
             file: Mutex::new(file),
         })

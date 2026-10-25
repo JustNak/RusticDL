@@ -33,7 +33,6 @@ pub struct BrowserPrompt {
     pub total_bytes: Option<u64>,
     pub browser: String,
     pub entry_point: String,
-    pub page_title: Option<String>,
     pub created_at: Instant,
     pub(crate) reply: oneshot::Sender<PromptDecision>,
 }
@@ -47,7 +46,6 @@ pub struct BrowserPromptView {
     pub total_bytes: Option<u64>,
     pub browser: String,
     pub entry_point: String,
-    pub page_title: Option<String>,
     pub default_directory: PathBuf,
 }
 
@@ -60,7 +58,6 @@ impl BrowserPrompt {
             total_bytes: self.total_bytes,
             browser: self.browser.clone(),
             entry_point: self.entry_point.clone(),
-            page_title: self.page_title.clone(),
             default_directory,
         }
     }
@@ -532,7 +529,6 @@ mod tests {
                 total_bytes: Some(1),
                 browser: "chrome".into(),
                 entry_point: "popup".into(),
-                page_title: None,
                 created_at: Instant::now(),
                 reply,
             },

@@ -18,6 +18,42 @@ const SETUP_ASSET_NAME: &str = "RusticDL-update.bin";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Whether a missing `--expected-sha256` fails the helper download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sha256Verify {
+    /// Linux: empty or omitted hash refuses the install.
+    Required,
+    /// Windows: verify when the app passed a hash; skip if it did not.
+    Optional,
+}
+
+fn sha256_verify_mode() -> Sha256Verify {
+    if cfg!(target_os = "linux") {
+        Sha256Verify::Required
+    } else {
+        Sha256Verify::Optional
+    }
+}
+
+/// Returns the hex to hash against, or `None` to skip verify.
+pub(crate) fn expected_sha256_for_verify(
+    expected_sha256: Option<&str>,
+    mode: Sha256Verify,
+) -> Result<Option<&str>, String> {
+    let value = expected_sha256
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match mode {
+        Sha256Verify::Required => value
+            .ok_or_else(|| {
+                "Linux update is missing SHA-256. Refuse to install an unverified archive."
+                    .to_string()
+            })
+            .map(Some),
+        Sha256Verify::Optional => Ok(value),
+    }
+}
+
 pub fn download_installer(
     url: &str,
     expected_size: Option<u64>,
@@ -95,19 +131,7 @@ pub fn download_installer(
         }
     }
 
-    if cfg!(target_os = "linux") {
-        let expected = expected_sha256
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                "Linux update is missing SHA-256. Refuse to install an unverified archive."
-                    .to_string()
-            })?;
-        verify_sha256(&installer_path, expected)?;
-    } else if let Some(expected) = expected_sha256
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(expected) = expected_sha256_for_verify(expected_sha256, sha256_verify_mode())? {
         verify_sha256(&installer_path, expected)?;
     }
 
@@ -204,5 +228,37 @@ mod tests {
         };
         verify_sha256(&path, &expected).expect("matching hash");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_verifies_when_expected_sha256_present() {
+        let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(
+            expected_sha256_for_verify(Some(hash), Sha256Verify::Optional).unwrap(),
+            Some(hash)
+        );
+    }
+
+    #[test]
+    fn windows_skips_verify_when_sha256_omitted() {
+        assert_eq!(
+            expected_sha256_for_verify(None, Sha256Verify::Optional).unwrap(),
+            None
+        );
+        assert_eq!(
+            expected_sha256_for_verify(Some("  "), Sha256Verify::Optional).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn linux_still_requires_expected_sha256() {
+        let err = expected_sha256_for_verify(None, Sha256Verify::Required).unwrap_err();
+        assert!(err.contains("SHA-256"));
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            expected_sha256_for_verify(Some(hash), Sha256Verify::Required).unwrap(),
+            Some(hash)
+        );
     }
 }

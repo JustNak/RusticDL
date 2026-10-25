@@ -332,10 +332,22 @@ export function firefoxWebRequestDownloadCandidate(
     return null;
   }
 
-  // fetch() + blob on Gofile/Pixeldrain never hits downloads.onCreated with an
-  // http(s) URL. Intercept only large, obvious file XHRs so we can hand off
-  // the real CDN link instead of a 3 KB HTML ticket.
+  // fetch()/XHR is not a browser download. Chat UIs request generated PDFs
+  // and other files this way (often with Content-Disposition: attachment)
+  // without the user starting a save. Chromium never sees those on
+  // downloads.onCreated. Content-Disposition does not make a page fetch a
+  // user download. Only file-host CDNs are intercepted, because their
+  // fetch()+blob saves never show up as an http(s) download item.
   if (isXhr) {
+    let xhrHost = '';
+    try {
+      xhrHost = new URL(url).hostname;
+    } catch {
+      return null;
+    }
+    if (!isFileHostObjectCdnHost(xhrHost)) {
+      return null;
+    }
     if (totalBytes != null && totalBytes < MIN_XHR_CAPTURE_BYTES) {
       return null;
     }
@@ -348,8 +360,8 @@ export function firefoxWebRequestDownloadCandidate(
     }
   }
 
-  // Chat UIs (Grok, etc.) fetch generated PDFs/Office docs to preview them.
-  // type=object is PDF.js / <embed>. Archives and attachment downloads stay.
+  // In-page PDF/Office viewers (PDF.js / <embed>, chat previews). A file-host
+  // XHR of one of these still needs attachment; archives are handled above.
   if (
     (isXhr || isObject) &&
     isPreviewableDownload(ext, mime) &&

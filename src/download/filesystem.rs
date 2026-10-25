@@ -1,6 +1,13 @@
 use percent_encoding::percent_decode_str;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
 use super::job::Job;
 use super::resume::{resume_oracle, ResumeOracle};
@@ -137,7 +144,137 @@ pub async fn ensure_parent_directory(path: &Path) -> Result<(), String> {
 }
 
 pub async fn metadata_len(path: &Path) -> Option<u64> {
-    fs::metadata(path).await.ok().map(|metadata| metadata.len())
+    let metadata = fs::symlink_metadata(io_path(path)).await.ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    Some(metadata.len())
+}
+
+/// Open a partial download without following a symlink or other reparse point
+/// at the final path component. `O_CREAT` on a dangling symlink must not create
+/// the link target outside the save folder.
+pub fn open_download_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+    truncate: bool,
+) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create(create)
+        .truncate(truncate);
+    apply_nofollow(&mut options);
+    let file = options.open(io_path(path))?;
+    reject_reparse_point(&file)?;
+    Ok(file)
+}
+
+fn apply_nofollow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = options;
+    }
+}
+
+fn reject_reparse_point(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to open a reparse point",
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+/// Filesystem path used for open, preallocate, and rename.
+///
+/// On Windows this is a `\\?\` absolute path (or `\\?\UNC\`) so paths longer
+/// than `MAX_PATH` can be opened. The job still stores the normal path.
+pub fn io_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(extended_windows_path_str(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+pub fn path_exists(path: &Path) -> bool {
+    // `metadata` follows links and treats a dangling symlink as absent.
+    // `symlink_metadata` sees the node itself, so allocation will not reuse it.
+    std::fs::symlink_metadata(io_path(path)).is_ok()
+}
+
+pub(crate) fn extended_windows_path_str(path: &str) -> String {
+    if path.starts_with(r"\\?\") {
+        return path.to_string();
+    }
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        if !rest.is_empty() {
+            return format!(r"\\?\UNC\{}", rest.trim_start_matches('\\'));
+        }
+    }
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if drive {
+        format!(r"\\?\{path}")
+    } else {
+        path.to_string()
+    }
+}
+
+pub(crate) fn ordinal_upcase_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_uppercase();
+    }
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(mapped), None) => mapped,
+        _ => c,
+    }
+}
+
+pub(crate) fn ordinal_casefold_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(ordinal_upcase_char)
+        .collect()
+}
+
+pub(crate) fn paths_equal_for_volume(left: &Path, right: &Path, case_insensitive: bool) -> bool {
+    left == right || (case_insensitive && ordinal_casefold_key(left) == ordinal_casefold_key(right))
+}
+
+pub(crate) fn same_occupied_path(left: &Path, right: &Path) -> bool {
+    paths_equal_for_volume(left, right, cfg!(windows))
+}
+
+pub(crate) fn path_occupied(path: &Path, occupied: &[PathBuf]) -> bool {
+    occupied.iter().any(|other| same_occupied_path(other, path))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +336,26 @@ pub fn apply_partial_progress_from_disk(job: &mut Job, on_disk: u64) -> Reconcil
 
 pub fn reconcile_from_oracle(job: &mut Job, on_disk: Option<u64>) -> ReconcileResult {
     let version_gated = job.transfer_format_version >= 1;
+    // Rejected bytes are not progress. Do not copy the file length or a
+    // segment sum that was counted from that file back into the job.
+    if job.rejected_partial {
+        let before = job.downloaded_bytes;
+        job.downloaded_bytes = 0;
+        job.progress = 0.0;
+        return ReconcileResult {
+            downloaded_bytes: 0,
+            on_disk: on_disk.unwrap_or(0),
+            changed: before != 0,
+            used_metadata_len: false,
+            version_gated,
+            used_map_sum: false,
+            map_consistent: job
+                .segment_map
+                .as_ref()
+                .is_some_and(|map| map.is_consistent()),
+            resume_required: false,
+        };
+    }
     match resume_oracle(job) {
         ResumeOracle::Multi { map } => {
             let sum = map.written_sum();
@@ -270,7 +427,7 @@ pub async fn move_to_final_path(
         allocate_final_path(target_path).await?
     };
 
-    fs::rename(temp_path, &final_path)
+    fs::rename(io_path(temp_path), io_path(&final_path))
         .await
         .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
 
@@ -278,8 +435,8 @@ pub async fn move_to_final_path(
 }
 
 async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), String> {
-    if !target_path.exists() {
-        fs::rename(temp_path, target_path)
+    if !path_exists(target_path) {
+        fs::rename(io_path(temp_path), io_path(target_path))
             .await
             .map_err(|error| format!("Could not finalize downloaded file: {error}"))?;
         return Ok(());
@@ -288,29 +445,29 @@ async fn replace_final_path(temp_path: &Path, target_path: &Path) -> Result<(), 
     let mut sidecar = target_path.as_os_str().to_os_string();
     sidecar.push(".replaced");
     let sidecar = PathBuf::from(sidecar);
-    if sidecar.exists() {
-        fs::remove_file(&sidecar)
+    if path_exists(&sidecar) {
+        fs::remove_file(io_path(&sidecar))
             .await
             .map_err(|error| format!("Could not clear leftover replacement backup: {error}"))?;
     }
 
-    fs::rename(target_path, &sidecar)
+    fs::rename(io_path(target_path), io_path(&sidecar))
         .await
         .map_err(|error| format!("Could not move existing download aside: {error}"))?;
 
-    if let Err(error) = fs::rename(temp_path, target_path).await {
-        let _ = fs::rename(&sidecar, target_path).await;
+    if let Err(error) = fs::rename(io_path(temp_path), io_path(target_path)).await {
+        let _ = fs::rename(io_path(&sidecar), io_path(target_path)).await;
         return Err(format!(
             "Could not finalize downloaded file: {error}. The original file was kept."
         ));
     }
 
-    let _ = fs::remove_file(&sidecar).await;
+    let _ = fs::remove_file(io_path(&sidecar)).await;
     Ok(())
 }
 
 pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> {
-    if !target_path.exists() {
+    if !path_exists(target_path) {
         return Ok(target_path.to_path_buf());
     }
 
@@ -329,7 +486,7 @@ pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> 
 
     for index in 1..10_000 {
         let candidate = parent.join(format!("{stem} ({index}){extension}"));
-        if !candidate.exists() {
+        if !path_exists(&candidate) {
             return Ok(candidate);
         }
     }
@@ -338,8 +495,95 @@ pub async fn allocate_final_path(target_path: &Path) -> Result<PathBuf, String> 
 }
 
 pub async fn remove_partial(path: &Path) {
-    let _ = fs::remove_file(path).await;
+    let _ = fs::remove_file(io_path(path)).await;
 }
+
+/// What happened to a `.part` whose bytes were rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectedPartialClear {
+    /// Unlink removed it, or it was already gone. Nothing left to resume.
+    Gone,
+    /// Delete failed and `set_len(0)` succeeded. The next offset is 0.
+    Truncated,
+    /// Delete and truncate both failed. The rejected bytes are still the file.
+    Unchanged,
+}
+
+/// Drop a rejected `.part`. Delete is enough when it works. A locked file
+/// (Windows antivirus is the usual case) stays on disk, so the bytes are
+/// truncated in place. When both fail, the caller must persist
+/// [`Job::rejected_partial`](super::job::Job::rejected_partial): the on-disk
+/// length is not a resume offset.
+/// A finished download is not passed here: truncating that would destroy it.
+///
+/// On Windows the read-only attribute does not stop this delete: it opens
+/// the file for `DELETE` and sets the disposition flag. A handle opened
+/// without `FILE_SHARE_DELETE` and without `FILE_SHARE_WRITE` does stop
+/// both this delete and the truncate.
+pub async fn clear_rejected_partial(path: &Path) -> RejectedPartialClear {
+    // Tests lock the file here, after the writer has closed it. A
+    // FILE_SHARE_NONE handle cannot be opened while that writer is still open.
+    #[cfg(test)]
+    rejected_clear_hook::run(path);
+    match fs::remove_file(io_path(path)).await {
+        Ok(()) => return RejectedPartialClear::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return RejectedPartialClear::Gone;
+        }
+        Err(_) => {}
+    }
+    let path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || truncate_rejected_partial(&path)).await {
+        Ok(Ok(())) => RejectedPartialClear::Truncated,
+        _ => RejectedPartialClear::Unchanged,
+    }
+}
+
+fn truncate_rejected_partial(path: &Path) -> io::Result<()> {
+    let file = open_download_file(path, false, true, false, true)?;
+    file.set_len(0)?;
+    Ok(())
+}
+
+/// Path-keyed lock installed by tests. Production builds have no hook.
+#[cfg(test)]
+mod rejected_clear_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn install(path: &Path, hook: Hook) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+        guard.push((path.to_path_buf(), hook));
+    }
+
+    pub(crate) fn remove(path: &Path) {
+        let mut guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+        guard.retain(|(existing, _)| existing != path);
+    }
+
+    pub(crate) fn run(path: &Path) {
+        let hook = {
+            let guard = HOOKS.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .iter()
+                .find(|(existing, _)| existing == path)
+                .map(|(_, hook)| Arc::clone(hook))
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use rejected_clear_hook::{
+    install as install_rejected_clear_hook, remove as remove_rejected_clear_hook,
+};
 
 pub fn parse_content_disposition_filename(header_value: &str) -> Option<String> {
     if let Some(encoded) = header_value
@@ -472,20 +716,31 @@ pub fn preferred_download_paths(
     (preferred, target, temp)
 }
 
+fn occupied_union_hits(
+    path: &Path,
+    occupied_targets: &[PathBuf],
+    occupied_temps: &[PathBuf],
+) -> bool {
+    occupied_targets
+        .iter()
+        .chain(occupied_temps.iter())
+        .any(|occupied| same_occupied_path(occupied, path))
+}
+
 fn paths_are_taken(
     target: &Path,
     temp: &Path,
     occupied_targets: &[PathBuf],
     occupied_temps: &[PathBuf],
 ) -> bool {
-    occupied_targets.iter().any(|path| path == target)
-        || occupied_temps.iter().any(|path| path == temp)
-        || target.exists()
-        || temp.exists()
+    occupied_union_hits(target, occupied_targets, occupied_temps)
+        || occupied_union_hits(temp, occupied_targets, occupied_temps)
+        || path_exists(target)
+        || path_exists(temp)
 }
 
 fn job_owns_paths(job: &Job, target: &Path, temp: &Path) -> bool {
-    job.target_path == target || job.temp_path == temp
+    same_occupied_path(&job.target_path, target) || same_occupied_path(&job.temp_path, temp)
 }
 
 fn job_blocks_overwrite(target: &Path, temp: &Path, jobs: &[Job]) -> bool {
@@ -500,13 +755,16 @@ fn pending_temp_blocks_overwrite(
     jobs: &[Job],
     extra_jobs: &[Job],
 ) -> bool {
-    if !occupied_temps.iter().any(|path| path == temp) {
+    if !occupied_temps
+        .iter()
+        .any(|path| same_occupied_path(path, temp))
+    {
         return false;
     }
     !jobs
         .iter()
         .chain(extra_jobs.iter())
-        .any(|job| job.temp_path == temp)
+        .any(|job| same_occupied_path(&job.temp_path, temp))
 }
 
 pub fn find_filename_collision(
@@ -560,7 +818,13 @@ pub fn allocate_download_paths(
         let (name, target, temp) = preferred_download_paths(directory, preferred_name);
         let blocked = job_blocks_overwrite(&target, &temp, jobs)
             || job_blocks_overwrite(&target, &temp, extra_jobs)
-            || pending_temp_blocks_overwrite(&temp, occupied_temps, jobs, extra_jobs);
+            || pending_temp_blocks_overwrite(&temp, occupied_temps, jobs, extra_jobs)
+            || occupied_temps
+                .iter()
+                .any(|path| same_occupied_path(path, &target))
+            || occupied_targets
+                .iter()
+                .any(|path| same_occupied_path(path, &temp));
         if !blocked {
             return (name, target, temp, true);
         }
@@ -636,10 +900,135 @@ pub fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::segment::{Segment, SegmentMap, SegmentState};
+
+    #[cfg(windows)]
+    use std::io::{Read, Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
 
     #[test]
     fn sanitizes_unsafe_names() {
         assert_eq!(sanitize_filename("a/b\\c:d?.zip"), "a_b_c_d_.zip");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_directory_is_not_writable() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        assert_eq!(
+            len,
+            Some(0),
+            "a failed delete must drop the rejected bytes in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_rejected_partial_is_unchanged_when_truncate_also_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-both-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        let body = b"rejected-prefix";
+        std::fs::write(&file, body).unwrap();
+        let mut file_perms = std::fs::metadata(&file).unwrap().permissions();
+        file_perms.set_mode(0o444);
+        std::fs::set_permissions(&file, file_perms).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+
+        let clear = clear_rejected_partial(&file).await;
+        let bytes = std::fs::read(&file).ok();
+
+        let mut file_perms = std::fs::metadata(&file).unwrap().permissions();
+        file_perms.set_mode(0o644);
+        std::fs::set_permissions(&file, file_perms).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+
+        assert_eq!(clear, RejectedPartialClear::Unchanged);
+        assert_eq!(bytes.as_deref(), Some(body.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clear_rejected_partial_truncates_when_delete_is_sharing_violation() {
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        let dir =
+            std::env::temp_dir().join(format!("rusticdl-reject-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        std::fs::write(&file, b"rejected-prefix").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&file)
+            .unwrap();
+
+        clear_rejected_partial(&file).await;
+        let len = metadata_len(&file).await;
+        drop(held);
+
+        assert_eq!(
+            len,
+            Some(0),
+            "a sharing violation on delete must still drop the rejected bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clear_rejected_partial_is_unchanged_when_write_is_also_denied() {
+        const FILE_SHARE_NONE: u32 = 0;
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reject-share-none-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.bin.part");
+        let body = b"rejected-prefix";
+        std::fs::write(&file, body).unwrap();
+        // share_mode(0) denies every later open, including the read this
+        // assertion would otherwise use. The bytes are read through the holder.
+        let mut held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_NONE)
+            .open(&file)
+            .unwrap();
+
+        let clear = clear_rejected_partial(&file).await;
+        held.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).unwrap();
+        drop(held);
+
+        assert_eq!(clear, RejectedPartialClear::Unchanged);
+        assert_eq!(bytes, body);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
@@ -728,6 +1117,56 @@ mod tests {
         assert!(!result.changed);
         assert_eq!(job.downloaded_bytes, 0);
         assert_eq!(result.on_disk, 8_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejected_partial_ignores_file_length_and_segment_sum() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-reconcile-rejected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.bin");
+        let temp = temp_path_for(&target);
+        std::fs::write(&temp, vec![0xFFu8; 4_000]).unwrap();
+
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            target,
+            temp,
+        );
+        job.downloaded_bytes = 4_000;
+        job.total_bytes = 4_000;
+        job.progress = 100.0;
+        job.rejected_partial = true;
+        job.transfer_format_version = 1;
+        job.segment_map = Some(SegmentMap {
+            total_bytes: 4_000,
+            segment_count: 1,
+            segments: vec![Segment {
+                index: 0,
+                start: 0,
+                end: 3_999,
+                written: 4_000,
+                state: SegmentState::Completed,
+            }],
+            preallocated: true,
+        });
+
+        let result = reconcile_partial_progress(&mut job).await;
+        assert!(!result.used_metadata_len);
+        assert!(!result.used_map_sum);
+        assert_eq!(job.downloaded_bytes, 0);
+        assert_eq!(job.progress, 0.0);
+        assert!(job.rejected_partial);
+        assert!(
+            job.segment_map.is_some(),
+            "the map stays until a truncate-open"
+        );
+        assert_eq!(std::fs::metadata(&job.temp_path).unwrap().len(), 4_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1327,6 +1766,133 @@ mod tests {
         #[cfg(not(any(windows, unix)))]
         {
             let _ = free;
+        }
+    }
+
+    #[test]
+    fn ordinal_casefold_collides_names_that_differ_only_by_case() {
+        let upper = Path::new(r"C:\dl\Report.pdf");
+        let lower = Path::new(r"C:\dl\report.pdf");
+        assert_ne!(upper, lower);
+        assert!(paths_equal_for_volume(upper, lower, true));
+        assert!(!paths_equal_for_volume(upper, lower, false));
+        assert!(paths_equal_for_volume(
+            Path::new("Résumé.bin"),
+            Path::new("résumé.bin"),
+            true
+        ));
+    }
+
+    #[test]
+    fn extended_windows_path_prefixes_absolute_and_unc() {
+        assert_eq!(
+            extended_windows_path_str(r"C:\dl\file.bin"),
+            r"\\?\C:\dl\file.bin"
+        );
+        assert_eq!(
+            extended_windows_path_str(r"\\server\share\file.bin"),
+            r"\\?\UNC\server\share\file.bin"
+        );
+        assert_eq!(
+            extended_windows_path_str(r"\\?\C:\already"),
+            r"\\?\C:\already"
+        );
+        assert_eq!(extended_windows_path_str("file.bin"), "file.bin");
+    }
+
+    #[test]
+    fn case_variant_is_taken_before_the_part_file_exists() {
+        let dir = Path::new(r"C:\dl");
+        let jobs = Vec::new();
+        let occupied_targets = vec![dir.join("Report.pdf")];
+        let occupied_temps = vec![dir.join("Report.pdf.part")];
+        let (_name, target, temp, _) = allocate_download_paths(
+            dir,
+            "report.pdf",
+            &occupied_targets,
+            &occupied_temps,
+            &jobs,
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        if cfg!(windows) {
+            assert!(
+                !paths_equal_for_volume(&target, &occupied_targets[0], true),
+                "Windows must not share one .part across case variants, got {}",
+                target.display()
+            );
+            assert!(!paths_equal_for_volume(&temp, &occupied_temps[0], true));
+        } else {
+            assert_eq!(target, dir.join("report.pdf"));
+        }
+    }
+
+    #[test]
+    fn final_path_that_matches_another_temp_is_taken() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, temp, _) = allocate_download_paths(
+            dir,
+            "Notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        assert!(
+            !same_occupied_path(&target, &occupied_temps[0]),
+            "a new final path must not reuse another job's temp, got {}",
+            target.display()
+        );
+        assert!(!same_occupied_path(&temp, &occupied_temps[0]));
+    }
+
+    #[test]
+    fn overwrite_falls_back_when_final_name_is_another_temp() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, _, replace) = allocate_download_paths(
+            dir,
+            "Notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Overwrite,
+        );
+        assert!(!replace);
+        assert!(
+            !same_occupied_path(&target, &occupied_temps[0]),
+            "overwrite must not land on another job's temp, got {}",
+            target.display()
+        );
+    }
+
+    #[test]
+    fn case_variant_of_another_temp_is_taken_on_windows() {
+        let dir = Path::new(r"C:\dl");
+        let occupied_targets = vec![dir.join("Notes.txt")];
+        let occupied_temps = vec![dir.join("Notes.txt.part")];
+        let (_name, target, _, _) = allocate_download_paths(
+            dir,
+            "notes.txt.part",
+            &occupied_targets,
+            &occupied_temps,
+            &[],
+            &[],
+            FilenameConflictPolicy::Uniquify,
+        );
+        if cfg!(windows) {
+            assert!(
+                !paths_equal_for_volume(&target, &occupied_temps[0], true),
+                "Windows must case-fold a new final path against another temp, got {}",
+                target.display()
+            );
+        } else {
+            assert_eq!(target, dir.join("notes.txt.part"));
         }
     }
 }

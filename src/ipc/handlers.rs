@@ -226,7 +226,6 @@ async fn prompt_download(
         total_bytes: payload.total_bytes,
         browser: payload.source.browser.clone(),
         entry_point: payload.source.entry_point.clone(),
-        page_title: payload.source.page_title.clone(),
         created_at: Instant::now(),
         reply: reply_tx,
     };

@@ -27,11 +27,11 @@ impl BrowserPromptWindow {
         engine: EngineHandle,
         settings: &Settings,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> Self {
         apply_window_opacity(window, settings.window_transparency, settings.backdrop_blur);
         apply_app_icon(window);
-        window.activate_window();
+        // Focus/raise is owned by open_capture_window (once).
         let cascade_index = ipc.capture_window_count().saturating_sub(1);
 
         Self {

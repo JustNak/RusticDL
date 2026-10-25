@@ -233,6 +233,21 @@ assert(
 );
 
 assert(
+  'rejects tiny xhr zip on a file-host CDN',
+  candidate({
+    url: 'https://store1.gofile.io/download/web/token/app.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="app.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES - 1) },
+    ],
+  }) === null,
+);
+
+assert(
   'captures large xhr zip from a file-host CDN',
   candidate({
     url: 'https://store1.gofile.io/download/web/token/app.zip',
@@ -440,12 +455,62 @@ assert(
 );
 
 assert(
-  'captures Grok PDF xhr when Content-Disposition is attachment',
+  'rejects page-generated PDF xhr even with Content-Disposition attachment',
   candidate({
     ...grokPdf,
     responseHeaders: [
       ...grokPdf.responseHeaders,
       { name: 'content-disposition', value: 'attachment; filename="MPC-Operating-Plan.pdf"' },
+    ],
+  }) === null,
+);
+
+assert(
+  'rejects page-generated zip xhr on a non-file-host',
+  candidate({
+    url: 'https://cdn.example.com/exports/chat-bundle.zip',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    originUrl: 'https://chat.example.com/',
+    documentUrl: 'https://chat.example.com/',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="chat-bundle.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 1_000_000) },
+    ],
+  }) === null,
+);
+
+assert(
+  'rejects page-generated Office xhr even with Content-Disposition attachment',
+  candidate({
+    url: 'https://cdn.example.com/exports/report.docx',
+    type: 'xmlhttprequest',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      {
+        name: 'content-type',
+        value: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      },
+      { name: 'content-disposition', value: 'attachment; filename="report.docx"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 50_000) },
+    ],
+  }) === null,
+);
+
+assert(
+  'still captures a type=other zip attachment outside file-host CDNs',
+  candidate({
+    url: 'https://cdn.example.com/exports/chat-bundle.zip',
+    type: 'other',
+    method: 'GET',
+    statusCode: 200,
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-disposition', value: 'attachment; filename="chat-bundle.zip"' },
+      { name: 'content-length', value: String(MIN_XHR_CAPTURE_BYTES + 1_000_000) },
     ],
   })?.reason === 'attachment_disposition',
 );

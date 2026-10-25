@@ -7,6 +7,13 @@
 /// User-facing product name for the main desktop application.
 pub const APP_NAME: &str = "RusticDL";
 
+/// Wayland / X11 app id for the main window.
+///
+/// Distinct from the capture HUD id (`rusticdl-capture`). GPUI only requests a
+/// Wayland activation token when this is set, and Hyprland class rules for
+/// HUDs must not match it.
+pub const MAIN_WINDOW_APP_ID: &str = "RusticDL";
+
 /// Built-in app version (About, update checks).
 ///
 /// Defaults to `Cargo.toml`. Nightly CI sets `RUSTICDL_VERSION` so the binary
@@ -146,6 +153,12 @@ pub const APP_LOGO_LIGHT: &str = "brand/logo-light.png";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_window_app_id_is_not_the_capture_hud() {
+        assert_eq!(MAIN_WINDOW_APP_ID, "RusticDL");
+        assert_ne!(MAIN_WINDOW_APP_ID, crate::hyprland::CAPTURE_APP_ID);
+    }
 
     #[test]
     fn update_asset_name_is_platform_archive() {

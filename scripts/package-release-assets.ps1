@@ -10,6 +10,7 @@
 #
 # Output:
 #   dist-release/RusticDL-windows-x64-setup.exe
+#   dist-release/SHA256SUMS.windows
 #   dist-release/RusticDL-windows-x64.zip
 #   dist-release/RusticDL-full-windows-x64.zip
 #   dist-release/extension-chromium.zip

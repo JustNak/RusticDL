@@ -5,8 +5,8 @@ use gpui::{
 use gpui_component::Root;
 
 use super::{
-    BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W,
-    CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
+    BrowserPromptWindow, CAPTURE_COMPLETE_H, CAPTURE_CONFIRM_H, CAPTURE_CONFIRM_TITLE,
+    CAPTURE_CONFLICT_H, CAPTURE_CONFLICT_W, CAPTURE_WINDOW_H, CAPTURE_WINDOW_W,
 };
 use crate::branding::APP_NAME;
 use crate::download::{EngineHandle, Job, JobState};
@@ -38,14 +38,14 @@ pub fn open_browser_prompt_window(
     let title = if opens_conflict {
         format!("{APP_NAME} — File already exists")
     } else {
-        format!("{APP_NAME} — Confirm download")
+        format!("{APP_NAME} — {CAPTURE_CONFIRM_TITLE}")
     };
     open_capture_window(
         title,
         if opens_conflict {
             size(px(CAPTURE_CONFLICT_W), px(CAPTURE_CONFLICT_H))
         } else {
-            size(px(CAPTURE_WINDOW_W), px(CAPTURE_WINDOW_H))
+            size(px(CAPTURE_WINDOW_W), px(CAPTURE_CONFIRM_H))
         },
         {
             let prompt = prompt.clone();
@@ -152,6 +152,18 @@ where
 {
     let bounds = Bounds::centered(None, prompt_size, cx);
     let fallback_id = fallback_prompt_id.to_string();
+    // Clone before SharedString::from consumes the opener title; Hyprland IPC
+    // and Wayland set_window_title need the same string.
+    let title_for_hypr = title.clone();
+    let hud_w = u32::from(prompt_size.width).max(1);
+    let hud_h = u32::from(prompt_size.height).max(1);
+
+    // Class-scoped float/size/center rules must land before map — post-map
+    // setfloating alone is the tile-then-float flash on Omarchy/Hyprland.
+    // On 0.55+/Omarchy this is Lua hl.window_rule; older Hyprland keeps
+    // hyprlang windowrule / windowrulev2. Snapshot addresses so the fallback
+    // cannot raise an older same-title HUD.
+    let prior = hyprland::prepare_capture_window(hud_w, hud_h);
 
     let result = cx.open_window(
         WindowOptions {
@@ -162,37 +174,53 @@ where
                 traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
             }),
             window_decorations: Some(WindowDecorations::Client),
+            // Floor below every capture phase so fit_window_to_phase can shrink.
             window_min_size: Some(size(px(360.0), px(160.0))),
-            kind: WindowKind::Normal,
+            // Floating → xdg parent / WM_TRANSIENT_FOR so Hyprland and other
+            // tiling WMs keep these at their designed size instead of tiling.
+            kind: WindowKind::Floating,
+            // Dedicated app_id so Hyprland class rules match at map time
+            // without floating the main queue (StartupWMClass=RusticDL).
+            app_id: Some(hyprland::CAPTURE_APP_ID.to_string()),
             focus: true,
             show: true,
             is_resizable: false,
             is_minimizable: false,
             ..Default::default()
         },
-        move |window, cx| {
-            let view = cx.new(|cx| build(window, cx));
+        {
+            let title_for_map = title_for_hypr.clone();
+            move |window, cx| {
+                // Set platform title as early as possible (Wayland ignores
+                // TitlebarOptions.title); post-map Hyprland title: IPC needs it.
+                window.set_window_title(&title_for_map);
+                let view = cx.new(|cx| build(window, cx));
 
-            let view_for_close = view.clone();
-            window.on_window_should_close(cx, move |window, cx| {
-                let _ = view_for_close.update(cx, |this, cx| {
-                    this.close_hud_on_native_close(window, cx);
+                let view_for_close = view.clone();
+                window.on_window_should_close(cx, move |window, cx| {
+                    let _ = view_for_close.update(cx, |this, cx| {
+                        this.close_hud_on_native_close(window, cx);
+                    });
+                    true
                 });
-                true
-            });
 
-            cx.new(|cx| Root::new(view, window, cx))
+                cx.new(|cx| Root::new(view, window, cx))
+            }
         },
     );
 
     match result {
         Ok(handle) => {
             let cascade_index = ipc_fallback.capture_window_count().saturating_sub(1);
-            cx.activate(true);
+            // Do not call cx.activate — on compositors that honor app activation
+            // that raises the main queue alongside the HUD. Focus only this HUD.
             let _ = handle.update(cx, |_root, window, _cx| {
                 cascade_window(window, cascade_index);
+                window.set_window_title(&title_for_hypr);
                 window.activate_window();
             });
+            // Confirm / conflict / progress / complete all share this opener.
+            hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h, prior);
             Some(handle)
         }
         Err(error) => {
@@ -201,5 +229,55 @@ where
             ipc_fallback.release_progress_job(&fallback_id);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod floating_kind_tests {
+    #[test]
+    fn capture_opener_uses_floating_window_kind() {
+        // Scan only the opener body so this test module's assertions cannot match themselves.
+        let src = include_str!("open.rs");
+        let opener = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production open.rs before tests");
+        assert!(
+            opener.contains("kind: WindowKind::Floating"),
+            "capture HUDs must open as Floating so tiling compositors get a parent/transient hint"
+        );
+        assert!(
+            !opener.contains("kind: WindowKind::Normal"),
+            "capture HUDs must not open as a normal toplevel (tiling compositors stretch them)"
+        );
+        assert!(
+            opener.contains("let prior = hyprland::prepare_capture_window(hud_w, hud_h)"),
+            "Hyprland class windowrules must be installed before open_window"
+        );
+        assert!(
+            opener
+                .contains("hyprland::float_capture_windows(&title_for_hypr, hud_w, hud_h, prior)"),
+            "Hyprland IPC float fallback must run after every successful capture open"
+        );
+        assert!(
+            opener.contains("app_id: Some(hyprland::CAPTURE_APP_ID.to_string())"),
+            "capture HUDs need rusticdl-capture app_id for pre-map class rules"
+        );
+        assert!(
+            !opener.contains("cx.activate("),
+            "app-wide activate raises the main queue on Omarchy/Hyprland"
+        );
+        assert!(
+            opener.contains("window.set_window_title(&title_for_hypr)"),
+            "Wayland ignores TitlebarOptions.title; Hyprland title match needs set_window_title"
+        );
+        assert!(
+            opener.contains("window_min_size: Some(size(px(360.0), px(160.0)))"),
+            "min size must stay below complete/confirm/progress so fit_window_to_phase can shrink"
+        );
+        assert!(
+            !opener.contains("window_min_size: Some(prompt_size)"),
+            "opening size as min blocks later HUD shrinks"
+        );
     }
 }

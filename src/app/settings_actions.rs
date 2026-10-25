@@ -430,6 +430,11 @@ impl DownloadApp {
     /// Safety: never enqueues without a confirm dialog. Skips when disabled,
     /// tray-hidden, a dialog is already open, or the same URL set was just offered.
     pub(crate) fn on_window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Restored by the compositor, taskbar, or a revealed special workspace.
+        #[cfg(target_os = "linux")]
+        {
+            self.window_hidden_to_tray = false;
+        }
         if !self.settings.clipboard_watch_enabled {
             return;
         }

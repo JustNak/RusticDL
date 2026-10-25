@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::super::job::Job;
 use super::super::progress::{apply_commit_identity, CommitIdentity, IdentityCommit, MapUpdate};
-use super::{emit_jobs_locked, find_job_mut, EngineInner};
+use super::{bump_jobs, emit_jobs_locked, find_job_mut, EngineInner};
 
 pub trait JobStore: Send + Sync {
     fn persist_jobs(&self, jobs: &[Job]) -> Result<(), String>;
@@ -48,14 +48,33 @@ pub(super) async fn persist_actor(
     mut rx: mpsc::Receiver<PersistReq>,
 ) {
     while let Some(req) = rx.recv().await {
-        let (jobs, store) = {
+        let result = persist_until_generation_stable(&inner).await;
+        let _ = req.ack.send(result);
+    }
+}
+
+/// Snapshot, write, and if a durable mutation landed during the write, snapshot
+/// again before ack. One actor is the only `state.json` writer.
+async fn persist_until_generation_stable(inner: &Arc<Mutex<EngineInner>>) -> Result<(), String> {
+    loop {
+        let (jobs, store, generation) = {
             let guard = inner.lock().await;
-            (guard.jobs.clone(), guard.store.clone())
+            (
+                guard.jobs.clone(),
+                guard.store.clone(),
+                guard.jobs_generation,
+            )
         };
-        let result = tokio::task::spawn_blocking(move || store.persist_jobs(&jobs))
+        let write = tokio::task::spawn_blocking(move || store.persist_jobs(&jobs))
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
-        let _ = req.ack.send(result);
+        if let Err(error) = write {
+            return Err(error);
+        }
+        let current = inner.lock().await.jobs_generation;
+        if current == generation {
+            return Ok(());
+        }
     }
 }
 
@@ -92,6 +111,7 @@ impl IdentityCommit for EngineIdentity {
                     false
                 } else {
                     apply_commit_identity(canonical, &c);
+                    bump_jobs(&mut guard);
                     emit_jobs_locked(&guard);
                     true
                 }
@@ -199,6 +219,7 @@ mod tests {
         let (persist_tx, persist_rx) = mpsc::channel(32);
         let inner = Arc::new(Mutex::new(EngineInner {
             jobs,
+            jobs_generation: 0,
             controls: HashMap::new(),
             active: HashMap::new(),
             handoff_auth: HashMap::new(),
@@ -280,6 +301,146 @@ mod tests {
         for snap in &snaps {
             assert_later_identities(snap);
         }
+    }
+
+    #[tokio::test]
+    async fn in_flight_snapshot_rewrites_when_generation_moves() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        struct GateStore {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            snaps: MemoryJobStore,
+        }
+        impl JobStore for GateStore {
+            fn persist_jobs(&self, jobs: &[Job]) -> Result<(), String> {
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                    let rx = self
+                        .release
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("release channel");
+                    let _ = rx.recv();
+                }
+                self.snaps.persist_jobs(jobs)
+            }
+        }
+
+        let store = std::sync::Arc::new(GateStore {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            snaps: MemoryJobStore::default(),
+        });
+        let inner = inner_with_store(vec![sample_job("kept")], store.clone()).await;
+        let persist_tx = inner.lock().await.persist_tx.clone();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        persist_tx.send(PersistReq { ack: ack_tx }).await.unwrap();
+
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv().expect("persist entered");
+        })
+        .await
+        .unwrap();
+
+        {
+            let mut guard = inner.lock().await;
+            guard.jobs.push(sample_job("added"));
+            bump_jobs(&mut guard);
+        }
+        release_tx.send(()).expect("release persist");
+
+        ack_rx.await.unwrap().unwrap();
+        let snaps = store.snaps.snapshots.lock().unwrap().clone();
+        assert!(
+            snaps.len() >= 2,
+            "stale snapshot must be followed by a rewrite, got {}",
+            snaps.len()
+        );
+        let last = snaps.last().unwrap();
+        assert!(last.iter().any(|job| job.id == "kept"));
+        assert!(
+            last.iter().any(|job| job.id == "added"),
+            "rewrite must include the job inserted during the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_snapshot_failure_returns_the_error() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        struct GateThenFail {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            snaps: MemoryJobStore,
+            writes: std::sync::atomic::AtomicUsize,
+        }
+        impl JobStore for GateThenFail {
+            fn persist_jobs(&self, jobs: &[Job]) -> Result<(), String> {
+                let n = self
+                    .writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    if let Some(tx) = self
+                        .entered
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                    {
+                        let _ = tx.send(());
+                        let rx = self
+                            .release
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                            .expect("release channel");
+                        let _ = rx.recv();
+                    }
+                    return self.snaps.persist_jobs(jobs);
+                }
+                Err("follow-up snapshot failed".into())
+            }
+        }
+
+        let store = std::sync::Arc::new(GateThenFail {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            snaps: MemoryJobStore::default(),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let inner = inner_with_store(vec![sample_job("kept")], store.clone()).await;
+        let persist_task = tokio::spawn({
+            let inner = inner.clone();
+            async move { persist_live_jobs(&inner).await }
+        });
+
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv().expect("persist entered");
+        })
+        .await
+        .unwrap();
+
+        {
+            let mut guard = inner.lock().await;
+            guard.jobs.push(sample_job("added"));
+            bump_jobs(&mut guard);
+        }
+        release_tx.send(()).expect("release persist");
+
+        let error = persist_task
+            .await
+            .unwrap()
+            .expect_err("a failed follow-up write must not ack");
+        assert!(error.contains("follow-up"), "{error}");
+        let snaps = store.snaps.snapshots.lock().unwrap().clone();
+        assert_eq!(snaps.len(), 1, "only the first snapshot may land");
+        assert!(snaps[0].iter().all(|job| job.id != "added"));
     }
 
     #[tokio::test]

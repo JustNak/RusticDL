@@ -61,8 +61,23 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     pub setup_download_url: String,
     pub setup_size: Option<u64>,
-    /// SHA-256 of the Linux tarball from `SHA256SUMS` (Windows has no checksum gate).
+    /// SHA-256 of this OS's update asset from `SHA256SUMS`.
+    ///
+    /// Linux **requires** a tarball line. Windows uses the setup.exe line when
+    /// present and continues without a hash if `SHA256SUMS` or that line is
+    /// missing (current GitHub releases). A listed `SHA256SUMS` that fails to
+    /// download still fails the check.
     pub setup_sha256: Option<String>,
+}
+
+/// Whether a missing checksums asset or missing asset line fails the update check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sha256Gate {
+    /// Linux: missing file or missing tarball line fails the check.
+    Required,
+    /// Windows: no checksums asset or no setup.exe line still offers the update.
+    /// A listed `SHA256SUMS` that fails to download fails the check.
+    Optional,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,11 +205,8 @@ async fn compare_release(
             )
         })?;
 
-    let setup_sha256 = if cfg!(target_os = "linux") {
-        Some(fetch_release_sha256(client, &release, asset_name).await?)
-    } else {
-        None
-    };
+    let setup_sha256 =
+        fetch_setup_sha256(client, &release, asset_name, sha256_gate_for_target()).await?;
 
     let notes = release
         .body
@@ -218,18 +230,50 @@ async fn compare_release(
     }))
 }
 
-async fn fetch_release_sha256(
+fn sha256_gate_for_target() -> Sha256Gate {
+    if cfg!(target_os = "linux") {
+        Sha256Gate::Required
+    } else {
+        Sha256Gate::Optional
+    }
+}
+
+async fn fetch_setup_sha256(
     client: &reqwest::Client,
     release: &GhRelease,
     asset_name: &str,
-) -> Result<String, String> {
-    let sums = release
+    gate: Sha256Gate,
+) -> Result<Option<String>, String> {
+    setup_sha256_from_loaded(
+        gate,
+        load_sha256sums_text(client, release).await,
+        asset_name,
+    )
+}
+
+/// Map a `SHA256SUMS` load result through the gate.
+///
+/// `Ok(None)` means the release listed no checksums asset. `Err` is a fetch or
+/// body-read failure for a listed asset and fails the check on every gate.
+fn setup_sha256_from_loaded(
+    gate: Sha256Gate,
+    loaded: Result<Option<String>, String>,
+    asset_name: &str,
+) -> Result<Option<String>, String> {
+    resolve_setup_sha256(gate, loaded?.as_deref(), asset_name)
+}
+
+async fn load_sha256sums_text(
+    client: &reqwest::Client,
+    release: &GhRelease,
+) -> Result<Option<String>, String> {
+    let Some(sums) = release
         .assets
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case(CHECKSUMS_ASSET_NAME))
-        .ok_or_else(|| {
-            "Release has no SHA256SUMS asset. Cannot verify the Linux tarball.".to_string()
-        })?;
+    else {
+        return Ok(None);
+    };
 
     let response = client
         .get(&sums.browser_download_url)
@@ -246,11 +290,31 @@ async fn fetch_release_sha256(
         .text()
         .await
         .map_err(|e| format!("Could not read SHA256SUMS: {e}"))?;
-    parse_sha256sums(&text, asset_name).ok_or_else(|| {
-        format!(
-            "SHA256SUMS has no entry for {asset_name}. Refuse to install an unverified archive."
-        )
-    })
+    Ok(Some(text))
+}
+
+/// Resolve the hash for `asset_name` from an optional `SHA256SUMS` body.
+///
+/// `sums_text` is `None` when the release has no checksums asset. Linux still
+/// refuses that case. Fetch errors are not `None`; they fail before this.
+pub fn resolve_setup_sha256(
+    gate: Sha256Gate,
+    sums_text: Option<&str>,
+    asset_name: &str,
+) -> Result<Option<String>, String> {
+    match gate {
+        Sha256Gate::Required => {
+            let text = sums_text.ok_or_else(|| {
+                "Release has no SHA256SUMS asset. Cannot verify the Linux tarball.".to_string()
+            })?;
+            parse_sha256sums(text, asset_name).map(Some).ok_or_else(|| {
+                format!(
+                    "SHA256SUMS has no entry for {asset_name}. Refuse to install an unverified archive."
+                )
+            })
+        }
+        Sha256Gate::Optional => Ok(sums_text.and_then(|text| parse_sha256sums(text, asset_name))),
+    }
 }
 
 /// Parse a GNU `sha256sum` listing and return the hash for `file_name`.
@@ -341,17 +405,153 @@ mod tests {
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
+    const TARBALL_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SETUP_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn tarball_only_sums() -> String {
+        format!("{TARBALL_HASH}  {LINUX_TARBALL_ASSET_NAME}\n")
+    }
+
+    fn windows_setup_sums() -> String {
+        format!("{SETUP_HASH}  {SETUP_ASSET_NAME}\n")
+    }
+
     #[test]
     fn parse_sha256sums_matches_basename() {
-        let text = "\
+        let text = format!(
+            "\
 # comment
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  RusticDL-linux-x64.tar.gz
+{TARBALL_HASH}  {LINUX_TARBALL_ASSET_NAME}
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *other.bin
-";
-        assert_eq!(
-            parse_sha256sums(text, LINUX_TARBALL_ASSET_NAME).as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+"
         );
-        assert!(parse_sha256sums(text, SETUP_ASSET_NAME).is_none());
+        assert_eq!(
+            parse_sha256sums(&text, LINUX_TARBALL_ASSET_NAME).as_deref(),
+            Some(TARBALL_HASH)
+        );
+        assert!(parse_sha256sums(&text, SETUP_ASSET_NAME).is_none());
+    }
+
+    #[test]
+    fn parse_sha256sums_reads_appended_windows_setup_line() {
+        let merged = format!("{}{}", tarball_only_sums(), windows_setup_sums());
+        assert_eq!(
+            parse_sha256sums(&merged, LINUX_TARBALL_ASSET_NAME).as_deref(),
+            Some(TARBALL_HASH)
+        );
+        assert_eq!(
+            parse_sha256sums(&merged, SETUP_ASSET_NAME).as_deref(),
+            Some(SETUP_HASH)
+        );
+    }
+
+    #[test]
+    fn windows_verifies_when_setup_exe_line_present() {
+        let merged = format!("{}{}", tarball_only_sums(), windows_setup_sums());
+        let hash = resolve_setup_sha256(Sha256Gate::Optional, Some(&merged), SETUP_ASSET_NAME)
+            .expect("optional gate must not fail the check");
+        assert_eq!(hash.as_deref(), Some(SETUP_HASH));
+    }
+
+    #[test]
+    fn listed_sha256sums_fetch_error_fails_optional_and_required() {
+        let loaded = Err("GitHub returned 502 while downloading SHA256SUMS.".to_string());
+        for gate in [Sha256Gate::Optional, Sha256Gate::Required] {
+            let err = setup_sha256_from_loaded(gate, loaded.clone(), SETUP_ASSET_NAME)
+                .expect_err("listed SHA256SUMS fetch error must fail the check");
+            assert!(err.contains("SHA256SUMS"));
+        }
+    }
+
+    #[test]
+    fn windows_still_updates_when_sha256sums_missing() {
+        let hash = resolve_setup_sha256(Sha256Gate::Optional, None, SETUP_ASSET_NAME)
+            .expect("missing SHA256SUMS must not fail Windows");
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn windows_still_updates_when_sha256sums_is_tarball_only() {
+        let hash = resolve_setup_sha256(
+            Sha256Gate::Optional,
+            Some(&tarball_only_sums()),
+            SETUP_ASSET_NAME,
+        )
+        .expect("tarball-only SHA256SUMS must not fail Windows");
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn linux_still_requires_tarball_line() {
+        let err = resolve_setup_sha256(Sha256Gate::Required, None, LINUX_TARBALL_ASSET_NAME)
+            .expect_err("Linux must refuse a missing SHA256SUMS");
+        assert!(err.contains("SHA256SUMS"));
+        let err = resolve_setup_sha256(
+            Sha256Gate::Required,
+            Some(&windows_setup_sums()),
+            LINUX_TARBALL_ASSET_NAME,
+        )
+        .expect_err("Linux must refuse a listing with no tarball line");
+        assert!(err.contains(LINUX_TARBALL_ASSET_NAME));
+        let hash = resolve_setup_sha256(
+            Sha256Gate::Required,
+            Some(&tarball_only_sums()),
+            LINUX_TARBALL_ASSET_NAME,
+        )
+        .expect("Linux accepts a tarball line");
+        assert_eq!(hash.as_deref(), Some(TARBALL_HASH));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_sha256sums_script_appends_windows_without_dropping_tarball() {
+        use std::process::Command;
+
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/merge-sha256sums.sh");
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-sha256sums-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dest = dir.join("SHA256SUMS");
+        let extra = dir.join("SHA256SUMS.windows");
+        let colliding_tarball_hash =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let extra_text = format!(
+            "{}{colliding_tarball_hash}  {LINUX_TARBALL_ASSET_NAME}\n",
+            windows_setup_sums()
+        );
+        std::fs::write(&dest, tarball_only_sums()).expect("dest");
+        std::fs::write(&extra, extra_text).expect("extra");
+        let status = Command::new("bash")
+            .arg(&script)
+            .arg(&dest)
+            .arg(&extra)
+            .status()
+            .expect("run merge-sha256sums.sh");
+        assert!(status.success(), "merge-sha256sums.sh failed: {status}");
+        let merged = std::fs::read_to_string(&dest).expect("merged");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            parse_sha256sums(&merged, LINUX_TARBALL_ASSET_NAME).as_deref(),
+            Some(TARBALL_HASH),
+            "existing dest tarball line must win"
+        );
+        assert_eq!(
+            parse_sha256sums(&merged, SETUP_ASSET_NAME).as_deref(),
+            Some(SETUP_HASH)
+        );
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            2
+        );
     }
 }

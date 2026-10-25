@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::super::super::job::Job;
-use super::super::{emit_jobs_locked, EngineInner, EngineRuntimeConfig};
+use super::super::{bump_jobs, emit_jobs_locked, EngineInner, EngineRuntimeConfig};
 
 pub(super) async fn update_settings(
     inner: &Arc<Mutex<EngineInner>>,
@@ -29,6 +29,7 @@ pub(super) async fn update_settings(
 pub(super) async fn replace_jobs(inner: &Arc<Mutex<EngineInner>>, jobs: Vec<Job>) {
     let mut guard = inner.lock().await;
     guard.jobs = jobs;
+    bump_jobs(&mut guard);
     emit_jobs_locked(&guard);
     guard.wake.notify_one();
 }

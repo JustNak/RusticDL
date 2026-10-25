@@ -10,6 +10,8 @@ mod extension_settings;
 mod format;
 mod hyprland;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod linux_restore;
 mod native_host_register;
 mod notifications;
 mod persistence;
@@ -24,7 +26,7 @@ mod window_placement;
 
 use app::DownloadApp;
 use assets::Assets;
-use branding::{APP_NAME, APP_USER_MODEL_ID};
+use branding::{APP_NAME, APP_USER_MODEL_ID, MAIN_WINDOW_APP_ID};
 use download::{spawn_engine, EngineRuntimeConfig, FileJobStore};
 use gpui::{
     point, px, size, App, AppContext, Application, Bounds, SharedString, WindowBounds,
@@ -60,7 +62,13 @@ fn main() {
     // Keep the OS autostart entry aligned with saved prefs (self-heal after moves/updates).
     let _ = apply_launch_at_startup(settings.launch_at_startup, settings.startup_minimized);
     let start_hidden = launched_minimized();
-    let jobs = load_jobs(&paths);
+    let (jobs, state_load_error) = match load_jobs(&paths) {
+        Ok(jobs) => (jobs, None),
+        Err(error) => {
+            eprintln!("rusticdl: {error}");
+            (Vec::new(), Some(error))
+        }
+    };
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = runtime.enter();
@@ -119,6 +127,9 @@ fn main() {
                                 px(MIN_WINDOW_WIDTH),
                                 px(MIN_WINDOW_HEIGHT),
                             )),
+                            // Without an app id, Wayland `activate_window` skips the
+                            // xdg-activation token entirely.
+                            app_id: Some(MAIN_WINDOW_APP_ID.to_string()),
                             show: !start_hidden,
                             ..Default::default()
                         },
@@ -126,7 +137,15 @@ fn main() {
                             apply_app_icon(window);
                             let view = cx.new(|cx| {
                                 DownloadApp::new(
-                                    jobs, settings, paths, engine, ui_rx, ipc_bridge, window, cx,
+                                    jobs,
+                                    settings,
+                                    paths,
+                                    engine,
+                                    ui_rx,
+                                    ipc_bridge,
+                                    state_load_error,
+                                    window,
+                                    cx,
                                 )
                             });
                             cx.new(|cx| Root::new(view, window, cx))

@@ -29,7 +29,11 @@ impl DownloadApp {
                                 });
                             }
                         })
-                        .hint("Hides to the tray instead of quitting."),
+                        .hint(if cfg!(target_os = "linux") {
+                            "Keeps running in the background for the browser extension. Ctrl+Q quits."
+                        } else {
+                            "Hides to the tray instead of quitting."
+                        }),
                     )
                     .child(SettingsToggleRow::new(
                         "startup",
@@ -95,7 +99,11 @@ impl DownloadApp {
                                 }
                             },
                         )
-                        .hint("Uses the tray icon even if Close to tray is Off."),
+                        .hint(if cfg!(target_os = "linux") {
+                            "Shown with notify-send."
+                        } else {
+                            "Uses the tray icon even if Close to tray is Off."
+                        }),
                     )
                     .child(SettingsToggleRow::new(
                         "notify-complete",

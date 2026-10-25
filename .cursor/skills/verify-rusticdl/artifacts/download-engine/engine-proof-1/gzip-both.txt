@@ -1,0 +1,52 @@
+CASE gzip-both
+URL http://127.0.0.1:43605/payload.bin
+driver_exit=0
+enqueue_status=queued
+job_id=4ff0d178-2bc3-40c5-ad22-e95b5d30edc4
+job_filename=payload.bin
+timed_out=false
+state=Completed
+error=-
+failure_category=-
+downloaded_bytes=0
+total_bytes=321
+resume_supported=false
+target_path=/tmp/rusticdl-engine-engine-proof-1/gzip-both/downloads/payload.bin
+target_exists=true
+temp_path=/tmp/rusticdl-engine-engine-proof-1/gzip-both/downloads/payload.bin.part
+temp_exists=false
+expected_sha256=5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af
+final_sha256=0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4
+final_len=321
+final_matches_expected=false
+wire_sha256=0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4
+final_matches_wire=true
+partial_sha256=-
+partial_len=-
+partial_matches_expected=false
+partial_matches_wire=false
+MANIFEST
+{
+  "case": "gzip-both",
+  "route": "/payload.bin",
+  "identity_len": 4096,
+  "identity_sha256": "5926d460797e567240a3fe92a401386b609f9caec03ecf515bcece11ea1349af",
+  "gzip_len": 321,
+  "gzip_sha256": "0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4",
+  "wire_len": 321,
+  "wire_sha256": "0cd9af2a300f7ddabf8f48b25a0ee6c4789abcce2e9f2082a1c7c9a88571a0b4",
+  "head_status": 200,
+  "head_content_encoding": "gzip",
+  "head_content_length": 321,
+  "head_accept_ranges": false,
+  "get_status": 200,
+  "get_content_encoding": "gzip",
+  "get_content_length": 321,
+  "get_accept_ranges": false,
+  "get_ranges": "ignore",
+  "get_cut_after": null
+}
+SERVER_LOG
+REQ HEAD /payload.bin range=- -> 200 encoding=gzip advertised_length=321 sent=0
+REQ GET /payload.bin range=- -> 200 encoding=gzip advertised_length=321 sent=321
+CASE_END gzip-both

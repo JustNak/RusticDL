@@ -1,23 +1,26 @@
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, ETAG, LAST_MODIFIED};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, ETAG, LAST_MODIFIED};
 use reqwest::StatusCode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::bandwidth::GlobalBandwidthLimiter;
-use super::body::{stream_body, AppendSink, StreamEnd};
+use super::body::{
+    is_incomplete_download, is_lengthless_eof, is_remote_size_mismatch, reject_encoded_body,
+    remote_size_changed_error, stream_body, AppendSink, BodySink, CountingSink, StreamEnd,
+};
 use super::client::download_client;
 use super::conn_budget::{host_key_for_budget, ConnectionBudget};
 use super::engine::EngineRuntimeConfig;
 use super::eta::EtaSmoother;
 use super::fetch::{
-    content_range_size_mismatch, fetch_range, sleep_interruptible, FetchRequest, RangeSpec,
-    RangeStatus, STALL_TIMEOUT,
+    content_range_size_mismatch, fetch_range, missing_content_range_error, sleep_interruptible,
+    FetchRequest, RangeSpec, RangeStatus, STALL_TIMEOUT,
 };
 use super::filesystem::{
-    ensure_parent_directory, metadata_len, move_to_final_path, parse_content_disposition_filename,
-    remove_partial, sanitize_filename,
+    clear_rejected_partial, ensure_parent_directory, metadata_len, move_to_final_path,
+    parse_content_disposition_filename, remove_partial, sanitize_filename, RejectedPartialClear,
 };
 use super::handoff::{session_url_after_auth_denied, HandoffAuth};
 use super::job::{
@@ -32,9 +35,22 @@ use super::verify::verify_sha256_if_expected;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 
-pub(crate) const RECONNECT_MAX: u32 = 5;
+const IGNORED_RANGE_PARTIAL_KEPT: &str =
+    "Server ignored Range; partial kept. Use Restart to download from zero.";
+
+pub(crate) const RECONNECT_MAX: u32 = 12;
 pub(crate) const RECONNECT_BASE: Duration = Duration::from_millis(200);
-pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(2);
+pub(crate) const RECONNECT_CAP: Duration = Duration::from_secs(8);
+/// Full-file restarts when the server rejects or ignores Range. Not reset by
+/// byte progress — a host that never honors Range must not spin forever.
+const FRESH_RESTART_MAX: u32 = 6;
+/// A single 416 is often a proxy glitch. Retry the same offset this many
+/// times before throwing away a partial.
+const RANGE_REJECT_BEFORE_RESTART: u32 = 2;
+/// How many same-validator lengthless bodies may disagree with the candidate
+/// before this attempt stops. One disagreement is reconnected so a following
+/// 416 can still confirm the bytes already saved.
+const LENGTHLESS_MISMATCH_BEFORE_GIVEUP: u32 = 1;
 
 const FULL_REPLACE_NOTICE: &str =
     "Remote file changed or server ignored resume; restarting download from the beginning.";
@@ -82,24 +98,32 @@ pub async fn run_http_download_with_ctx(
         return Ok(outcome);
     }
 
-    let mut existing_bytes = match resume_oracle(&ctx.job) {
-        ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
-            metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
-        }
-        ResumeOracle::Multi { .. } => {
-            return Err(download_error(
-                FailureCategory::Resume,
-                "Multi-connection partial; single-stream resume is not supported. Use Restart."
-                    .into(),
-                false,
-            ));
-        }
-        ResumeOracle::RestartRequired => {
-            return Err(download_error(
-                FailureCategory::Resume,
-                "Multi-part incomplete; Restart required.".into(),
-                false,
-            ));
+    // A rejected `.part` is not a resume point, for a single stream or a
+    // segment map. Delete and truncate can both fail and leave that length
+    // on disk; the next attempt still starts at 0 and truncates on open.
+    // A partial this engine did not reject still resumes from the file.
+    let mut existing_bytes = if ctx.job.rejected_partial {
+        0
+    } else {
+        match resume_oracle(&ctx.job) {
+            ResumeOracle::FreshSingle | ResumeOracle::LegacySingle => {
+                metadata_len(&ctx.job.temp_path).await.unwrap_or(0)
+            }
+            ResumeOracle::Multi { .. } => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    "Multi-connection partial; single-stream resume is not supported. Use Restart."
+                        .into(),
+                    false,
+                ));
+            }
+            ResumeOracle::RestartRequired => {
+                return Err(download_error(
+                    FailureCategory::Resume,
+                    "Multi-part incomplete; Restart required.".into(),
+                    false,
+                ));
+            }
         }
     };
 
@@ -120,10 +144,23 @@ pub async fn run_http_download_with_ctx(
     let mut temp_path = ctx.job.temp_path.clone();
     let mut filename = ctx.job.filename.clone();
     let mut transfer_format_version = ctx.job.transfer_format_version;
-    let mut total_bytes: u64;
+    let mut total_bytes: u64 = ctx.job.total_bytes;
     let mut resume_supported = ctx.job.resume_supported;
 
     let mut short_reconnects: u32 = 0;
+    let mut fresh_restarts: u32 = 0;
+    let mut range_rejects: u32 = 0;
+    // Set when ETag or Last-Modified changes and the new response has no size.
+    // The previous entity length must not cap or reject the replacement.
+    let mut known_size_retired = false;
+    // Length of a lengthless full body saved after the validators changed.
+    // A clean close is not the end of the file; a later 416, 206, or a second
+    // full body of this length is.
+    let mut lengthless_candidate = pending_lengthless_confirm(&ctx.job, existing_bytes);
+    if lengthless_candidate.is_some() {
+        known_size_retired = true;
+    }
+    let mut length_mismatches: u32 = 0;
     let mut cumulative_reconnects = ctx.job.reconnect_count;
     let reconnect_baseline = ctx.job.reconnect_count;
     // One remint from job.url after a 401 on a burned Inst-FS / Drive hop.
@@ -134,6 +171,8 @@ pub async fn run_http_download_with_ctx(
     let committer = ctx.committer.clone();
     let handoff_auth = ctx.handoff_auth.clone();
     let limiter = ctx.limiter.clone();
+    let occupied_paths = ctx.occupied_paths.clone();
+    let original_filename = ctx.job.filename.clone();
 
     loop {
         if let Some(outcome) = control_outcome(&control) {
@@ -163,11 +202,11 @@ pub async fn run_http_download_with_ctx(
                 }
                 match prepare_reconnect(
                     &error,
-                    /*is_fetch_phase=*/ true,
                     short_reconnects,
                     existing_bytes,
                     resume_supported,
                     transfer_format_version,
+                    !ctx.job.rejected_partial,
                     &temp_path,
                     &control,
                     &on_progress,
@@ -181,7 +220,10 @@ pub async fn run_http_download_with_ctx(
                         continue;
                     }
                     ReconnectAction::Control(outcome) => return Ok(outcome),
-                    ReconnectAction::GiveUp => return Err(error),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
                 }
             }
         };
@@ -211,37 +253,110 @@ pub async fn run_http_download_with_ctx(
         let mut full_replace = false;
         let range_total = match &range_status {
             RangeStatus::RangeNotSatisfiable { at } => {
-                return Err(download_error(
-                    FailureCategory::Resume,
-                    format!(
-                        "Server rejected resume at {at} bytes. Use Restart to download from zero."
-                    ),
-                    false,
-                ));
+                // The candidate body closed cleanly and this 416 names that
+                // same length. The 416 must repeat every saved validator.
+                // A missing ETag or Last-Modified does not prove the bytes.
+                if lengthless_candidate == Some(existing_bytes)
+                    && existing_bytes > 0
+                    && unsatisfied_content_range_total(response.headers()) == Some(existing_bytes)
+                    && validators_confirmed(
+                        &validators,
+                        &content_validators_from_headers(response.headers(), 0),
+                    )
+                {
+                    return finish_downloaded_entity(
+                        ctx,
+                        &temp_path,
+                        &target_path,
+                        existing_bytes,
+                        existing_bytes,
+                        resume_supported,
+                    )
+                    .await;
+                }
+                // Keep the partial across a transient 416. Only discard it
+                // after the same offset has been rejected and a retry is
+                // actually starting — pause and give-up must not wipe it.
+                let keep_partial =
+                    existing_bytes > 0 && range_rejects < RANGE_REJECT_BEFORE_RESTART;
+                if keep_partial {
+                    range_rejects = range_rejects.saturating_add(1);
+                } else {
+                    fresh_restarts = fresh_restarts.saturating_add(1);
+                    if fresh_restarts > FRESH_RESTART_MAX {
+                        let error = download_error(
+                            FailureCategory::Resume,
+                            format!(
+                                "Server rejected resume at {at} bytes. Use Restart to download from zero."
+                            ),
+                            true,
+                        );
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
+                }
+                let error = download_error(
+                    FailureCategory::Http,
+                    format!("Server rejected resume at {at} bytes; retrying."),
+                    true,
+                );
+                match prepare_reconnect(
+                    &error,
+                    short_reconnects,
+                    existing_bytes,
+                    true,
+                    transfer_format_version,
+                    !ctx.job.rejected_partial,
+                    &temp_path,
+                    &control,
+                    &on_progress,
+                    &mut cumulative_reconnects,
+                )
+                .await
+                {
+                    ReconnectAction::Retry { offset } => {
+                        short_reconnects += 1;
+                        if keep_partial {
+                            existing_bytes = offset;
+                        } else {
+                            let _ = tokio::fs::remove_file(&temp_path).await;
+                            existing_bytes = 0;
+                        }
+                        continue;
+                    }
+                    ReconnectAction::Control(outcome) => return Ok(outcome),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(download_error(
+                            FailureCategory::Resume,
+                            format!(
+                                "Server rejected resume at {at} bytes. Use Restart to download from zero."
+                            ),
+                            true,
+                        ));
+                    }
+                }
             }
             RangeStatus::AuthDenied { status } => {
                 return Err(http_status_error(*status, false));
             }
             RangeStatus::Other { status, retryable } => {
-                if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
-                    return Err(download_error(
-                        FailureCategory::Resume,
-                        "Missing or invalid Content-Range on partial response. Use Restart.".into(),
-                        false,
-                    ));
-                }
-                let error = http_status_error(*status, *retryable);
+                let error = if *status == StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
+                    missing_content_range_error()
+                } else {
+                    http_status_error(*status, *retryable)
+                };
                 if let Some(outcome) = control_outcome(&control) {
                     return Ok(outcome);
                 }
-                if *retryable {
+                if error.retryable {
                     match prepare_reconnect(
                         &error,
-                        /*is_fetch_phase=*/ true,
                         short_reconnects,
                         existing_bytes,
                         resume_supported,
                         transfer_format_version,
+                        !ctx.job.rejected_partial,
                         &temp_path,
                         &control,
                         &on_progress,
@@ -255,9 +370,13 @@ pub async fn run_http_download_with_ctx(
                             continue;
                         }
                         ReconnectAction::Control(outcome) => return Ok(outcome),
-                        ReconnectAction::GiveUp => return Err(error),
+                        ReconnectAction::GiveUp => {
+                            checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                            return Err(error);
+                        }
                     }
                 }
+                checkpoint_partial(ctx, existing_bytes, total_bytes).await;
                 return Err(error);
             }
             RangeStatus::RedirectWhenPinned => {
@@ -268,12 +387,167 @@ pub async fn run_http_download_with_ctx(
                 ));
             }
             RangeStatus::FullEntityWhenRangeRequested => {
+                // A server that never advertised ranges answered the speculative
+                // Range with the whole entity. Streaming that 200 deletes the
+                // .part first; if the new body also dies, the offset is gone.
+                if !resume_supported && existing_bytes > 0 {
+                    if let Some(outcome) = control_outcome(&control) {
+                        return Ok(outcome);
+                    }
+                    let error = download_error(
+                        FailureCategory::Resume,
+                        IGNORED_RANGE_PARTIAL_KEPT.into(),
+                        false,
+                    );
+                    checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                    return Err(error);
+                }
+                // This 200 would replace the partial. An encoded body is not
+                // that file, even when its Content-Length matches.
+                reject_encoded_body(response.headers())?;
+                // This 200 answered a Range request. It may carry a new size only
+                // when ETag or Last-Modified says the resource changed. Reject a
+                // conflicting Content-Length before the partial is deleted.
+                let announced_length = response.content_length();
+                let expected_size = known_expected_size(total_bytes, &validators);
+                let identity_changed = resume_identity_mismatch(
+                    &validators,
+                    &content_validators_from_headers(response.headers(), 0),
+                );
+                if !identity_changed {
+                    if let Some((actual, expected)) = content_length_size_mismatch(
+                        StatusCode::OK,
+                        announced_length,
+                        expected_size,
+                    ) {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(remote_size_changed_error(actual, expected));
+                    }
+                    // Absent validators are not a mismatch, and they are not
+                    // proof either. A lengthless 200 may confirm the candidate
+                    // only when it repeats the saved validators and the length.
+                    // It must not delete the `.part`.
+                    if announced_length.is_none()
+                        && (known_size_retired || lengthless_candidate.is_some())
+                    {
+                        if lengthless_candidate == Some(existing_bytes) && existing_bytes > 0 {
+                            let repeated = if validators_confirmed(
+                                &validators,
+                                &content_validators_from_headers(response.headers(), 0),
+                            ) {
+                                confirm_repeated_lengthless_body(
+                                    response,
+                                    existing_bytes,
+                                    &control,
+                                    limiter.as_ref(),
+                                )
+                                .await
+                            } else {
+                                drop(response);
+                                RepeatedBody::Differs
+                            };
+                            let decision = match repeated {
+                                RepeatedBody::Matches => RepeatedDecision::Complete,
+                                RepeatedBody::Differs => {
+                                    length_mismatches = length_mismatches.saturating_add(1);
+                                    if length_mismatches > LENGTHLESS_MISMATCH_BEFORE_GIVEUP {
+                                        RepeatedDecision::Stop(Err(ignored_range_partial_kept()))
+                                    } else {
+                                        // One reconnect can still confirm the candidate.
+                                        // This signal stays retryable; the worker only
+                                        // sees the terminal error below.
+                                        RepeatedDecision::Retry(
+                                            ignored_range_partial_kept_reconnect(),
+                                        )
+                                    }
+                                }
+                                RepeatedBody::Control(outcome) => {
+                                    RepeatedDecision::Stop(Ok(outcome))
+                                }
+                                RepeatedBody::Failed(error) => {
+                                    if let Some(outcome) = control_outcome(&control) {
+                                        RepeatedDecision::Stop(Ok(outcome))
+                                    } else {
+                                        RepeatedDecision::Retry(error)
+                                    }
+                                }
+                            };
+                            match decision {
+                                RepeatedDecision::Complete => {
+                                    return finish_downloaded_entity(
+                                        ctx,
+                                        &temp_path,
+                                        &target_path,
+                                        existing_bytes,
+                                        existing_bytes,
+                                        resume_supported,
+                                    )
+                                    .await;
+                                }
+                                RepeatedDecision::Stop(Ok(outcome)) => return Ok(outcome),
+                                RepeatedDecision::Stop(Err(error)) => {
+                                    checkpoint_partial(ctx, existing_bytes, 0).await;
+                                    return Err(error);
+                                }
+                                RepeatedDecision::Retry(error) => {
+                                    match prepare_reconnect(
+                                        &error,
+                                        short_reconnects,
+                                        existing_bytes,
+                                        true,
+                                        transfer_format_version,
+                                        !ctx.job.rejected_partial,
+                                        &temp_path,
+                                        &control,
+                                        &on_progress,
+                                        &mut cumulative_reconnects,
+                                    )
+                                    .await
+                                    {
+                                        ReconnectAction::Retry { offset } => {
+                                            short_reconnects += 1;
+                                            existing_bytes = offset;
+                                            continue;
+                                        }
+                                        ReconnectAction::Control(outcome) => return Ok(outcome),
+                                        ReconnectAction::GiveUp => {
+                                            checkpoint_partial(ctx, existing_bytes, 0).await;
+                                            return Err(terminal_ignored_range(error));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(outcome) = control_outcome(&control) {
+                            return Ok(outcome);
+                        }
+                        let error = download_error(
+                            FailureCategory::Resume,
+                            IGNORED_RANGE_PARTIAL_KEPT.into(),
+                            false,
+                        );
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
+                }
+                fresh_restarts = fresh_restarts.saturating_add(1);
+                if fresh_restarts > FRESH_RESTART_MAX {
+                    let error = download_error(
+                        FailureCategory::Network,
+                        "Server ignored resume too many times on an unstable connection.".into(),
+                        true,
+                    );
+                    checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                    return Err(error);
+                }
                 existing_bytes = 0;
                 full_replace = true;
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 None
             }
             RangeStatus::Partial { start, total, .. } => {
+                fresh_restarts = 0;
+                range_rejects = 0;
                 if *start != existing_bytes {
                     return Err(download_error(
                         FailureCategory::Resume,
@@ -296,7 +570,12 @@ pub async fn run_http_download_with_ctx(
                 }
                 *total
             }
-            RangeStatus::OkFromZero => None,
+            RangeStatus::OkFromZero => {
+                // The from-zero body is a new partial. One later 416 must not
+                // see the counter left at the discard threshold.
+                range_rejects = 0;
+                None
+            }
         };
 
         let http_status = response.status();
@@ -308,22 +587,39 @@ pub async fn run_http_download_with_ctx(
                 .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
             || resume_supported;
 
-        if !full_replace {
+        // Captured before Content-Length is allowed to replace the running total.
+        // HEAD and a stored expected_size both land here; a later 200 must not
+        // quietly adopt a different entity size. A ranged restart may adopt a
+        // new size only when ETag or Last-Modified says the resource changed.
+        let announced_length = response.content_length();
+        let expected_size = known_expected_size(total_bytes, &validators);
+        let accept_new_size = full_replace
+            && resume_identity_mismatch(
+                &validators,
+                &content_validators_from_headers(response.headers(), 0),
+            );
+        // Before the size check, and before `AppendSink::open`. A gzip GET
+        // whose Content-Length matches HEAD must not be stored, and a gzip
+        // GET whose length disagrees must name the coding. A 206 that already
+        // holds a prefix keeps that count, the same as the other failures here.
+        if let Err(error) = reject_encoded_body(response.headers()) {
+            checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+            return Err(error);
+        }
+        if !accept_new_size {
             if let Some((total, expected)) =
                 content_range_size_mismatch(range_total, validators.expected_size)
             {
-                return Err(download_error(
-                    FailureCategory::Resume,
-                    format!(
-                        "Remote size changed ({total} bytes vs expected {expected}). Use Restart."
-                    ),
-                    false,
-                ));
+                return Err(remote_size_changed_error(total, expected));
+            }
+            if let Some((actual, expected)) =
+                content_length_size_mismatch(http_status, announced_length, expected_size)
+            {
+                return Err(remote_size_changed_error(actual, expected));
             }
         }
 
-        total_bytes = response
-            .content_length()
+        total_bytes = announced_length
             .map(|len| {
                 if http_status == StatusCode::PARTIAL_CONTENT {
                     existing_bytes.saturating_add(len)
@@ -331,10 +627,26 @@ pub async fn run_http_download_with_ctx(
                     len
                 }
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                known_total_without_content_length(&ctx.job, &validators, known_size_retired)
+            });
 
         if let Some(total) = range_total {
             total_bytes = total;
+        }
+        // A declared length belongs to the response in hand. Forget the retirement
+        // and use that length. A changed resource with no length has no size yet:
+        // clear the job and the saved total so a reconnect cannot bring the old
+        // one back.
+        if announced_length.is_some() || range_total.is_some() {
+            known_size_retired = false;
+        }
+        if accept_new_size && announced_length.is_none() && range_total.is_none() {
+            total_bytes = 0;
+            ctx.job.total_bytes = 0;
+            ctx.job.validators.expected_size = None;
+            validators.expected_size = None;
+            known_size_retired = true;
         }
 
         // Capture validators for this response; keep local copy for reconnect If-Range.
@@ -360,29 +672,29 @@ pub async fn run_http_download_with_ctx(
                 if filename == "download.bin"
                     || filename_from_url_fallback(&job_url).as_deref() == Some(filename.as_str())
                 {
-                    filename = header_name;
-                    if let Some(parent) = target_path.parent() {
-                        let new_target = parent.join(&filename);
-                        let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if temp_path != new_temp && temp_path.exists() {
-                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
-                        }
-                        target_path = new_target;
-                        temp_path = new_temp;
-                    }
+                    adopt_filename(
+                        &mut filename,
+                        header_name,
+                        &original_filename,
+                        &mut target_path,
+                        &mut temp_path,
+                        existing_bytes,
+                        &occupied_paths,
+                    )
+                    .await;
                 }
             } else if let Some(from_final) = filename_from_response_url(&current_url) {
                 if filename == "download.bin" {
-                    filename = from_final;
-                    if let Some(parent) = target_path.parent() {
-                        let new_target = parent.join(&filename);
-                        let new_temp = super::filesystem::temp_path_for(&new_target);
-                        if temp_path != new_temp && temp_path.exists() {
-                            let _ = tokio::fs::rename(&temp_path, &new_temp).await;
-                        }
-                        target_path = new_target;
-                        temp_path = new_temp;
-                    }
+                    adopt_filename(
+                        &mut filename,
+                        from_final,
+                        &original_filename,
+                        &mut target_path,
+                        &mut temp_path,
+                        existing_bytes,
+                        &occupied_paths,
+                    )
+                    .await;
                 }
             }
         }
@@ -436,9 +748,50 @@ pub async fn run_http_download_with_ctx(
             .await
             .map_err(|message| download_error(FailureCategory::Disk, message, false))?;
 
-        let mut sink = AppendSink::open(&temp_path, existing_bytes)
-            .await?
-            .with_target(total_bytes);
+        // A changed resource with no Content-Length has no declared size, so
+        // the body is the entity. A retired size must not cap the follow-up
+        // either. Every other response stops at the known size.
+        let write_limit = if announced_length.is_none() && (accept_new_size || known_size_retired) {
+            0
+        } else {
+            total_bytes
+        };
+        // The open itself is the replace. Offset 0 truncates. A rejected file
+        // must not be appended to, even if an earlier reconnect copied its length.
+        if ctx.job.rejected_partial {
+            existing_bytes = 0;
+        }
+        let sink = match AppendSink::open(&temp_path, existing_bytes).await {
+            Ok(sink) => sink,
+            Err(error) if ctx.job.rejected_partial => {
+                return Err(rejected_partial_locked_error(&error));
+            }
+            Err(error) => return Err(error),
+        };
+        if ctx.job.rejected_partial {
+            // The rejected bytes are gone. Later reconnects in this attempt
+            // may trust the length of the body we are about to write.
+            ctx.job.rejected_partial = false;
+            ctx.job.segment_map = None;
+            ctx.job.transfer_format_version = 0;
+            ctx.job.downloaded_bytes = 0;
+            ctx.job.progress = 0.0;
+            let _ = ctx
+                .committer
+                .commit(
+                    &mut ctx.job,
+                    CommitIdentity {
+                        rejected_partial: Some(false),
+                        downloaded_bytes: Some(0),
+                        progress: Some(0.0),
+                        transfer_format_version: Some(0),
+                        map: MapUpdate::Clear,
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        let mut sink = sink.with_target(write_limit);
         let mut downloaded = existing_bytes;
         let mut last_progress = Instant::now();
         let mut window_start = Instant::now();
@@ -482,55 +835,34 @@ pub async fn run_http_download_with_ctx(
         downloaded = sink.offset();
         match body_result {
             Ok(StreamEnd::Control(outcome)) => {
-                if matches!(outcome, DownloadOutcome::Paused) {
-                    let _ = sink.sync_data().await;
+                if should_sync_data_on_exit(outcome) {
+                    sink.sync_data().await?;
                 }
                 drop(sink);
                 emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                 return Ok(outcome);
             }
             Ok(StreamEnd::Exhausted { downloaded }) => {
+                sink.sync_data().await?;
                 drop(sink);
-                verify_sha256_if_expected(&temp_path, ctx.job.expected_sha256.as_deref()).await?;
-                let Some(final_path) = move_to_final_path_unless_discarded(
-                    ctx.committer.as_ref(),
-                    &ctx.job.id,
+                if let Some((actual, expected)) = lengthless_size_mismatch(
+                    accept_new_size,
+                    announced_length,
+                    expected_size,
+                    downloaded,
+                ) {
+                    discard_rejected_partial(ctx, &temp_path).await;
+                    return Err(remote_size_changed_error(actual, expected));
+                }
+                return finish_downloaded_entity(
+                    ctx,
                     &temp_path,
                     &target_path,
-                    ctx.job.replace_existing,
+                    downloaded,
+                    total_bytes,
+                    resume_supported,
                 )
-                .await?
-                else {
-                    return Ok(DownloadOutcome::Canceled);
-                };
-                committer
-                    .commit(
-                        &mut ctx.job,
-                        CommitIdentity {
-                            downloaded_bytes: Some(downloaded),
-                            total_bytes: Some(if total_bytes == 0 {
-                                downloaded
-                            } else {
-                                total_bytes
-                            }),
-                            progress: Some(100.0),
-                            filename: final_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|s| s.to_string()),
-                            target_path: Some(final_path.clone()),
-                            temp_path: Some(temp_path.clone()),
-                            resume_supported: Some(resume_supported),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
-                if committer.output_discarded(&ctx.job.id).await {
-                    remove_and_forget_produced(committer.as_ref(), &ctx.job.id, &final_path).await;
-                    return Ok(DownloadOutcome::Canceled);
-                }
-                return Ok(DownloadOutcome::Completed);
+                .await;
             }
             Err(error) => {
                 if let Some(outcome) = control_outcome(&control) {
@@ -541,22 +873,81 @@ pub async fn run_http_download_with_ctx(
                         )
                     {
                         if should_sync_data_on_exit(outcome) {
-                            let _ = sink.sync_data().await;
+                            sink.sync_data().await?;
                         }
                         drop(sink);
                         emit_control_exit_progress(&on_progress, downloaded, total_bytes);
                         return Ok(outcome);
                     }
                 }
+                // A lengthless close never finishes the file. When this response
+                // is the one whose validators changed, keep the body and confirm
+                // it with Range bytes=N- and If-Range set to the new validators.
+                if is_lengthless_eof(&error) && accept_new_size && downloaded > 0 {
+                    sink.sync_data().await?;
+                    drop(sink);
+                    lengthless_candidate = Some(downloaded);
+                    length_mismatches = 0;
+                    known_size_retired = true;
+                    ctx.job.total_bytes = 0;
+                    ctx.job.validators.expected_size = None;
+                    validators.expected_size = None;
+                    checkpoint_partial(ctx, downloaded, 0).await;
+                    existing_bytes = downloaded;
+                    short_reconnects = 0;
+                    match prepare_reconnect(
+                        &error,
+                        short_reconnects,
+                        existing_bytes,
+                        resume_supported,
+                        transfer_format_version,
+                        !ctx.job.rejected_partial,
+                        &temp_path,
+                        &control,
+                        &on_progress,
+                        &mut cumulative_reconnects,
+                    )
+                    .await
+                    {
+                        ReconnectAction::Retry { offset } => {
+                            short_reconnects += 1;
+                            existing_bytes = offset;
+                            continue;
+                        }
+                        ReconnectAction::Control(outcome) => return Ok(outcome),
+                        ReconnectAction::GiveUp => {
+                            checkpoint_partial(ctx, existing_bytes, 0).await;
+                            return Err(error);
+                        }
+                    }
+                }
                 drop(sink);
+                if is_remote_size_mismatch(&error) {
+                    discard_rejected_partial(ctx, &temp_path).await;
+                    return Err(error);
+                }
+                if is_clean_short_body(&error) {
+                    if let Some((actual, expected)) = lengthless_size_mismatch(
+                        accept_new_size,
+                        announced_length,
+                        expected_size,
+                        downloaded,
+                    ) {
+                        discard_rejected_partial(ctx, &temp_path).await;
+                        return Err(remote_size_changed_error(actual, expected));
+                    }
+                }
+                if downloaded > existing_bytes {
+                    short_reconnects = 0;
+                }
                 existing_bytes = downloaded;
                 match prepare_reconnect(
                     &error,
-                    /*is_fetch_phase=*/ false,
                     short_reconnects,
                     existing_bytes,
                     resume_supported,
                     transfer_format_version,
+                    !ctx.job.rejected_partial,
                     &temp_path,
                     &control,
                     &on_progress,
@@ -570,7 +961,10 @@ pub async fn run_http_download_with_ctx(
                         continue;
                     }
                     ReconnectAction::Control(outcome) => return Ok(outcome),
-                    ReconnectAction::GiveUp => return Err(error),
+                    ReconnectAction::GiveUp => {
+                        checkpoint_partial(ctx, existing_bytes, total_bytes).await;
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -585,23 +979,17 @@ enum ReconnectAction {
 
 async fn prepare_reconnect(
     error: &DownloadError,
-    is_fetch_phase: bool,
     short_reconnects: u32,
     existing_bytes: u64,
     resume_supported: bool,
     transfer_format_version: u32,
+    trust_file_length: bool,
     temp_path: &std::path::Path,
     control: &AtomicU8,
     on_progress: &TransferEventCallback,
     cumulative_reconnects: &mut u32,
 ) -> ReconnectAction {
-    if !can_mid_transfer_reconnect(
-        error,
-        is_fetch_phase,
-        short_reconnects,
-        existing_bytes,
-        resume_supported,
-    ) {
+    if !can_mid_transfer_reconnect(error, short_reconnects, existing_bytes, resume_supported) {
         return ReconnectAction::GiveUp;
     }
 
@@ -622,14 +1010,350 @@ async fn prepare_reconnect(
         return ReconnectAction::Control(outcome);
     }
 
-    let offset = refresh_reconnect_offset(transfer_format_version, existing_bytes, temp_path).await;
+    let offset = refresh_reconnect_offset(
+        transfer_format_version,
+        existing_bytes,
+        temp_path,
+        trust_file_length,
+    )
+    .await;
 
     ReconnectAction::Retry { offset }
 }
 
+/// Size already known from HEAD, a previous response, or `validators.expected_size`.
+fn known_expected_size(total_bytes: u64, validators: &ContentValidators) -> Option<u64> {
+    validators
+        .expected_size
+        .filter(|size| *size > 0)
+        .or_else(|| (total_bytes > 0).then_some(total_bytes))
+}
+
+/// A fresh 200's Content-Length is the whole entity. Partial responses carry
+/// only the slice length, so they are compared via Content-Range instead.
+fn content_length_size_mismatch(
+    status: StatusCode,
+    content_length: Option<u64>,
+    expected_size: Option<u64>,
+) -> Option<(u64, u64)> {
+    if status != StatusCode::OK {
+        return None;
+    }
+    match (content_length, expected_size.filter(|size| *size > 0)) {
+        (Some(len), Some(expected)) if len != expected => Some((len, expected)),
+        _ => None,
+    }
+}
+
+fn known_size_differs(downloaded: u64, expected_size: Option<u64>) -> Option<(u64, u64)> {
+    match expected_size.filter(|size| *size > 0) {
+        Some(expected) if downloaded != expected => Some((downloaded, expected)),
+        _ => None,
+    }
+}
+
+/// Clean end of a 200 that never declared Content-Length, when the bytes
+/// received are not a size we already know. A restart that adopted a new
+/// entity (`accept_new_size`) and a truncated Content-Length body stay on
+/// the existing resume path.
+fn lengthless_size_mismatch(
+    accept_new_size: bool,
+    announced_length: Option<u64>,
+    expected_size: Option<u64>,
+    downloaded: u64,
+) -> Option<(u64, u64)> {
+    if accept_new_size || announced_length.is_some() {
+        return None;
+    }
+    known_size_differs(downloaded, expected_size)
+}
+
+fn is_clean_short_body(error: &DownloadError) -> bool {
+    is_incomplete_download(error) || is_lengthless_eof(error)
+}
+
+fn ignored_range_partial_kept() -> DownloadError {
+    // A Range GET answered with 200, partial kept. Same stop as the other
+    // two ignored-Range sites: Resume, and not a worker retry.
+    download_error(
+        FailureCategory::Resume,
+        IGNORED_RANGE_PARTIAL_KEPT.into(),
+        false,
+    )
+}
+
+/// In-attempt signal for one lengthless mismatch. Same text as the terminal
+/// error, but retryable so `prepare_reconnect` can run. GiveUp of this text
+/// becomes `ignored_range_partial_kept`.
+fn ignored_range_partial_kept_reconnect() -> DownloadError {
+    download_error(
+        FailureCategory::Network,
+        IGNORED_RANGE_PARTIAL_KEPT.into(),
+        true,
+    )
+}
+
+fn terminal_ignored_range(error: DownloadError) -> DownloadError {
+    if error.message == IGNORED_RANGE_PARTIAL_KEPT {
+        ignored_range_partial_kept()
+    } else {
+        error
+    }
+}
+
+/// A saved job whose size was cleared after a lengthless validator change.
+/// The bytes on disk are a candidate, not a finished file.
+fn pending_lengthless_confirm(job: &Job, on_disk: u64) -> Option<u64> {
+    if on_disk == 0 || job.downloaded_bytes != on_disk || job.total_bytes != 0 {
+        return None;
+    }
+    if job.validators.expected_size.is_some() {
+        return None;
+    }
+    if job.validators.etag.is_none() && job.validators.last_modified.is_none() {
+        return None;
+    }
+    Some(on_disk)
+}
+
+fn unsatisfied_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    parse_unsatisfied_content_range(value)
+}
+
+fn parse_unsatisfied_content_range(value: &str) -> Option<u64> {
+    let (unit, rest) = value.trim().split_once(char::is_whitespace)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim().split_once('/')?;
+    if range.trim() != "*" {
+        return None;
+    }
+    let total = total.trim();
+    if total.is_empty() || total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+enum RepeatedBody {
+    Matches,
+    Differs,
+    Control(DownloadOutcome),
+    Failed(DownloadError),
+}
+
+enum RepeatedDecision {
+    Complete,
+    Retry(DownloadError),
+    Stop(Result<DownloadOutcome, DownloadError>),
+}
+
+/// Read a same-validator lengthless 200 without writing it over the candidate.
+/// Reading stops once the body passes `candidate`.
+async fn confirm_repeated_lengthless_body(
+    response: reqwest::Response,
+    candidate: u64,
+    control: &AtomicU8,
+    limiter: &GlobalBandwidthLimiter,
+) -> RepeatedBody {
+    let mut sink = CountingSink::new().stop_after(candidate);
+    match stream_body(response, &mut sink, control, limiter, |_| {}).await {
+        Ok(StreamEnd::Control(outcome)) => RepeatedBody::Control(outcome),
+        Ok(StreamEnd::Exhausted { downloaded }) => {
+            if downloaded == candidate {
+                RepeatedBody::Matches
+            } else {
+                RepeatedBody::Differs
+            }
+        }
+        Err(error) if is_lengthless_eof(&error) || is_remote_size_mismatch(&error) => {
+            if sink.offset() == candidate {
+                RepeatedBody::Matches
+            } else {
+                RepeatedBody::Differs
+            }
+        }
+        Err(error) => RepeatedBody::Failed(error),
+    }
+}
+
+fn known_total_without_content_length(
+    job: &Job,
+    validators: &ContentValidators,
+    size_retired: bool,
+) -> u64 {
+    if size_retired {
+        return 0;
+    }
+    if job.total_bytes > 0 {
+        return job.total_bytes;
+    }
+    validators
+        .expected_size
+        .filter(|size| *size > 0)
+        .unwrap_or(0)
+}
+
+async fn finish_downloaded_entity(
+    ctx: &mut TransferContext,
+    temp_path: &Path,
+    target_path: &Path,
+    downloaded: u64,
+    total_bytes: u64,
+    resume_supported: bool,
+) -> Result<DownloadOutcome, DownloadError> {
+    verify_sha256_if_expected(temp_path, ctx.job.expected_sha256.as_deref()).await?;
+    let Some(final_path) = move_to_final_path_unless_discarded(
+        ctx.committer.as_ref(),
+        &ctx.job.id,
+        temp_path,
+        target_path,
+        ctx.job.replace_existing,
+    )
+    .await?
+    else {
+        return Ok(DownloadOutcome::Canceled);
+    };
+    let total = if total_bytes == 0 {
+        downloaded
+    } else {
+        total_bytes
+    };
+    ctx.committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(downloaded),
+                total_bytes: Some(total),
+                progress: Some(100.0),
+                filename: final_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string()),
+                target_path: Some(final_path.clone()),
+                temp_path: Some(temp_path.to_path_buf()),
+                resume_supported: Some(resume_supported),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|message| download_error(FailureCategory::Internal, message, false))?;
+    if ctx.committer.output_discarded(&ctx.job.id).await {
+        remove_and_forget_produced(ctx.committer.as_ref(), &ctx.job.id, &final_path).await;
+        return Ok(DownloadOutcome::Canceled);
+    }
+    Ok(DownloadOutcome::Completed)
+}
+
+/// Switch to a Content-Disposition name only after the existing partial moved,
+/// or when nothing has been written and the destination is an absent node.
+/// A failed stat is not an empty file.
+pub(crate) fn disposition_switch_allowed(
+    rename_ok: bool,
+    existing_bytes: u64,
+    new_file_len: Option<u64>,
+) -> bool {
+    rename_ok || (existing_bytes == 0 && new_file_len == Some(0))
+}
+
+async fn adopt_filename(
+    filename: &mut String,
+    candidate: String,
+    original: &str,
+    target_path: &mut PathBuf,
+    temp_path: &mut PathBuf,
+    existing_bytes: u64,
+    occupied: &[PathBuf],
+) {
+    *filename = candidate;
+    let Some(parent) = target_path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let new_target = parent.join(filename.as_str());
+    let new_temp = super::filesystem::temp_path_for(&new_target);
+    if adopt_renamed_partial(
+        temp_path,
+        &new_temp,
+        target_path,
+        &new_target,
+        existing_bytes,
+        occupied,
+    )
+    .await
+    {
+        *target_path = new_target;
+        *temp_path = new_temp;
+    } else {
+        *filename = original.to_string();
+    }
+}
+
+async fn adopt_renamed_partial(
+    temp_path: &Path,
+    new_temp: &Path,
+    current_target: &Path,
+    new_target: &Path,
+    existing_bytes: u64,
+    occupied: &[PathBuf],
+) -> bool {
+    if !path_is_free_for_us(new_temp, temp_path, occupied).await
+        || !path_is_free_for_us(new_target, current_target, occupied).await
+    {
+        return false;
+    }
+    if super::filesystem::paths_equal_for_volume(temp_path, new_temp, cfg!(windows)) {
+        return true;
+    }
+    let rename_ok = if regular_file_present(temp_path).await {
+        tokio::fs::rename(
+            super::filesystem::io_path(temp_path),
+            super::filesystem::io_path(new_temp),
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    let new_len = if rename_ok {
+        None
+    } else if proven_absent(new_temp).await {
+        Some(0)
+    } else {
+        None
+    };
+    disposition_switch_allowed(rename_ok, existing_bytes, new_len)
+}
+
+async fn path_is_free_for_us(path: &Path, ours: &Path, occupied: &[PathBuf]) -> bool {
+    if super::filesystem::paths_equal_for_volume(path, ours, cfg!(windows)) {
+        return true;
+    }
+    if super::filesystem::path_occupied(path, occupied) {
+        return false;
+    }
+    proven_absent(path).await
+}
+
+/// `Ok` only when `symlink_metadata` reports no node. A dangling symlink, a
+/// case-variant `.part`, and any other stat failure are not absent.
+async fn proven_absent(path: &Path) -> bool {
+    match tokio::fs::symlink_metadata(super::filesystem::io_path(path)).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        _ => false,
+    }
+}
+
+async fn regular_file_present(path: &Path) -> bool {
+    match tokio::fs::symlink_metadata(super::filesystem::io_path(path)).await {
+        Ok(metadata) => metadata.is_file(),
+        Err(_) => false,
+    }
+}
+
 fn can_mid_transfer_reconnect(
     error: &DownloadError,
-    is_fetch_phase: bool,
     short_reconnects: u32,
     existing_bytes: u64,
     resume_supported: bool,
@@ -640,10 +1364,7 @@ fn can_mid_transfer_reconnect(
     if !is_reconnectable_error(error) {
         return false;
     }
-    if is_fetch_phase && short_reconnects == 0 {
-        return false;
-    }
-    ranges_usable_for_reconnect(existing_bytes, resume_supported)
+    ranges_usable_for_reconnect(existing_bytes, resume_supported, error)
 }
 
 fn is_reconnectable_error(error: &DownloadError) -> bool {
@@ -654,8 +1375,75 @@ fn is_reconnectable_error(error: &DownloadError) -> bool {
         )
 }
 
-fn ranges_usable_for_reconnect(existing_bytes: u64, resume_supported: bool) -> bool {
-    existing_bytes == 0 || resume_supported
+/// Byte 0 can always be fetched again. A confirmed Range server can resume.
+/// Otherwise a retryable network or HTTP error is worth a Range attempt.
+/// A clean EOF that never had a length must not spin.
+fn ranges_usable_for_reconnect(
+    existing_bytes: u64,
+    resume_supported: bool,
+    error: &DownloadError,
+) -> bool {
+    if existing_bytes == 0 || resume_supported {
+        return true;
+    }
+    is_reconnectable_error(error) && !is_lengthless_eof(error)
+}
+
+/// The bytes on disk belong to a body we rejected. Remove them and forget
+/// the offset so Retry starts clean instead of Range-resuming the mismatch.
+/// `downloaded_bytes` is committed as 0. When the file survives both delete
+/// and truncate, `rejected_partial` is committed too: a reload must not
+/// treat that length as progress.
+async fn discard_rejected_partial(ctx: &mut TransferContext, temp_path: &Path) {
+    let untrusted = clear_rejected_partial(temp_path).await == RejectedPartialClear::Unchanged;
+    ctx.job.downloaded_bytes = 0;
+    ctx.job.progress = 0.0;
+    ctx.job.rejected_partial = untrusted;
+    let _ = ctx
+        .committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(0),
+                progress: Some(0.0),
+                rejected_partial: Some(untrusted),
+                ..Default::default()
+            },
+        )
+        .await;
+}
+
+fn rejected_partial_locked_error(open_error: &DownloadError) -> DownloadError {
+    download_error(
+        FailureCategory::Disk,
+        format!(
+            "Could not replace the rejected partial download because another program has the file open. Close that program and use Retry. ({})",
+            open_error.message
+        ),
+        false,
+    )
+}
+
+async fn checkpoint_partial(ctx: &mut TransferContext, downloaded: u64, total_bytes: u64) {
+    if downloaded == 0 {
+        return;
+    }
+    ctx.job.downloaded_bytes = downloaded;
+    if total_bytes > 0 {
+        ctx.job.total_bytes = total_bytes;
+    }
+    let _ = ctx
+        .committer
+        .commit(
+            &mut ctx.job,
+            CommitIdentity {
+                downloaded_bytes: Some(downloaded),
+                total_bytes: (total_bytes > 0).then_some(total_bytes),
+                progress: Some(progress_percent(downloaded, total_bytes)),
+                ..Default::default()
+            },
+        )
+        .await;
 }
 
 pub(crate) fn reconnect_backoff(attempt_1_based: u32) -> Duration {
@@ -668,8 +1456,10 @@ async fn refresh_reconnect_offset(
     transfer_format_version: u32,
     tracked_downloaded: u64,
     temp_path: &std::path::Path,
+    trust_file_length: bool,
 ) -> u64 {
-    if transfer_format_version >= 1 {
+    // A rejected `.part` still has a length. That length is not this offset.
+    if !trust_file_length || transfer_format_version >= 1 {
         tracked_downloaded
     } else {
         metadata_len(temp_path).await.unwrap_or(tracked_downloaded)
@@ -787,6 +1577,29 @@ pub(crate) fn progress_percent(downloaded: u64, total: u64) -> f64 {
     }
     ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
 }
+/// Completion proof. Every saved ETag and Last-Modified must be present and
+/// equal. A 206 may omit them (`resume_identity_mismatch` treats that as
+/// "not a change"); a 416 or a second full body may not.
+fn validators_confirmed(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
+    fn field(stored: Option<&str>, incoming: Option<&str>) -> Option<bool> {
+        let stored = stored.map(str::trim).filter(|value| !value.is_empty())?;
+        let incoming = incoming.map(str::trim).filter(|value| !value.is_empty());
+        Some(incoming == Some(stored))
+    }
+    match (
+        field(stored.etag.as_deref(), incoming.etag.as_deref()),
+        field(
+            stored.last_modified.as_deref(),
+            incoming.last_modified.as_deref(),
+        ),
+    ) {
+        (None, None) => false,
+        (Some(etag_ok), None) => etag_ok,
+        (None, Some(lm_ok)) => lm_ok,
+        (Some(etag_ok), Some(lm_ok)) => etag_ok && lm_ok,
+    }
+}
+
 fn resume_identity_mismatch(stored: &ContentValidators, incoming: &ContentValidators) -> bool {
     if let (Some(a), Some(b)) = (stored.etag.as_deref(), incoming.etag.as_deref()) {
         if a.trim() != b.trim() {
@@ -1105,6 +1918,51 @@ mod tests {
     }
 
     #[test]
+    fn validators_confirmed_requires_every_saved_field() {
+        let stored = ContentValidators {
+            etag: Some("\"a\"".into()),
+            last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+            expected_size: None,
+        };
+        let both = stored.clone();
+        assert!(validators_confirmed(&stored, &both));
+        assert!(!validators_confirmed(
+            &stored,
+            &ContentValidators {
+                etag: Some("\"a\"".into()),
+                ..ContentValidators::default()
+            }
+        ));
+        assert!(!validators_confirmed(
+            &stored,
+            &ContentValidators {
+                etag: Some("\"b\"".into()),
+                last_modified: Some("Tue, 15 Nov 1994 12:45:26 GMT".into()),
+                expected_size: None,
+            }
+        ));
+        let etag_only = ContentValidators {
+            etag: Some(" \"a\" ".into()),
+            ..ContentValidators::default()
+        };
+        assert!(validators_confirmed(
+            &etag_only,
+            &ContentValidators {
+                etag: Some("\"a\"".into()),
+                ..ContentValidators::default()
+            }
+        ));
+        assert!(!validators_confirmed(
+            &etag_only,
+            &ContentValidators::default()
+        ));
+        assert!(!validators_confirmed(
+            &ContentValidators::default(),
+            &etag_only
+        ));
+    }
+
+    #[test]
     fn preflight_patch_preserves_user_and_uniquified_filename() {
         let mut job = Job::new(
             "https://example.com/file.zip".into(),
@@ -1132,13 +1990,15 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_200ms_to_2s() {
+    fn reconnect_backoff_200ms_to_8s() {
         assert_eq!(reconnect_backoff(1), Duration::from_millis(200));
         assert_eq!(reconnect_backoff(2), Duration::from_millis(400));
         assert_eq!(reconnect_backoff(3), Duration::from_millis(800));
         assert_eq!(reconnect_backoff(4), Duration::from_millis(1600));
-        assert_eq!(reconnect_backoff(5), Duration::from_secs(2)); // 3200 capped
-        assert_eq!(reconnect_backoff(6), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(5), Duration::from_millis(3200));
+        assert_eq!(reconnect_backoff(6), Duration::from_millis(6400));
+        assert_eq!(reconnect_backoff(7), Duration::from_secs(8)); // 12800 capped
+        assert_eq!(reconnect_backoff(12), Duration::from_secs(8));
     }
 
     #[test]
@@ -1154,30 +2014,187 @@ mod tests {
             true,
         );
         let stalled = crate::download::body::stall_error(std::time::Duration::from_secs(30));
-        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 100, true));
-        assert!(can_mid_transfer_reconnect(&incomplete, false, 0, 100, true));
-        assert!(can_mid_transfer_reconnect(&stalled, false, 0, 100, true));
-        assert!(!can_mid_transfer_reconnect(&stalled, false, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, true));
+        assert!(can_mid_transfer_reconnect(&stalled, 0, 100, true));
+        // Unadvertised ranges still get a Range attempt after a stall or a short body.
+        assert!(can_mid_transfer_reconnect(&stalled, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&incomplete, 0, 100, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 100, false));
+        let clean_eof = crate::download::body::lengthless_eof_error(10);
+        assert!(!can_mid_transfer_reconnect(&clean_eof, 0, 100, false));
         assert!(!can_mid_transfer_reconnect(
             &body_err,
-            false,
             RECONNECT_MAX,
             100,
             true
         ));
-        assert!(!can_mid_transfer_reconnect(&body_err, false, 0, 100, false));
-        assert!(can_mid_transfer_reconnect(&body_err, false, 0, 0, false));
+        assert!(can_mid_transfer_reconnect(&body_err, 0, 0, false));
     }
 
     #[test]
-    fn can_reconnect_fetch_only_after_prior_short_reconnect() {
+    fn content_length_mismatch_rejects_fresh_200_only() {
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), Some(65_536)),
+            Some((4096, 65_536))
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(65_536), Some(4096)),
+            Some((65_536, 4096))
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), Some(4096)),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, None, Some(65_536)),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::OK, Some(4096), None),
+            None
+        );
+        assert_eq!(
+            content_length_size_mismatch(StatusCode::PARTIAL_CONTENT, Some(48), Some(64)),
+            None,
+            "206 Content-Length is the slice, not the entity size"
+        );
+    }
+
+    #[test]
+    fn known_expected_size_prefers_validator_then_running_total() {
+        let validators = ContentValidators {
+            expected_size: Some(80),
+            ..ContentValidators::default()
+        };
+        assert_eq!(known_expected_size(0, &validators), Some(80));
+        assert_eq!(known_expected_size(4096, &validators), Some(80));
+        assert_eq!(
+            known_expected_size(4096, &ContentValidators::default()),
+            Some(4096)
+        );
+        assert_eq!(known_expected_size(0, &ContentValidators::default()), None);
+    }
+
+    #[test]
+    fn lengthless_size_mismatch_rejects_short_and_long_bodies() {
+        assert_eq!(
+            lengthless_size_mismatch(false, None, Some(65_536), 4096),
+            Some((4096, 65_536))
+        );
+        assert_eq!(
+            lengthless_size_mismatch(false, None, Some(65_536), 131_072),
+            Some((131_072, 65_536))
+        );
+        assert_eq!(
+            lengthless_size_mismatch(false, None, Some(4096), 4096),
+            None
+        );
+        assert_eq!(
+            lengthless_size_mismatch(true, None, Some(65_536), 131_072),
+            None,
+            "a changed resource may adopt a new length"
+        );
+        assert_eq!(
+            lengthless_size_mismatch(false, Some(65_536), Some(65_536), 4096),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_content_length_keeps_preflight_total() {
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            std::path::PathBuf::from("file.bin"),
+            std::path::PathBuf::from("file.bin.part"),
+        );
+        job.total_bytes = 4096;
+        assert_eq!(
+            known_total_without_content_length(&job, &ContentValidators::default(), false),
+            4096
+        );
+        job.total_bytes = 0;
+        let validators = ContentValidators {
+            expected_size: Some(80),
+            ..ContentValidators::default()
+        };
+        assert_eq!(
+            known_total_without_content_length(&job, &validators, false),
+            80
+        );
+        assert_eq!(
+            known_total_without_content_length(&job, &ContentValidators::default(), false),
+            0
+        );
+        job.total_bytes = 262_144;
+        assert_eq!(
+            known_total_without_content_length(&job, &validators, true),
+            0,
+            "a retired size must not come back from the job or its validators"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_content_range_reads_star_total_only() {
+        assert_eq!(
+            parse_unsatisfied_content_range("bytes */524288"),
+            Some(524_288)
+        );
+        assert_eq!(parse_unsatisfied_content_range("Bytes */8"), Some(8));
+        assert_eq!(parse_unsatisfied_content_range("bytes 0-1/8"), None);
+        assert_eq!(parse_unsatisfied_content_range("bytes */*"), None);
+    }
+
+    #[test]
+    fn pending_lengthless_confirm_requires_cleared_size_and_a_validator() {
+        let mut job = Job::new(
+            "https://example.com/file.bin".into(),
+            "file.bin".into(),
+            std::path::PathBuf::from("file.bin"),
+            std::path::PathBuf::from("file.bin.part"),
+        );
+        job.downloaded_bytes = 96;
+        job.validators.etag = Some("\"e2\"".into());
+        assert_eq!(pending_lengthless_confirm(&job, 96), Some(96));
+        job.total_bytes = 96;
+        assert_eq!(pending_lengthless_confirm(&job, 96), None);
+        job.total_bytes = 0;
+        job.validators.expected_size = Some(96);
+        assert_eq!(pending_lengthless_confirm(&job, 96), None);
+        job.validators.expected_size = None;
+        job.validators.etag = None;
+        assert_eq!(pending_lengthless_confirm(&job, 96), None);
+        job.validators.last_modified = Some("Thu, 02 Jan 2020 00:00:00 GMT".into());
+        assert_eq!(pending_lengthless_confirm(&job, 96), Some(96));
+        assert_eq!(pending_lengthless_confirm(&job, 95), None);
+    }
+
+    #[test]
+    fn failed_disposition_rename_does_not_switch_a_resumed_partial() {
+        assert!(disposition_switch_allowed(true, 100, None));
+        assert!(!disposition_switch_allowed(false, 0, None));
+        assert!(disposition_switch_allowed(false, 0, Some(0)));
+        assert!(!disposition_switch_allowed(false, 100, None));
+        assert!(!disposition_switch_allowed(false, 100, Some(0)));
+        assert!(!disposition_switch_allowed(false, 0, Some(12)));
+    }
+
+    #[test]
+    fn can_reconnect_opening_get_uses_short_budget() {
         let connect = download_error(
             FailureCategory::Network,
             "Could not connect: timed out".into(),
             true,
         );
-        assert!(!can_mid_transfer_reconnect(&connect, true, 0, 50, true));
-        assert!(can_mid_transfer_reconnect(&connect, true, 1, 50, true));
+        assert!(can_mid_transfer_reconnect(&connect, 0, 50, true));
+        assert!(can_mid_transfer_reconnect(&connect, 1, 0, false));
+        assert!(!can_mid_transfer_reconnect(
+            &connect,
+            RECONNECT_MAX,
+            0,
+            false
+        ));
     }
 
     #[test]
@@ -1188,18 +2205,21 @@ mod tests {
             false,
         );
         let disk = download_error(FailureCategory::Disk, "Could not write".into(), false);
-        assert!(!can_mid_transfer_reconnect(&resume, false, 0, 10, true));
-        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 10, true));
+        assert!(!can_mid_transfer_reconnect(&resume, 0, 10, true));
+        assert!(!can_mid_transfer_reconnect(&disk, 0, 10, true));
         assert!(!is_reconnectable_error(&resume));
         assert!(!is_reconnectable_error(&disk));
     }
 
     #[test]
     fn ranges_usable_for_reconnect_rules() {
-        assert!(ranges_usable_for_reconnect(0, false));
-        assert!(ranges_usable_for_reconnect(0, true));
-        assert!(ranges_usable_for_reconnect(10, true));
-        assert!(!ranges_usable_for_reconnect(10, false));
+        let stall = crate::download::body::stall_error(std::time::Duration::from_secs(30));
+        let clean_eof = crate::download::body::lengthless_eof_error(10);
+        assert!(ranges_usable_for_reconnect(0, false, &stall));
+        assert!(ranges_usable_for_reconnect(0, true, &stall));
+        assert!(ranges_usable_for_reconnect(10, true, &stall));
+        assert!(ranges_usable_for_reconnect(10, false, &stall));
+        assert!(!ranges_usable_for_reconnect(10, false, &clean_eof));
     }
 
     #[test]
@@ -1210,7 +2230,7 @@ mod tests {
             false,
         );
         assert!(!is_reconnectable_error(&disk));
-        assert!(!can_mid_transfer_reconnect(&disk, false, 0, 100, true));
+        assert!(!can_mid_transfer_reconnect(&disk, 0, 100, true));
         assert_eq!(disk.category, FailureCategory::Disk);
         assert!(!disk.retryable);
     }
@@ -1225,8 +2245,9 @@ mod tests {
         let part = dir.join("f.bin.part");
         tokio::fs::write(&part, vec![0u8; 77]).await.unwrap();
 
-        assert_eq!(refresh_reconnect_offset(0, 10, &part).await, 77);
-        assert_eq!(refresh_reconnect_offset(1, 42, &part).await, 42);
+        assert_eq!(refresh_reconnect_offset(0, 10, &part, true).await, 77);
+        assert_eq!(refresh_reconnect_offset(0, 10, &part, false).await, 10);
+        assert_eq!(refresh_reconnect_offset(1, 42, &part, true).await, 42);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -1254,11 +2275,11 @@ mod tests {
         );
         let action = prepare_reconnect(
             &err,
-            false,
             0,
             64,
             true,
             0,
+            true,
             &part,
             &control,
             &on_progress,
@@ -1381,5 +2402,76 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn disposition_rename_does_not_replace_another_part_or_follow_a_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "rusticdl-disposition-adopt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let ours = dir.join("download.bin.part");
+        tokio::fs::write(&ours, b"ours").await.unwrap();
+        let other_part = dir.join("Report.pdf.part");
+        tokio::fs::write(&other_part, b"other").await.unwrap();
+        let other_target = dir.join("Report.pdf");
+        let occupied = vec![other_target.clone(), other_part.clone()];
+
+        let case_variant = dir.join("report.pdf.part");
+        let replaced = adopt_renamed_partial(
+            &ours,
+            &case_variant,
+            &dir.join("download.bin"),
+            &dir.join("report.pdf"),
+            4,
+            &occupied,
+        )
+        .await;
+        if cfg!(windows) {
+            assert!(!replaced, "Windows case-fold must refuse the other .part");
+            assert_eq!(tokio::fs::read(&ours).await.unwrap(), b"ours");
+        } else {
+            assert!(replaced, "Linux keeps byte-wise distinct case variants");
+            assert_eq!(tokio::fs::read(&case_variant).await.unwrap(), b"ours");
+            tokio::fs::write(&ours, b"ours").await.unwrap();
+        }
+        assert_eq!(tokio::fs::read(&other_part).await.unwrap(), b"other");
+
+        let exact = adopt_renamed_partial(
+            &ours,
+            &other_part,
+            &dir.join("download.bin"),
+            &other_target,
+            0,
+            &occupied,
+        )
+        .await;
+        assert!(!exact);
+        assert_eq!(tokio::fs::read(&other_part).await.unwrap(), b"other");
+        assert_eq!(tokio::fs::read(&ours).await.unwrap(), b"ours");
+
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside-target");
+            let link = dir.join("link.bin.part");
+            tokio::fs::symlink(&outside, &link).await.unwrap();
+            let followed = adopt_renamed_partial(
+                &ours,
+                &link,
+                &dir.join("download.bin"),
+                &dir.join("link.bin"),
+                0,
+                &[],
+            )
+            .await;
+            assert!(!followed, "a dangling symlink is not an empty destination");
+            assert!(
+                tokio::fs::symlink_metadata(&outside).await.is_err(),
+                "adopt must not create the symlink target"
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

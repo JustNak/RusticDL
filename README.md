@@ -36,6 +36,7 @@ Download the latest stable build from [GitHub Releases](https://github.com/JustN
 | **`RusticDL-windows-x64.zip`** | Portable app (`rusticdl.exe`) |
 | **`RusticDL-full-windows-x64.zip`** | Portable app, native host, register scripts, and browser extension packages |
 | **`RusticDL-linux-x64.tar.gz`** | Linux app, native host, updater, and `install-linux.sh` |
+| **`SHA256SUMS`** | GNU sha256sum listing for the Linux tarball and Windows setup.exe |
 | **`extension-chromium.zip`** | Chromium, Edge, and Brave unpacked extension |
 | **`extension-firefox.zip`** | Firefox temporary-add-on package |
 

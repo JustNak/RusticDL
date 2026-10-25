@@ -49,16 +49,12 @@ fn stage_updater_exe(installed: &std::path::Path) -> Result<PathBuf, String> {
     Ok(staged)
 }
 
-/// Spawn the updater, which downloads/installs the update after this process exits.
-///
-/// Callers must flush app state, then quit promptly so the updater can replace files.
-pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
-    let installed = updater_exe_path()?;
-    let updater = stage_updater_exe(&installed)?;
-    let app_exe =
-        std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
-    let pid = std::process::id();
-
+/// CLI args passed to the staged helper (download URL, optional SHA-256, …).
+fn updater_handoff_args(
+    opts: &LaunchUpdaterOpts,
+    app_exe: &std::path::Path,
+    pid: u32,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--app-exe".into(),
         app_exe.to_string_lossy().into_owned(),
@@ -77,10 +73,29 @@ pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
         args.push("--expected-size".into());
         args.push(size.to_string());
     }
-    if let Some(sha256) = &opts.setup_sha256 {
+    if let Some(sha256) = opts
+        .setup_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         args.push("--expected-sha256".into());
-        args.push(sha256.clone());
+        args.push(sha256.to_string());
     }
+    args
+}
+
+/// Spawn the updater, which downloads/installs the update after this process exits.
+///
+/// Callers must flush app state, then quit promptly so the updater can replace files.
+pub fn launch_updater(opts: &LaunchUpdaterOpts) -> Result<(), String> {
+    let installed = updater_exe_path()?;
+    let updater = stage_updater_exe(&installed)?;
+    let app_exe =
+        std::env::current_exe().map_err(|e| format!("Could not resolve app path: {e}"))?;
+    let pid = std::process::id();
+
+    let args = updater_handoff_args(opts, &app_exe, pid);
 
     #[cfg(windows)]
     {
@@ -209,4 +224,35 @@ fn shell_execute_detached(exe: &std::path::Path, args: &[String]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn opts(setup_sha256: Option<String>) -> LaunchUpdaterOpts {
+        LaunchUpdaterOpts {
+            download_url: "https://example.com/RusticDL-windows-x64-setup.exe".into(),
+            from_version: "0.3.4".into(),
+            to_version: "0.3.6".into(),
+            release_page: "https://github.com/JustNak/RusticDL/releases".into(),
+            setup_size: Some(12),
+            setup_sha256,
+        }
+    }
+
+    #[test]
+    fn handoff_passes_expected_sha256_when_setup_line_present() {
+        let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let args = updater_handoff_args(&opts(Some(hash.into())), Path::new("rusticdl.exe"), 7);
+        let flag = args.iter().position(|a| a == "--expected-sha256");
+        assert_eq!(flag.map(|i| args[i + 1].as_str()), Some(hash));
+    }
+
+    #[test]
+    fn handoff_omits_expected_sha256_when_sums_missing() {
+        let args = updater_handoff_args(&opts(None), Path::new("rusticdl.exe"), 7);
+        assert!(!args.iter().any(|a| a == "--expected-sha256"));
+    }
 }
