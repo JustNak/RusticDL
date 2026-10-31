@@ -1014,6 +1014,103 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
 }
 
 {
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1a', 'C2 NETWORK_FAILED interrupt is FAIL, not pass', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL'
+      && r.browserDownloadStopped === false
+      && String(r.reason).includes('NETWORK_FAILED'),
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1b', 'C2 SERVER_CONTENT_LENGTH_MISMATCH interrupt is FAIL', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'SERVER_CONTENT_LENGTH_MISMATCH', url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'SERVER_CONTENT_LENGTH_MISMATCH', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL'
+      && String(r.reason).includes('SERVER_CONTENT_LENGTH_MISMATCH'),
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  const outsider = {
+    id: 9,
+    state: 'complete',
+    url: 'http://other.example/not-this-click',
+    finalUrl: c2Url,
+  };
+  check('R7-1c', 'item with url outside and finalUrl inside is counted (complete is FAIL)', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [outsider] }),
+    next: run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [outsider] }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1d', 'item with url outside and finalUrl inside USER_CANCELED still passes', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{
+        id: 9,
+        state: 'interrupted',
+        error: 'USER_CANCELED',
+        url: 'http://other.example/not-this-click',
+        finalUrl: c2Url,
+      }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass' && r.browserDownloadStopped === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  check('R7-1e', 'G5 NETWORK_FAILED interrupt is FAIL with error named, not xfail', {
+    old: run(legacy, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+    }),
+    next: run(fixed, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+    }),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL'
+      && r.browserDownloadStopped === false
+      && String(r.reason).includes('NETWORK_FAILED'),
+  });
+}
+
+{
   const dir = mkdtempSync(path.join(tmpdir(), 'r2-drain-'));
   writeFileSync(path.join(dir, 'host-log.jsonl'), '');
   const startedAt = Date.now();

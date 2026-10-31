@@ -51,6 +51,16 @@ export function isSlowC2() {
   return attack === 'slow-c2' || attack === 'slow-body-c2';
 }
 
+export function isSocketReset() {
+  const attack = attackName();
+  return attack === 'socket-reset' || attack === 'reset-c2' || attack === 'network-failed';
+}
+
+export function isLengthAbort() {
+  const attack = attackName();
+  return attack === 'length-abort' || attack === 'content-length-abort';
+}
+
 export function applySearchDownloadsAttack(result) {
   const attack = attackName();
   if (attack === 'search-error') {

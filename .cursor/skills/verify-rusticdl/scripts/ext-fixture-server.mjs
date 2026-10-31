@@ -385,6 +385,8 @@ function handleFile(id, req, res, url) {
         'Content-Length': String(BODY_64K),
       };
       const body = bytes(BODY_64K, 0x42);
+      const abort = fileAbortMode();
+      if (abort) return abortAfterBytes(res, headers, body, 512, abort);
       if (attackMod?.isSlowC2?.()) {
         return streamSlowBody(res, headers, body, 4096, 250);
       }
@@ -500,6 +502,38 @@ function streamSlowBody(res, headers, body, chunkBytes, delayMs) {
   pump();
 }
 
+function abortAfterBytes(res, headers, body, n, mode) {
+  res.writeHead(200, { ...headers, Connection: 'close' });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  const slice = body.subarray(0, Math.min(n, body.length));
+  try {
+    res.write(slice);
+  } catch {
+    return;
+  }
+  // Capture fires ~70ms after headers. Same-tick abort turns C2 into a failed
+  // navigation. res.end() can keep the HTTP socket open (in_progress forever);
+  // RST → NETWORK_FAILED, TCP FIN → SERVER_CONTENT_LENGTH_MISMATCH.
+  setTimeout(() => {
+    if (res.writableEnded || res.destroyed) return;
+    const sock = res.socket;
+    if (mode === 'reset') {
+      if (sock && typeof sock.resetAndDestroy === 'function') sock.resetAndDestroy();
+      else if (sock) sock.destroy();
+      else res.destroy();
+      return;
+    }
+    if (sock) sock.end();
+    else res.end();
+  }, 300);
+}
+
+function fileAbortMode() {
+  if (attackMod?.isSocketReset?.()) return 'reset';
+  if (attackMod?.isLengthAbort?.()) return 'length';
+  return null;
+}
+
 function streamChunked(res, extraHeaders, totalBytes) {
   res.writeHead(200, {
     'Content-Type': 'application/octet-stream',
@@ -576,12 +610,19 @@ function onRequest(req, res) {
     return;
   }
   if (url.pathname === '/C10/final') {
-    send(res, 200, {
+    const headers = {
       'Content-Type': 'application/zip',
       'Content-Disposition': 'attachment; filename="archive.zip"',
       'Content-Length': String(BODY_64K),
       'Set-Cookie': cookieHeader(nonce),
-    }, bytes(BODY_64K));
+    };
+    const body = bytes(BODY_64K);
+    const abort = fileAbortMode();
+    if (abort) {
+      abortAfterBytes(res, headers, body, 512, abort);
+      return;
+    }
+    send(res, 200, headers, body);
     return;
   }
 
