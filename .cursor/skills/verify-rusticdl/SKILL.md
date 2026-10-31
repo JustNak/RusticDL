@@ -209,15 +209,19 @@ The prove script checks the fixture pid owns the port, the unpacked Chromium dis
 .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
 ```
 
-Each case is a real click on `[data-case=Cn]`. Capture, keep, stop, end-window recheck, end-download recheck, and the G1/G3/G4/G5 conjuncts are `PROOF_RULES` rows in `apps/extension/e2e/classify.mjs`. Not every verdict goes through that table. Remaining direct sites: `classify.mjs` skip (`:854`), the G5 `XPASS` path (`:927`), `isSentinelOk` (`:968`), `invalidateNegatives` (`:972`), `hostFailedHandoff` (`:1046`), the spec C2/N1 `expect`s and blocker filter (`extension-capture.spec.ts:520-529`), and the metrics `observed === 'capture'` filter (`extension-capture.spec.ts:486`). Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round’s negatives. Recipe: `features/extension-capture.md`.
+Each case is a real click on `[data-case=Cn]`. Capture, keep, stop, end-window recheck, end-download recheck, and the kit-G1/kit-G3/kit-G4/kit-G5 conjuncts are `PROOF_RULES` rows in `apps/extension/e2e/classify.mjs`. Not every verdict goes through that table. Remaining direct sites: `classify.mjs` skip (`:854`), the `g5-final-url` original-URL `XPASS` path (`:929`), `isSentinelOk` (`:968`), `invalidateNegatives` (`:972`), `hostFailedHandoff` (`:1046`), the spec C2/N1 `expect`s and blocker filter (`extension-capture.spec.ts:520-529`), and the metrics `observed === 'capture'` filter (`extension-capture.spec.ts:486`). Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round’s negatives. Recipe: `features/extension-capture.md`.
+
+Baseline at d0f7f75b (master merge base 0dd08e23): capture_rate=5/10 false_grab_rate=1/9 (CI run 41227323808, Extension e2e). PR2-PR5 are graded against this; EXT-METRICS is printed, not asserted, so graders compare it by hand.
 
 ### Known gaps
 
-- G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8).
-- G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
-- G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
-- G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
-- G6 — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row (`keepClickProved`, `classify.mjs:358`). Unconfirmed: (a) stop compares href strings, so a reordered query on a `complete` item counts as erased; (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
+Kit gap ids (`kit-G1`..`kit-G6`) are separate from EXT-SCOPE gap ids. EXT-SCOPE G2 (Firefox inline PDF) is out of scope for PR1 and lands in PR3.
+
+- kit-G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8).
+- kit-G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
+- kit-G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
+- kit-G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
+- kit-G6 (R8-1, Medium, V4) — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row (`keepClickProved`, `classify.mjs:359`). Unconfirmed: (a) stop compares href strings, so a reordered query on a `complete` item counts as erased; (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
 
 ### Evidence
 
@@ -245,7 +249,7 @@ Recipe detail: `features/extension-capture.md`.
 | `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock; logs the reply next to each request |
 | `scripts/ext-cases.json` | Capture matrix rows (`id, route, trigger, expect, url, filename, xfail`) |
 | `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
-| `apps/extension/e2e/classify.mjs` | Matrix classifier (`PROOF_RULES`; G1/G3/G4/G5 xfails; G6 blob/data keep arm is a documented harness gap) |
+| `apps/extension/e2e/classify.mjs` | Matrix classifier (`PROOF_RULES`; kit-G1/kit-G3/kit-G4/kit-G5 xfails; kit-G6 blob/data keep arm is a documented harness gap) |
 | `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot; imported only by `selftest-classifier.mjs` |
 | `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2–R7 classifier attacks plus R8 `PROOF_RULES` honest+mutant coverage against both classifiers |
 
