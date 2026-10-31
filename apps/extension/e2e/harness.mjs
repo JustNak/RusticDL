@@ -90,11 +90,12 @@ export async function launchExtensionContext({
   distChromium,
 }) {
   mkdirSync(userDataDir, { recursive: true });
-  mkdirSync(path.join(runDir, 'browser-downloads'), { recursive: true });
+  const downloadsPath = path.join(runDir, 'browser-downloads');
+  mkdirSync(downloadsPath, { recursive: true });
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
     acceptDownloads: true,
-    downloadsPath: path.join(runDir, 'browser-downloads'),
+    downloadsPath,
     env: browserEnv({ isolatedHome, runDir }),
     ignoreDefaultArgs: ['--disable-extensions'],
     args: [
@@ -104,9 +105,51 @@ export async function launchExtensionContext({
       '--disable-dev-shm-usage',
     ],
   });
+  // Playwright maps acceptDownloads to CDP allowAndName *with browserContextId*
+  // (GUID paths), which skips chrome.downloads.onDeterminingFilename. A
+  // Browser.setDownloadBehavior without that id does not override the context.
+  // Re-set `allow` on every context id Chrome reports so the real event fires
+  // (raw Chrome already does, with no Playwright interception).
+  const browser = context.browser();
+  if (browser && typeof browser.newBrowserCDPSession === 'function') {
+    const session = await browser.newBrowserCDPSession();
+    // Playwright's persistent context sets allowAndName without a context id
+    // (CRBrowserContext is constructed with undefined). Override that default
+    // first, then each reported context id.
+    await session.send('Browser.setDownloadBehavior', {
+      behavior: 'allow',
+      downloadPath: downloadsPath,
+      eventsEnabled: true,
+    });
+    const { targetInfos } = await session.send('Target.getTargets');
+    const contextIds = new Set(
+      (targetInfos ?? [])
+        .map((target) => target.browserContextId)
+        .filter((id) => typeof id === 'string' && id.length > 0),
+    );
+    for (const browserContextId of contextIds) {
+      await session.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadsPath,
+        eventsEnabled: true,
+        browserContextId,
+      });
+    }
+  }
+  for (const page of context.pages()) {
+    try {
+      const pageSession = await context.newCDPSession(page);
+      await pageSession.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: downloadsPath,
+      });
+    } catch {
+      // Page.setDownloadBehavior is deprecated; Browser.setDownloadBehavior is enough
+    }
+  }
   return {
     context,
-    browserVersion: context.browser()?.version() ?? 'unknown',
+    browserVersion: browser?.version() ?? 'unknown',
     executablePath: chromium.executablePath(),
   };
 }

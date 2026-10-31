@@ -292,10 +292,9 @@ export function peekCreatedAction(
   now = Date.now(),
 ): CreatedAction {
   const probe = probeFromDownload(item, extra);
-  if (item.byExtensionId) {
-    followCaptureFamily(store, probe, now);
-    return 'skip-restore';
-  }
+  // Do not skip on byExtensionId here. Chrome sets it to *this* extension when
+  // downloads.onDeterminingFilename runs; that is not a restore. Other
+  // extensions still fail shouldCaptureDownloadItem (`byExtensionId`).
   const existing = followCaptureFamily(store, probe, now);
   if (existing) {
     return actionForBlockedPhase(existing.phase);

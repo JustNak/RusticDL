@@ -48,14 +48,6 @@ const targets = [
         'webRequest',
       ],
       host_permissions: ['<all_urls>'],
-      content_scripts: [
-        {
-          matches: ['http://*/*', 'https://*/*'],
-          js: ['downloadHint.js'],
-          run_at: 'document_start',
-          all_frames: true,
-        },
-      ],
       background: {
         service_worker: 'background.js',
         type: 'module',
@@ -150,21 +142,6 @@ for (const target of targets) {
     sourcemap: true,
     logLevel: 'info',
   });
-
-  if (target.name === 'chromium') {
-    await build({
-      entryPoints: {
-        downloadHint: path.join(appRoot, 'src/content/downloadHint.ts'),
-      },
-      bundle: true,
-      outdir: outDir,
-      format: 'iife',
-      platform: 'browser',
-      target: ['chrome110'],
-      sourcemap: true,
-      logLevel: 'info',
-    });
-  }
 
   await writeFile(path.join(outDir, 'manifest.json'), `${JSON.stringify(target.manifest, null, 2)}\n`);
 

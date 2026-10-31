@@ -217,9 +217,9 @@ Baseline at d0f7f75b (master merge base 0dd08e23): capture_rate=5/10 false_grab_
 
 Kit gap ids (`kit-G1`..`kit-G6`) are separate from EXT-SCOPE gap ids. EXT-SCOPE G2 (Firefox inline PDF) is out of scope for PR1 and lands in PR3.
 
-- kit-G1 — closed: Chromium now captures `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8).
+- kit-G1 — closed: Chromium captures `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8). Capture decision uses header MIME / sanitized URL basename; the name sent to the host is Chrome’s determined name (`downloads.onDeterminingFilename`, or `DownloadItem.filename` once Chrome fills it).
 - kit-G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
-- kit-G4 — closed: Chromium now captures octet-stream with no Content-Disposition and no filename in the URL (C4).
+- kit-G4 — closed: Chromium captures octet-stream with no Content-Disposition and no filename in the URL (C4) as sanitized basename `get`, after a webRequest `main_frame`/`other` type is known. `sub_frame`/`object` stay keep.
 - kit-G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
 - kit-G6 (R8-1, Medium, V4) — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row (`keepClickProved`, `classify.mjs:359`). Unconfirmed: (a) stop compares href strings, so a reordered query on a `complete` item counts as erased; (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
 

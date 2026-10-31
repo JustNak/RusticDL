@@ -62,7 +62,7 @@ Product xfails in `scripts/ext-cases.json` (Chromium, not this harness):
 - kit-G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
 - kit-G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
 
-Closed by the Chromium capture coordinator (header-hint / URL-basename filename, final decision at `onDeterminingFilename`):
+Closed by the Chromium capture coordinator. Capture decision uses header hints and a sanitized URL basename when `onCreated` is empty (G4 `/get?id=5` → `get`). The name sent to the host is Chrome’s determined name: `downloads.onDeterminingFilename` on raw Chrome, and (when Playwright’s CDP `allowAndName` skips that event) `DownloadItem.filename` after this harness re-sets CDP `allow`. Page-controlled HTML `download` is not an authority.
 
 - kit-G1 — was: Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3 inline zip, C7 `location.href`, C8 programmatic `a.click()`).
 - kit-G4 — was: Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).

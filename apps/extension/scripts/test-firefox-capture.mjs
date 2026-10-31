@@ -56,11 +56,12 @@ const {
   rememberResponseFilenameHint,
   lookupFilenameHint,
   rememberDeterminedFilename,
-  rememberHtmlDownloadHint,
+  rememberResourceType,
   resolveSuggestedFilename,
   applyDeterminedFilename,
   applyChromiumCaptureHints,
   downloadUrlBasename,
+  needsDeterminedFilename,
   rememberRequestAuth,
   lookupOriginAuth,
 } = require(chromiumOutfile);
@@ -103,6 +104,10 @@ const {
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
   downloadCreatedAction,
+  downloadStateAllowsHandoff,
+  isNonUserInitiatedResourceType,
+  MAX_SUGGESTED_FILENAME_LENGTH,
+  sanitizeSuggestedFilename,
   knownDownloadBytes,
   matchesInterceptedDownload,
   followRestoreSkip,
@@ -1659,51 +1664,6 @@ assert(
     && decideCreatedAction(createCaptureSessionStore(), emptyZipHinted, defaultSettings) === 'handoff',
 );
 
-const htmlHintUrl = 'https://cdn.example.com/pr2/N1';
-rememberResponseFilenameHint({
-  url: htmlHintUrl,
-  responseHeaders: [
-    { name: 'content-type', value: 'text/html; charset=utf-8' },
-    { name: 'content-length', value: '4096' },
-  ],
-});
-const emptyHtml = applyChromiumCaptureHints({
-  id: 102,
-  url: htmlHintUrl,
-  filename: '',
-  mime: 'text/html',
-  totalBytes: 4096,
-});
-assert(
-  'onCreated empty filename + HTML hint is kept',
-  shouldCaptureDownloadItem(emptyHtml, defaultSettings) === false
-    && decideCreatedAction(createCaptureSessionStore(), emptyHtml, defaultSettings) === 'ignore',
-);
-
-const inlinePdfUrl = 'https://cdn.example.com/pr2/N2';
-rememberResponseFilenameHint({
-  url: inlinePdfUrl,
-  responseHeaders: [
-    { name: 'content-type', value: 'application/pdf' },
-    { name: 'content-length', value: '65536' },
-    { name: 'content-disposition', value: 'inline; filename="inline.pdf"' },
-  ],
-});
-const emptyInlinePdf = applyChromiumCaptureHints({
-  id: 103,
-  url: inlinePdfUrl,
-  filename: '',
-  mime: 'application/pdf',
-  totalBytes: 65536,
-});
-assert(
-  'onCreated empty filename + inline PDF hint is kept',
-  emptyInlinePdf.filename === 'inline.pdf'
-    && emptyInlinePdf.hasAttachment !== true
-    && shouldCaptureDownloadItem(emptyInlinePdf, defaultSettings) === false
-    && decideCreatedAction(createCaptureSessionStore(), emptyInlinePdf, defaultSettings) === 'ignore',
-);
-
 const emptyGet = applyChromiumCaptureHints({
   id: 104,
   url: 'https://cdn.example.com/get?id=5',
@@ -1711,12 +1671,16 @@ const emptyGet = applyChromiumCaptureHints({
   mime: 'application/octet-stream',
   totalBytes: 65536,
 });
+rememberResourceType('https://cdn.example.com/get?id=5', 'main_frame');
+const emptyGetTyped = applyChromiumCaptureHints(emptyGet);
 assert(
   'octet-stream /get?id=5 with empty onCreated filename is captured as get',
-  emptyGet.filename === 'get'
-    && shouldCaptureDownloadItem(emptyGet, defaultSettings) === true
-    && resolveSuggestedFilename(emptyGet) === 'get'
-    && decideCreatedAction(createCaptureSessionStore(), emptyGet, defaultSettings) === 'handoff',
+  emptyGetTyped.filename === 'get'
+    && emptyGetTyped.filenameFromUrlBasename === true
+    && emptyGetTyped.resourceType === 'main_frame'
+    && shouldCaptureDownloadItem(emptyGetTyped, defaultSettings) === true
+    && resolveSuggestedFilename(emptyGetTyped) === 'get'
+    && decideCreatedAction(createCaptureSessionStore(), emptyGetTyped, defaultSettings) === 'handoff',
 );
 
 const emptyC1 = applyChromiumCaptureHints({
@@ -1726,50 +1690,64 @@ const emptyC1 = applyChromiumCaptureHints({
   mime: 'application/zip',
   totalBytes: 65536,
 });
+rememberResourceType('https://cdn.example.com/C1', 'main_frame');
+const emptyC1Typed = applyChromiumCaptureHints(emptyC1);
 assert(
   'empty filename + zip MIME uses the URL basename so C1 is not ignored',
-  emptyC1.filename === 'C1'
-    && shouldCaptureDownloadItem(emptyC1, defaultSettings) === true,
+  emptyC1Typed.filename === 'C1'
+    && emptyC1Typed.filenameFromUrlBasename === true
+    && shouldCaptureDownloadItem(emptyC1Typed, defaultSettings) === true,
 );
 
-const htmlAttrUrl = 'https://cdn.example.com/pr2/C1-attr';
 assert(
-  'HTML download attribute is remembered for http(s) URLs only',
-  rememberHtmlDownloadHint(htmlAttrUrl, 'app.zip') === 'app.zip'
-    && rememberHtmlDownloadHint('blob:https://cdn.example.com/abc', 'blob.zip') === undefined
-    && rememberHtmlDownloadHint('data:application/zip,AA', 'data.zip') === undefined,
-);
-const emptyHtmlAttr = applyChromiumCaptureHints({
-  id: 106,
-  url: htmlAttrUrl,
-  filename: '',
-  mime: 'application/zip',
-  totalBytes: 65536,
-});
-assert(
-  'HTML download attribute fills empty onCreated filename (C1/C8 app.zip)',
-  emptyHtmlAttr.filename === 'app.zip'
-    && shouldCaptureDownloadItem(emptyHtmlAttr, defaultSettings) === true
-    && resolveSuggestedFilename(emptyHtmlAttr) === 'app.zip'
-    && decideCreatedAction(createCaptureSessionStore(), emptyHtmlAttr, defaultSettings) === 'handoff',
+  'G4 octet-stream /get?id=5 does not wait 1500ms for a determined extension',
+  emptyGetTyped.filename === 'get'
+    && emptyGetTyped.filenameFromUrlBasename === true
+    && needsDeterminedFilename(emptyGetTyped) === false
+    && needsDeterminedFilename({
+      ...emptyGetTyped,
+      chromeDeterminedFilename: 'get',
+    }) === false,
 );
 
-const dispositionBeatsAttrUrl = 'https://cdn.example.com/pr2/disposition-vs-attr';
-rememberHtmlDownloadHint(dispositionBeatsAttrUrl, 'from-attr.zip');
-rememberResponseFilenameHint({
-  url: dispositionBeatsAttrUrl,
-  responseHeaders: [
-    { name: 'content-type', value: 'application/zip' },
-    { name: 'content-length', value: '65536' },
-    { name: 'content-disposition', value: 'attachment; filename="from-header.zip"' },
-  ],
-});
 assert(
-  'Content-Disposition filename still wins over the HTML download attribute',
-  resolveSuggestedFilename({
-    url: dispositionBeatsAttrUrl,
-    filename: '',
-  }) === 'from-header.zip',
+  'C1 zip URL token waits for Chrome app.zip then finalizes without the timer',
+  emptyC1Typed.filename === 'C1'
+    && emptyC1Typed.filenameFromUrlBasename === true
+    && needsDeterminedFilename(emptyC1Typed) === true
+    && needsDeterminedFilename({
+      ...emptyC1Typed,
+      chromeDeterminedFilename: 'app.zip',
+    }) === false
+    && needsDeterminedFilename({
+      ...emptyC1Typed,
+      chromeDeterminedFilename: 'C1',
+    }) === false,
+);
+
+assert(
+  'Firefox onCreated /get?id=5 without chromium url-basename flag is kept',
+  emptyGetTyped.filenameFromUrlBasename === true
+    && shouldCaptureDownloadItem(emptyGetTyped, defaultSettings) === true
+    && shouldCaptureDownloadItem(
+      {
+        url: 'https://cdn.example.com/get?id=5',
+        filename: 'get',
+        mime: 'application/octet-stream',
+        totalBytes: 65536,
+      },
+      defaultSettings,
+    ) === false
+    && shouldCaptureDownloadItem(
+      {
+        url: 'https://cdn.example.com/get?id=5',
+        filename: 'get',
+        mime: 'application/octet-stream',
+        totalBytes: 65536,
+        filenameFromUrlBasename: true,
+      },
+      defaultSettings,
+    ) === false,
 );
 
 assert(
@@ -1783,6 +1761,197 @@ assert(
     },
     defaultSettings,
   ) === true,
+);
+
+console.log('\nChecker corpus (html-evil, longname, poison, dotdot, trav, cross, cancel, uuid, iframe)\n');
+
+assert(
+  'C1 send name uses Chrome shelf app.zip without capturing as app.zip',
+  (() => {
+    rememberResourceType('https://cdn.example.com/C1-shelf', 'main_frame');
+    const item = applyChromiumCaptureHints({
+      id: 801,
+      url: 'https://cdn.example.com/C1-shelf',
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+      chromeDeterminedFilename: 'app.zip',
+    });
+    return item.filename === 'C1-shelf'
+      && item.filename !== 'app.zip'
+      && item.filenameFromUrlBasename === true
+      && shouldCaptureDownloadItem(item, defaultSettings) === true
+      && resolveSuggestedFilename(item) === 'app.zip';
+  })(),
+);
+
+assert(
+  'html-evil /notes.html stays keep when determined name is evil.exe',
+  (() => {
+    const url = 'http://127.0.0.1:18821/notes.html';
+    applyDeterminedFilename(
+      { id: 201, url, filename: 'evil.exe' },
+      () => undefined,
+    );
+    const item = applyChromiumCaptureHints({
+      id: 201,
+      url,
+      filename: '',
+      mime: 'text/html',
+      totalBytes: 4096,
+    });
+    return item.filename === 'notes.html'
+      && item.filename !== 'evil.exe'
+      && shouldCaptureDownloadItem(item, defaultSettings) === false
+      && resolveSuggestedFilename(item) === 'evil.exe';
+  })(),
+);
+
+assert(
+  'longname 2000 n + .exe is rejected before the extension check',
+  sanitizeSuggestedFilename(`${'n'.repeat(2000)}.exe`) === undefined
+    && `${'n'.repeat(2000)}.exe`.length > MAX_SUGGESTED_FILENAME_LENGTH
+    && sanitizeSuggestedFilename(`${'n'.repeat(2000)}.exe`) !== `${'n'.repeat(2000)}.exe`.slice(0, MAX_SUGGESTED_FILENAME_LENGTH)
+    && sanitizeSuggestedFilename('\u0000evil.exe') === undefined
+    && sanitizeSuggestedFilename('ok.zip') === 'ok.zip',
+);
+
+assert(
+  'poison-then-realzip determined names are keyed by download id not URL',
+  (() => {
+    const url = 'http://127.0.0.1:18821/real.zip?mime=application/zip';
+    rememberDeterminedFilename(301, 'evil.exe');
+    rememberDeterminedFilename(302, 'real.zip');
+    const item = applyChromiumCaptureHints({
+      id: 302,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    return item.filename === 'real.zip'
+      && item.filename !== 'evil.exe'
+      && item.filenameFromUrlBasename === true
+      && resolveSuggestedFilename({ id: 302, url, filename: '' }) === 'real.zip'
+      && resolveSuggestedFilename({ id: 301, url, filename: '' }) === 'evil.exe';
+  })(),
+);
+
+assert(
+  'dotdot download=".." is rejected as a suggested name',
+  sanitizeSuggestedFilename('..') === undefined
+    && sanitizeSuggestedFilename('.') === undefined,
+);
+
+assert(
+  'trav /files/%2e%2e%2fsecret.zip does not suggest ../secret.zip',
+  downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') === undefined
+    && downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') !== '../secret.zip'
+    && sanitizeSuggestedFilename('../secret.zip') === undefined
+    && sanitizeSuggestedFilename('%2e%2e%2fsecret.zip') === undefined
+    && sanitizeSuggestedFilename('%2e%2e%5csecret.zip') === undefined,
+);
+
+assert(
+  'cross determined export is not replaced by page download x.zip',
+  (() => {
+    const url = 'http://localhost:18821/api/export?mime=application/octet-stream&bytes=65536';
+    applyDeterminedFilename({ id: 401, url, filename: 'export' }, () => undefined);
+    const item = applyChromiumCaptureHints({
+      id: 401,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return item.filename === 'export'
+      && item.filenameFromUrlBasename === true
+      && item.filename !== 'x.zip'
+      && resolveSuggestedFilename({
+        id: 401,
+        url,
+        filename: 'x.zip',
+      }) === 'export';
+  })(),
+);
+
+assert(
+  'cancel-during-name-wait interrupted state does not allow handoff',
+  downloadStateAllowsHandoff('interrupted') === false
+    && downloadStateAllowsHandoff('in_progress') === true
+    && downloadStateAllowsHandoff('complete') === true,
+);
+
+assert(
+  'uuid aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee is weak and not a G4 send name',
+  (() => {
+    const uuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const chromeTemp = '1d97dd55-4c2b-4681-8b2e-e65cf9800a8e';
+    const url = `http://127.0.0.1:18821/${uuid}`;
+    applyDeterminedFilename({ id: 501, url, filename: chromeTemp }, () => undefined);
+    const item = applyChromiumCaptureHints({
+      id: 501,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    const sendName = resolveSuggestedFilename(item);
+    return item.filenameFromUrlBasename === true
+      && item.filename === uuid
+      && isWeakSuggestedFilename(uuid) === true
+      && isWeakSuggestedFilename(chromeTemp) === true
+      && isWeakSuggestedFilename(item.filename) === true
+      && isWeakSuggestedFilename(sendName) === true
+      && sendName !== 'get';
+  })(),
+);
+
+assert(
+  'iframe-octet sub_frame /api/export stays keep',
+  (() => {
+    const url = 'http://127.0.0.1:18821/api/export?mime=application/octet-stream&bytes=65536&iframe=1';
+    rememberResourceType(url, 'sub_frame');
+    const item = applyChromiumCaptureHints({
+      id: 601,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return item.resourceType === 'sub_frame'
+      && isNonUserInitiatedResourceType('sub_frame') === true
+      && shouldCaptureDownloadItem(item, defaultSettings) === false;
+  })(),
+);
+
+assert(
+  'concurrent same-URL items keep distinct determined names',
+  (() => {
+    const url = 'http://127.0.0.1:18821/same.zip';
+    rememberDeterminedFilename(701, 'one.zip');
+    rememberDeterminedFilename(702, 'two.zip');
+    const first = applyChromiumCaptureHints({
+      id: 701,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    const second = applyChromiumCaptureHints({
+      id: 702,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    return first.filenameFromUrlBasename === true
+      && second.filenameFromUrlBasename === true
+      && first.filename === 'same.zip'
+      && second.filename === 'same.zip'
+      && resolveSuggestedFilename({ id: 701, url, filename: '' }) === 'one.zip'
+      && resolveSuggestedFilename({ id: 702, url, filename: '' }) === 'two.zip';
+  })(),
 );
 
 assert(
