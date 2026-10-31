@@ -42,10 +42,11 @@ Headless CI wraps the same script with `xvfb-run`. Each case is a real click on 
 - Branded Chrome 137+ ignores `--load-extension`. This harness uses Playwright's bundled Chromium with `--disable-extensions-except` and `--load-extension`.
 - Matching a `ping` line, a URL substring, or another case's host-log line is a FAIL. Filter by `receivedAt` after the case start, then require exact `payload.url`.
 - G3 (C9) xfail counts only the exact false-grab line: `url` equals this attempt's POST URL, `suggestedFilename` is `posted.zip`, `entryPoint` is `browser_download`, `receivedAt` in the case window. Any other line is FAIL.
-- G5 (C10) xfail counts only when `payload.url ===` origin + `/C10/final` + this attempt's query. Evil hosts and superstrings are FAIL.
-- G1/G4 miss-xfails drain the host log over a quiet window after the 5 s wait and re-check the full log at the end of the run. A late exact capture is XPASS.
+- G5 (C10) xfail counts only when `payload.url ===` origin + `/C10/final` + this attempt's query, the host reply is `accepted`, and the browser download is not `state: complete`. Evil hosts, superstrings, garbage replies, and a completed download are FAIL.
+- G1/G4 miss-xfails drain the host log for up to `maxWaitMs` (20 s) while it stays empty, then a 3 s quiet window after the first line, and re-check the full log at the end of the run. A late exact capture inside that cap is XPASS. A late wrong-shape prompt (for example `suggestedFilename` null) is FAIL.
+- Keep proof is tied to this attempt: a fixture hit plus a chrome/playwright download created after `triggerAt` (or whose URL/referrer carries this attempt) or a page render of the target. The pre-click launcher page and leftover `blob:`/`data:` items from another attempt are not proof. A no-op or fetch-and-stay click is FAIL.
 - Bodies are 64 KiB unless the case says otherwise (N6 is 3 KiB; L1 is 200 MiB chunked with no Content-Length). Smaller bodies hit the 8 KiB capture gate.
 - L2/L3 are skipped unless a real user action can drive them (download-shelf cancel and desktop-prompt dismiss cannot).
 - An `xfail` that starts passing is XPASS and fails the job; the fix PR must flip that row in `ext-cases.json`.
 - `--live` only prints the live-site list. It is never CI-gated.
-- `EXT_ATTACK` is a test-only hook in `apps/extension/e2e/ext-attack.mjs` (loaded by the mock host / fixture). Never product code.
+- `EXT_ATTACK` is a test-only hook in `apps/extension/e2e/ext-attack.mjs` (loaded by the mock host / fixture). Never product code. Attacks can only fail the job closed; they cannot select a weaker classifier. `EXT_CLASSIFIER` is ignored by the prove script and spec (legacy exists only for `selftest-classifier.mjs`).

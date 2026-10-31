@@ -1,6 +1,6 @@
 /**
  * Snapshot of the 9227e12 classifier (the bugs F1–F9). Used only by
- * selftest-classifier.mjs and EXT_CLASSIFIER=legacy. Not product code.
+ * selftest-classifier.mjs. The prove spec must not import this module.
  */
 export const KEEP_WAIT_MS = 5000;
 export const MISS_DRAIN = { minWaitMs: 5000, quietMs: 0, maxWaitMs: 5000 };

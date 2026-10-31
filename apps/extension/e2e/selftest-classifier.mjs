@@ -4,9 +4,13 @@
  * classifier. Exit 0 only when every finding is red on legacy and green after
  * the fix. No browser; uses the same classify*.mjs modules as the spec.
  */
+import { mkdtempSync, writeFileSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import * as fixed from './classify.mjs';
 import * as legacy from './classify.legacy.mjs';
-import { EXPECTED_POST_BODY, lateC1LogLine } from './ext-attack.mjs';
+import { EXPECTED_POST_BODY, lateC1LogLine, lateCaptureLine } from './ext-attack.mjs';
+import { drainCaptureLines } from './harness.mjs';
 
 const G3_REASON = 'Chromium false-captures the POST attachment and would replay it as GET';
 const G5_REASON = 'Chromium handed off the final same-origin redirect URL (/C10/final), not the original /C10 URL';
@@ -58,8 +62,35 @@ function n1Def() {
   return {
     id: 'N1',
     route: '/N1',
+    trigger: 'click-link',
     expect: 'keep',
     filename: null,
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function c5Def() {
+  return {
+    id: 'C5',
+    route: '/page/C5',
+    trigger: 'blob-anchor',
+    expect: 'keep',
+    filename: 'blob.zip',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function c6Def() {
+  return {
+    id: 'C6',
+    route: '/page/C6',
+    trigger: 'data-anchor',
+    expect: 'keep',
+    filename: 'data.zip',
     xfail: null,
     skip: null,
     fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
@@ -110,14 +141,15 @@ function run(mod, caseDef, extra) {
     expectedFinalUrl: extra.expectedFinalUrl ?? null,
     pageUrl,
     nonce,
-    attempt,
+    attempt: extra.attempt || attempt,
     startedAt,
-    triggerAt,
+    triggerAt: extra.triggerAt ?? triggerAt,
     promptLines: extra.promptLines || [],
     enqueueLines: extra.enqueueLines || [],
     downloads: extra.downloads || [],
     fixtureHits: extra.fixtureHits || [],
     pageEvidence: extra.pageEvidence || { href: pageUrl, text: '', dataPage: caseDef.id },
+    playwrightDownload: extra.playwrightDownload,
   });
 }
 
@@ -360,6 +392,155 @@ const n1Url = `${origin}/N1?nonce=${nonce}&attempt=${attempt}`;
     next: n1New,
     oldWant: (r) => r.status === 'pass',
     newWant: (r) => r.status === 'INVALID',
+  });
+}
+
+// R2-1 late wrong-shape filename is FAIL, not xfail
+{
+  const lateBad = lateCaptureLine(c1Url, startedAt + 15_000, {
+    filename: null,
+    requestId: 'late-null',
+  });
+  check('R2-1b', 'late C1 with null filename is FAIL', {
+    old: run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [lateBad] }),
+    next: run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [lateBad] }),
+    oldWant: (r) => r.status === 'FAIL',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// R2-2 G5 wrong-shape + complete download
+{
+  const finalUrl = c10Final;
+  const lines = [promptLine({
+    url: finalUrl,
+    filename: 'archive.zip',
+    reply: { hello: 'wrong-shape' },
+  })];
+  const extra = {
+    expectedUrl: c10Original,
+    expectedFinalUrl: finalUrl,
+    promptLines: lines,
+    downloads: [{ id: 4, state: 'complete', url: finalUrl }],
+  };
+  check('R2-2', 'G5 garbage reply + complete download is FAIL', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+// R2-4 N1 fetch-and-stay
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    pageEvidence: { href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`, text: 'N1 html page', dataPage: 'N1' },
+    downloads: [],
+  };
+  check('R2-4a', 'N1 fetch-and-stay is FAIL', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const leftover = [{
+    id: 2,
+    state: 'complete',
+    url: 'blob:http://127.0.0.1:18765/0415dce4-94d1-4d37-a590-9c45f8448dab',
+    referrer: `${origin}/page/C5?nonce=${nonce}&attempt=other-attempt`,
+    startTime: new Date(startedAt - 60_000).toISOString(),
+    filename: 'blob.zip',
+  }];
+  check('R2-4b', 'C5 no-op leftover blob is FAIL', {
+    old: run(legacy, c5Def(), { expectedUrl: `${origin}/page/C5`, promptLines: [], downloads: leftover }),
+    next: run(fixed, c5Def(), {
+      expectedUrl: `${origin}/page/C5`,
+      promptLines: [],
+      downloads: leftover,
+      triggerAt: startedAt,
+      attempt,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  check('R2-4c', 'C6 no-op after C5 blob is FAIL', {
+    old: run(legacy, c6Def(), { expectedUrl: `${origin}/page/C6`, promptLines: [], downloads: leftover }),
+    next: run(fixed, c6Def(), {
+      expectedUrl: `${origin}/page/C6`,
+      promptLines: [],
+      downloads: leftover,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const thisAttemptBlob = [{
+    id: 3,
+    state: 'complete',
+    url: 'blob:http://127.0.0.1:18765/this-attempt',
+    referrer: `${origin}/page/C5?nonce=${nonce}&attempt=${attempt}`,
+    startTime: new Date(startedAt + 20).toISOString(),
+    filename: 'blob.zip',
+  }];
+  check('R2-4d', 'C5 this-attempt blob is still pass', {
+    old: run(legacy, c5Def(), { expectedUrl: `${origin}/page/C5`, promptLines: [], downloads: thisAttemptBlob }),
+    next: run(fixed, c5Def(), {
+      expectedUrl: `${origin}/page/C5`,
+      promptLines: [],
+      downloads: thisAttemptBlob,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+}
+
+{
+  const dir = mkdtempSync(path.join(tmpdir(), 'r2-drain-'));
+  writeFileSync(path.join(dir, 'host-log.jsonl'), '');
+  const startedAt = Date.now();
+  const delayMs = 400;
+  const timer = setTimeout(() => {
+    appendFileSync(path.join(dir, 'host-log.jsonl'), `${JSON.stringify({
+      receivedAt: Date.now(),
+      type: 'prompt_download',
+      payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+    })}\n`);
+  }, delayMs);
+  const t0 = Date.now();
+  const withoutWaitOut = await drainCaptureLines(dir, startedAt, {
+    minWaitMs: 50,
+    quietMs: 80,
+    maxWaitMs: 1500,
+    waitOutEmpty: false,
+  });
+  const earlyElapsed = Date.now() - t0;
+  const withWaitOut = await drainCaptureLines(dir, startedAt, {
+    minWaitMs: 0,
+    quietMs: 80,
+    maxWaitMs: 1500,
+    waitOutEmpty: true,
+  });
+  clearTimeout(timer);
+  const waitedElapsed = Date.now() - t0;
+  check('R2-1-drain', 'waitOutEmpty keeps draining empty logs past min+quiet', {
+    old: {
+      status: withoutWaitOut.length === 0 && earlyElapsed < delayMs ? 'xfail' : 'FAIL',
+      observed: withoutWaitOut.length ? 'capture' : 'keep',
+    },
+    next: {
+      status: withWaitOut.length === 1 && waitedElapsed >= delayMs ? 'XPASS' : 'FAIL',
+      observed: withWaitOut.length ? 'capture' : 'keep',
+    },
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'XPASS',
   });
 }
 

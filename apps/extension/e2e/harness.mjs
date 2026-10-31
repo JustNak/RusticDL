@@ -75,7 +75,6 @@ export function browserEnv({ isolatedHome, runDir, nodeBin = process.execPath })
     NODE_BIN: nodeBin,
     EXT_ATTACK: process.env.EXT_ATTACK || '',
     EXT_ATTACK_DELAY_MS: process.env.EXT_ATTACK_DELAY_MS || '',
-    EXT_CLASSIFIER: process.env.EXT_CLASSIFIER || '',
     PATH: `${path.dirname(nodeBin)}:${process.env.PATH || '/usr/bin:/bin'}`,
   };
 }
@@ -173,20 +172,31 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function drainCaptureLines(runDir, startedAt, { minWaitMs = 0, quietMs = 0, maxWaitMs = 0 } = {}) {
+export async function drainCaptureLines(runDir, startedAt, {
+  minWaitMs = 0,
+  quietMs = 0,
+  maxWaitMs = 0,
+  waitOutEmpty = false,
+} = {}) {
   const t0 = Date.now();
   if (minWaitMs > 0) await sleep(minWaitMs);
   if (maxWaitMs <= 0) return captureLinesSince(runDir, startedAt);
-  let lastSig = `${captureLinesSince(runDir, startedAt).length}`;
+  const sigOf = (lines) => `${lines.length}:${lines.at(-1)?.receivedAt ?? 0}`;
+  let lastSig = sigOf(captureLinesSince(runDir, startedAt));
   let quietFrom = Date.now();
   while (Date.now() - t0 < maxWaitMs) {
     await sleep(50);
     const lines = captureLinesSince(runDir, startedAt);
-    const sig = `${lines.length}:${lines.at(-1)?.receivedAt ?? 0}`;
+    const sig = sigOf(lines);
     if (sig !== lastSig) {
       lastSig = sig;
       quietFrom = Date.now();
-    } else if (quietMs <= 0 || Date.now() - quietFrom >= quietMs) {
+      continue;
+    }
+    if (lines.length === 0 && waitOutEmpty) {
+      continue;
+    }
+    if (quietMs <= 0 || Date.now() - quietFrom >= quietMs) {
       break;
     }
   }

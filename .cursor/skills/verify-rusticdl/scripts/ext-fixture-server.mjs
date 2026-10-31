@@ -111,12 +111,18 @@ function pageFor(id, url) {
     case 'C4':
       return wrap(`<a data-case="C4" href="${file('/get?id=5')}">C4 get id=5</a>`);
     case 'C5':
+      if (attackMod?.c5PageIsNoop?.(RUN_DIR)) {
+        return wrap(`<a data-case="C5" href="#" onclick="return false">C5 blob</a>`);
+      }
       return wrap(`<a data-case="C5" id="c5-link" download="blob.zip">C5 blob</a>
 <script>
 const blob = new Blob([new Uint8Array(${BODY_64K}).fill(65)], { type: "application/zip" });
 document.getElementById("c5-link").href = URL.createObjectURL(blob);
 </script>`);
     case 'C6': {
+      if (attackMod?.c6IsNoop?.()) {
+        return wrap(`<a data-case="C6" href="#" onclick="return false">C6 data</a>`);
+      }
       const dataUrl = `data:application/zip;base64,${bytes(64, 0x41).toString('base64')}`;
       return wrap(`<a data-case="C6" download="data.zip" href="${dataUrl}">C6 data</a>`);
     }
@@ -156,6 +162,15 @@ document.querySelector("[data-case=C8]").addEventListener("click", () => {
     case 'N1':
       if (attackMod?.n1IsNoop?.()) {
         return wrap(`<a data-case="N1" href="#" onclick="return false">N1 html page</a>`);
+      }
+      if (attackMod?.n1IsFetch?.()) {
+        return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>
+<script>
+document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
+  event.preventDefault();
+  fetch(event.currentTarget.href);
+});
+</script>`);
       }
       return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>`);
     case 'N2':
@@ -343,8 +358,13 @@ function onRequest(req, res) {
   const url = new URL(req.url || '/', `http://${host}`);
   const nonce = nonceOf(url);
   logHit(req, url);
-  if (url.pathname === '/C1' && attackMod?.scheduleLateC1Inject && RUN_DIR) {
-    attackMod.scheduleLateC1Inject(RUN_DIR, url.href);
+  if (RUN_DIR && attackMod) {
+    if (url.pathname === '/C1' && attackMod.scheduleLateC1Inject) {
+      attackMod.scheduleLateC1Inject(RUN_DIR, url.href);
+    }
+    if (url.pathname === '/get' && attackMod.scheduleLateC4Inject) {
+      attackMod.scheduleLateC4Inject(RUN_DIR, url.href);
+    }
   }
 
   if (url.pathname === '/health') {

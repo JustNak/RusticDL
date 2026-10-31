@@ -5,8 +5,8 @@
 import { EXPECTED_POST_BODY } from './ext-attack.mjs';
 
 export const KEEP_WAIT_MS = 5000;
-export const MISS_DRAIN = { minWaitMs: 5000, quietMs: 3000, maxWaitMs: 20_000 };
-export const END_DRAIN = { minWaitMs: 0, quietMs: 3000, maxWaitMs: 20_000 };
+export const MISS_DRAIN = { minWaitMs: 5000, quietMs: 3000, maxWaitMs: 20_000, waitOutEmpty: true };
+export const END_DRAIN = { minWaitMs: 0, quietMs: 3000, maxWaitMs: 20_000, waitOutEmpty: false };
 export const END_RECHECK = true;
 export const INVALIDATE_END_SENTINEL = true;
 export const INVALIDATE_BY_REF = true;
@@ -91,7 +91,38 @@ function routePathname(route) {
   return q === -1 ? route : route.slice(0, q);
 }
 
-export function keepClickProved(caseDef, { hits, downloads, pageEvidence, nonce, attempt, expectedUrl, playwrightDownload }) {
+function downloadIsThisAttempt(item, { triggerAt, attempt, nonce, expectedUrl, caseDef }) {
+  if (!item || item.error) return false;
+  const url = typeof item.url === 'string' ? item.url : '';
+  const referrer = typeof item.referrer === 'string' ? item.referrer : '';
+  if (attempt && (url.includes(`attempt=${attempt}`) || referrer.includes(`attempt=${attempt}`))) {
+    return true;
+  }
+  if (expectedUrl && url === expectedUrl) return true;
+  if (typeof triggerAt === 'number' && item.startTime) {
+    const startMs = Date.parse(item.startTime);
+    if (Number.isFinite(startMs) && startMs >= triggerAt - 50) {
+      if (caseDef.id === 'C5' && url.startsWith('blob:')) return true;
+      if (caseDef.id === 'C6' && url.startsWith('data:')) return true;
+      if (expectedUrl && url === expectedUrl) return true;
+    }
+  }
+  if (nonce && (url.includes(`nonce=${nonce}`) && attempt && url.includes(`attempt=${attempt}`))) {
+    return true;
+  }
+  return false;
+}
+
+export function keepClickProved(caseDef, {
+  hits,
+  downloads,
+  pageEvidence,
+  nonce,
+  attempt,
+  expectedUrl,
+  playwrightDownload,
+  triggerAt,
+}) {
   const path = routePathname(caseDef.route);
   const fileOnFixture = path && !path.startsWith('/page/');
   if (fileOnFixture) {
@@ -101,14 +132,13 @@ export function keepClickProved(caseDef, { hits, downloads, pageEvidence, nonce,
   }
 
   const items = Array.isArray(downloads) ? downloads : [];
-  const downloadKept = items.some((item) => {
-    if (!item || item.error) return false;
-    if (expectedUrl && item.url === expectedUrl) return true;
-    if (typeof item.url === 'string' && (item.url.startsWith('blob:') || item.url.startsWith('data:'))) return true;
-    if (caseDef.filename && typeof item.filename === 'string' && item.filename.endsWith(caseDef.filename)) return true;
-    if (caseDef.filename && item.filename === caseDef.filename) return true;
-    return false;
-  });
+  const downloadKept = items.some((item) => downloadIsThisAttempt(item, {
+    triggerAt,
+    attempt,
+    nonce,
+    expectedUrl,
+    caseDef,
+  }));
 
   let pagePath = '';
   try {
@@ -116,19 +146,23 @@ export function keepClickProved(caseDef, { hits, downloads, pageEvidence, nonce,
   } catch {
     pagePath = '';
   }
-  const renderedItem = pagePath === path
+  const pageChangedToTarget = pagePath === path
     || (pageEvidence?.dataPage && String(pageEvidence.dataPage) === `${caseDef.id}-target`);
-  const stillOnCasePage = pageEvidence?.dataPage === caseDef.id
-    || pagePath === `/page/${caseDef.id}`;
 
-  if (fileOnFixture && (downloadKept || renderedItem || stillOnCasePage)) {
+  if (caseDef.trigger === 'fetch-attachment') {
     return { ok: true, reason: null };
   }
-  if (!fileOnFixture && (downloadKept || playwrightDownload)) return { ok: true, reason: null };
-  if (!fileOnFixture && !downloadKept) {
-    return { ok: false, reason: 'no chrome.downloads.search item for blob/data keep' };
+
+  if (fileOnFixture && (downloadKept || pageChangedToTarget)) {
+    return { ok: true, reason: null };
   }
-  return { ok: false, reason: 'keep click produced no download or page-render evidence' };
+  if (!fileOnFixture && (downloadKept || playwrightDownload)) {
+    return { ok: true, reason: null };
+  }
+  if (!fileOnFixture) {
+    return { ok: false, reason: 'no this-attempt chrome.downloads.search / playwright download for blob/data keep' };
+  }
+  return { ok: false, reason: 'keep click produced no this-attempt download or page-render evidence' };
 }
 
 export function fidelityFor(caseDef, line, expectedUrl, pageUrl, nonce) {
@@ -173,6 +207,7 @@ export function classifyCase(input) {
     downloads,
     fixtureHits,
     pageEvidence,
+    playwrightDownload,
   } = input;
 
   const result = {
@@ -235,11 +270,11 @@ export function classifyCase(input) {
   const captured = promptLines.length + enqueueLines.length > 0;
   result.observed = captured ? 'capture' : 'keep';
 
-  const accepted = Boolean(matchLine && isAcceptedReply(matchLine));
-  const completed = downloadCompletedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
   const exactPositiveLine = Boolean(matchLine) && promptLines.length === 1 && enqueueLines.length === 0;
   const exactNegative = promptLines.length === 0 && enqueueLines.length === 0;
-  const fullHandoff = exactPositiveLine && accepted && !completed;
+  const accepted = Boolean(prompt && isAcceptedReply(prompt));
+  const completed = downloadCompletedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
+  const fullHandoff = exactPositiveLine && Boolean(matchLine && isAcceptedReply(matchLine)) && !completed;
 
   const gap = caseDef.xfail?.gap ?? '';
   const missGaps = new Set(['G1', 'G4']);
@@ -278,7 +313,7 @@ export function classifyCase(input) {
     } else if (falseGrabGaps.has(gap) && exactFalseGrab) {
       result.status = 'xfail';
       result.reason = caseDef.xfail.reason;
-    } else if (finalUrlGaps.has(gap) && exactFinalCapture) {
+    } else if (finalUrlGaps.has(gap) && exactFinalCapture && accepted && !completed) {
       result.status = 'xfail';
       result.reason = caseDef.xfail.reason;
     } else {
@@ -310,6 +345,8 @@ export function classifyCase(input) {
       nonce,
       attempt,
       expectedUrl,
+      playwrightDownload: Boolean(playwrightDownload),
+      triggerAt,
     });
     if (exactNegative && proof.ok) {
       result.status = 'pass';

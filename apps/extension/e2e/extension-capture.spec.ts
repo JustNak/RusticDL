@@ -22,10 +22,7 @@ import {
   waitForServiceWorker,
   writeNativeHostManifest,
 } from './harness.mjs';
-import * as classifyFixed from './classify.mjs';
-import * as classifyLegacy from './classify.legacy.mjs';
-
-const classify = process.env.EXT_CLASSIFIER === 'legacy' ? classifyLegacy : classifyFixed;
+import * as classify from './classify.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const paths = extensionPaths(path.resolve(here, '..'));
@@ -137,7 +134,7 @@ test('extension capture matrix', async () => {
   const nonce = envOr('EXT_NONCE', crypto.randomUUID());
   const fixtureOrigin = envOr('EXT_FIXTURE_ORIGIN', 'http://127.0.0.1:18765');
   const fixtureLocalhost = envOr('EXT_FIXTURE_LOCALHOST', 'http://localhost:18765');
-  const onlyCase = process.env.EXT_CASE || '';
+  const onlyCases = (process.env.EXT_CASE || '').split(',').map((id) => id.trim()).filter(Boolean);
   const repeat = Math.max(1, Number(process.env.EXT_REPEAT || '1'));
   const live = process.env.EXT_LIVE === '1';
   const evidenceRoot = path.join(runDir, 'evidence', 'extension');
@@ -186,7 +183,11 @@ test('extension capture matrix', async () => {
     expect(doctor.ok, `sentinel ping failed: ${JSON.stringify(pong)}`).toBe(true);
     expect(extensionId).toBe(paths.identity.id);
 
-    const selected = matrix.cases.filter((row) => !onlyCase || row.id === onlyCase || row.id === 'C2');
+    const selected = matrix.cases.filter((row) => (
+      onlyCases.length === 0
+      || onlyCases.includes(row.id)
+      || row.id === 'C2'
+    ));
     const latencies: number[] = [];
     const results: CaseResult[] = [];
 
@@ -374,32 +375,23 @@ test('extension capture matrix', async () => {
       const batchSentinel = await runSentinel(`C2-sentinel-negatives${suffix}`);
       const hostDead = classify.hostFailedHandoff(roundCaptureAttempts.concat(batchSentinel));
       const batchOk = classify.isSentinelOk(batchSentinel) && !hostDead;
-      const invalidateTargets = (roundItems: CaseResult[]) => (
-        classify.INVALIDATE_BY_REF
-          ? roundItems
-          : results.filter((item) => roundItems.some((row) => row.id === item.id))
-      );
       if (!batchOk) {
         classify.invalidateNegatives(
-          invalidateTargets(roundNegatives),
+          roundNegatives,
           hostDead
             ? 'missing or wrong accepted reply; negative keep is INVALID'
             : 'sentinel C2 did not capture; negative keep is INVALID',
         );
-        for (const item of invalidateTargets(roundNegatives)) persistResult(item);
+        for (const item of roundNegatives) persistResult(item);
       }
       const endSentinel = await runSentinel(`C2-sentinel-end${suffix}`);
       const endOk = classify.isSentinelOk(endSentinel);
       if (!endOk) {
-        if (classify.INVALIDATE_END_SENTINEL) {
-          classify.invalidateNegatives(
-            invalidateTargets(roundNegatives),
-            'end sentinel C2 did not capture; negative keep is INVALID',
-          );
-          for (const item of invalidateTargets(roundNegatives)) persistResult(item);
-        } else {
-          console.error('sentinel C2 at end of run did not capture');
-        }
+        classify.invalidateNegatives(
+          roundNegatives,
+          'end sentinel C2 did not capture; negative keep is INVALID',
+        );
+        for (const item of roundNegatives) persistResult(item);
       }
     }
 
@@ -473,10 +465,10 @@ test('extension capture matrix', async () => {
     const blockers = results.filter((row) => row.status === 'FAIL' || row.status === 'XPASS' || row.status === 'INVALID');
     const c2 = latestById.get('C2');
     const n1 = latestById.get('N1');
-    if (!onlyCase || onlyCase === 'C2') {
+    if (onlyCases.length === 0 || onlyCases.includes('C2')) {
       expect(c2?.status, `C2 must pass, got ${JSON.stringify(c2)}`).toBe('pass');
     }
-    if (!onlyCase || onlyCase === 'N1') {
+    if (onlyCases.length === 0 || onlyCases.includes('N1')) {
       expect(n1?.status, `N1 must pass, got ${JSON.stringify(n1)}`).toBe('pass');
     }
     expect(blockers, `blocking results: ${JSON.stringify(blockers, null, 2)}`).toHaveLength(0);

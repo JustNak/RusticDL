@@ -119,6 +119,8 @@ echo "DOCTOR run-dir=${VERIFY_RUN_DIR}"
 export VERIFY_RUN_DIR
 export EXT_CASE="${CASE_ID}"
 export EXT_LIVE="${LIVE}"
+# Classifier switch is selftest-only. Prove/spec always use classify.mjs.
+unset EXT_CLASSIFIER || true
 cd "${EXT_ROOT}"
 if [[ "${EXT_SKIP_SELFTEST:-}" != "1" ]]; then
   node "${EXT_ROOT}/e2e/selftest-classifier.mjs"

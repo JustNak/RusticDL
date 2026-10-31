@@ -2,11 +2,7 @@
 /**
  * Test-only EXT_ATTACK hook for the mock native host and fixture server.
  * Never imported by product code (apps/extension/src, packages/, src/).
- *
- * Host attacks (mock-native-host.mjs): g3-other, g5-evil, g5-super, g5-prefix,
- * exit-after-log, exit-before-log, wrong-shape, delay-c1, inject-postbody,
- * fail-c2-N, kill-immediate.
- * Fixture attacks: n1-noop, cookie-tamper, inject-late-c1.
+ * Attacks can only make a prove run fail closed; they are not a classifier switch.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -19,7 +15,7 @@ export function attackName() {
 }
 
 export function attackDelayMs() {
-  const raw = Number(process.env.EXT_ATTACK_DELAY_MS || '15000');
+  const raw = Number(process.env.EXT_ATTACK_DELAY_MS || process.env.CHECKER_DELAY_MS || '15000');
   return Number.isFinite(raw) && raw >= 0 ? raw : 15_000;
 }
 
@@ -30,6 +26,14 @@ export function cookieValueForNonce(nonce) {
 
 export function n1IsNoop() {
   return attackName() === 'n1-noop';
+}
+
+export function n1IsFetch() {
+  return attackName() === 'n1-fetch';
+}
+
+export function c6IsNoop() {
+  return attackName() === 'c6-noop';
 }
 
 function payloadOf(request) {
@@ -57,12 +61,12 @@ function sleepMs(ms) {
   Atomics.wait(buf, 0, 0, ms);
 }
 
-function c2CountPath(runDir) {
-  return `${runDir}/c2prompt.count`;
+function countPath(runDir, name) {
+  return `${runDir}/${name}`;
 }
 
-function bumpC2Count(runDir) {
-  const path = c2CountPath(runDir);
+function bumpCount(runDir, name) {
+  const path = countPath(runDir, name);
   let n = 0;
   if (existsSync(path)) {
     n = Number(readFileSync(path, 'utf8').trim()) || 0;
@@ -72,9 +76,15 @@ function bumpC2Count(runDir) {
   return n;
 }
 
+export function c5PageIsNoop(runDir) {
+  const attack = attackName();
+  if (attack === 'c5-noop') return true;
+  if (attack !== 'c5-second-noop') return false;
+  return bumpCount(runDir, 'c5page.count') >= 2;
+}
+
 function failC2Nth() {
-  const name = attackName();
-  const match = /^fail-c2-(\d+)$/.exec(name);
+  const match = /^fail-c2-(\d+)$/.exec(attackName());
   return match ? Number(match[1]) : null;
 }
 
@@ -85,9 +95,14 @@ function mutatePayload(request, patch) {
   };
 }
 
+function note(runDir, text) {
+  if (!runDir) return;
+  appendFileSync(`${runDir}/ext-attack.log`, `${Date.now()} ${text}\n`);
+}
+
 /**
  * Apply a host-side attack. Returns true when the mock should skip its default
- * log+reply path (the hook already logged and/or replied, or exited).
+ * log+reply path.
  */
 export function applyHostAttack({
   request,
@@ -111,7 +126,7 @@ export function applyHostAttack({
   const url = payloadUrl(request);
   const nth = failC2Nth();
   if (nth != null && request.type === 'prompt_download' && pathnameOf(url) === '/C2') {
-    const count = bumpC2Count(runDir);
+    const count = bumpCount(runDir, 'c2prompt.count');
     if (count === nth) {
       writeMessage(respond(request));
       return true;
@@ -165,10 +180,22 @@ export function applyHostAttack({
     return true;
   }
 
-  if (attack === 'delay-c1' && request.type === 'prompt_download' && pathnameOf(url) === '/C1') {
+  if (
+    (attack === 'host-delay-c1' || attack === 'delay-c1')
+    && request.type === 'prompt_download'
+    && pathnameOf(url) === '/C1'
+  ) {
+    note(runDir, `host-delay-c1 sleep ${attackDelayMs()}`);
     sleepMs(attackDelayMs());
     const reply = respond(request);
     logRequest(request, Date.now(), reply);
+    writeMessage(reply);
+    return true;
+  }
+
+  if (attack === 'c10-wrong-shape' && request.type === 'prompt_download' && url.includes('/C10')) {
+    const reply = { hello: 'wrong-shape' };
+    logRequest(request, receivedAt, reply);
     writeMessage(reply);
     return true;
   }
@@ -188,27 +215,68 @@ export function applyHostAttack({
   return false;
 }
 
-export function lateC1LogLine(fileUrl, receivedAt) {
+export function lateCaptureLine(fileUrl, receivedAt, { filename, requestId }) {
   return {
     receivedAt,
     protocolVersion: 1,
-    requestId: 'ext-attack-inject-late-c1',
+    requestId,
     type: 'prompt_download',
     payload: {
       url: fileUrl,
-      suggestedFilename: 'app.zip',
+      suggestedFilename: filename,
       source: { entryPoint: 'browser_download' },
     },
   };
 }
 
-export function scheduleLateC1Inject(runDir, fileUrl) {
-  if (attackName() !== 'inject-late-c1') return;
+export function lateC1LogLine(fileUrl, receivedAt) {
+  return lateCaptureLine(fileUrl, receivedAt, {
+    filename: 'app.zip',
+    requestId: 'ext-attack-late-c1',
+  });
+}
+
+const scheduledLate = new Set();
+
+function scheduleLateLine(runDir, fileUrl, { filename, requestId, label }) {
+  const key = `${runDir}:${label}`;
+  if (scheduledLate.has(key)) return;
+  scheduledLate.add(key);
   const delay = attackDelayMs();
   const logPath = `${runDir}/host-log.jsonl`;
   mkdirSync(dirname(logPath), { recursive: true });
+  note(runDir, `scheduled ${label} delay=${delay} url=${fileUrl}`);
   setTimeout(() => {
-    const line = lateC1LogLine(fileUrl, Date.now());
+    const line = lateCaptureLine(fileUrl, Date.now(), { filename, requestId });
     appendFileSync(logPath, `${JSON.stringify(line)}\n`, 'utf8');
+    note(runDir, `late-wrote ${label} receivedAt=${line.receivedAt}`);
   }, delay);
+}
+
+export function scheduleLateC1Inject(runDir, fileUrl) {
+  const attack = attackName();
+  if (attack === 'late-c1' || attack === 'inject-late-c1') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'app.zip',
+      requestId: 'ext-attack-late-c1',
+      label: 'late-c1',
+    });
+    return;
+  }
+  if (attack === 'late-c1-nullfile') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: null,
+      requestId: 'ext-attack-late-c1-nullfile',
+      label: 'late-c1-nullfile',
+    });
+  }
+}
+
+export function scheduleLateC4Inject(runDir, fileUrl) {
+  if (attackName() !== 'late-c4') return;
+  scheduleLateLine(runDir, fileUrl, {
+    filename: 'get',
+    requestId: 'ext-attack-late-c4',
+    label: 'late-c4',
+  });
 }
