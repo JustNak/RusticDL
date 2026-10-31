@@ -377,13 +377,19 @@ function handleFile(id, req, res, url) {
         'Content-Type': 'application/zip',
         'Content-Length': String(BODY_64K),
       }, bytes(BODY_64K));
-    case 'C2':
-      return send(res, 200, {
+    case 'C2': {
+      const headers = {
         ...common,
         'Content-Type': 'application/octet-stream',
         'Content-Disposition': 'attachment; filename="setup.exe"',
         'Content-Length': String(BODY_64K),
-      }, bytes(BODY_64K, 0x42));
+      };
+      const body = bytes(BODY_64K, 0x42);
+      if (attackMod?.isSlowC2?.()) {
+        return streamSlowBody(res, headers, body, 4096, 250);
+      }
+      return send(res, 200, headers, body);
+    }
     case 'C3':
       return send(res, 200, {
         ...common,
@@ -473,6 +479,25 @@ function handleFile(id, req, res, url) {
     default:
       send(res, 404, { 'Content-Type': 'text/plain' }, 'not found');
   }
+}
+
+function streamSlowBody(res, headers, body, chunkBytes, delayMs) {
+  res.writeHead(200, headers);
+  let offset = 0;
+  const pump = () => {
+    if (offset >= body.length) {
+      res.end();
+      return;
+    }
+    const next = body.subarray(offset, Math.min(offset + chunkBytes, body.length));
+    offset += next.length;
+    res.write(next);
+    setTimeout(pump, delayMs);
+  };
+  res.on('close', () => {
+    offset = body.length;
+  });
+  pump();
 }
 
 function streamChunked(res, extraHeaders, totalBytes) {

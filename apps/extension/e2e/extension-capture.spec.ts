@@ -23,6 +23,7 @@ import {
   waitForServiceWorker,
   writeNativeHostManifest,
 } from './harness.mjs';
+import { plantEndCompleteDownloads } from './ext-attack.mjs';
 import * as classify from './classify.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -80,6 +81,8 @@ type CaseResult = {
   nonce?: string;
   handoffAccepted?: boolean;
   downloadCompleted?: boolean;
+  browserDownloadStopped?: boolean;
+  downloadSearchError?: boolean;
   pageEvidence?: Record<string, unknown>;
 };
 
@@ -285,19 +288,17 @@ test('extension capture matrix', async () => {
       const promptLines = lines.filter((line) => line.type === 'prompt_download');
       const enqueueLines = lines.filter((line) => line.type === 'enqueue_download');
       const sw = context.serviceWorkers()[0] || worker;
-      const matchPreview = promptLines.find((line) => (
+      const matchPreview = [...promptLines, ...enqueueLines].find((line) => (
         (line.payload ?? {}).url === expectedUrl
         || (expectedFinal && (line.payload ?? {}).url === expectedFinal)
       ));
       const trackedUrls = [expectedUrl, expectedFinal, matchPreview?.payload?.url].filter(Boolean);
       let downloads = await searchDownloads(sw);
-      if (caseDef.expect === 'capture' && promptLines.length > 0) {
-        const settleUntil = Date.now() + 2000;
+      if (caseDef.expect === 'capture' && (promptLines.length + enqueueLines.length) > 0) {
+        const settleUntil = Date.now() + classify.DOWNLOAD_SETTLE.maxWaitMs;
         while (Date.now() < settleUntil) {
-          const items = Array.isArray(downloads) ? downloads : [];
-          const complete = items.some((item) => trackedUrls.includes(item.url) && item.state === 'complete');
-          if (!complete) break;
-          await sleep(50);
+          if (classify.downloadItemsTerminal(downloads, trackedUrls)) break;
+          await sleep(classify.DOWNLOAD_SETTLE.pollMs);
           downloads = await searchDownloads(sw);
         }
       }
@@ -423,6 +424,12 @@ test('extension capture matrix', async () => {
     if (classify.END_RECHECK) {
       await drainCaptureLines(runDir, 0, classify.END_DRAIN);
       classify.recheckLateMissXfails(results, readHostLog(runDir));
+      if (classify.END_DOWNLOAD_RECHECK) {
+        const swEnd = context.serviceWorkers()[0] || worker;
+        const endDownloads = plantEndCompleteDownloads(results, await searchDownloads(swEnd));
+        writeFileSync(path.join(evidenceRoot, 'downloads-end.json'), `${JSON.stringify(endDownloads, null, 2)}\n`);
+        classify.recheckCaptureDownloads(results, endDownloads);
+      }
       for (const item of results) persistResult(item);
     }
 

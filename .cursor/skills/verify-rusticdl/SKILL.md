@@ -209,7 +209,7 @@ The prove script checks the fixture pid owns the port, the unpacked Chromium dis
 .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
 ```
 
-Each case is a real click on `[data-case=Cn]`. Ask-mode positives must be exactly one `prompt_download` with exact `payload.url`, `payload.suggestedFilename`, and `payload.source.entryPoint == "browser_download"`, an `accepted` host reply, and the browser item erased or cancelled (not `state: complete`). Negatives wait 5 s for zero capture lines, a fixture hit for that attempt, and `chrome.downloads.search({})` or page-render proof. Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round's negatives. G1/G4 miss-xfails drain a quiet window and re-check the host log at end of run with the same `prompt_download` / `enqueue_download` predicate as the in-case drain.
+Each case is a real click on `[data-case=Cn]`. Ask-mode positives must be exactly one `prompt_download` with exact `payload.url`, `payload.suggestedFilename`, and `payload.source.entryPoint == "browser_download"`, an `accepted` host reply, and positive proof the browser item for that URL was stopped (erased or `interrupted`) at the end of a bounded settle — not a single `in_progress` snapshot. A later complete at end-of-run recheck is FAIL. Negatives wait 5 s for zero capture lines, a fixture hit for that attempt, and `chrome.downloads.search({})` or page-render proof. Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round's negatives. G1/G4 miss-xfails drain a quiet window and re-check the host log at end of run with the same `prompt_download` / `enqueue_download` predicate as the in-case drain.
 
 ### Evidence
 
@@ -239,7 +239,7 @@ Recipe detail: `features/extension-capture.md`.
 | `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
 | `apps/extension/e2e/classify.mjs` | Matrix classifier (exact G3/G5 match, accepted handoff, keep proof, late recheck) |
 | `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot; imported only by `selftest-classifier.mjs` |
-| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2–R5 classifier attacks against both classifiers |
+| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2–R6 classifier attacks against both classifiers |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 

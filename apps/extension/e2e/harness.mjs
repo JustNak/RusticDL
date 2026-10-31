@@ -13,6 +13,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { applySearchDownloadsAttack } from './ext-attack.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -136,13 +137,17 @@ export async function pingNativeHost(worker, requestId) {
 }
 
 export async function searchDownloads(worker) {
-  return worker.evaluate(async () => {
+  if ((process.env.EXT_ATTACK || process.env.CHECKER_ATTACK) === 'search-error') {
+    return { error: 'ext-attack search-error' };
+  }
+  const result = await worker.evaluate(async () => {
     try {
       return await chrome.downloads.search({});
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
   });
+  return applySearchDownloadsAttack(result);
 }
 
 export function readHostLog(runDir) {

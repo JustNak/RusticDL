@@ -914,6 +914,106 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
 }
 
 {
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1a', 'C2 in_progress download is FAIL, not pass', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'in_progress', bytesReceived: 0, url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'in_progress', bytesReceived: 0, url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.browserDownloadStopped === false,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1b', 'C2 chrome.downloads.search error is FAIL, not pass', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: { error: 'boom' } }),
+    next: run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: { error: 'boom' } }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadSearchError === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  check('R6-1c', 'G5 in_progress final download is FAIL, not xfail', {
+    old: run(legacy, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'in_progress', bytesReceived: 0, url: c10Final }],
+    }),
+    next: run(fixed, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'in_progress', bytesReceived: 0, url: c10Final }],
+    }),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.browserDownloadStopped === false,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1d', 'C2 interrupted (cancelled) download still passes', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass' && r.browserDownloadStopped === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  const oldEarly = run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] });
+  const newEarly = run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] });
+  if (typeof legacy.recheckCaptureDownloads === 'function') {
+    legacy.recheckCaptureDownloads([oldEarly], [{ id: 3, state: 'complete', url: c2Url }]);
+  }
+  fixed.recheckCaptureDownloads([newEarly], [{ id: 3, state: 'complete', url: c2Url }]);
+  check('R6-1e', 'end-of-run complete C2 download flips pass to FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  const extra = {
+    expectedUrl: c10Original,
+    expectedFinalUrl: c10Final,
+    promptLines: lines,
+    downloads: [],
+  };
+  const oldEarly = run(legacy, c10Def(), extra);
+  const newEarly = run(fixed, c10Def(), extra);
+  if (typeof legacy.recheckCaptureDownloads === 'function') {
+    legacy.recheckCaptureDownloads([oldEarly], [{ id: 4, state: 'complete', url: c10Final }]);
+  }
+  fixed.recheckCaptureDownloads([newEarly], [{ id: 4, state: 'complete', url: c10Final }]);
+  check('R6-1f', 'end-of-run complete C10 final download flips G5 xfail to FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
   const dir = mkdtempSync(path.join(tmpdir(), 'r2-drain-'));
   writeFileSync(path.join(dir, 'host-log.jsonl'), '');
   const startedAt = Date.now();

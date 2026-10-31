@@ -8,6 +8,8 @@ export const KEEP_WAIT_MS = 5000;
 export const MISS_DRAIN = { minWaitMs: 5000, quietMs: 3000, maxWaitMs: 20_000, waitOutEmpty: true };
 export const END_DRAIN = { minWaitMs: 0, quietMs: 3000, maxWaitMs: 20_000, waitOutEmpty: false };
 export const END_RECHECK = true;
+export const END_DOWNLOAD_RECHECK = true;
+export const DOWNLOAD_SETTLE = { maxWaitMs: 12_000, pollMs: 50 };
 export const INVALIDATE_END_SENTINEL = true;
 export const INVALIDATE_BY_REF = true;
 export const REQUIRE_ACCEPTED_HANDOFF = true;
@@ -63,9 +65,71 @@ export function isAcceptedReply(line) {
 }
 
 export function downloadCompletedFor(downloads, urls) {
+  return browserDownloadStoppedFor(downloads, urls).completed;
+}
+
+export function downloadSearchFailed(downloads) {
+  return Boolean(downloads && typeof downloads === 'object' && !Array.isArray(downloads) && downloads.error);
+}
+
+/**
+ * Positive proof the browser download for this click was stopped: no matching
+ * chrome.downloads item (erased), or every match is terminal non-complete
+ * (`interrupted`). `in_progress` and a search `{error}` are not proof.
+ */
+export function browserDownloadStoppedFor(downloads, urls) {
+  if (downloadSearchFailed(downloads)) {
+    return {
+      stopped: false,
+      completed: false,
+      inProgress: false,
+      searchError: true,
+      reason: `chrome.downloads.search failed: ${downloads.error}`,
+    };
+  }
   const items = Array.isArray(downloads) ? downloads : [];
   const wanted = new Set((urls || []).filter((url) => typeof url === 'string' && url));
-  return items.some((item) => item && wanted.has(item.url) && item.state === 'complete');
+  const matched = items.filter((item) => item && wanted.has(item.url));
+  if (matched.length === 0) {
+    return {
+      stopped: true,
+      completed: false,
+      inProgress: false,
+      searchError: false,
+      reason: null,
+    };
+  }
+  if (matched.some((item) => item.state === 'complete')) {
+    return {
+      stopped: false,
+      completed: true,
+      inProgress: false,
+      searchError: false,
+      reason: 'browser download completed; capture requires erase/cancel, not state complete',
+    };
+  }
+  const inProgress = matched.some((item) => item.state !== 'interrupted');
+  if (inProgress) {
+    return {
+      stopped: false,
+      completed: false,
+      inProgress: true,
+      searchError: false,
+      reason: 'browser download still in_progress; capture requires erase/cancel or interrupted',
+    };
+  }
+  return {
+    stopped: true,
+    completed: false,
+    inProgress: false,
+    searchError: false,
+    reason: null,
+  };
+}
+
+export function downloadItemsTerminal(downloads, urls) {
+  const stop = browserDownloadStoppedFor(downloads, urls);
+  return stop.searchError || stop.stopped || stop.completed;
 }
 
 /**
@@ -322,7 +386,7 @@ function firstPrompt(promptLines) {
  * - expect-keep xfail + exactNegative → XPASS (no keep-xfail rows today)
  * - G3 exactFalseGrab → xfail; other/super/badfile/badep → FAIL (`g3-other`)
  * - G5 exactFinal + accepted + !complete → xfail; garbage/complete → FAIL (`c10-wrong-shape`)
- * - capture fullHandoff → pass; missing accepted or complete download → FAIL (`wrong-shape`)
+ * - capture fullHandoff → pass; missing accepted, in_progress, complete, or search error → FAIL (`wrong-shape` / `slow-c2` / `search-error`)
  * - keep: exactNegative && keepClickProved → pass, else FAIL
  */
 export function classifyCase(input) {
@@ -408,8 +472,10 @@ export function classifyCase(input) {
   const exactPositiveLine = capture.exactPositive;
   const exactNegative = capture.promptLines.length === 0 && capture.enqueueLines.length === 0;
   const accepted = Boolean(prompt && isAcceptedReply(prompt));
-  const completed = downloadCompletedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
-  const fullHandoff = exactPositiveLine && Boolean(matchLine && isAcceptedReply(matchLine)) && !completed;
+  const stop = browserDownloadStoppedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
+  const completed = stop.completed;
+  const stopped = stop.stopped;
+  const fullHandoff = exactPositiveLine && Boolean(matchLine && isAcceptedReply(matchLine)) && stopped;
 
   const gap = caseDef.xfail?.gap ?? '';
   const missGaps = new Set(['G1', 'G4']);
@@ -448,7 +514,7 @@ export function classifyCase(input) {
     } else if (falseGrabGaps.has(gap) && exactFalseGrab) {
       result.status = 'xfail';
       result.reason = caseDef.xfail.reason;
-    } else if (finalUrlGaps.has(gap) && exactFinalCapture && accepted && !completed) {
+    } else if (finalUrlGaps.has(gap) && exactFinalCapture && accepted && stopped) {
       result.status = 'xfail';
       result.reason = caseDef.xfail.reason;
     } else {
@@ -467,8 +533,8 @@ export function classifyCase(input) {
       if (exactPositiveLine && !accepted) {
         bits.push('missing or wrong accepted reply (ok, type=accepted, echoed requestId)');
       }
-      if (exactPositiveLine && completed) {
-        bits.push('browser download completed; capture requires erase/cancel, not state complete');
+      if (exactPositiveLine && !stopped) {
+        bits.push(stop.reason || 'browser download was not shown stopped (erased or interrupted)');
       }
       result.reason = bits.join('; ') || 'capture failed';
     }
@@ -495,6 +561,8 @@ export function classifyCase(input) {
 
   result.handoffAccepted = accepted;
   result.downloadCompleted = completed;
+  result.browserDownloadStopped = stopped;
+  result.downloadSearchError = stop.searchError;
   return result;
 }
 
@@ -537,11 +605,40 @@ export function recheckLateMissXfails(results, hostLog) {
   }
 }
 
+export function recheckCaptureDownloads(results, downloads) {
+  for (const item of results) {
+    if (item.skip || item.status === 'INVALID') continue;
+    const captureRow = item.expect === 'capture'
+      && item.observed === 'capture'
+      && (item.status === 'pass' || item.status === 'xfail' || item.status === 'XPASS');
+    if (!captureRow) continue;
+    const stop = browserDownloadStoppedFor(downloads, [
+      item.expectedUrl,
+      item.capturedUrl,
+      item.expectedFinalUrl,
+    ]);
+    if (stop.stopped) continue;
+    item.status = 'FAIL';
+    item.downloadCompleted = stop.completed;
+    item.browserDownloadStopped = false;
+    item.downloadSearchError = stop.searchError;
+    item.reason = stop.reason
+      || (item.gap
+        ? `xfail ${item.gap} failed for a different reason (timeout/harness/wrong line)`
+        : 'browser download was not shown stopped (erased or interrupted)');
+  }
+}
+
 export function hostFailedHandoff(results) {
   return results.some((item) => (
     item.expect === 'capture'
     && item.observed === 'capture'
-    && (item.handoffAccepted === false || item.downloadCompleted === true)
     && item.status === 'FAIL'
+    && (
+      item.handoffAccepted === false
+      || item.downloadCompleted === true
+      || item.downloadSearchError === true
+      || item.browserDownloadStopped === false
+    )
   ));
 }

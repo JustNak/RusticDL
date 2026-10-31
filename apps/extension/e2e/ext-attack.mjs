@@ -46,6 +46,62 @@ export function n1IsWrongPage() {
   return attackName() === 'n1-wrong-page';
 }
 
+export function isSlowC2() {
+  const attack = attackName();
+  return attack === 'slow-c2' || attack === 'slow-body-c2';
+}
+
+export function applySearchDownloadsAttack(result) {
+  const attack = attackName();
+  if (attack === 'search-error') {
+    return { error: 'ext-attack search-error' };
+  }
+  if (attack !== 'g5-inprogress') return result;
+  const items = Array.isArray(result) ? [...result] : [];
+  const runDir = process.env.VERIFY_RUN_DIR || process.env.RUN_DIR;
+  const logPath = runDir ? `${runDir}/host-log.jsonl` : '';
+  if (!logPath || !existsSync(logPath)) return items;
+  const log = readFileSync(logPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  for (const line of log) {
+    const url = line?.payload?.url;
+    if (typeof url !== 'string' || !url.includes('/C10/final')) continue;
+    const existing = items.find((item) => item.url === url);
+    if (existing) {
+      if (existing.state !== 'complete') existing.state = 'in_progress';
+      continue;
+    }
+    items.push({
+      id: 8000 + items.length,
+      state: 'in_progress',
+      bytesReceived: 0,
+      totalBytes: 65536,
+      url,
+    });
+  }
+  return items;
+}
+
+export function plantEndCompleteDownloads(results, downloads) {
+  if (attackName() !== 'g5-late-complete') return downloads;
+  const items = Array.isArray(downloads) ? [...downloads] : [];
+  for (const item of results || []) {
+    if (item.gap !== 'G5') continue;
+    const url = item.capturedUrl || item.expectedFinalUrl;
+    if (typeof url !== 'string' || !url) continue;
+    items.push({
+      id: 9000 + items.length,
+      state: 'complete',
+      bytesReceived: 65536,
+      totalBytes: 65536,
+      url,
+    });
+  }
+  return items;
+}
+
 export function n5Mode() {
   const attack = attackName();
   if (attack === 'n5-noop') return 'noop';
