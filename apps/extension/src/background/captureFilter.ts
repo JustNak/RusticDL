@@ -92,6 +92,7 @@ export type DownloadItemLike = {
   /** webRequest details.type for the request that became this download. */
   resourceType?: string;
   state?: string;
+  paused?: boolean;
 };
 
 /** Prefer Firefox totalBytes, then fileSize (totalBytes is often -1 onCreated). */
@@ -130,7 +131,6 @@ export function sanitizeSuggestedFilename(filename: string | undefined): string 
   const trimmed = filename.trim();
   if (!trimmed) return undefined;
   if (trimmed.length > MAX_SUGGESTED_FILENAME_LENGTH) return undefined;
-  if (/%2f|%5c/i.test(trimmed)) return undefined;
   const parts = trimmed.split(/[\\/]/);
   if (parts.some((part) => {
     const segment = part.trim();
@@ -159,9 +159,16 @@ export function isNonUserInitiatedResourceType(type: string | undefined): boolea
   return type === 'sub_frame' || type === 'object';
 }
 
-export function downloadStateAllowsHandoff(state: string | undefined): boolean {
-  if (state == null || state === '') return true;
-  return state === 'in_progress' || state === 'complete';
+/**
+ * Fail closed: missing/unknown state never hands off. A user-paused item
+ * (`paused === true`) is left as the user left it even when still in_progress.
+ */
+export function downloadStateAllowsHandoff(
+  state: string | undefined,
+  paused?: boolean,
+): boolean {
+  if (paused === true) return false;
+  return state === 'complete' || state === 'in_progress';
 }
 
 /**
@@ -185,15 +192,26 @@ export function filenameFromContentDisposition(value: string): string | undefine
 /**
  * True when the name is a CDN token / Chrome temp name, not a user-facing file.
  */
+const UUID_FILENAME_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const HEX_FILENAME_RE = /^[0-9a-f]{20,}$/i;
+
+function filenameStem(base: string): string {
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return base;
+  const ext = base.slice(dot + 1);
+  if (!/^[a-z0-9]{1,10}$/i.test(ext)) return base;
+  return base.slice(0, dot);
+}
+
 export function isWeakSuggestedFilename(filename: string | undefined): boolean {
   const base = downloadBasename(filename);
   if (!base) return true;
   if (/\.crdownload$/i.test(base)) return true;
   if (/^unconfirmed\s+\d+/i.test(base)) return true;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(base)) {
-    return true;
-  }
-  return /^[0-9a-f]{20,}$/i.test(base);
+  const stem = filenameStem(base);
+  if (UUID_FILENAME_RE.test(base) || UUID_FILENAME_RE.test(stem)) return true;
+  return HEX_FILENAME_RE.test(base) || HEX_FILENAME_RE.test(stem);
 }
 
 /** Prefer a Content-Disposition / Chrome-determined name over a URL token. */

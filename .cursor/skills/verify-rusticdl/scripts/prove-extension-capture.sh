@@ -142,5 +142,14 @@ if not data.get("ok"):
 print(f"DOCTOR ping ok version={data.get('browserVersion')} manifest={data.get('manifestPath')}")
 PY
 
+set +e
+node "${EXT_ROOT}/e2e/raw-chrome-app-zip.mjs"
+RAW_RC=$?
+set -e
+if [[ "${RAW_RC}" -ne 0 ]]; then
+  echo "DOCTOR FAIL: raw Chrome app.zip proof exited ${RAW_RC}" >&2
+  exit "${RAW_RC}"
+fi
+
 echo "prove-extension-capture exit=${PW_RC} evidence=${VERIFY_EVIDENCE_DIR}/extension"
 exit "${PW_RC}"

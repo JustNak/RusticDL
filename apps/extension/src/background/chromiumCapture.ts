@@ -12,6 +12,7 @@ import {
   filenameExtension,
   filenameFromContentDisposition,
   httpOrigin,
+  isNonUserInitiatedResourceType,
   isWeakSuggestedFilename,
   knownDownloadBytes,
   mimeLooksLikeDownload,
@@ -162,16 +163,21 @@ export function rememberResponseFilenameHint(
   if (!downloadLike || (!filename && totalBytes == null)) {
     return undefined;
   }
+  pruneFilenameHints();
+  const key = normalizeCaptureUrl(url);
+  const existing = filenameHints.get(key);
+  const resourceType = isNonUserInitiatedResourceType(existing?.resourceType)
+    ? existing?.resourceType
+    : details.type;
   const hint: FilenameHint = {
     filename: sanitizeSuggestedFilename(filename),
     totalBytes,
     hasAttachment,
     mime: mime || undefined,
-    resourceType: details.type,
+    resourceType,
     ts: Date.now(),
   };
-  pruneFilenameHints(hint.ts);
-  filenameHints.set(normalizeCaptureUrl(url), hint);
+  filenameHints.set(key, hint);
   return hint;
 }
 
@@ -191,7 +197,12 @@ export function rememberDeterminedFilename(id: number, filename?: string): void 
 export function rememberResourceType(url: string | undefined, type: string | undefined): void {
   if (!url || !type) return;
   pruneFilenameHints();
-  resourceTypes.set(normalizeCaptureUrl(url), { type, ts: Date.now() });
+  const key = normalizeCaptureUrl(url);
+  const existing = resourceTypes.get(key)?.type;
+  // iframe / <object> veto is sticky per URL so a later fetch/img cannot
+  // flip the same download into a capture (W195-1).
+  if (isNonUserInitiatedResourceType(existing)) return;
+  resourceTypes.set(key, { type, ts: Date.now() });
 }
 
 export function lookupResourceType(url: string | undefined): string | undefined {
@@ -235,9 +246,9 @@ export function resolveSuggestedFilename(item: {
   if (determined && !isWeakSuggestedFilename(determined)) {
     return determined;
   }
-  // Playwright's CDP allowAndName skips onDeterminingFilename. With `allow`,
-  // Chrome still writes the same name onto DownloadItem.filename (app.zip).
-  // That shelf name is send-only — never copied onto the capture decision.
+  // Playwright's CDP allowAndName skips onDeterminingFilename. Raw Chrome and
+  // CDP `default` fire it; the shelf name is send-only fallback, never a
+  // capture-decision input.
   const shelfName = sanitizeSuggestedFilename(item.chromeDeterminedFilename);
   if (shelfName && !isWeakSuggestedFilename(shelfName)) {
     return shelfName;
@@ -254,22 +265,12 @@ export function resolveSuggestedFilename(item: {
   return withExt ?? preferredSuggestedFilename(determined, ...names);
 }
 
-function mimeMayStillSupplyDeterminedName(mime: string | undefined): boolean {
-  const normalized = (mime || '').toLowerCase().split(';')[0].trim();
-  if (!normalized) return true;
-  return (
-    normalized.includes('zip')
-    || normalized.includes('x-rar')
-    || normalized.includes('x-7z')
-    || normalized.includes('x-tar')
-    || normalized.includes('gzip')
-  );
-}
-
 /**
- * True while Chrome may still replace an extensionless URL token (C1 `C1` →
- * `app.zip`). False as soon as a non-weak determined or shelf name is known,
- * and for G4 octet-stream `/get` whose basename is already the send name.
+ * True while Chrome may still replace an extensionless URL token (C1 `C1` /
+ * `/dl` → `app.zip` from onDeterminingFilename). False as soon as a non-weak
+ * determined or shelf name is known, or the send name already has an
+ * extension (`huge.bin`). Extensionless G4 (`get`) still waits — skipping
+ * that wait sent the URL token before Chrome determined `app.zip`.
  */
 export function needsDeterminedFilename(item: {
   id?: number;
@@ -288,9 +289,6 @@ export function needsDeterminedFilename(item: {
   const resolved = resolveSuggestedFilename(item);
   if (isWeakSuggestedFilename(resolved)) return true;
   if (filenameExtension(resolved) != null) return false;
-  if (item.filenameFromUrlBasename === true && item.hasAttachment !== true) {
-    return mimeMayStillSupplyDeterminedName(item.mime);
-  }
   return true;
 }
 
@@ -418,9 +416,10 @@ export function getChromiumDeterminingFilenameApi(): {
       };
     };
   };
-  return g.chrome?.downloads?.onDeterminingFilename
-    ?? g.browser?.downloads?.onDeterminingFilename
-    ?? null;
+  // Prefer the native chrome event. The polyfill may expose a dummy that
+  // never fires, which is why raw Chrome logged determining while we sent
+  // the URL token.
+  return g.chrome?.downloads?.onDeterminingFilename ?? null;
 }
 
 /**

@@ -208,6 +208,13 @@ async function updateBrowserBadge(state: PopupStateResponse) {
 
 configureCaptureCoordinator({ updateBadge: updateBrowserBadge });
 
+function registerChromiumDeterminingFilename(): void {
+  const determining = getChromiumDeterminingFilenameApi();
+  determining?.addListener((item, suggest) => {
+    onChromiumDeterminingFilename(item, suggest, settingsForSyncCapture());
+  });
+}
+
 function registerChromiumFilenameHints(): void {
   const webRequest = getChromiumWebRequest();
   webRequest?.onHeadersReceived?.addListener(
@@ -242,11 +249,6 @@ function registerChromiumFilenameHints(): void {
     },
     { urls: ['http://*/*', 'https://*/*'] },
   );
-
-  const determining = getChromiumDeterminingFilenameApi();
-  determining?.addListener((item, suggest) => {
-    onChromiumDeterminingFilename(item, suggest, settingsForSyncCapture());
-  });
 }
 
 function registerFirefoxWebRequestInterception() {
@@ -338,6 +340,9 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 function registerDownloadCaptureListeners(
   whenReady: Promise<ExtensionIntegrationSettings>,
 ): void {
+  // Chromium must see onDeterminingFilename on the first turn — register it
+  // before other downloads listeners so Chrome delivers the determined name.
+  registerChromiumDeterminingFilename();
   // Firefox primary: blocking webRequest. downloads.onCreated is fallback.
   registerFirefoxWebRequestInterception();
   // Chromium: observe Content-Disposition so handoff is not a URL token.

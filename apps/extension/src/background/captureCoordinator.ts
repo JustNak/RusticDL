@@ -113,6 +113,7 @@ type DownloadChangeDelta = {
   filename?: { current?: string };
   mime?: { current?: string };
   state?: { current?: string };
+  paused?: { current?: boolean };
   totalBytes?: { current?: number };
   fileSize?: { current?: number };
 };
@@ -206,6 +207,9 @@ export function resetCaptureCoordinatorForTests(): void {
   store = createCaptureSessionStore();
   sessionsReady = true;
   queuedCaptureEvents.length = 0;
+  for (const pending of pendingSizeWaits.values()) {
+    clearTimeout(pending.timer);
+  }
   pendingSizeWaits.clear();
   pausedForCapture.clear();
 }
@@ -509,6 +513,11 @@ async function handOffUrl(
   }
 }
 
+function snapshotAllowsHandoff(item: CapturedDownloadItem): boolean {
+  const userPaused = item.paused === true && !pausedForCapture.has(item.id);
+  return downloadStateAllowsHandoff(item.state, userPaused);
+}
+
 async function handoffBrowserDownload(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
@@ -530,6 +539,14 @@ async function handoffBrowserDownload(
     }
     return;
   }
+
+  const latest = await latestDownloadSnapshot(item);
+  if (!latest || !snapshotAllowsHandoff(latest)) {
+    if (sessionId) dropCaptureSession(store, sessionId);
+    persistSessions();
+    return;
+  }
+
   await eraseBrowserDownload(item.id);
 
   const attempt = await handOffUrl(url, settings, {
@@ -569,6 +586,8 @@ function mergeDownloadDelta(
   const mime = deltaCurrent(delta.mime);
   const url = deltaCurrent(delta.url);
   const filename = deltaCurrent(delta.filename);
+  const paused = deltaCurrent(delta.paused);
+  const state = deltaCurrent(delta.state);
   const chromeDeterminedFilename = sanitizeSuggestedFilename(filename);
   // Keep DownloadItem.filename off the capture decision. Chrome's onChanged
   // name is send-only (C1 `app.zip` / html-evil `evil.exe`).
@@ -577,6 +596,8 @@ function mergeDownloadDelta(
     ...(url ? { url } : {}),
     ...(mime ? { mime } : {}),
     ...(chromeDeterminedFilename ? { chromeDeterminedFilename } : {}),
+    ...(typeof paused === 'boolean' ? { paused } : {}),
+    ...(state ? { state: state as CapturedDownloadItem['state'] } : {}),
     ...(typeof fileSize === 'number' && fileSize > 0 ? { fileSize } : {}),
     ...(typeof totalBytes === 'number' && totalBytes > 0 ? { totalBytes } : {}),
   };
@@ -607,6 +628,7 @@ async function latestDownloadSnapshot(
       filenameFromUrlBasename: item.filenameFromUrlBasename,
       chromeDeterminedFilename:
         sanitizeSuggestedFilename(latest.filename) ?? item.chromeDeterminedFilename,
+      paused: typeof latest.paused === 'boolean' ? latest.paused : item.paused,
       hasAttachment: item.hasAttachment === true || latest.hasAttachment === true,
       resourceType: item.resourceType ?? latest.resourceType,
       cookieStoreId: latest.cookieStoreId ?? item.cookieStoreId,
@@ -623,7 +645,7 @@ async function latestDownloadSnapshot(
   }
 }
 
-async function finalizePendingCapture(
+export async function finalizePendingCapture(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
   sessionId?: string,
@@ -646,7 +668,7 @@ async function finalizePendingCapture(
     return;
   }
 
-  if (!downloadStateAllowsHandoff(tracked.state)) {
+  if (!snapshotAllowsHandoff(tracked)) {
     if (sessionId) dropCaptureSession(store, sessionId);
     persistSessions();
     return;
@@ -838,7 +860,7 @@ export function onDownloadChanged(
 
   const known = knownDownloadBytes(merged);
   const state = deltaCurrent(delta.state);
-  if (state && !downloadStateAllowsHandoff(state)) {
+  if (!snapshotAllowsHandoff(merged)) {
     clearPendingSizeWait(delta.id);
     if (existing?.phase === 'pending') {
       dropCaptureSession(store, pending.sessionId);
@@ -895,7 +917,11 @@ export function onChromiumDeterminingFilename(
   applyDeterminedFilename(item, suggest);
   const pending = pendingSizeWaits.get(item.id);
   if (!pending || !settings) return;
-  pending.item = applyChromiumCaptureHints(pending.item);
+  pending.item = {
+    ...applyChromiumCaptureHints(pending.item),
+    chromeDeterminedFilename:
+      sanitizeSuggestedFilename(item.filename) ?? pending.item.chromeDeterminedFilename,
+  };
   followCaptureFamily(store, familyProbe(pending.item));
   persistSessions();
   if (stillWaitingForCaptureSignals(pending.item, pending)) return;

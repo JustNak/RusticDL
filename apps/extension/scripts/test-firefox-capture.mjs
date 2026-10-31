@@ -64,6 +64,7 @@ const {
   needsDeterminedFilename,
   rememberRequestAuth,
   lookupOriginAuth,
+  lookupResourceType,
 } = require(chromiumOutfile);
 const sessionOutfile = join(tmp, 'captureSession.cjs');
 await esbuild.build({
@@ -1700,14 +1701,18 @@ assert(
 );
 
 assert(
-  'G4 octet-stream /get?id=5 does not wait 1500ms for a determined extension',
+  'G4 octet-stream /get?id=5 waits for Chrome determined name then uses get',
   emptyGetTyped.filename === 'get'
     && emptyGetTyped.filenameFromUrlBasename === true
-    && needsDeterminedFilename(emptyGetTyped) === false
+    && needsDeterminedFilename(emptyGetTyped) === true
     && needsDeterminedFilename({
       ...emptyGetTyped,
       chromeDeterminedFilename: 'get',
-    }) === false,
+    }) === false
+    && resolveSuggestedFilename({
+      ...emptyGetTyped,
+      chromeDeterminedFilename: 'get',
+    }) === 'get',
 );
 
 assert(
@@ -1848,8 +1853,10 @@ assert(
   downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') === undefined
     && downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') !== '../secret.zip'
     && sanitizeSuggestedFilename('../secret.zip') === undefined
+    && decodeURIComponent('%2e%2e%2fsecret.zip') === '../secret.zip'
     && sanitizeSuggestedFilename('%2e%2e%2fsecret.zip') === undefined
-    && sanitizeSuggestedFilename('%2e%2e%5csecret.zip') === undefined,
+    && sanitizeSuggestedFilename('%2E%2E%5Csecret.zip') === undefined
+    && sanitizeSuggestedFilename(decodeURIComponent('%2e%2e%2fsecret.zip')) === undefined,
 );
 
 assert(
@@ -1879,7 +1886,11 @@ assert(
   'cancel-during-name-wait interrupted state does not allow handoff',
   downloadStateAllowsHandoff('interrupted') === false
     && downloadStateAllowsHandoff('in_progress') === true
-    && downloadStateAllowsHandoff('complete') === true,
+    && downloadStateAllowsHandoff('in_progress', true) === false
+    && downloadStateAllowsHandoff('complete') === true
+    && downloadStateAllowsHandoff(undefined) === false
+    && downloadStateAllowsHandoff('') === false
+    && downloadStateAllowsHandoff('unknown') === false,
 );
 
 assert(
@@ -1900,10 +1911,18 @@ assert(
     return item.filenameFromUrlBasename === true
       && item.filename === uuid
       && isWeakSuggestedFilename(uuid) === true
+      && isWeakSuggestedFilename(`${uuid}.zip`) === true
       && isWeakSuggestedFilename(chromeTemp) === true
+      && isWeakSuggestedFilename(`${chromeTemp}.zip`) === true
       && isWeakSuggestedFilename(item.filename) === true
       && isWeakSuggestedFilename(sendName) === true
-      && sendName !== 'get';
+      && sendName !== 'get'
+      && resolveSuggestedFilename({
+        id: 501,
+        url,
+        filename: uuid,
+        chromeDeterminedFilename: `${uuid}.zip`,
+      }) !== `${uuid}.zip`;
   })(),
 );
 
@@ -1921,6 +1940,26 @@ assert(
     });
     return item.resourceType === 'sub_frame'
       && isNonUserInitiatedResourceType('sub_frame') === true
+      && shouldCaptureDownloadItem(item, defaultSettings) === false;
+  })(),
+);
+
+assert(
+  'W195-1 sub_frame veto sticks when a later fetch hits the same URL',
+  (() => {
+    const url = 'http://127.0.0.1:18821/w195-1/export?mime=application/octet-stream&bytes=65536';
+    rememberResourceType(url, 'sub_frame');
+    rememberResourceType(url, 'xmlhttprequest');
+    rememberResourceType(url, 'image');
+    const item = applyChromiumCaptureHints({
+      id: 902,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return lookupResourceType(url) === 'sub_frame'
+      && item.resourceType === 'sub_frame'
       && shouldCaptureDownloadItem(item, defaultSettings) === false;
   })(),
 );
@@ -2193,6 +2232,364 @@ assert(
   'MV3 startup does not await hydrate before addListener',
   !/await hydrateCaptureSessions\(\);\s*await getCachedSettings\(\);\s*registerDownloadCaptureListeners/.test(indexSrc),
 );
+assert(
+  'MV3 startup registers onDeterminingFilename before onCreated',
+  indexSrc.indexOf('registerChromiumDeterminingFilename()')
+    < indexSrc.indexOf('browser.downloads.onCreated.addListener'),
+);
+
+console.log('\nCoordinator-driven capture (stubbed chrome.downloads)\n');
+
+const coordStubPath = join(tmp, 'coord-browser-stub.cjs');
+writeFileSync(
+  coordStubPath,
+  `const nativeMessages = [];
+const downloadItems = new Map();
+const erased = [];
+let searchImpl = null;
+function makeStore() {
+  const data = {};
+  return {
+    async get(keys) {
+      if (keys == null) return { ...data };
+      if (typeof keys === 'string') return { [keys]: data[keys] };
+      if (Array.isArray(keys)) {
+        const out = {};
+        for (const k of keys) out[k] = data[k];
+        return out;
+      }
+      return { ...data };
+    },
+    async set(items) { Object.assign(data, items); },
+  };
+}
+const local = makeStore();
+const session = makeStore();
+const api = {
+  downloads: {
+    search: async (query) => {
+      if (searchImpl) return searchImpl(query, downloadItems);
+      if (query && query.id != null) {
+        const item = downloadItems.get(query.id);
+        return item ? [{ ...item }] : [];
+      }
+      return [...downloadItems.values()].map((item) => ({ ...item }));
+    },
+    pause: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) item.paused = true;
+    },
+    resume: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) item.paused = false;
+    },
+    cancel: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) {
+        item.state = 'interrupted';
+        item.error = 'USER_CANCELED';
+      }
+    },
+    erase: async ({ id }) => {
+      erased.push(id);
+      downloadItems.delete(id);
+      return [id];
+    },
+    removeFile: async () => {},
+  },
+  runtime: {
+    sendNativeMessage: async (_host, msg) => {
+      nativeMessages.push(msg);
+      return {
+        ok: true,
+        requestId: msg.requestId,
+        type: 'accepted',
+        payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+      };
+    },
+    getManifest: () => ({ version: '0.0.0' }),
+    id: 'looccikmfpkiagfaeiocohmcneoacmom',
+  },
+  cookies: {
+    getAllCookieStores: async () => [{ id: '0', tabIds: [] }],
+    getAll: async () => [],
+  },
+  storage: { local, session },
+  action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+  _test: {
+    nativeMessages,
+    downloadItems,
+    erased,
+    setSearchImpl(fn) { searchImpl = fn; },
+    reset() {
+      nativeMessages.length = 0;
+      downloadItems.clear();
+      erased.length = 0;
+      searchImpl = null;
+    },
+  },
+};
+module.exports = api;
+module.exports.default = api;
+`,
+);
+
+const coordOutfile = join(tmp, 'captureCoordinator.cjs');
+await esbuild.build({
+  entryPoints: [join(root, 'src/background/captureCoordinator.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: coordOutfile,
+  plugins: [
+    {
+      name: 'stub-browser',
+      setup(build) {
+        build.onResolve(
+          { filter: /^\.\/browser$/ },
+          () => ({ path: coordStubPath, external: true }),
+        );
+      },
+    },
+  ],
+});
+
+const coord = require(coordOutfile);
+const coordBrowser = require(coordStubPath);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function coordPrompts(url) {
+  return coordBrowser._test.nativeMessages.filter(
+    (msg) => msg.type === 'prompt_download' && msg.payload?.url === url,
+  );
+}
+
+async function withCoordinator(fn) {
+  coordBrowser._test.reset();
+  coord.resetCaptureCoordinatorForTests();
+  coord.configureCaptureCoordinator({ updateBadge: async () => {} });
+  await fn();
+}
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C1?coord=appzip';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 11,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(11, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 11, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await sleep(200);
+  assert(
+    'coordinator determining app.zip prompts that exact URL',
+    coordPrompts(url).length === 1
+      && coordPrompts(url)[0].payload.suggestedFilename === 'app.zip',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=cancel&slow=1';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 7,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(7, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onDownloadChanged({ id: 7, state: { current: 'interrupted' } }, defaultSettings);
+  await sleep(1700);
+  assert(
+    'coordinator cancel-during-name-wait onChanged interrupted does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(7),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=pause&slow=1';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 4,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(4, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onDownloadChanged({ id: 4, paused: { current: true } }, defaultSettings);
+  await sleep(1700);
+  assert(
+    'coordinator pause-during-name-wait does not prompt or erase that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(4),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=finalize-interrupted';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 9,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(9, { ...item });
+  let searchCalls = 0;
+  coordBrowser._test.setSearchImpl(async (query) => {
+    searchCalls += 1;
+    const found = coordBrowser._test.downloadItems.get(query.id);
+    if (!found) return [];
+    if (searchCalls === 1) {
+      return [{ ...found, state: 'interrupted', paused: false }];
+    }
+    return [{ ...found, state: 'in_progress', paused: false }];
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.finalizePendingCapture(item, defaultSettings);
+  assert(
+    'coordinator finalize interrupted snapshot does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(9),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/get?id=5&ck=missing-state';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 1,
+    url,
+    filename: 'get',
+    mime: 'application/octet-stream',
+    totalBytes: 65536,
+    filenameFromUrlBasename: true,
+  };
+  coordBrowser._test.downloadItems.set(1, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.finalizePendingCapture(item, defaultSettings);
+  assert(
+    'coordinator missing-state finalize does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(1),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=erase';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 8,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(8, { ...item });
+  coordBrowser._test.setSearchImpl(async () => []);
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.finalizePendingCapture(item, defaultSettings);
+  assert(
+    'coordinator erase-during-wait search [] does not prompt that URL',
+    coordPrompts(url).length === 0,
+  );
+});
+
+await withCoordinator(async () => {
+  const uuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const url = `http://127.0.0.1:18921/${uuid}`;
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 5,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(5, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 5, url, filename: `${uuid}.zip` },
+    () => undefined,
+    defaultSettings,
+  );
+  await sleep(1700);
+  assert(
+    'coordinator uuid.zip determined name does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(5),
+  );
+});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 rmSync(tmp, { recursive: true, force: true });
