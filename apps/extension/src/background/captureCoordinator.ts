@@ -547,8 +547,6 @@ async function handoffBrowserDownload(
     return;
   }
 
-  await eraseBrowserDownload(item.id);
-
   const attempt = await handOffUrl(url, settings, {
     suggestedFilename,
     totalBytes: knownDownloadBytes(item) ?? lookupFilenameHint(item.finalUrl || url)?.totalBytes,
@@ -562,11 +560,23 @@ async function handoffBrowserDownload(
     sessionId,
   });
 
-  await restoreIfHandoffRejected(attempt, {
-    url,
-    filename: suggestedFilename,
-    sessionId,
-  });
+  switch (attempt) {
+    case 'accepted':
+      await eraseBrowserDownload(item.id);
+      return;
+    case 'already_claimed':
+      return;
+    case 'dismissed':
+    case 'rejected':
+      if (pausedForCapture.has(item.id)) {
+        await resumeBrowserDownload(item.id);
+      }
+      return;
+    default: {
+      const _exhaustive: never = attempt;
+      return _exhaustive;
+    }
+  }
 }
 
 function deltaCurrent<T>(field: { current?: T } | T | undefined): T | undefined {
@@ -742,10 +752,9 @@ export function pauseIfLikelyCapture(
       void eraseBrowserDownload(item.id);
       return;
     case 'handoff':
-      if (!needsDeterminedFilename(tracked) && !needsResourceType(tracked)) {
-        void eraseBrowserDownload(item.id);
-        return;
-      }
+      // Never erase before the host accepts. Pre-handoff erase plus the
+      // re-read-before-send check drops the shelf item with no prompt
+      // (C2 setup.exe, C3 file.zip) — a lost user download.
       return;
     case 'wait':
       requestPause(item.id);

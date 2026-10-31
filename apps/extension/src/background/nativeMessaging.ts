@@ -24,8 +24,19 @@ import {
 import browser from './browser';
 import type { PopupStateResponse } from '../shared/messages';
 
+function navigatorInfo(): { platform: string; userAgent: string } {
+  if (typeof navigator === 'undefined') {
+    return { platform: '', userAgent: '' };
+  }
+  return {
+    platform: navigator.platform ?? '',
+    userAgent: navigator.userAgent ?? '',
+  };
+}
+
 function isLinuxHost(): boolean {
-  const platform = `${navigator.platform} ${navigator.userAgent}`;
+  const info = navigatorInfo();
+  const platform = `${info.platform} ${info.userAgent}`;
   return /linux/i.test(platform);
 }
 
@@ -122,7 +133,7 @@ async function sendNativeMessage(request: object): Promise<HostToExtensionRespon
 }
 
 export function detectBrowser(): BrowserKind {
-  const userAgent = navigator.userAgent.toLowerCase();
+  const userAgent = navigatorInfo().userAgent.toLowerCase();
   if (userAgent.includes('firefox')) return 'firefox';
   if (userAgent.includes('edg/')) return 'edge';
   return 'chrome';

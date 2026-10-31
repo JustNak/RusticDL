@@ -9,6 +9,15 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 
+// Node 20 (CI) has no global navigator; Node 22+ does. Stub before any
+// bundled coordinator code calls detectBrowser().
+if (typeof globalThis.navigator === 'undefined') {
+  globalThis.navigator = {
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0',
+    platform: 'Linux x86_64',
+  };
+}
+
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tmp = mkdtempSync(join(tmpdir(), 'rusticdl-capture-'));
 const outfile = join(tmp, 'firefoxCapture.cjs');
@@ -2247,6 +2256,7 @@ writeFileSync(
 const downloadItems = new Map();
 const erased = [];
 let searchImpl = null;
+let sendImpl = null;
 function makeStore() {
   const data = {};
   return {
@@ -2300,6 +2310,7 @@ const api = {
   runtime: {
     sendNativeMessage: async (_host, msg) => {
       nativeMessages.push(msg);
+      if (sendImpl) return sendImpl(msg);
       return {
         ok: true,
         requestId: msg.requestId,
@@ -2321,11 +2332,13 @@ const api = {
     downloadItems,
     erased,
     setSearchImpl(fn) { searchImpl = fn; },
+    setSendImpl(fn) { sendImpl = fn; },
     reset() {
       nativeMessages.length = 0;
       downloadItems.clear();
       erased.length = 0;
       searchImpl = null;
+      sendImpl = null;
     },
   },
 };
@@ -2588,6 +2601,81 @@ await withCoordinator(async () => {
   assert(
     'coordinator uuid.zip determined name does not prompt that URL',
     coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(5),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=known-name';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 22,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(22, { ...item });
+  coord.pauseIfLikelyCapture(item, defaultSettings);
+  await sleep(50);
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator known-name C2 still prompts after pauseIfLikelyCapture',
+    coordPrompts(url).length === 1
+      && coordPrompts(url)[0].payload.suggestedFilename === 'setup.exe',
+  );
+  assert(
+    'coordinator known-name C2 erases only after the host accepts',
+    coordBrowser._test.erased.includes(22),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=reject-no-erase';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 33,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(33, { ...item });
+  coordBrowser._test.setSendImpl(async (msg) => ({
+    ok: false,
+    requestId: msg.requestId,
+    type: 'rejected',
+    code: 'HOST_NOT_AVAILABLE',
+    message: 'no host',
+  }));
+  coord.pauseIfLikelyCapture(item, defaultSettings);
+  await sleep(50);
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator known-name rejected host does not erase that item',
+    coordPrompts(url).length === 1 && !coordBrowser._test.erased.includes(33),
+  );
+  assert(
+    'coordinator known-name rejected host leaves the download item',
+    coordBrowser._test.downloadItems.has(33),
   );
 });
 
