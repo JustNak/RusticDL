@@ -752,9 +752,14 @@ export function pauseIfLikelyCapture(
       void eraseBrowserDownload(item.id);
       return;
     case 'handoff':
-      // Never erase before the host accepts. Pre-handoff erase plus the
-      // re-read-before-send check drops the shelf item with no prompt
-      // (C2 setup.exe, C3 file.zip) — a lost user download.
+      // Pause known-name captures so Chrome cannot finish the file during the
+      // host round-trip. Do not erase until the host accepts — a pre-handoff
+      // erase plus re-read-before-send drops the shelf item with no prompt
+      // (C2 setup.exe). Do not pause while the name is still a URL token:
+      // Chrome skips onDeterminingFilename for a paused item.
+      if (!needsDeterminedFilename(tracked) && !needsResourceType(tracked)) {
+        requestPause(item.id);
+      }
       return;
     case 'wait':
       requestPause(item.id);

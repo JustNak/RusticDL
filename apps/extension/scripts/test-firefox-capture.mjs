@@ -2627,6 +2627,11 @@ await withCoordinator(async () => {
   coordBrowser._test.downloadItems.set(22, { ...item });
   coord.pauseIfLikelyCapture(item, defaultSettings);
   await sleep(50);
+  assert(
+    'coordinator known-name C2 pauses instead of erasing before send',
+    !coordBrowser._test.erased.includes(22)
+      && coordBrowser._test.downloadItems.get(22)?.paused === true,
+  );
   await coord.onDownloadCreated(item, defaultSettings);
   assert(
     'coordinator known-name C2 still prompts after pauseIfLikelyCapture',
