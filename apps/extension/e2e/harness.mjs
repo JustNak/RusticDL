@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applySearchDownloadsAttack } from './ext-attack.mjs';
+import { classifyCaptureLinesForCase } from './classify.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -150,38 +151,58 @@ export async function searchDownloads(worker) {
   return applySearchDownloadsAttack(result);
 }
 
+export function readJsonlEvidence(logPath, label) {
+  if (!existsSync(logPath)) {
+    return { ok: false, items: [], reason: `${label} missing` };
+  }
+  try {
+    const items = readFileSync(logPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    return { ok: true, items, reason: null };
+  } catch (error) {
+    return {
+      ok: false,
+      items: [],
+      reason: `${label} unreadable: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export function readHostLogEvidence(runDir) {
+  return readJsonlEvidence(path.join(runDir, 'host-log.jsonl'), 'mock-host log');
+}
+
 export function readHostLog(runDir) {
-  const logPath = path.join(runDir, 'host-log.jsonl');
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
+  return readHostLogEvidence(runDir).items;
+}
+
+export function captureLinesSinceEvidence(runDir, startMs) {
+  const ev = readHostLogEvidence(runDir);
+  if (!ev.ok) return { ...ev, items: [] };
+  const capture = classifyCaptureLinesForCase(ev.items, {}, startMs);
+  return { ok: true, items: capture.captureLines, reason: null };
 }
 
 export function captureLinesSince(runDir, startMs) {
-  return readHostLog(runDir).filter((line) => (
-    line.receivedAt >= startMs
-    && (line.type === 'prompt_download' || line.type === 'enqueue_download')
-  ));
+  return captureLinesSinceEvidence(runDir, startMs).items;
+}
+
+export function readFixtureHitsEvidence(runDir) {
+  return readJsonlEvidence(path.join(runDir, 'fixture-requests.jsonl'), 'fixture request log');
 }
 
 export function readFixtureHits(runDir) {
-  const logPath = path.join(runDir, 'fixture-requests.jsonl');
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
+  return readFixtureHitsEvidence(runDir).items;
+}
+
+export function readFixtureServesEvidence(runDir) {
+  return readJsonlEvidence(path.join(runDir, 'fixture-serves.jsonl'), 'fixture serve log');
 }
 
 export function readFixtureServes(runDir) {
-  const logPath = path.join(runDir, 'fixture-serves.jsonl');
-  if (!existsSync(logPath)) return [];
-  return readFileSync(logPath, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
+  return readFixtureServesEvidence(runDir).items;
 }
 
 function sleep(ms) {
@@ -195,6 +216,8 @@ export async function drainCaptureLines(runDir, startedAt, {
   waitOutEmpty = false,
 } = {}) {
   const t0 = Date.now();
+  const initial = captureLinesSinceEvidence(runDir, startedAt);
+  if (!initial.ok) return [];
   if (minWaitMs > 0) await sleep(minWaitMs);
   if (maxWaitMs <= 0) return captureLinesSince(runDir, startedAt);
   const sigOf = (lines) => `${lines.length}:${lines.at(-1)?.receivedAt ?? 0}`;
@@ -202,7 +225,9 @@ export async function drainCaptureLines(runDir, startedAt, {
   let quietFrom = Date.now();
   while (Date.now() - t0 < maxWaitMs) {
     await sleep(50);
-    const lines = captureLinesSince(runDir, startedAt);
+    const ev = captureLinesSinceEvidence(runDir, startedAt);
+    if (!ev.ok) return [];
+    const lines = ev.items;
     const sig = sigOf(lines);
     if (sig !== lastSig) {
       lastSig = sig;

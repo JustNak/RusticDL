@@ -16,9 +16,10 @@ import {
   launchExtensionContext,
   percentile,
   pingNativeHost,
-  readFixtureHits,
-  readFixtureServes,
+  readFixtureHitsEvidence,
+  readFixtureServesEvidence,
   readHostLog,
+  readHostLogEvidence,
   searchDownloads,
   waitForServiceWorker,
   writeNativeHostManifest,
@@ -285,8 +286,13 @@ test('extension capture matrix', async () => {
         hostSlice.map((line) => JSON.stringify(line)).join('\n') + (hostSlice.length ? '\n' : ''),
       );
 
-      const promptLines = lines.filter((line) => line.type === 'prompt_download');
-      const enqueueLines = lines.filter((line) => line.type === 'enqueue_download');
+      const split = classify.classifyCaptureLinesForCase(lines, {
+        url: expectedUrl,
+        expectedUrl,
+        filename: caseDef.filename,
+      }, startedAt);
+      const promptLines = split.promptLines;
+      const enqueueLines = split.enqueueLines;
       const sw = context.serviceWorkers()[0] || worker;
       const matchPreview = [...promptLines, ...enqueueLines].find((line) => (
         (line.payload ?? {}).url === expectedUrl
@@ -333,8 +339,11 @@ test('extension capture matrix', async () => {
         fetchAttempt: null,
       }));
 
-      const fixtureHits = readFixtureHits(runDir).filter((hit) => hit.attempt === attempt);
-      const fixtureServes = readFixtureServes(runDir).filter((row) => row.attempt === attempt);
+      const hostEv = readHostLogEvidence(runDir);
+      const hitEv = readFixtureHitsEvidence(runDir);
+      const serveEv = readFixtureServesEvidence(runDir);
+      const fixtureHits = (hitEv.ok ? hitEv.items : []).filter((hit: { attempt?: string }) => hit.attempt === attempt);
+      const fixtureServes = (serveEv.ok ? serveEv.items : []).filter((row: { attempt?: string }) => row.attempt === attempt);
       writeFileSync(path.join(evidenceDir, 'fixture-hits.json'), `${JSON.stringify(fixtureHits, null, 2)}\n`);
       writeFileSync(path.join(evidenceDir, 'fixture-serves.json'), `${JSON.stringify(fixtureServes, null, 2)}\n`);
 
@@ -349,10 +358,20 @@ test('extension capture matrix', async () => {
         triggerAt,
         promptLines,
         enqueueLines,
+        hostLog: hostEv.ok ? hostSlice : { ok: false, reason: hostEv.reason, items: [] },
+        hostLogOk: hostEv.ok,
+        hostLogReason: hostEv.reason,
         downloads,
+        downloadsOk: classify.downloadSearchFailed(downloads) || Array.isArray(downloads),
+        downloadsReason: classify.downloadSearchFailed(downloads)
+          ? `chrome.downloads.search failed: ${(downloads as { error?: string }).error}`
+          : undefined,
         fixtureHits,
         fixtureServes,
+        fixtureServesOk: serveEv.ok,
+        fixtureServesReason: serveEv.reason,
         pageEvidence,
+        pageEvidenceOk: Boolean(pageEvidence && typeof pageEvidence === 'object'),
         playwrightDownload: Boolean(playwrightDownload),
       }) as CaseResult;
       classified.evidencePath = evidenceDir;
@@ -423,7 +442,11 @@ test('extension capture matrix', async () => {
 
     if (classify.END_RECHECK) {
       await drainCaptureLines(runDir, 0, classify.END_DRAIN);
-      classify.recheckLateMissXfails(results, readHostLog(runDir));
+      const endHost = readHostLogEvidence(runDir);
+      classify.recheckLateMissXfails(
+        results,
+        endHost.ok ? endHost.items : { ok: false, reason: endHost.reason, items: [] },
+      );
       if (classify.END_DOWNLOAD_RECHECK) {
         const swEnd = context.serviceWorkers()[0] || worker;
         const endDownloads = plantEndCompleteDownloads(results, await searchDownloads(swEnd));

@@ -399,19 +399,400 @@ function firstPrompt(promptLines) {
   return promptLines[0] ?? null;
 }
 
+function failProof(reason, extra = {}) {
+  return { ok: false, verdict: 'FAIL', reason, ...extra };
+}
+
+export function asEvidence(value, label) {
+  if (value == null) {
+    return { ok: false, items: [], reason: `${label} missing` };
+  }
+  if (Array.isArray(value)) {
+    return { ok: true, items: value, reason: null };
+  }
+  if (typeof value === 'object') {
+    if (value.ok === false) {
+      return {
+        ok: false,
+        items: Array.isArray(value.items) ? value.items : [],
+        reason: value.reason || `${label} missing`,
+      };
+    }
+    if (value.error) {
+      return {
+        ok: false,
+        items: [],
+        reason: `${label} failed: ${value.error}`,
+        searchError: value.error,
+      };
+    }
+    if (value.ok === true && Array.isArray(value.items)) {
+      return { ok: true, items: value.items, reason: null };
+    }
+  }
+  return { ok: false, items: [], reason: `${label} unreadable` };
+}
+
+function hostLinesOf(ctx) {
+  if (Array.isArray(ctx.hostLog)) return ctx.hostLog;
+  return [...(ctx.promptLines || []), ...(ctx.enqueueLines || [])];
+}
+
+function hostEvidence(ctx) {
+  if (ctx.hostLogOk === false) {
+    return { ok: false, lines: [], reason: ctx.hostLogReason || 'mock-host log missing' };
+  }
+  if (ctx.hostLog && typeof ctx.hostLog === 'object' && !Array.isArray(ctx.hostLog)) {
+    const ev = asEvidence(ctx.hostLog, 'mock-host log');
+    return { ok: ev.ok, lines: ev.items, reason: ev.reason };
+  }
+  return { ok: true, lines: hostLinesOf(ctx), reason: null };
+}
+
+function captureSnapshot(ctx, { matchUrl = false, url } = {}) {
+  const host = hostEvidence(ctx);
+  if (!host.ok) {
+    return { host, capture: null };
+  }
+  const capture = classifyCaptureLinesForCase(
+    host.lines,
+    {
+      url: url ?? ctx.expectedUrl,
+      filename: ctx.filename ?? ctx.caseDef?.filename,
+      expectedUrl: url ?? ctx.expectedUrl,
+    },
+    ctx.startedAt,
+    { matchUrl },
+  );
+  return { host, capture };
+}
+
+function checkCapture(ctx) {
+  const { host, capture } = captureSnapshot(ctx);
+  if (!host.ok) return failProof(host.reason);
+  const match = capture.matchLine;
+  if (!capture.exactPositive) {
+    return failProof(
+      `expected one prompt_download url=${ctx.expectedUrl} filename=${ctx.filename ?? ctx.caseDef?.filename} entryPoint=browser_download; got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`,
+      { capture },
+    );
+  }
+  if (!match || !isAcceptedReply(match)) {
+    return failProof('missing or wrong accepted reply (ok, type=accepted, echoed requestId)', { capture });
+  }
+  return { ok: true, verdict: 'pass', reason: null, capture, matchLine: match };
+}
+
+function checkKeep(ctx) {
+  const { host, capture } = captureSnapshot(ctx);
+  if (!host.ok) return failProof(host.reason);
+  if (capture.captured) {
+    return failProof(
+      `expected keep (zero capture lines); got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`,
+      { capture },
+    );
+  }
+  const path = routePathname(ctx.caseDef.route);
+  const fileOnFixture = path && !path.startsWith('/page/');
+  if (fileOnFixture && ctx.fixtureServesOk === false) {
+    return failProof(ctx.fixtureServesReason || 'fixture serve log missing');
+  }
+  if (ctx.pageEvidenceOk === false) {
+    return failProof(ctx.pageEvidenceReason || 'DOM marker missing');
+  }
+  const downloadsEv = asEvidence(
+    ctx.downloadsOk === false ? { ok: false, reason: ctx.downloadsReason || 'chrome.downloads.search not read' } : ctx.downloads,
+    'chrome.downloads.search',
+  );
+  if (ctx.downloadsOk === false) {
+    return failProof(downloadsEv.reason);
+  }
+  const proof = keepClickProved(ctx.caseDef, {
+    hits: ctx.fixtureHits,
+    fixtureServes: ctx.fixtureServes,
+    downloads: Array.isArray(ctx.downloads) ? ctx.downloads : downloadsEv.items,
+    pageEvidence: ctx.pageEvidence,
+    nonce: ctx.nonce,
+    attempt: ctx.attempt,
+    playwrightDownload: Boolean(ctx.playwrightDownload),
+    triggerAt: ctx.triggerAt,
+  });
+  if (!proof.ok) return failProof(proof.reason || 'keep click not proved');
+  return { ok: true, verdict: 'pass', reason: null, capture };
+}
+
+function checkStop(ctx) {
+  const urls = (ctx.urls || [ctx.expectedUrl, ctx.capturedUrl, ctx.expectedFinalUrl]).filter(Boolean);
+  if (ctx.downloadsOk === false) {
+    return failProof(ctx.downloadsReason || 'chrome.downloads.search not read', {
+      stopped: false,
+      completed: false,
+      inProgress: false,
+      searchError: true,
+    });
+  }
+  const inner = browserDownloadStoppedFor(ctx.downloads, urls);
+  if (inner.searchError || !inner.stopped) {
+    return failProof(
+      inner.reason || 'browser download was not shown stopped (erased or USER_CANCELED)',
+      inner,
+    );
+  }
+  return {
+    ok: true,
+    verdict: 'pass',
+    reason: null,
+    stopped: true,
+    completed: false,
+    inProgress: false,
+    searchError: false,
+  };
+}
+
+function checkMissGap(gap, ctx) {
+  const { host, capture } = captureSnapshot(ctx, { matchUrl: Boolean(ctx.matchUrl) });
+  if (!host.ok) return failProof(host.reason);
+  if (capture.exactPositive) {
+    return {
+      ok: false,
+      verdict: 'XPASS',
+      reason: `xfail ${gap} passed`,
+      capture,
+    };
+  }
+  if (capture.captured) {
+    return failProof(
+      `xfail ${gap} failed for a different reason (timeout/harness/wrong line)`,
+      { capture },
+    );
+  }
+  return {
+    ok: true,
+    verdict: 'xfail',
+    reason: ctx.caseDef?.xfail?.reason || `xfail ${gap}`,
+    capture,
+  };
+}
+
+function checkG3(ctx) {
+  const { host, capture } = captureSnapshot(ctx);
+  if (!host.ok) return failProof(host.reason);
+  if (capture.exactPositive) {
+    return {
+      ok: true,
+      verdict: 'xfail',
+      reason: ctx.caseDef?.xfail?.reason || 'xfail G3',
+      capture,
+    };
+  }
+  return failProof(
+    `xfail G3 failed for a different reason (timeout/harness/wrong line)`,
+    { capture },
+  );
+}
+
+function checkG5(ctx) {
+  const finalUrl = ctx.expectedFinalUrl;
+  const { host, capture } = captureSnapshot(ctx, { url: finalUrl });
+  if (!host.ok) return failProof(host.reason);
+  const line = capture.matchLine;
+  if (!(capture.exactPositive && line && isAcceptedReply(line))) {
+    return failProof(
+      `xfail G5 failed for a different reason (timeout/harness/wrong line)`,
+      { capture },
+    );
+  }
+  const stop = checkStop({
+    ...ctx,
+    capturedUrl: line?.payload?.url,
+    urls: [ctx.expectedUrl, line?.payload?.url, finalUrl],
+  });
+  if (!stop.ok) {
+    return failProof(
+      stop.reason || 'xfail G5 failed for a different reason (timeout/harness/wrong line)',
+      { capture, ...stop },
+    );
+  }
+  return {
+    stopped: stop.stopped,
+    completed: stop.completed,
+    inProgress: stop.inProgress,
+    searchError: stop.searchError,
+    ok: true,
+    verdict: 'xfail',
+    reason: ctx.caseDef?.xfail?.reason || 'xfail G5',
+    capture,
+  };
+}
+
+function checkEndWindow(ctx) {
+  const { host, capture } = captureSnapshot(ctx, { matchUrl: true, url: ctx.expectedUrl });
+  if (!host.ok) return failProof(host.reason);
+  if (!capture.captured) {
+    return {
+      ok: true,
+      verdict: 'xfail',
+      reason: null,
+      capture,
+    };
+  }
+  if (capture.exactPositive) {
+    return {
+      ok: false,
+      verdict: 'XPASS',
+      reason: `xfail ${ctx.gap || ctx.item?.gap} passed`,
+      capture,
+      matchLine: capture.matchLine,
+    };
+  }
+  return failProof(
+    `xfail ${ctx.gap || ctx.item?.gap} failed for a different reason (timeout/harness/wrong line)`,
+    { capture },
+  );
+}
+
+function checkEndDownload(ctx) {
+  return checkStop(ctx);
+}
+
 /**
- * Classify one matrix case. Does not mutate host logs.
+ * Single predicate table. Every pass/fail in classify.mjs (and harness
+ * capture-line / evidence-log reads) goes through evaluateProof.
+ * A pass never comes from a bare chrome.downloads state, from "no error",
+ * from a log that was not read, or from another case's path.
  *
- * Early returns / gap branches (each has a fail-closed sibling attack):
- * - skip → skip (L2/L3; not a keep pass)
- * - G1/G4 exactPositiveLine → XPASS (`late-c1` / `late-c4` / `end-exact`); wrong shape → FAIL (`late-c1-nullfile` / `end-null` / `end-badep` / `end-enqueue`)
- * - G1/G4 empty keep → xfail; observed capture that is not exact → FAIL (`plant-c1` / `enqueue-c1`)
- * - expect-capture xfail + fullHandoff → XPASS (G5 prefix rewrite)
- * - expect-keep xfail + exactNegative → XPASS (no keep-xfail rows today)
- * - G3 exactFalseGrab → xfail; other/super/badfile/badep → FAIL (`g3-other`)
- * - G5 exactFinal + accepted + erased or interrupted USER_CANCELED → xfail; other interrupt/complete/in_progress/search error → FAIL
- * - capture fullHandoff → pass; missing accepted, in_progress, complete, or search error → FAIL (`wrong-shape` / `slow-c2` / `search-error`)
- * - keep: exactNegative && keepClickProved → pass, else FAIL
+ * Rewired into this table (no leftover ad-hoc pass/fail):
+ * - classifyCase capture/keep/G1/G3/G4/G5 status → evaluateProof(id)
+ * - recheckLateMissXfails → end-window-recheck
+ * - recheckCaptureDownloads → end-download-recheck
+ * - checkG3/checkG5 exact-line counts → capture.exactPositive
+ * - harness captureLinesSince type===prompt|enqueue → classifyCaptureLinesForCase
+ * - unread host/fixture/downloads logs → asEvidence / *Ok flags (FAIL named)
+ */
+export const PROOF_RULES = Object.freeze([
+  Object.freeze({
+    id: 'capture',
+    evidence: Object.freeze(['mock-host log line for this case (payload.url, suggestedFilename, source.entryPoint, receivedAt in window)']),
+    cause: 'exactly one prompt_download for this case URL+filename+entryPoint=browser_download with accepted reply (ok, type=accepted, echoed requestId)',
+    missingDefault: 'FAIL: mock-host log missing/empty/unreadable/ambiguous, or a capture line for another URL/filename/entryPoint',
+    check: checkCapture,
+  }),
+  Object.freeze({
+    id: 'keep',
+    evidence: Object.freeze([
+      'mock-host log (this case window; must be zero capture lines)',
+      'fixture serve log entry for this case path+nonce+attempt',
+      'chrome.downloads item matched by this-case path+nonce+attempt OR DOM document.URL / fetch marker for this path+nonce+attempt',
+    ]),
+    cause: 'zero prompt_download/enqueue_download AND a completed this-case fixture serve (file keeps) AND this-attempt keep evidence (complete download, page render, or fetch marker)',
+    missingDefault: 'FAIL: mock-host/fixture/DOM/chrome.downloads missing, other-case path, or no this-attempt keep evidence',
+    check: checkKeep,
+  }),
+  Object.freeze({
+    id: 'stop',
+    evidence: Object.freeze(['chrome.downloads.search items matched by url OR finalUrl in this click\'s wanted set']),
+    cause: 'no matching item (erased by the extension) OR every match interrupted with error===USER_CANCELED (chrome.downloads.cancel)',
+    missingDefault: 'FAIL: search not read/errored/unreadable, in_progress, complete, or any other interrupt reason named',
+    check: checkStop,
+  }),
+  Object.freeze({
+    id: 'end-window-recheck',
+    evidence: Object.freeze(['full mock-host log at end of run, filtered by this case startedAt and this case URL']),
+    cause: 'same capture predicate as the in-case drain: still empty → miss holds; exact prompt_download → XPASS; enqueue_download or wrong-shape line for this URL → FAIL',
+    missingDefault: 'FAIL: mock-host log missing/unreadable, or a this-URL capture line that is not exact prompt_download',
+    check: checkEndWindow,
+  }),
+  Object.freeze({
+    id: 'end-download-recheck',
+    evidence: Object.freeze(['end-of-run chrome.downloads.search, match url OR finalUrl']),
+    cause: 'stop rule still holds (erased or USER_CANCELED)',
+    missingDefault: 'FAIL: search not read/errored, or stop cause no longer holds (complete / other interrupt / in_progress)',
+    check: checkEndDownload,
+  }),
+  Object.freeze({
+    id: 'g1-miss',
+    evidence: Object.freeze(['mock-host log for this C1-family URL in the case window']),
+    cause: 'successfully read log with zero capture lines for this case (Chromium did not enqueue this URL)',
+    missingDefault: 'FAIL: log missing/unreadable, or a capture line for this URL that is not exact prompt_download',
+    check: (ctx) => checkMissGap('G1', ctx),
+  }),
+  Object.freeze({
+    id: 'g4-miss',
+    evidence: Object.freeze(['mock-host log for this C4-family URL in the case window']),
+    cause: 'successfully read log with zero capture lines for this case (Chromium did not enqueue this URL)',
+    missingDefault: 'FAIL: log missing/unreadable, or a capture line for this URL that is not exact prompt_download',
+    check: (ctx) => checkMissGap('G4', ctx),
+  }),
+  Object.freeze({
+    id: 'g3-false-grab',
+    evidence: Object.freeze(['mock-host log line for this-attempt POST URL']),
+    cause: 'exactly one prompt_download with url=this-attempt POST URL, suggestedFilename=posted.zip, entryPoint=browser_download',
+    missingDefault: 'FAIL: log missing/unreadable, other-case URL, superstring, wrong filename, or non-prompt type',
+    check: checkG3,
+  }),
+  Object.freeze({
+    id: 'g5-final-url',
+    evidence: Object.freeze([
+      'mock-host log line for origin+/C10/final+this-attempt query',
+      'chrome.downloads.search matched by url OR finalUrl',
+    ]),
+    cause: 'exactly one prompt_download with payload.url===final URL, accepted reply, AND stop (erased or USER_CANCELED)',
+    missingDefault: 'FAIL: log/search missing, evil/super/garbage URL, in_progress/complete, or other interrupt named',
+    check: checkG5,
+  }),
+]);
+
+export const PROOF_RULE_BY_ID = Object.freeze(Object.fromEntries(
+  PROOF_RULES.map((row) => [row.id, row]),
+));
+
+export function evaluateProof(id, ctx) {
+  const rule = PROOF_RULE_BY_ID[id];
+  if (!rule) {
+    return { ...failProof(`unknown proof rule ${id}`), id };
+  }
+  const result = rule.check(ctx);
+  return { ...result, id };
+}
+
+function gapProofId(gap) {
+  switch (gap) {
+    case 'G1':
+      return 'g1-miss';
+    case 'G4':
+      return 'g4-miss';
+    case 'G3':
+      return 'g3-false-grab';
+    case 'G5':
+      return 'g5-final-url';
+    default:
+      return null;
+  }
+}
+
+function applyProofFields(result, capture, stop) {
+  const prompt = capture?.matchLine
+    ?? firstPrompt(capture?.promptLines || [])
+    ?? capture?.enqueueLines?.[0]
+    ?? null;
+  if (prompt) {
+    result.capturedUrl = prompt.payload?.url ?? null;
+    result.suggestedFilename = prompt.payload?.suggestedFilename ?? null;
+    result.entryPoint = prompt.payload?.source?.entryPoint ?? null;
+    result.hostReceivedAt = prompt.receivedAt ?? null;
+    if (result.triggerAt != null && result.hostReceivedAt != null) {
+      result.latencyMs = result.hostReceivedAt - result.triggerAt;
+    }
+  }
+  result.observed = capture?.captured ? 'capture' : 'keep';
+  result.handoffAccepted = Boolean(prompt && isAcceptedReply(prompt));
+  result.downloadCompleted = Boolean(stop?.completed);
+  result.browserDownloadStopped = Boolean(stop?.ok || stop?.stopped);
+  result.downloadSearchError = Boolean(stop?.searchError);
+}
+
+/**
+ * Classify one matrix case. Every pass/fail is evaluateProof (PROOF_RULES).
  */
 export function classifyCase(input) {
   const {
@@ -425,10 +806,19 @@ export function classifyCase(input) {
     triggerAt,
     promptLines,
     enqueueLines,
+    hostLog,
+    hostLogOk,
+    hostLogReason,
     downloads,
+    downloadsOk,
+    downloadsReason,
     fixtureHits,
     fixtureServes,
+    fixtureServesOk,
+    fixtureServesReason,
     pageEvidence,
+    pageEvidenceOk,
+    pageEvidenceReason,
     playwrightDownload,
   } = input;
 
@@ -469,128 +859,109 @@ export function classifyCase(input) {
     return result;
   }
 
-  const capture = classifyCaptureLinesForCase(
-    [...(promptLines || []), ...(enqueueLines || [])],
-    { url: expectedUrl, filename: caseDef.filename },
+  const ctx = {
+    caseDef,
+    expectedUrl,
+    expectedFinalUrl: finalUrl,
+    filename: caseDef.filename,
+    nonce,
+    attempt,
     startedAt,
-  );
-  const matchLine = capture.matchLine;
-  const prompt = matchLine ?? firstPrompt(capture.promptLines) ?? capture.enqueueLines[0] ?? null;
-  if (prompt) {
-    result.capturedUrl = prompt.payload?.url ?? null;
-    result.suggestedFilename = prompt.payload?.suggestedFilename ?? null;
-    result.entryPoint = prompt.payload?.source?.entryPoint ?? null;
-    result.hostReceivedAt = prompt.receivedAt ?? null;
-    if (result.triggerAt != null && result.hostReceivedAt != null) {
-      result.latencyMs = result.hostReceivedAt - result.triggerAt;
-    }
-  }
+    triggerAt,
+    promptLines,
+    enqueueLines,
+    hostLog,
+    hostLogOk,
+    hostLogReason,
+    downloads,
+    downloadsOk,
+    downloadsReason,
+    fixtureHits,
+    fixtureServes,
+    fixtureServesOk,
+    fixtureServesReason,
+    pageEvidence,
+    pageEvidenceOk,
+    pageEvidenceReason,
+    playwrightDownload,
+  };
+
+  const snap = captureSnapshot(ctx);
+  const capture = snap.capture || {
+    captureLines: [],
+    promptLines: [],
+    enqueueLines: [],
+    matchLine: null,
+    captured: false,
+    exactPositive: false,
+  };
+  const prompt = capture.matchLine ?? firstPrompt(capture.promptLines) ?? capture.enqueueLines[0] ?? null;
   result.fidelity = fidelityFor(caseDef, prompt, expectedUrl, pageUrl, nonce);
   if (caseDef.fidelity.postBody && result.fidelity.postBody === 'fail') {
     result.reason = [result.reason, 'protocol has no POST body field'].filter(Boolean).join('; ');
   }
 
-  const captured = capture.captured;
-  result.observed = captured ? 'capture' : 'keep';
-
-  const exactPositiveLine = capture.exactPositive;
-  const exactNegative = capture.promptLines.length === 0 && capture.enqueueLines.length === 0;
-  const accepted = Boolean(prompt && isAcceptedReply(prompt));
-  const stop = browserDownloadStoppedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
-  const completed = stop.completed;
-  const stopped = stop.stopped;
-  const fullHandoff = exactPositiveLine && Boolean(matchLine && isAcceptedReply(matchLine)) && stopped;
+  ctx.capturedUrl = prompt?.payload?.url ?? null;
+  ctx.urls = [expectedUrl, ctx.capturedUrl, finalUrl];
+  const stop = evaluateProof('stop', ctx);
+  applyProofFields(result, capture, stop);
 
   const gap = caseDef.xfail?.gap ?? '';
-  const missGaps = new Set(['G1', 'G4']);
-  const falseGrabGaps = new Set(['G3']);
-  const finalUrlGaps = new Set(['G5']);
-
-  const exactFalseGrab = capture.promptLines.length === 1
-    && capture.enqueueLines.length === 0
-    && exactPromptMatch(capture.promptLines[0], {
-      url: expectedUrl,
-      filename: caseDef.filename,
-      startedAt,
-    });
-
-  const exactFinalCapture = capture.promptLines.length === 1
-    && capture.enqueueLines.length === 0
-    && exactPromptMatch(capture.promptLines[0], {
-      url: finalUrl,
-      filename: caseDef.filename,
-      startedAt,
-    });
+  const gapId = gapProofId(gap);
 
   if (caseDef.xfail) {
-    if (missGaps.has(gap) && exactPositiveLine) {
-      result.status = 'XPASS';
-      result.reason = `xfail ${caseDef.xfail.gap} passed`;
-    } else if (caseDef.expect === 'capture' && fullHandoff) {
-      result.status = 'XPASS';
-      result.reason = `xfail ${caseDef.xfail.gap} passed`;
-    } else if (caseDef.expect === 'keep' && exactNegative) {
-      result.status = 'XPASS';
-      result.reason = `xfail ${caseDef.xfail.gap} passed`;
-    } else if (missGaps.has(gap) && result.observed === 'keep' && caseDef.expect === 'capture') {
-      result.status = 'xfail';
-      result.reason = caseDef.xfail.reason;
-    } else if (falseGrabGaps.has(gap) && exactFalseGrab) {
-      result.status = 'xfail';
-      result.reason = caseDef.xfail.reason;
-    } else if (finalUrlGaps.has(gap) && exactFinalCapture && accepted && stopped) {
-      result.status = 'xfail';
-      result.reason = caseDef.xfail.reason;
-    } else if (finalUrlGaps.has(gap) && exactFinalCapture && accepted && !stopped) {
+    if (!gapId) {
       result.status = 'FAIL';
-      result.reason = stop.reason
-        || `xfail ${caseDef.xfail.gap} failed for a different reason (timeout/harness/wrong line)`;
+      result.reason = `xfail ${gap} has no proof rule`;
+    } else if (gapId === 'g1-miss' || gapId === 'g4-miss') {
+      const miss = evaluateProof(gapId, ctx);
+      result.status = miss.verdict;
+      result.reason = miss.reason;
+      if (miss.capture) applyProofFields(result, miss.capture, stop);
+    } else if (gapId === 'g3-false-grab') {
+      const g3 = evaluateProof('g3-false-grab', ctx);
+      result.status = g3.verdict;
+      result.reason = g3.reason;
+      if (g3.capture) applyProofFields(result, g3.capture, stop);
+    } else if (gapId === 'g5-final-url') {
+      const cap = evaluateProof('capture', ctx);
+      if (cap.ok && stop.ok) {
+        result.status = 'XPASS';
+        result.reason = `xfail ${gap} passed`;
+        applyProofFields(result, cap.capture || capture, stop);
+      } else {
+        const g5 = evaluateProof('g5-final-url', ctx);
+        result.status = g5.verdict;
+        result.reason = g5.reason;
+        applyProofFields(result, g5.capture || capture, g5.ok ? g5 : stop);
+      }
     } else {
       result.status = 'FAIL';
-      result.reason = `xfail ${caseDef.xfail.gap} failed for a different reason (timeout/harness/wrong line)`;
+      result.reason = `xfail ${gap} has no proof rule`;
     }
   } else if (caseDef.expect === 'capture') {
-    if (fullHandoff) {
+    const cap = evaluateProof('capture', ctx);
+    if (cap.ok && stop.ok) {
       result.status = 'pass';
+      result.reason = null;
     } else {
       result.status = 'FAIL';
       const bits = [];
-      if (!exactPositiveLine) {
-        bits.push(`expected one prompt_download url=${expectedUrl} filename=${caseDef.filename} entryPoint=browser_download; got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`);
-      }
-      if (exactPositiveLine && !accepted) {
-        bits.push('missing or wrong accepted reply (ok, type=accepted, echoed requestId)');
-      }
-      if (exactPositiveLine && !stopped) {
-        bits.push(stop.reason || 'browser download was not shown stopped (erased or USER_CANCELED)');
-      }
-      result.reason = bits.join('; ') || 'capture failed';
+      if (!cap.ok) bits.push(cap.reason);
+      if (cap.ok && !stop.ok) bits.push(stop.reason);
+      result.reason = bits.filter(Boolean).join('; ') || 'capture failed';
     }
+    applyProofFields(result, cap.capture || capture, stop);
   } else {
-    const proof = keepClickProved(caseDef, {
-      hits: fixtureHits,
-      fixtureServes,
-      downloads,
-      pageEvidence,
-      nonce,
-      attempt,
-      playwrightDownload: Boolean(playwrightDownload),
-      triggerAt,
-    });
-    if (exactNegative && proof.ok) {
-      result.status = 'pass';
-    } else {
-      result.status = 'FAIL';
-      result.reason = exactNegative
-        ? (proof.reason || 'keep click not proved')
-        : `expected keep (zero capture lines); got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`;
-    }
+    const keep = evaluateProof('keep', ctx);
+    result.status = keep.verdict;
+    result.reason = keep.reason;
+    applyProofFields(result, keep.capture || capture, stop);
   }
 
-  result.handoffAccepted = accepted;
-  result.downloadCompleted = completed;
-  result.browserDownloadStopped = stopped;
-  result.downloadSearchError = stop.searchError;
+  if (caseDef.fidelity.postBody && result.fidelity.postBody === 'fail') {
+    result.reason = [result.reason, 'protocol has no POST body field'].filter(Boolean).join('; ');
+  }
   return result;
 }
 
@@ -609,47 +980,62 @@ export function invalidateNegatives(items, reason) {
 }
 
 export function recheckLateMissXfails(results, hostLog) {
+  const ev = asEvidence(hostLog, 'mock-host log');
   for (const item of results) {
     if (item.status !== 'xfail') continue;
     if (!item.gap || !['G1', 'G4'].includes(item.gap)) continue;
-    const capture = classifyCaptureLinesForCase(hostLog, item, item.startedAt, { matchUrl: true });
-    if (!capture.captured) continue;
-    const first = capture.matchLine ?? capture.captureLines[0];
-    item.observed = 'capture';
-    item.capturedUrl = first?.payload?.url ?? null;
-    item.suggestedFilename = first?.payload?.suggestedFilename ?? null;
-    item.entryPoint = first?.payload?.source?.entryPoint ?? null;
-    item.hostReceivedAt = first?.receivedAt ?? null;
-    if (item.triggerAt != null && item.hostReceivedAt != null) {
-      item.latencyMs = item.hostReceivedAt - item.triggerAt;
+    const proof = evaluateProof('end-window-recheck', {
+      caseDef: { filename: item.filename, xfail: { gap: item.gap, reason: item.reason } },
+      expectedUrl: item.expectedUrl,
+      filename: item.filename,
+      startedAt: item.startedAt,
+      hostLog: ev.ok ? ev.items : { ok: false, reason: ev.reason },
+      hostLogOk: ev.ok,
+      hostLogReason: ev.reason,
+      gap: item.gap,
+      item,
+      matchUrl: true,
+    });
+    if (proof.verdict === 'xfail' && proof.ok) continue;
+    const capture = proof.capture;
+    const first = capture?.matchLine ?? capture?.captureLines?.[0];
+    if (first) {
+      item.observed = 'capture';
+      item.capturedUrl = first?.payload?.url ?? null;
+      item.suggestedFilename = first?.payload?.suggestedFilename ?? null;
+      item.entryPoint = first?.payload?.source?.entryPoint ?? null;
+      item.hostReceivedAt = first?.receivedAt ?? null;
+      if (item.triggerAt != null && item.hostReceivedAt != null) {
+        item.latencyMs = item.hostReceivedAt - item.triggerAt;
+      }
     }
-    if (capture.exactPositive) {
-      item.status = 'XPASS';
-      item.reason = `xfail ${item.gap} passed`;
-    } else {
-      item.status = 'FAIL';
-      item.reason = `xfail ${item.gap} failed for a different reason (timeout/harness/wrong line)`;
-    }
+    item.status = proof.verdict;
+    item.reason = proof.reason;
   }
 }
 
 export function recheckCaptureDownloads(results, downloads) {
+  const ev = asEvidence(downloads, 'chrome.downloads.search');
   for (const item of results) {
     if (item.skip || item.status === 'INVALID') continue;
     const captureRow = item.expect === 'capture'
       && item.observed === 'capture'
       && (item.status === 'pass' || item.status === 'xfail' || item.status === 'XPASS');
     if (!captureRow) continue;
-    const stop = browserDownloadStoppedFor(downloads, [
-      item.expectedUrl,
-      item.capturedUrl,
-      item.expectedFinalUrl,
-    ]);
-    if (stop.stopped) continue;
+    const stop = evaluateProof('end-download-recheck', {
+      expectedUrl: item.expectedUrl,
+      capturedUrl: item.capturedUrl,
+      expectedFinalUrl: item.expectedFinalUrl,
+      downloads: ev.ok ? ev.items : downloads,
+      downloadsOk: ev.ok || Boolean(ev.searchError),
+      downloadsReason: ev.reason,
+      urls: [item.expectedUrl, item.capturedUrl, item.expectedFinalUrl],
+    });
+    if (stop.ok) continue;
     item.status = 'FAIL';
-    item.downloadCompleted = stop.completed;
+    item.downloadCompleted = Boolean(stop.completed);
     item.browserDownloadStopped = false;
-    item.downloadSearchError = stop.searchError;
+    item.downloadSearchError = Boolean(stop.searchError);
     item.reason = stop.reason
       || (item.gap
         ? `xfail ${item.gap} failed for a different reason (timeout/harness/wrong line)`

@@ -198,10 +198,18 @@ function run(mod, caseDef, extra) {
     triggerAt: extra.triggerAt ?? triggerAt,
     promptLines: extra.promptLines || [],
     enqueueLines: extra.enqueueLines || [],
+    hostLog: extra.hostLog,
+    hostLogOk: extra.hostLogOk,
+    hostLogReason: extra.hostLogReason,
     downloads: extra.downloads || [],
+    downloadsOk: extra.downloadsOk,
+    downloadsReason: extra.downloadsReason,
     fixtureHits: extra.fixtureHits || [],
     fixtureServes: extra.fixtureServes || [],
+    fixtureServesOk: extra.fixtureServesOk,
+    fixtureServesReason: extra.fixtureServesReason,
     pageEvidence: extra.pageEvidence || { href: pageUrl, text: '', dataPage: caseDef.id },
+    pageEvidenceOk: extra.pageEvidenceOk,
     playwrightDownload: extra.playwrightDownload,
   });
 }
@@ -215,7 +223,8 @@ function check(id, title, { old: oldGot, next: newGot, oldWant, newWant }) {
   findings.push({ id, title, pass, oldGot, newGot });
   const fmt = (got) => {
     if (typeof got === 'string') return got;
-    return `${got.status}/obs=${got.observed}/url=${got.capturedUrl ?? ''}/file=${got.suggestedFilename ?? ''}/cookies=${got.fidelity?.cookies ?? ''}/postBody=${got.fidelity?.postBody ?? ''}`;
+    const reason = got.reason ? `/reason=${got.reason}` : '';
+    return `${got.status}/obs=${got.observed}/url=${got.capturedUrl ?? ''}/file=${got.suggestedFilename ?? ''}/cookies=${got.fidelity?.cookies ?? ''}/postBody=${got.fidelity?.postBody ?? ''}${reason}`;
   };
   console.log(
     `${pass ? 'PASS' : 'FAIL'} ${id} ${title}\n  old=${fmt(oldGot)}\n  new=${fmt(newGot)}`,
@@ -1150,6 +1159,542 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     oldWant: (r) => r.status === 'xfail',
     newWant: (r) => r.status === 'XPASS',
   });
+}
+
+function proofCheck(testId, title, proof, wantFn) {
+  check(testId, title, {
+    old: { status: 'n/a', observed: '', capturedUrl: '', suggestedFilename: '', fidelity: {} },
+    next: {
+      status: proof.verdict,
+      observed: proof.ok ? 'ok' : 'fail',
+      capturedUrl: proof.capture?.matchLine?.payload?.url ?? '',
+      suggestedFilename: proof.capture?.matchLine?.payload?.suggestedFilename ?? '',
+      fidelity: {},
+      reason: proof.reason,
+    },
+    oldWant: () => true,
+    newWant: () => wantFn(proof),
+  });
+}
+
+function failNamed(proof, needle) {
+  return proof.verdict === 'FAIL' && proof.ok === false && String(proof.reason || '').includes(needle);
+}
+
+function passOk(proof, verdict = 'pass') {
+  return proof.ok === true && proof.verdict === verdict;
+}
+
+{
+  console.log('PROOF_RULES');
+  for (const row of fixed.PROOF_RULES) {
+    console.log(`  ${row.id}`);
+    console.log(`    evidence: ${row.evidence.join('; ')}`);
+    console.log(`    cause: ${row.cause}`);
+    console.log(`    default: ${row.missingDefault}`);
+  }
+}
+
+{
+  const ctx = {
+    caseDef: c2Def(),
+    expectedUrl: c2Url,
+    filename: 'setup.exe',
+    startedAt,
+    promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+    hostLogOk: true,
+  };
+  proofCheck('R8-capture-honest', 'capture exact prompt+accepted passes',
+    fixed.evaluateProof('capture', ctx),
+    (p) => passOk(p, 'pass'));
+}
+
+{
+  proofCheck('R8-capture-mutant-missing', 'capture unread host log FAILs named',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-capture-mutant-other-case', 'capture other-case URL FAILs',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'setup.exe' })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'expected one prompt_download'));
+}
+
+{
+  proofCheck('R8-capture-mutant-no-accepted', 'capture without accepted reply FAILs',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({
+        url: c2Url,
+        filename: 'setup.exe',
+        reply: { hello: 'wrong-shape' },
+      })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'accepted reply'));
+}
+
+{
+  const downloads = [{
+    id: 1,
+    state: 'complete',
+    url: n1Url,
+    startTime: new Date(triggerAt).toISOString(),
+  }];
+  proofCheck('R8-keep-honest', 'keep zero capture + this-attempt serve+download passes',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: true,
+      downloads,
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+      pageEvidence: { href: n1Url, text: 'html', dataPage: 'N1-target' },
+      pageEvidenceOk: true,
+    }),
+    (p) => passOk(p, 'pass'));
+}
+
+{
+  proofCheck('R8-keep-mutant-missing', 'keep unread host log FAILs named',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      downloads: [],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      pageEvidence: { href: n1Url },
+      pageEvidenceOk: true,
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-keep-mutant-other-case', 'keep N6 serve does not prove N1',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: true,
+      downloads: [{
+        id: 1,
+        state: 'complete',
+        url: `${origin}/N6?nonce=${nonce}&attempt=${attempt}`,
+        startTime: new Date(triggerAt).toISOString(),
+      }],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N6')],
+      fixtureServesOk: true,
+      fixtureHits: [{ pathname: '/N6', nonce, attempt }],
+      pageEvidence: { href: `${origin}/N6?nonce=${nonce}&attempt=${attempt}` },
+      pageEvidenceOk: true,
+    }),
+    (p) => p.verdict === 'FAIL' && p.ok === false);
+}
+
+{
+  proofCheck('R8-keep-mutant-capture-line', 'keep with a capture line FAILs',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [promptLine({ url: n1Url, filename: 'x' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      pageEvidence: { href: n1Url },
+      pageEvidenceOk: true,
+    }),
+    (p) => failNamed(p, 'expected keep'));
+}
+
+{
+  proofCheck('R8-stop-honest', 'stop USER_CANCELED for this URL passes',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'pass') && p.stopped === true);
+}
+
+{
+  proofCheck('R8-stop-mutant-complete', 'stop complete is state-without-cause FAIL',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'complete', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-stop-mutant-missing', 'stop unread search FAILs named',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [],
+      downloadsOk: false,
+      downloadsReason: 'chrome.downloads.search not read',
+    }),
+    (p) => failNamed(p, 'chrome.downloads.search not read'));
+}
+
+{
+  proofCheck('R8-stop-mutant-network-failed', 'stop NETWORK_FAILED is wrong-cause FAIL',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'NETWORK_FAILED'));
+}
+
+{
+  proofCheck('R8-stop-mutant-other-cancel-this-complete', 'other URL USER_CANCELED does not prove this complete',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [
+        { id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c9Url },
+        { id: 2, state: 'complete', url: c2Url },
+      ],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-end-window-recheck-honest', 'end-window empty miss holds as xfail',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: [],
+      hostLogOk: true,
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-end-window-recheck-mutant-missing', 'end-window unread log FAILs named',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: { ok: false, reason: 'mock-host log missing', items: [] },
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  const enq = {
+    receivedAt: startedAt + 50,
+    type: 'enqueue_download',
+    payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+  };
+  proofCheck('R8-end-window-recheck-mutant-enqueue', 'end-window enqueue for this URL FAILs',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: [enq],
+      hostLogOk: true,
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-end-download-recheck-honest', 'end-download erased still holds',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      capturedUrl: c2Url,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'pass') && p.stopped === true);
+}
+
+{
+  proofCheck('R8-end-download-recheck-mutant-complete', 'end-download later complete FAILs',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      capturedUrl: c2Url,
+      downloads: [{ id: 1, state: 'complete', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-end-download-recheck-mutant-missing', 'end-download unread search FAILs named',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      downloads: [],
+      downloadsOk: false,
+      downloadsReason: 'chrome.downloads.search not read',
+    }),
+    (p) => failNamed(p, 'chrome.downloads.search not read'));
+}
+
+{
+  proofCheck('R8-g1-miss-honest', 'g1 empty log after successful read is xfail',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      promptLines: [],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g1-miss-mutant-missing', 'g1 unread log FAILs named',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g1-miss-mutant-other-shape', 'g1 this-URL enqueue is FAIL not xfail',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      enqueueLines: [{
+        receivedAt: startedAt + 50,
+        type: 'enqueue_download',
+        payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+      }],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-g4-miss-honest', 'g4 empty log after successful read is xfail',
+    fixed.evaluateProof('g4-miss', {
+      caseDef: c4Def(),
+      expectedUrl: c4Url,
+      filename: 'get',
+      startedAt,
+      promptLines: [],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g4-miss-mutant-missing', 'g4 unread log FAILs named',
+    fixed.evaluateProof('g4-miss', {
+      caseDef: c4Def(),
+      expectedUrl: c4Url,
+      filename: 'get',
+      startedAt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-honest', 'g3 exact this-attempt POST is xfail',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-mutant-other-case', 'g3 other-case URL FAILs',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-mutant-missing', 'g3 unread log FAILs named',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g5-final-url-honest', 'g5 exact final+accepted+erased is xfail',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-network-failed', 'g5 NETWORK_FAILED is state-without-cause FAIL',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'NETWORK_FAILED'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-missing', 'g5 unread host log FAILs named',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-original-url', 'g5 original URL is wrong-cause FAIL',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Original, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  console.log('PROOF_RULES coverage');
+  let coverageFail = false;
+  for (const row of fixed.PROOF_RULES) {
+    const honest = findings.filter((item) => item.id.startsWith(`R8-${row.id}-honest`));
+    const mutant = findings.filter((item) => item.id.startsWith(`R8-${row.id}-mutant`));
+    const honestIds = honest.map((item) => item.id).join(',') || 'MISSING';
+    const mutantIds = mutant.map((item) => item.id).join(',') || 'MISSING';
+    console.log(`  ${row.id}: honest=${honestIds} mutant=${mutantIds}`);
+    if (honest.length === 0 || mutant.length === 0) coverageFail = true;
+  }
+  if (coverageFail) {
+    findings.push({
+      id: 'R8-coverage',
+      title: 'every PROOF_RULES row needs ≥1 honest pass and ≥1 mutant FAIL',
+      pass: false,
+      oldGot: 'n/a',
+      newGot: 'incomplete coverage',
+    });
+    console.log('FAIL R8-coverage every PROOF_RULES row needs ≥1 honest pass and ≥1 mutant FAIL');
+  } else {
+    findings.push({
+      id: 'R8-coverage',
+      title: 'every PROOF_RULES row has honest+mutant',
+      pass: true,
+      oldGot: 'n/a',
+      newGot: 'complete',
+    });
+    console.log('PASS R8-coverage every PROOF_RULES row has honest+mutant');
+  }
 }
 
 const failed = findings.filter((row) => !row.pass);
