@@ -73,6 +73,9 @@ export function browserEnv({ isolatedHome, runDir, nodeBin = process.execPath })
     RUN_DIR: runDir,
     VERIFY_RUN_DIR: runDir,
     NODE_BIN: nodeBin,
+    EXT_ATTACK: process.env.EXT_ATTACK || '',
+    EXT_ATTACK_DELAY_MS: process.env.EXT_ATTACK_DELAY_MS || '',
+    EXT_CLASSIFIER: process.env.EXT_CLASSIFIER || '',
     PATH: `${path.dirname(nodeBin)}:${process.env.PATH || '/usr/bin:/bin'}`,
   };
 }
@@ -155,6 +158,39 @@ export function captureLinesSince(runDir, startMs) {
     line.receivedAt >= startMs
     && (line.type === 'prompt_download' || line.type === 'enqueue_download')
   ));
+}
+
+export function readFixtureHits(runDir) {
+  const logPath = path.join(runDir, 'fixture-requests.jsonl');
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function drainCaptureLines(runDir, startedAt, { minWaitMs = 0, quietMs = 0, maxWaitMs = 0 } = {}) {
+  const t0 = Date.now();
+  if (minWaitMs > 0) await sleep(minWaitMs);
+  if (maxWaitMs <= 0) return captureLinesSince(runDir, startedAt);
+  let lastSig = `${captureLinesSince(runDir, startedAt).length}`;
+  let quietFrom = Date.now();
+  while (Date.now() - t0 < maxWaitMs) {
+    await sleep(50);
+    const lines = captureLinesSince(runDir, startedAt);
+    const sig = `${lines.length}:${lines.at(-1)?.receivedAt ?? 0}`;
+    if (sig !== lastSig) {
+      lastSig = sig;
+      quietFrom = Date.now();
+    } else if (quietMs <= 0 || Date.now() - quietFrom >= quietMs) {
+      break;
+    }
+  }
+  return captureLinesSince(runDir, startedAt);
 }
 
 export function percentile(values, p) {

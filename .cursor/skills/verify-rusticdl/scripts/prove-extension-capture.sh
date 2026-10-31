@@ -120,6 +120,9 @@ export VERIFY_RUN_DIR
 export EXT_CASE="${CASE_ID}"
 export EXT_LIVE="${LIVE}"
 cd "${EXT_ROOT}"
+if [[ "${EXT_SKIP_SELFTEST:-}" != "1" ]]; then
+  node "${EXT_ROOT}/e2e/selftest-classifier.mjs"
+fi
 set +e
 npx playwright test -c e2e/playwright.config.ts
 PW_RC=$?

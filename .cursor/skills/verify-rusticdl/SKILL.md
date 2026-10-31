@@ -209,7 +209,7 @@ The prove script checks the fixture pid owns the port, the unpacked Chromium dis
 .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
 ```
 
-Each case is a real click on `[data-case=Cn]`. Ask-mode positives must be exactly one `prompt_download` with exact `payload.url`, `payload.suggestedFilename`, and `payload.source.entryPoint == "browser_download"`. Negatives wait 5 s for zero capture lines plus `chrome.downloads.search({})`. Every negative batch and the whole run ends with sentinel C2.
+Each case is a real click on `[data-case=Cn]`. Ask-mode positives must be exactly one `prompt_download` with exact `payload.url`, `payload.suggestedFilename`, and `payload.source.entryPoint == "browser_download"`, an `accepted` host reply, and the browser item erased or cancelled (not `state: complete`). Negatives wait 5 s for zero capture lines, a fixture hit for that attempt, and `chrome.downloads.search({})` or page-render proof. Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round's negatives. G1/G4 miss-xfails drain a quiet window and re-check the host log at end of run.
 
 ### Evidence
 
@@ -232,10 +232,14 @@ Recipe detail: `features/extension-capture.md`.
 | `scripts/prove-download-engine.sh` | Headless proof of the `download-engine` feature (local HTTP fixture) |
 | `scripts/engine_http_server.py` | Fixture server used by `prove-download-engine.sh` |
 | `scripts/engine_drive.rs` | Engine driver source compiled by `prove-download-engine.sh` |
-| `scripts/prove-extension-capture.sh` | Chromium extension capture matrix against the mock native host |
-| `scripts/ext-fixture-server.mjs` | Per-case HTTP fixture (127.0.0.1 and localhost) |
-| `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock |
+| `scripts/prove-extension-capture.sh` | Chromium extension capture matrix against the mock native host (runs `e2e/selftest-classifier.mjs` first) |
+| `scripts/ext-fixture-server.mjs` | Per-case HTTP fixture (127.0.0.1 and localhost); logs hits to `fixture-requests.jsonl` |
+| `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock; logs the reply next to each request |
 | `scripts/ext-cases.json` | Capture matrix rows (`id, route, trigger, expect, url, filename, xfail`) |
+| `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
+| `apps/extension/e2e/classify.mjs` | Matrix classifier (exact G3/G5 match, accepted handoff, keep proof, late recheck) |
+| `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot for red/green self-tests (`EXT_CLASSIFIER=legacy`) |
+| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9 attacks against both classifiers |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 

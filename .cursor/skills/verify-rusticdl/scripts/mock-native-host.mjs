@@ -2,10 +2,14 @@
 /**
  * Length-prefixed native-messaging mock for the extension capture harness.
  * Speaks the same SuccessResponse shape as packages/protocol (pong / accepted).
- * Logs every fully-read request to $RUN_DIR/host-log.jsonl with receivedAt (epoch ms).
+ * Logs every fully-read request to $RUN_DIR/host-log.jsonl with receivedAt (epoch ms)
+ * and the reply actually written back (proof of accepted vs missing/wrong shape).
+ *
+ * EXT_ATTACK loads apps/extension/e2e/ext-attack.mjs (test-only; never product code).
  */
 import { appendFileSync, mkdirSync, writeSync, readSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const RUN_DIR = process.env.RUN_DIR || process.env.VERIFY_RUN_DIR;
 if (!RUN_DIR) {
@@ -20,6 +24,12 @@ mkdirSync(RUN_DIR, { recursive: true });
 const STDIN_FD = 0;
 const STDOUT_FD = 1;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
+
+const here = dirname(fileURLToPath(import.meta.url));
+const attackModulePath = join(here, '../../../../apps/extension/e2e/ext-attack.mjs');
+const applyHostAttack = process.env.EXT_ATTACK
+  ? (await import(pathToFileURL(attackModulePath).href)).applyHostAttack
+  : null;
 
 function readExact(fd, size) {
   const buf = Buffer.alloc(size);
@@ -97,18 +107,23 @@ function respond(request) {
   };
 }
 
-function logRequest(request, receivedAt) {
+function logRequest(request, receivedAt, reply) {
   const line = {
     receivedAt,
     protocolVersion: request.protocolVersion,
     requestId: request.requestId,
     type: request.type,
     payload: request.payload ?? {},
+    ...(reply !== undefined ? { reply } : {}),
   };
   appendFileSync(logPath, `${JSON.stringify(line)}\n`, 'utf8');
 }
 
-process.stderr.write(`mock-native-host: start log=${logPath}\n`);
+process.stderr.write(`mock-native-host: start log=${logPath} attack=${process.env.EXT_ATTACK || ''}\n`);
+
+if (process.env.EXT_ATTACK === 'kill-immediate') {
+  process.exit(0);
+}
 
 try {
   while (true) {
@@ -132,11 +147,28 @@ try {
       });
       continue;
     }
-    logRequest(request, receivedAt);
+    if (applyHostAttack) {
+      const handled = applyHostAttack({
+        request,
+        receivedAt,
+        runDir: RUN_DIR,
+        logRequest,
+        writeMessage,
+        respond,
+      });
+      if (handled) {
+        process.stderr.write(
+          `mock-native-host: attack=${process.env.EXT_ATTACK} type=${String(request.type)} requestId=${String(request.requestId)}\n`,
+        );
+        continue;
+      }
+    }
+    const reply = respond(request);
+    logRequest(request, receivedAt, reply);
     process.stderr.write(
       `mock-native-host: received type=${String(request.type)} requestId=${String(request.requestId)} at=${receivedAt}\n`,
     );
-    writeMessage(respond(request));
+    writeMessage(reply);
   }
 } catch (error) {
   if (error && error.code === 'EOF') {

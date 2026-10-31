@@ -4,14 +4,20 @@
  * Listens on 127.0.0.1 and localhost (cross-origin pair). Node built-ins only.
  */
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 
 const PORT = Number(process.env.EXT_FIXTURE_PORT || 18765);
 const PIDFILE = process.env.EXT_FIXTURE_PIDFILE || '';
+const RUN_DIR = process.env.RUN_DIR || process.env.VERIFY_RUN_DIR || '';
 const BODY_64K = 64 * 1024;
 const BODY_3K = 3 * 1024;
 const BODY_200M = 200 * 1024 * 1024;
 const COOKIE_NAME = 'rusticdl_e2e';
+const HIT_LOG = RUN_DIR ? `${RUN_DIR}/fixture-requests.jsonl` : '';
+
+const attackMod = process.env.EXT_ATTACK
+  ? await import(new URL('../../../../apps/extension/e2e/ext-attack.mjs', import.meta.url).href)
+  : null;
 
 function bytes(size, fill = 0x41) {
   return Buffer.alloc(size, fill);
@@ -31,8 +37,35 @@ function withNonce(path, url) {
   return `${next.pathname}${next.search}`;
 }
 
+function cookieValue(nonce) {
+  if (attackMod?.cookieValueForNonce) return attackMod.cookieValueForNonce(nonce);
+  return nonce;
+}
+
 function cookieHeader(nonce) {
-  return `${COOKIE_NAME}=${nonce || 'missing'}; Path=/`;
+  const value = cookieValue(nonce);
+  return `${COOKIE_NAME}=${value || 'missing'}; Path=/`;
+}
+
+function logHit(req, url) {
+  if (!HIT_LOG) return;
+  mkdirSync(dirnameHit(HIT_LOG), { recursive: true });
+  const record = {
+    at: Date.now(),
+    method: req.method || 'GET',
+    href: url.href,
+    pathname: url.pathname,
+    search: url.search,
+    nonce: url.searchParams.get('nonce') || '',
+    attempt: url.searchParams.get('attempt') || '',
+    host: req.headers.host || '',
+  };
+  appendFileSync(HIT_LOG, `${JSON.stringify(record)}\n`);
+}
+
+function dirnameHit(filePath) {
+  const idx = filePath.lastIndexOf('/');
+  return idx === -1 ? '.' : filePath.slice(0, idx);
 }
 
 function send(res, status, headers, body) {
@@ -42,7 +75,7 @@ function send(res, status, headers, body) {
 
 function htmlPage(id, inner, nonce = '') {
   const cookieScript = nonce
-    ? `<script>document.cookie = "${COOKIE_NAME}=${nonce}; path=/";</script>`
+    ? `<script>document.cookie = "${COOKIE_NAME}=${cookieValue(nonce)}; path=/";</script>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -121,6 +154,9 @@ document.querySelector("[data-case=C8]").addEventListener("click", () => {
       return wrap(`<a data-case="C12" href="${localhostUrl.href}">C12 cross-origin</a>`);
     }
     case 'N1':
+      if (attackMod?.n1IsNoop?.()) {
+        return wrap(`<a data-case="N1" href="#" onclick="return false">N1 html page</a>`);
+      }
       return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>`);
     case 'N2':
       return wrap(`<a data-case="N2" href="${file('/N2')}">N2 inline pdf</a>`);
@@ -306,6 +342,10 @@ function onRequest(req, res) {
   const host = req.headers.host || `127.0.0.1:${PORT}`;
   const url = new URL(req.url || '/', `http://${host}`);
   const nonce = nonceOf(url);
+  logHit(req, url);
+  if (url.pathname === '/C1' && attackMod?.scheduleLateC1Inject && RUN_DIR) {
+    attackMod.scheduleLateC1Inject(RUN_DIR, url.href);
+  }
 
   if (url.pathname === '/health') {
     send(res, 200, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: true, pid: process.pid, port: PORT }));

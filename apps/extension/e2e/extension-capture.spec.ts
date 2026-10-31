@@ -10,16 +10,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   captureLinesSince,
+  drainCaptureLines,
   extensionPaths,
   isolateHome,
   launchExtensionContext,
   percentile,
   pingNativeHost,
+  readFixtureHits,
   readHostLog,
   searchDownloads,
   waitForServiceWorker,
   writeNativeHostManifest,
 } from './harness.mjs';
+import * as classifyFixed from './classify.mjs';
+import * as classifyLegacy from './classify.legacy.mjs';
+
+const classify = process.env.EXT_CLASSIFIER === 'legacy' ? classifyLegacy : classifyFixed;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const paths = extensionPaths(path.resolve(here, '..'));
@@ -68,6 +74,14 @@ type CaseResult = {
   entryPoint: string | null;
   fidelity: Record<string, 'pass' | 'fail' | 'n/a'>;
   invalid: boolean;
+  expectedUrl?: string;
+  expectedFinalUrl?: string | null;
+  startedAt?: number;
+  filename?: string | null;
+  attempt?: string;
+  nonce?: string;
+  handoffAccepted?: boolean;
+  downloadCompleted?: boolean;
 };
 
 function envOr(name: string, fallback: string): string {
@@ -95,43 +109,6 @@ function pageUrlFor(caseDef: CaseDef, origin: string, nonce: string, attempt: st
   return url.href;
 }
 
-function cookieInHandoff(payload: Record<string, unknown> | undefined, nonce: string): boolean {
-  if (!payload || typeof payload !== 'object') return false;
-  const auth = payload.handoffAuth as {
-    headers?: Array<{ name: string; value: string }>;
-    originAuth?: Array<{ origin: string; headers: Array<{ name: string; value: string }> }>;
-  } | undefined;
-  const blobs: Array<{ name: string; value: string }> = [];
-  for (const header of auth?.headers ?? []) blobs.push(header);
-  for (const origin of auth?.originAuth ?? []) blobs.push(...origin.headers);
-  return blobs.some((header) => (
-    header.name.toLowerCase() === 'cookie'
-    && header.value.includes('rusticdl_e2e=')
-    && header.value.includes(nonce)
-  ));
-}
-
-function fidelityFor(caseDef: CaseDef, line: Record<string, unknown> | null, expectedUrl: string, pageUrl: string, nonce: string) {
-  const flags = caseDef.fidelity;
-  const payload = (line?.payload ?? null) as Record<string, unknown> | null;
-  const source = (payload?.source ?? null) as Record<string, unknown> | null;
-  const result: Record<string, 'pass' | 'fail' | 'n/a'> = {};
-
-  result.cookies = flags.cookies
-    ? (payload && cookieInHandoff(payload, nonce) ? 'pass' : 'fail')
-    : 'n/a';
-  result.referrer = flags.referrer
-    ? (source && source.referrer === pageUrl ? 'pass' : 'fail')
-    : 'n/a';
-  result.postBody = flags.postBody
-    ? 'fail'
-    : 'n/a';
-  result.originalUrl = flags.originalUrl
-    ? (payload && payload.url === expectedUrl ? 'pass' : 'fail')
-    : 'n/a';
-  return result;
-}
-
 async function waitForCapture(runDir: string, startedAt: number, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -140,6 +117,19 @@ async function waitForCapture(runDir: string, startedAt: number, timeoutMs: numb
     await sleep(50);
   }
   return captureLinesSince(runDir, startedAt);
+}
+
+function persistResult(result: CaseResult, extra: Record<string, unknown> = {}) {
+  writeFileSync(
+    path.join(result.evidencePath, 'result.json'),
+    `${JSON.stringify({ ...result, ...extra }, null, 2)}\n`,
+  );
+}
+
+function logCase(evidenceId: string, result: CaseResult) {
+  console.log(
+    `${evidenceId}  ${result.status}  obs=${result.observed}  url=${result.capturedUrl ?? ''}  file=${result.suggestedFilename ?? ''}  ep=${result.entryPoint ?? ''}  reason=${result.reason ?? ''}`,
+  );
 }
 
 test('extension capture matrix', async () => {
@@ -208,37 +198,29 @@ test('extension capture matrix', async () => {
       const fallbackUrl = caseDef.id === 'C12'
         ? fileUrlFor(caseDef, fixtureLocalhost, nonce, attempt)
         : fileUrlFor(caseDef, fixtureOrigin, nonce, attempt);
-      const result: CaseResult = {
-        id: caseDef.id,
-        expect: caseDef.expect,
-        observed: 'keep',
-        status: 'FAIL',
-        gap: caseDef.xfail?.gap ?? null,
-        reason: null,
-        evidencePath: evidenceDir,
-        triggerAt: null,
-        hostReceivedAt: null,
-        latencyMs: null,
-        capturedUrl: null,
-        suggestedFilename: null,
-        entryPoint: null,
-        fidelity: {
-          cookies: caseDef.fidelity.cookies ? 'fail' : 'n/a',
-          referrer: caseDef.fidelity.referrer ? 'fail' : 'n/a',
-          postBody: caseDef.fidelity.postBody ? 'fail' : 'n/a',
-          originalUrl: caseDef.fidelity.originalUrl ? 'fail' : 'n/a',
-        },
-        invalid: false,
-      };
 
       if (caseDef.skip) {
-        result.observed = 'skip';
-        result.status = 'skip';
-        result.reason = caseDef.skip;
-        writeFileSync(path.join(evidenceDir, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
+        const skipped = classify.classifyCase({
+          caseDef,
+          expectedUrl: fallbackUrl,
+          expectedFinalUrl: null,
+          pageUrl,
+          nonce,
+          attempt,
+          startedAt: Date.now(),
+          triggerAt: null,
+          promptLines: [],
+          enqueueLines: [],
+          downloads: [],
+          fixtureHits: [],
+          pageEvidence: {},
+        }) as CaseResult;
+        skipped.evidencePath = evidenceDir;
+        persistResult(skipped, { expectedUrl: fallbackUrl, pageUrl, nonce, attempt });
         writeFileSync(path.join(evidenceDir, 'host-log.jsonl'), '');
         writeFileSync(path.join(evidenceDir, 'downloads.json'), '[]\n');
-        return result;
+        logCase(evidenceId, skipped);
+        return skipped;
       }
 
       const page = context.pages()[0] || await context.newPage();
@@ -256,28 +238,38 @@ test('extension capture matrix', async () => {
         if (raw) return new URL(raw, location.href).href;
         return '';
       }, caseDef.id) || fallbackUrl;
+      const expectedFinal = caseDef.id === 'C10'
+        ? classify.expectedFinalUrl(fixtureOrigin, nonce, attempt)
+        : null;
 
       const startedAt = Date.now();
       const triggerAt = await page.evaluate(() => Date.now());
-      result.triggerAt = triggerAt;
       const popupPromise = caseDef.trigger === 'target-blank'
         ? page.waitForEvent('popup', { timeout: 8_000 }).catch(() => null)
+        : Promise.resolve(null);
+      const downloadPromise = (caseDef.id === 'C5' || caseDef.id === 'C6')
+        ? page.waitForEvent('download', { timeout: 8_000 }).catch(() => null)
         : Promise.resolve(null);
 
       await locator.click({ timeout: 10_000 });
       await popupPromise;
+      const playwrightDownload = await downloadPromise;
 
       const missXfail = Boolean(caseDef.xfail && ['G1', 'G4'].includes(caseDef.xfail.gap));
       const keepWait = (caseDef.expect === 'keep' && !caseDef.xfail) || missXfail;
-      const waitMs = keepWait
-        ? matrix.negativeWaitMs
-        : caseDef.id === 'L1'
-          ? 20_000
-          : 10_000;
-      const captureWait = keepWait
-        ? sleep(waitMs).then(() => captureLinesSince(runDir, startedAt))
-        : waitForCapture(runDir, startedAt, waitMs);
-      const lines = await captureWait;
+      let lines;
+      if (missXfail) {
+        lines = await drainCaptureLines(runDir, startedAt, classify.MISS_DRAIN);
+      } else if (keepWait) {
+        lines = await drainCaptureLines(runDir, startedAt, {
+          minWaitMs: matrix.negativeWaitMs,
+          quietMs: 0,
+          maxWaitMs: matrix.negativeWaitMs,
+        });
+      } else {
+        const waitMs = caseDef.id === 'L1' ? 20_000 : 10_000;
+        lines = await waitForCapture(runDir, startedAt, waitMs);
+      }
       const hostSlice = readHostLog(runDir).filter((line) => line.receivedAt >= startedAt);
       writeFileSync(
         path.join(evidenceDir, 'host-log.jsonl'),
@@ -287,7 +279,22 @@ test('extension capture matrix', async () => {
       const promptLines = lines.filter((line) => line.type === 'prompt_download');
       const enqueueLines = lines.filter((line) => line.type === 'enqueue_download');
       const sw = context.serviceWorkers()[0] || worker;
-      const downloads = await searchDownloads(sw);
+      const matchPreview = promptLines.find((line) => (
+        (line.payload ?? {}).url === expectedUrl
+        || (expectedFinal && (line.payload ?? {}).url === expectedFinal)
+      ));
+      const trackedUrls = [expectedUrl, expectedFinal, matchPreview?.payload?.url].filter(Boolean);
+      let downloads = await searchDownloads(sw);
+      if (caseDef.expect === 'capture' && promptLines.length > 0) {
+        const settleUntil = Date.now() + 2000;
+        while (Date.now() < settleUntil) {
+          const items = Array.isArray(downloads) ? downloads : [];
+          const complete = items.some((item) => trackedUrls.includes(item.url) && item.state === 'complete');
+          if (!complete) break;
+          await sleep(50);
+          downloads = await searchDownloads(sw);
+        }
+      }
       writeFileSync(path.join(evidenceDir, 'downloads.json'), `${JSON.stringify(downloads, null, 2)}\n`);
 
       const shotPage = context.pages().at(-1) ?? page;
@@ -296,131 +303,110 @@ test('extension capture matrix', async () => {
       } catch {
         writeFileSync(path.join(evidenceDir, 'page.png.missing.txt'), 'screenshot failed\n');
       }
+      const pageEvidence = await shotPage.evaluate(() => ({
+        href: location.href,
+        title: document.title,
+        text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2000),
+        dataPage: document.querySelector('[data-page]')?.getAttribute('data-page') || null,
+      })).catch(() => ({ href: '', title: '', text: '', dataPage: null }));
 
-      const captured = promptLines.length + enqueueLines.length > 0;
-      result.observed = captured ? 'capture' : 'keep';
-      const matchLine = promptLines.find((line) => {
-        const payload = line.payload ?? {};
-        return payload.url === expectedUrl
-          && payload.suggestedFilename === caseDef.filename
-          && payload.source?.entryPoint === 'browser_download';
-      }) ?? null;
-      const firstPrompt = promptLines[0] ?? null;
-      if (firstPrompt) {
-        result.capturedUrl = firstPrompt.payload?.url ?? null;
-        result.suggestedFilename = firstPrompt.payload?.suggestedFilename ?? null;
-        result.entryPoint = firstPrompt.payload?.source?.entryPoint ?? null;
-        result.hostReceivedAt = firstPrompt.receivedAt ?? null;
-        if (result.triggerAt != null && result.hostReceivedAt != null) {
-          result.latencyMs = result.hostReceivedAt - result.triggerAt;
-        }
-      }
-      result.fidelity = fidelityFor(
+      const fixtureHits = readFixtureHits(runDir).filter((hit) => hit.attempt === attempt);
+      writeFileSync(path.join(evidenceDir, 'fixture-hits.json'), `${JSON.stringify(fixtureHits, null, 2)}\n`);
+
+      const classified = classify.classifyCase({
         caseDef,
-        (matchLine ?? firstPrompt) as Record<string, unknown> | null,
         expectedUrl,
+        expectedFinalUrl: expectedFinal,
         pageUrl,
         nonce,
-      );
-      if (caseDef.fidelity.postBody) {
-        result.fidelity.postBody = 'fail';
-        result.reason = [result.reason, 'protocol has no POST body field'].filter(Boolean).join('; ');
+        attempt,
+        startedAt,
+        triggerAt,
+        promptLines,
+        enqueueLines,
+        downloads,
+        fixtureHits,
+        pageEvidence,
+        playwrightDownload: Boolean(playwrightDownload),
+      }) as CaseResult;
+      classified.evidencePath = evidenceDir;
+      persistResult(classified, { expectedUrl, expectedFinalUrl: expectedFinal, pageUrl, nonce, attempt, pageEvidence });
+      if (classified.latencyMs != null && classified.observed === 'capture') {
+        latencies.push(classified.latencyMs);
       }
-
-      const exactPositive = Boolean(matchLine) && promptLines.length === 1 && enqueueLines.length === 0;
-      const exactNegative = promptLines.length === 0 && enqueueLines.length === 0;
-      const missGaps = new Set(['G1', 'G4']);
-      const falseGrabGaps = new Set(['G3']);
-      const finalUrlGaps = new Set(['G5']);
-      const gap = caseDef.xfail?.gap ?? '';
-
-      if (caseDef.xfail) {
-        const failedForReason = (
-          (missGaps.has(gap) && result.observed === 'keep' && caseDef.expect === 'capture')
-          || (falseGrabGaps.has(gap) && result.observed === 'capture' && caseDef.expect === 'keep')
-          || (
-            finalUrlGaps.has(gap)
-            && result.observed === 'capture'
-            && caseDef.expect === 'capture'
-            && typeof result.capturedUrl === 'string'
-            && result.capturedUrl.includes('/C10/final')
-            && result.suggestedFilename === caseDef.filename
-            && result.entryPoint === 'browser_download'
-          )
-        );
-        if (caseDef.expect === 'capture' && exactPositive) {
-          result.status = 'XPASS';
-          result.reason = `xfail ${caseDef.xfail.gap} passed`;
-        } else if (caseDef.expect === 'keep' && exactNegative) {
-          result.status = 'XPASS';
-          result.reason = `xfail ${caseDef.xfail.gap} passed`;
-        } else if (failedForReason) {
-          result.status = 'xfail';
-          result.reason = caseDef.xfail.reason;
-        } else {
-          result.status = 'FAIL';
-          result.reason = `xfail ${caseDef.xfail.gap} failed for a different reason (timeout/harness/wrong line)`;
-        }
-      } else if (caseDef.expect === 'capture') {
-        result.status = exactPositive ? 'pass' : 'FAIL';
-        if (!exactPositive) {
-          result.reason = `expected one prompt_download url=${expectedUrl} filename=${caseDef.filename} entryPoint=browser_download; got ${JSON.stringify(promptLines.concat(enqueueLines))}`;
-        }
-      } else {
-        result.status = exactNegative ? 'pass' : 'FAIL';
-        if (!exactNegative) {
-          result.reason = `expected keep (zero capture lines in ${matrix.negativeWaitMs}ms); got ${JSON.stringify(promptLines.concat(enqueueLines))}`;
-        }
-      }
-
-      if (result.latencyMs != null && result.observed === 'capture') {
-        latencies.push(result.latencyMs);
-      }
-      writeFileSync(path.join(evidenceDir, 'result.json'), `${JSON.stringify({ ...result, expectedUrl, pageUrl, nonce }, null, 2)}\n`);
-      return result;
+      logCase(evidenceId, classified);
+      return classified;
     };
 
-    const runSentinel = async (label: string): Promise<boolean> => {
+    const runSentinel = async (label: string): Promise<CaseResult> => {
       const sentinel = matrix.cases.find((row) => row.id === 'C2');
       if (!sentinel) throw new Error('C2 missing from ext-cases.json');
       const sent = await runCase(sentinel, label);
       results.push(sent);
-      return sent.status === 'pass' && sent.observed === 'capture';
+      return sent;
     };
 
     for (let round = 0; round < repeat; round += 1) {
       const suffix = repeat > 1 ? `-r${round + 1}` : '';
       const positives = selected.filter((row) => row.expect === 'capture' && !row.skip);
       const negatives = selected.filter((row) => row.expect === 'keep' && row.id !== 'C2');
+      const roundNegatives: CaseResult[] = [];
+      const roundCaptureAttempts: CaseResult[] = [];
 
       for (const row of positives) {
         if (row.id === 'C2') continue;
-        results.push(await runCase(row, `${row.id}${suffix}`));
+        const item = await runCase(row, `${row.id}${suffix}`);
+        results.push(item);
+        roundCaptureAttempts.push(item);
       }
       const c2 = selected.find((row) => row.id === 'C2');
-      if (c2) results.push(await runCase(c2, `C2${suffix}`));
+      if (c2) {
+        const item = await runCase(c2, `C2${suffix}`);
+        results.push(item);
+        roundCaptureAttempts.push(item);
+      }
 
-      const negativeIds: string[] = [];
       for (const row of negatives) {
         const item = await runCase(row, `${row.id}${suffix}`);
         results.push(item);
-        negativeIds.push(item.id);
+        roundNegatives.push(item);
       }
-      const sentinelOk = await runSentinel(`C2-sentinel-negatives${suffix}`);
-      if (!sentinelOk) {
-        for (const item of results) {
-          if (negativeIds.includes(item.id) && item.status === 'pass') {
-            item.status = 'INVALID';
-            item.invalid = true;
-            item.reason = 'sentinel C2 did not capture; negative keep is INVALID';
-            writeFileSync(path.join(item.evidencePath, 'result.json'), `${JSON.stringify(item, null, 2)}\n`);
-          }
+      const batchSentinel = await runSentinel(`C2-sentinel-negatives${suffix}`);
+      const hostDead = classify.hostFailedHandoff(roundCaptureAttempts.concat(batchSentinel));
+      const batchOk = classify.isSentinelOk(batchSentinel) && !hostDead;
+      const invalidateTargets = (roundItems: CaseResult[]) => (
+        classify.INVALIDATE_BY_REF
+          ? roundItems
+          : results.filter((item) => roundItems.some((row) => row.id === item.id))
+      );
+      if (!batchOk) {
+        classify.invalidateNegatives(
+          invalidateTargets(roundNegatives),
+          hostDead
+            ? 'missing or wrong accepted reply; negative keep is INVALID'
+            : 'sentinel C2 did not capture; negative keep is INVALID',
+        );
+        for (const item of invalidateTargets(roundNegatives)) persistResult(item);
+      }
+      const endSentinel = await runSentinel(`C2-sentinel-end${suffix}`);
+      const endOk = classify.isSentinelOk(endSentinel);
+      if (!endOk) {
+        if (classify.INVALIDATE_END_SENTINEL) {
+          classify.invalidateNegatives(
+            invalidateTargets(roundNegatives),
+            'end sentinel C2 did not capture; negative keep is INVALID',
+          );
+          for (const item of invalidateTargets(roundNegatives)) persistResult(item);
+        } else {
+          console.error('sentinel C2 at end of run did not capture');
         }
       }
-      const endOk = await runSentinel(`C2-sentinel-end${suffix}`);
-      if (!endOk) {
-        console.error('sentinel C2 at end of run did not capture');
-      }
+    }
+
+    if (classify.END_RECHECK) {
+      await drainCaptureLines(runDir, 0, classify.END_DRAIN);
+      classify.recheckLateMissXfails(results, readHostLog(runDir));
+      for (const item of results) persistResult(item);
     }
 
     if (live) {

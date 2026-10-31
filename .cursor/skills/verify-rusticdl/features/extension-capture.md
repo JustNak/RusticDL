@@ -4,10 +4,10 @@ The Chromium extension, under default settings (ask mode), either sends one `pro
 
 ## Sub-features
 
-- `ext-positive` — a user click on `[data-case=Cn]` for a capture case produces exactly one `prompt_download` with the fixture URL, suggested filename, and `source.entryPoint == "browser_download"`.
-- `ext-negative` — a keep case produces zero `prompt_download` / `enqueue_download` lines within 5 s, and `chrome.downloads.search({})` from the service worker shows the browser kept or rendered the item.
-- `ext-sentinel` — every negative batch and the whole run ends with C2; if that sentinel does not capture, those negatives are INVALID.
-- `ext-metrics` — the run writes `evidence/extension/metrics.json` and prints one `EXT-METRICS` line (capture rate, false-grab rate, click-to-host latency, payload fidelity).
+- `ext-positive` — a user click on `[data-case=Cn]` for a capture case produces exactly one `prompt_download` with the fixture URL, suggested filename, and `source.entryPoint == "browser_download"`, the host replies `accepted` (`ok`, `type`, echoed `requestId`), and `chrome.downloads.search({})` does not show that item in `state: complete` (erased or cancelled). A positive whose browser download completes is FAIL.
+- `ext-negative` — a keep case produces zero `prompt_download` / `enqueue_download` lines within 5 s. The click must have requested the item (a fixture-server hit for that attempt's nonce) and `chrome.downloads.search({})` or the rendered page must show the browser kept it. A no-op click is FAIL. A missing or wrong host `accepted` reply makes negatives INVALID.
+- `ext-sentinel` — every negative batch and the whole run ends with C2; if that sentinel does not capture, every preceding negative in that round is INVALID. Under `--repeat`, a failed sentinel invalidates only that round's negatives.
+- `ext-metrics` — the run writes `evidence/extension/metrics.json` and prints one `EXT-METRICS` line (capture rate, false-grab rate, click-to-host latency, payload fidelity). `fidelity.postBody` is computed from the payload; cookie fidelity requires `rusticdl_e2e=<nonce>` after parsing the Cookie header (`===`).
 
 ## How to get to it (user POV)
 
@@ -41,7 +41,11 @@ Headless CI wraps the same script with `xvfb-run`. Each case is a real click on 
 
 - Branded Chrome 137+ ignores `--load-extension`. This harness uses Playwright's bundled Chromium with `--disable-extensions-except` and `--load-extension`.
 - Matching a `ping` line, a URL substring, or another case's host-log line is a FAIL. Filter by `receivedAt` after the case start, then require exact `payload.url`.
+- G3 (C9) xfail counts only the exact false-grab line: `url` equals this attempt's POST URL, `suggestedFilename` is `posted.zip`, `entryPoint` is `browser_download`, `receivedAt` in the case window. Any other line is FAIL.
+- G5 (C10) xfail counts only when `payload.url ===` origin + `/C10/final` + this attempt's query. Evil hosts and superstrings are FAIL.
+- G1/G4 miss-xfails drain the host log over a quiet window after the 5 s wait and re-check the full log at the end of the run. A late exact capture is XPASS.
 - Bodies are 64 KiB unless the case says otherwise (N6 is 3 KiB; L1 is 200 MiB chunked with no Content-Length). Smaller bodies hit the 8 KiB capture gate.
 - L2/L3 are skipped unless a real user action can drive them (download-shelf cancel and desktop-prompt dismiss cannot).
 - An `xfail` that starts passing is XPASS and fails the job; the fix PR must flip that row in `ext-cases.json`.
 - `--live` only prints the live-site list. It is never CI-gated.
+- `EXT_ATTACK` is a test-only hook in `apps/extension/e2e/ext-attack.mjs` (loaded by the mock host / fixture). Never product code.
