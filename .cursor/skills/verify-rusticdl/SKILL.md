@@ -1,6 +1,6 @@
 ---
 name: verify-rusticdl
-description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup, plus a headless download-engine recipe against a local HTTP fixture. Use when verifying queue, add-download, settings, search, pause/resume, close-window, or download-engine behavior, or when a UI/IPC change needs cold-agent proof."
+description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup, plus a headless download-engine recipe against a local HTTP fixture and a Chromium extension capture matrix against a mock native host. Use when verifying queue, add-download, settings, search, pause/resume, close-window, download-engine, or extension-capture behavior, or when a UI/IPC change needs cold-agent proof."
 ---
 
 # Verify RusticDL
@@ -176,6 +176,47 @@ No window, no `launch.sh`. The helper compiles a small driver over the existing 
 
 Stdout shows the job state and `final_sha256` compared with `expected_sha256` (the identity payload) and with `wire_sha256` (the GET body). Details and the server request log are in `features/download-engine.md`.
 
+## Extension capture (Chromium)
+
+No desktop window and no `launch.sh`. Playwright's bundled Chromium loads `apps/extension/dist/chromium`, talks to `scripts/mock-native-host.sh` via native messaging, and clicks `[data-case=Cn]` on the local fixture server.
+
+### Launch
+
+```bash
+export RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh
+```
+
+Ready when:
+
+1. Fixture log contains `READY port=… pid=…` and `/health` reports that pid
+2. `apps/extension/dist/chromium/manifest.json` exists
+3. Host manifest exists at `$VERIFY_RUN_DIR/chromium-profile/NativeMessagingHosts/com.rusticdl.native_host.json`
+4. `doctor.json` records a `ping` → `pong` round-trip from the service worker
+
+The host manifest path that works is `<user-data-dir>/NativeMessagingHosts/` (proven first; do not skip that). Chromium runs with isolated `HOME` and a copied `XAUTHORITY` so X11 still authenticates. CI wraps the same script with `xvfb-run`.
+
+### Doctor
+
+The prove script checks the fixture pid owns the port, the unpacked Chromium dist is present, the host manifest resolves, and the service-worker ping round-trips. A failed ping is not a keep; it fails doctor.
+
+### Drive
+
+```bash
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --case C2
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --repeat 5
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
+```
+
+Each case is a real click on `[data-case=Cn]`. Ask-mode positives must be exactly one `prompt_download` with exact `payload.url`, `payload.suggestedFilename`, and `payload.source.entryPoint == "browser_download"`. Negatives wait 5 s for zero capture lines plus `chrome.downloads.search({})`. Every negative batch and the whole run ends with sentinel C2.
+
+### Evidence
+
+`/tmp/rusticdl-verify-$RUN_ID/evidence/extension/<case>/{host-log.jsonl,downloads.json,page.png,result.json}` plus `evidence/extension/metrics.json`. The run prints one `EXT-METRICS` line. Cleanup kills only pidfile processes (the fixture) and keeps this evidence.
+
+Recipe detail: `features/extension-capture.md`.
+
 ## Helpers
 
 | Script | Purpose |
@@ -191,6 +232,10 @@ Stdout shows the job state and `final_sha256` compared with `expected_sha256` (t
 | `scripts/prove-download-engine.sh` | Headless proof of the `download-engine` feature (local HTTP fixture) |
 | `scripts/engine_http_server.py` | Fixture server used by `prove-download-engine.sh` |
 | `scripts/engine_drive.rs` | Engine driver source compiled by `prove-download-engine.sh` |
+| `scripts/prove-extension-capture.sh` | Chromium extension capture matrix against the mock native host |
+| `scripts/ext-fixture-server.mjs` | Per-case HTTP fixture (127.0.0.1 and localhost) |
+| `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock |
+| `scripts/ext-cases.json` | Capture matrix rows (`id, route, trigger, expect, url, filename, xfail`) |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 

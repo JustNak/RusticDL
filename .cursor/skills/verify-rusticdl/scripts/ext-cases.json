@@ -1,0 +1,248 @@
+{
+  "portDefault": 18765,
+  "bodyBytes": 65536,
+  "negativeWaitMs": 5000,
+  "cases": [
+    {
+      "id": "C1",
+      "route": "/C1",
+      "page": "/page/C1",
+      "trigger": "click-download-attr",
+      "expect": "capture",
+      "filename": "app.zip",
+      "xfail": { "gap": "G1", "reason": "Chromium did not capture <a download> same-origin zip (no Content-Disposition attachment)" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C2",
+      "route": "/C2",
+      "page": "/page/C2",
+      "trigger": "click-link",
+      "expect": "capture",
+      "filename": "setup.exe",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": true, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C3",
+      "route": "/C3/file.zip",
+      "page": "/page/C3",
+      "trigger": "click-link",
+      "expect": "capture",
+      "filename": "file.zip",
+      "xfail": { "gap": "G1", "reason": "Chromium did not capture a .zip navigation served inline with application/zip" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C4",
+      "route": "/get",
+      "page": "/page/C4",
+      "trigger": "click-link",
+      "expect": "capture",
+      "filename": "get",
+      "query": { "id": "5" },
+      "xfail": { "gap": "G4", "reason": "Chromium misses octet-stream with no Content-Disposition and no filename in the URL" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C5",
+      "route": "/page/C5",
+      "page": "/page/C5",
+      "trigger": "blob-anchor",
+      "expect": "keep",
+      "filename": "blob.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C6",
+      "route": "/page/C6",
+      "page": "/page/C6",
+      "trigger": "data-anchor",
+      "expect": "keep",
+      "filename": "data.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C7",
+      "route": "/C7/file.zip",
+      "page": "/page/C7",
+      "trigger": "js-location",
+      "expect": "capture",
+      "filename": "file.zip",
+      "xfail": { "gap": "G1", "reason": "Chromium did not capture JS location.href to a .zip (same miss as C1)" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C8",
+      "route": "/C8",
+      "page": "/page/C8",
+      "trigger": "js-a-click",
+      "expect": "capture",
+      "filename": "app.zip",
+      "xfail": { "gap": "G1", "reason": "Chromium did not capture programmatic a.click() with download (same miss as C1)" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C9",
+      "route": "/C9",
+      "page": "/page/C9",
+      "trigger": "form-post",
+      "expect": "keep",
+      "filename": "posted.zip",
+      "xfail": { "gap": "G3", "reason": "Chromium false-captures the POST attachment and would replay it as GET" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": true, "originalUrl": false }
+    },
+    {
+      "id": "C10",
+      "route": "/C10",
+      "page": "/page/C10",
+      "trigger": "click-link",
+      "expect": "capture",
+      "filename": "archive.zip",
+      "xfail": { "gap": "G5", "reason": "Chromium handed off the final same-origin redirect URL (/C10/final), not the original /C10 URL" },
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": true }
+    },
+    {
+      "id": "C11",
+      "route": "/C11",
+      "page": "/page/C11",
+      "trigger": "target-blank",
+      "expect": "capture",
+      "filename": "blank.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "C12",
+      "route": "/C12",
+      "page": "/page/C12",
+      "trigger": "cross-origin",
+      "expect": "capture",
+      "filename": "cross.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": true, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N1",
+      "route": "/N1",
+      "page": "/page/N1",
+      "trigger": "click-link",
+      "expect": "keep",
+      "filename": null,
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N2",
+      "route": "/N2",
+      "page": "/page/N2",
+      "trigger": "click-link",
+      "expect": "keep",
+      "filename": "inline.pdf",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N3",
+      "route": "/N3",
+      "page": "/page/N3",
+      "trigger": "click-link",
+      "expect": "keep",
+      "filename": "photo.png",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N4",
+      "route": "/files/app.zip",
+      "page": "/page/N4",
+      "trigger": "click-link",
+      "expect": "keep",
+      "filename": "app.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N5",
+      "route": "/N5",
+      "page": "/page/N5",
+      "trigger": "fetch-attachment",
+      "expect": "keep",
+      "filename": "fetched.zip",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "N6",
+      "route": "/N6",
+      "page": "/page/N6",
+      "trigger": "click-link",
+      "expect": "keep",
+      "filename": "stub.rar",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "L1",
+      "route": "/L1",
+      "page": "/page/L1",
+      "trigger": "click-link",
+      "expect": "capture",
+      "filename": "huge.bin",
+      "xfail": null,
+      "skip": null,
+      "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "L2",
+      "route": "/L2",
+      "page": "/page/L2",
+      "trigger": "user-cancel-shelf",
+      "expect": "keep",
+      "filename": "cancel.bin",
+      "xfail": null,
+      "skip": "cannot drive Chrome's download-shelf cancel as a real page user action within 1.5s",
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    },
+    {
+      "id": "L3",
+      "route": "/L3",
+      "page": "/page/L3",
+      "trigger": "dismiss-desktop-prompt",
+      "expect": "keep",
+      "filename": "dismiss.bin",
+      "xfail": null,
+      "skip": "requires the desktop ask prompt; mock host auto-accepts so dismiss/restore cannot be driven",
+      "fidelity": { "cookies": false, "referrer": false, "postBody": false, "originalUrl": false }
+    }
+  ],
+  "live": [
+    { "id": "LIVE-github", "expect": "capture", "note": "GitHub release asset (.zip/.exe)" },
+    { "id": "LIVE-sourceforge", "expect": "capture", "note": "SourceForge countdown → mirror" },
+    { "id": "LIVE-python-mozilla", "expect": "capture", "note": "python.org / Mozilla installers" },
+    { "id": "LIVE-file-hosts", "expect": "capture", "note": "Gofile / Pixeldrain / Buzzheavier" },
+    { "id": "LIVE-canvas-drive", "expect": "capture", "note": "Canvas / Instructure → Drive, gateway URL" },
+    { "id": "LIVE-drive-dropbox", "expect": "keep", "note": "Google Drive / Dropbox direct, app-owned skip" },
+    { "id": "LIVE-nexus-csv", "expect": "keep", "note": "Nexus Mods stats CSV" }
+  ]
+}

@@ -21,6 +21,11 @@ Desktop.ini
 # Generated docs / local output
 /out/
 
+# Playwright (extension e2e)
+apps/extension/test-results/
+apps/extension/playwright-report/
+apps/extension/blob-report/
+
 # Logs and env
 *.log
 .env
