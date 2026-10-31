@@ -18,6 +18,7 @@ import {
   onChromiumHeadersReceived,
   onDownloadChanged,
   onDownloadCreated,
+  onHtmlDownloadHint,
   pauseIfLikelyCapture,
 } from './captureCoordinator';
 import {
@@ -47,6 +48,7 @@ import {
   setLastResult,
   updatePopupState,
 } from './state';
+import { isHtmlDownloadHintMessage } from '../shared/htmlDownloadHint';
 import type { PopupRequest, PopupStateResponse } from '../shared/messages';
 
 const CONTEXT_MENU_ID = 'download-with-rusticdl';
@@ -360,8 +362,12 @@ function registerDownloadCaptureListeners(
   }
 }
 
-browser.runtime.onMessage.addListener((message: PopupRequest) => {
-  return handlePopupMessage(message);
+browser.runtime.onMessage.addListener((message: unknown) => {
+  if (isHtmlDownloadHintMessage(message)) {
+    onHtmlDownloadHint(message.url, message.filename, settingsForSyncCapture());
+    return;
+  }
+  return handlePopupMessage(message as PopupRequest);
 });
 
 async function handlePopupMessage(message: PopupRequest): Promise<PopupStateResponse | void> {

@@ -56,8 +56,11 @@ const {
   rememberResponseFilenameHint,
   lookupFilenameHint,
   rememberDeterminedFilename,
+  rememberHtmlDownloadHint,
   resolveSuggestedFilename,
   applyDeterminedFilename,
+  applyChromiumCaptureHints,
+  downloadUrlBasename,
   rememberRequestAuth,
   lookupOriginAuth,
 } = require(chromiumOutfile);
@@ -1623,6 +1626,163 @@ assert(
     },
     defaultSettings,
   ) === false,
+);
+
+console.log('\nChromium empty onCreated filename (G1 / G4)\n');
+
+assert(
+  'URL basename keeps extension-less /get?id=5',
+  downloadUrlBasename('http://127.0.0.1:18765/get?id=5') === 'get',
+);
+
+const emptyZipHintUrl = 'https://cdn.example.com/pr2/C1-hint';
+rememberResponseFilenameHint({
+  url: emptyZipHintUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'application/zip' },
+    { name: 'content-length', value: '65536' },
+    { name: 'content-disposition', value: 'filename="app.zip"' },
+  ],
+});
+const emptyZipHinted = applyChromiumCaptureHints({
+  id: 101,
+  url: emptyZipHintUrl,
+  filename: '',
+  mime: 'application/zip',
+  totalBytes: 65536,
+});
+assert(
+  'onCreated empty filename + zip header hint (no attachment) is captured',
+  emptyZipHinted.filename === 'app.zip'
+    && emptyZipHinted.hasAttachment !== true
+    && shouldCaptureDownloadItem(emptyZipHinted, defaultSettings) === true
+    && decideCreatedAction(createCaptureSessionStore(), emptyZipHinted, defaultSettings) === 'handoff',
+);
+
+const htmlHintUrl = 'https://cdn.example.com/pr2/N1';
+rememberResponseFilenameHint({
+  url: htmlHintUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'text/html; charset=utf-8' },
+    { name: 'content-length', value: '4096' },
+  ],
+});
+const emptyHtml = applyChromiumCaptureHints({
+  id: 102,
+  url: htmlHintUrl,
+  filename: '',
+  mime: 'text/html',
+  totalBytes: 4096,
+});
+assert(
+  'onCreated empty filename + HTML hint is kept',
+  shouldCaptureDownloadItem(emptyHtml, defaultSettings) === false
+    && decideCreatedAction(createCaptureSessionStore(), emptyHtml, defaultSettings) === 'ignore',
+);
+
+const inlinePdfUrl = 'https://cdn.example.com/pr2/N2';
+rememberResponseFilenameHint({
+  url: inlinePdfUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'application/pdf' },
+    { name: 'content-length', value: '65536' },
+    { name: 'content-disposition', value: 'inline; filename="inline.pdf"' },
+  ],
+});
+const emptyInlinePdf = applyChromiumCaptureHints({
+  id: 103,
+  url: inlinePdfUrl,
+  filename: '',
+  mime: 'application/pdf',
+  totalBytes: 65536,
+});
+assert(
+  'onCreated empty filename + inline PDF hint is kept',
+  emptyInlinePdf.filename === 'inline.pdf'
+    && emptyInlinePdf.hasAttachment !== true
+    && shouldCaptureDownloadItem(emptyInlinePdf, defaultSettings) === false
+    && decideCreatedAction(createCaptureSessionStore(), emptyInlinePdf, defaultSettings) === 'ignore',
+);
+
+const emptyGet = applyChromiumCaptureHints({
+  id: 104,
+  url: 'https://cdn.example.com/get?id=5',
+  filename: '',
+  mime: 'application/octet-stream',
+  totalBytes: 65536,
+});
+assert(
+  'octet-stream /get?id=5 with empty onCreated filename is captured as get',
+  emptyGet.filename === 'get'
+    && shouldCaptureDownloadItem(emptyGet, defaultSettings) === true
+    && resolveSuggestedFilename(emptyGet) === 'get'
+    && decideCreatedAction(createCaptureSessionStore(), emptyGet, defaultSettings) === 'handoff',
+);
+
+const emptyC1 = applyChromiumCaptureHints({
+  id: 105,
+  url: 'https://cdn.example.com/C1',
+  filename: '',
+  mime: 'application/zip',
+  totalBytes: 65536,
+});
+assert(
+  'empty filename + zip MIME uses the URL basename so C1 is not ignored',
+  emptyC1.filename === 'C1'
+    && shouldCaptureDownloadItem(emptyC1, defaultSettings) === true,
+);
+
+const htmlAttrUrl = 'https://cdn.example.com/pr2/C1-attr';
+assert(
+  'HTML download attribute is remembered for http(s) URLs only',
+  rememberHtmlDownloadHint(htmlAttrUrl, 'app.zip') === 'app.zip'
+    && rememberHtmlDownloadHint('blob:https://cdn.example.com/abc', 'blob.zip') === undefined
+    && rememberHtmlDownloadHint('data:application/zip,AA', 'data.zip') === undefined,
+);
+const emptyHtmlAttr = applyChromiumCaptureHints({
+  id: 106,
+  url: htmlAttrUrl,
+  filename: '',
+  mime: 'application/zip',
+  totalBytes: 65536,
+});
+assert(
+  'HTML download attribute fills empty onCreated filename (C1/C8 app.zip)',
+  emptyHtmlAttr.filename === 'app.zip'
+    && shouldCaptureDownloadItem(emptyHtmlAttr, defaultSettings) === true
+    && resolveSuggestedFilename(emptyHtmlAttr) === 'app.zip'
+    && decideCreatedAction(createCaptureSessionStore(), emptyHtmlAttr, defaultSettings) === 'handoff',
+);
+
+const dispositionBeatsAttrUrl = 'https://cdn.example.com/pr2/disposition-vs-attr';
+rememberHtmlDownloadHint(dispositionBeatsAttrUrl, 'from-attr.zip');
+rememberResponseFilenameHint({
+  url: dispositionBeatsAttrUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'application/zip' },
+    { name: 'content-length', value: '65536' },
+    { name: 'content-disposition', value: 'attachment; filename="from-header.zip"' },
+  ],
+});
+assert(
+  'Content-Disposition filename still wins over the HTML download attribute',
+  resolveSuggestedFilename({
+    url: dispositionBeatsAttrUrl,
+    filename: '',
+  }) === 'from-header.zip',
+);
+
+assert(
+  'captures chunked octet-stream attachment named huge.bin (bin is not a captured ext)',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://cdn.example.com/L1',
+      filename: 'huge.bin',
+      mime: 'application/octet-stream',
+      hasAttachment: true,
+    },
+    defaultSettings,
+  ) === true,
 );
 
 assert(

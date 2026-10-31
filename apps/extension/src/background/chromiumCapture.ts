@@ -3,12 +3,16 @@
  * downloads.onCreated is the capture path — but Chrome fills `filename` from
  * the URL token (UUID) before it applies Content-Disposition.
  *
- * Observe response headers and downloads.onDeterminingFilename so handoff
- * can send the real name the way Firefox webRequest already does.
+ * Observe response headers, the HTML `download` attribute, and
+ * downloads.onDeterminingFilename so handoff can send the real name the
+ * way Firefox webRequest already does.
  */
 import {
+  filenameExtension,
   filenameFromContentDisposition,
   httpOrigin,
+  isWeakSuggestedFilename,
+  knownDownloadBytes,
   mimeLooksLikeDownload,
   normalizeCaptureUrl,
   preferredSuggestedFilename,
@@ -21,6 +25,7 @@ export type FilenameHint = {
   filename?: string;
   totalBytes?: number;
   hasAttachment?: boolean;
+  mime?: string;
   ts: number;
 };
 
@@ -50,6 +55,7 @@ type SuggestFn = (suggestion?: { filename?: string }) => void;
 
 const filenameHints = new Map<string, FilenameHint>();
 const determinedFilenames = new Map<number, { filename: string; ts: number }>();
+const htmlDownloadHints = new Map<string, { filename: string; ts: number }>();
 const REQUEST_AUTH_NAMES = new Set(['cookie', 'authorization']);
 const requestAuthByUrl = new Map<string, CapturedOriginAuth & { ts: number }>();
 const requestAuthByOrigin = new Map<string, CapturedOriginAuth & { ts: number }>();
@@ -75,6 +81,9 @@ function pruneFilenameHints(now = Date.now()): void {
   }
   for (const [id, entry] of determinedFilenames) {
     if (now - entry.ts > HINT_TTL_MS) determinedFilenames.delete(id);
+  }
+  for (const [key, entry] of htmlDownloadHints) {
+    if (now - entry.ts > HINT_TTL_MS) htmlDownloadHints.delete(key);
   }
   for (const [key, entry] of requestAuthByUrl) {
     if (now - entry.ts > HINT_TTL_MS) requestAuthByUrl.delete(key);
@@ -141,7 +150,13 @@ export function rememberResponseFilenameHint(
   if (!downloadLike || (!filename && totalBytes == null)) {
     return undefined;
   }
-  const hint: FilenameHint = { filename, totalBytes, hasAttachment, ts: Date.now() };
+  const hint: FilenameHint = {
+    filename,
+    totalBytes,
+    hasAttachment,
+    mime: mime || undefined,
+    ts: Date.now(),
+  };
   pruneFilenameHints(hint.ts);
   filenameHints.set(normalizeCaptureUrl(url), hint);
   return hint;
@@ -166,6 +181,27 @@ export function lookupDeterminedFilename(id: number | undefined): string | undef
   return determinedFilenames.get(id)?.filename;
 }
 
+/**
+ * Same-origin `<a download="app.zip">` name. Content-Disposition still wins.
+ */
+export function rememberHtmlDownloadHint(
+  url: string | undefined,
+  filename: string | undefined,
+): string | undefined {
+  const name = filename?.split(/[\\/]/).pop()?.trim();
+  if (!url || !name) return undefined;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) return undefined;
+  pruneFilenameHints();
+  htmlDownloadHints.set(normalizeCaptureUrl(url), { filename: name, ts: Date.now() });
+  return name;
+}
+
+export function lookupHtmlDownloadHint(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  pruneFilenameHints();
+  return htmlDownloadHints.get(normalizeCaptureUrl(url))?.filename;
+}
+
 function hintNamesForDownload(item: {
   id?: number;
   url?: string;
@@ -174,8 +210,29 @@ function hintNamesForDownload(item: {
   return [
     lookupFilenameHint(item.finalUrl)?.filename,
     lookupFilenameHint(item.url)?.filename,
+    lookupHtmlDownloadHint(item.finalUrl),
+    lookupHtmlDownloadHint(item.url),
     lookupDeterminedFilename(item.id),
   ];
+}
+
+/**
+ * Last path segment, including extension-less names (`/get?id=5` → `get`).
+ * Firefox `basenameFromUrl` requires a dot and is left unchanged.
+ */
+export function downloadUrlBasename(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const base = new URL(url).pathname.split('/').filter(Boolean).pop()?.trim();
+    if (!base) return undefined;
+    try {
+      return decodeURIComponent(base) || undefined;
+    } catch {
+      return base;
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 export function resolveSuggestedFilename(item: {
@@ -184,7 +241,48 @@ export function resolveSuggestedFilename(item: {
   finalUrl?: string;
   filename?: string;
 }): string | undefined {
-  return preferredSuggestedFilename(...hintNamesForDownload(item), item.filename);
+  const names = [
+    ...hintNamesForDownload(item),
+    item.filename,
+    downloadUrlBasename(item.finalUrl || item.url),
+  ];
+  const withExt = names.find(
+    (name) => Boolean(filenameExtension(name)) && !isWeakSuggestedFilename(name),
+  );
+  return withExt ?? preferredSuggestedFilename(...names);
+}
+
+type ChromiumHintedItem = {
+  id?: number;
+  url: string;
+  finalUrl?: string;
+  filename?: string;
+  mime?: string;
+  totalBytes?: number;
+  fileSize?: number;
+  hasAttachment?: boolean;
+};
+
+/**
+ * Copy header-hint size / attachment / filename onto a Chromium onCreated
+ * item, then fall back to the determined name and the URL basename when
+ * `item.filename` is empty.
+ */
+export function applyChromiumCaptureHints<T extends ChromiumHintedItem>(item: T): T {
+  const hint = lookupFilenameHint(item.finalUrl || item.url) ?? lookupFilenameHint(item.url);
+  const next: T = { ...item };
+  if (knownDownloadBytes(item) == null && hint?.totalBytes != null) {
+    next.totalBytes = hint.totalBytes;
+  }
+  if (hint?.hasAttachment) {
+    next.hasAttachment = true;
+  }
+  if (!next.mime && hint?.mime) {
+    next.mime = hint.mime;
+  }
+  const resolved = resolveSuggestedFilename(next);
+  if (resolved) next.filename = resolved;
+  return next;
 }
 
 type ChromiumWebRequestApi = {
@@ -227,7 +325,7 @@ export function getChromiumDeterminingFilenameApi(): {
   if (navigator.userAgent.toLowerCase().includes('firefox')) {
     return null;
   }
-  const api = (globalThis as {
+  const g = globalThis as {
     chrome?: {
       downloads?: {
         onDeterminingFilename?: {
@@ -237,8 +335,19 @@ export function getChromiumDeterminingFilenameApi(): {
         };
       };
     };
-  }).chrome?.downloads?.onDeterminingFilename;
-  return api ?? null;
+    browser?: {
+      downloads?: {
+        onDeterminingFilename?: {
+          addListener(
+            listener: (item: ChromiumDeterminingFilenameItem, suggest: SuggestFn) => void,
+          ): void;
+        };
+      };
+    };
+  };
+  return g.chrome?.downloads?.onDeterminingFilename
+    ?? g.browser?.downloads?.onDeterminingFilename
+    ?? null;
 }
 
 /**

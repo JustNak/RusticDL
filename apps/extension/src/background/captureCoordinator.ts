@@ -30,6 +30,7 @@ import {
 import {
   attachToSession,
   beginHandoff,
+  beginPending,
   CAPTURE_SESSIONS_STORAGE_KEY,
   createCaptureSessionStore,
   decideCreatedAction,
@@ -48,9 +49,11 @@ import {
   type FirefoxCandidateAction,
 } from './captureSession';
 import {
+  applyChromiumCaptureHints,
   applyDeterminedFilename,
   lookupFilenameHint,
   lookupOriginAuth,
+  rememberHtmlDownloadHint,
   rememberRequestAuth,
   rememberResponseFilenameHint,
   resolveSuggestedFilename,
@@ -252,15 +255,31 @@ export function followCaptureRedirect(
 }
 
 function withHeaderSize(item: CapturedDownloadItem): CapturedDownloadItem {
-  const hint = lookupFilenameHint(item.finalUrl || item.url) ?? lookupFilenameHint(item.url);
-  const next: CapturedDownloadItem = { ...item };
-  if (knownDownloadBytes(item) == null && hint?.totalBytes != null) {
-    next.totalBytes = hint.totalBytes;
-  }
-  if (hint?.hasAttachment) {
-    next.hasAttachment = true;
-  }
-  return next;
+  return applyChromiumCaptureHints(item);
+}
+
+function schedulePendingCapture(
+  tracked: CapturedDownloadItem,
+  settings: ExtensionIntegrationSettings,
+  sessionId: string,
+  waitingForSize: boolean,
+  waitingForName: boolean,
+): void {
+  const timer = setTimeout(() => {
+    const pending = pendingSizeWaits.get(tracked.id);
+    if (!pending) return;
+    pendingSizeWaits.delete(tracked.id);
+    void latestDownloadSnapshot(pending.item).then((latest) =>
+      finalizePendingCapture(latest, settings, pending.sessionId),
+    );
+  }, SIZE_WAIT_MS);
+  pendingSizeWaits.set(tracked.id, {
+    item: tracked,
+    sessionId,
+    timer,
+    waitingForSize,
+    waitingForName,
+  });
 }
 
 function needsFilenameHint(item: CapturedDownloadItem): boolean {
@@ -596,6 +615,7 @@ async function finalizePendingCapture(
     || settings.downloadHandoffMode === 'off'
     || isCaptureSizeStub(tracked)
     || ignoredResolvedExtension(resolveSuggestedFilename(tracked), settings)
+    || downloadCreatedAction(tracked, settings) === 'ignore'
   ) {
     if (sessionId) dropCaptureSession(store, sessionId);
     persistSessions();
@@ -627,7 +647,12 @@ export function pauseIfLikelyCapture(
   if (!sessionsReady) {
     // Pause on the waking onCreated turn; do not touch the session store
     // until hydrate finishes (peek/follow would write into an empty store).
-    if (shouldPauseDownloadItem(tracked, heuristicCaptureSettings(settings))) {
+    // Do not pause while the name is still a URL token — Chrome skips
+    // onDeterminingFilename (the download attribute) for a paused item.
+    if (
+      shouldPauseDownloadItem(tracked, heuristicCaptureSettings(settings))
+      && !needsFilenameHint(tracked)
+    ) {
       requestPause(item.id);
     }
     return;
@@ -647,7 +672,6 @@ export function pauseIfLikelyCapture(
         void eraseBrowserDownload(item.id);
         return;
       }
-      requestPause(item.id);
       return;
     case 'wait':
       requestPause(item.id);
@@ -666,6 +690,20 @@ export async function onDownloadCreated(
   if (!sessionsReady) return;
   const tracked = withHeaderSize(item);
   const extra = familyProbe(tracked);
+  const peek = peekCreatedAction(store, tracked, settings, extra);
+  // Keep the session pending until onDeterminingFilename. beginHandoff here
+  // would make finalizePendingCapture treat the later determined name as a ghost.
+  if (peek === 'handoff' && needsFilenameHint(tracked)) {
+    const claim = beginPending(store, extra);
+    persistSessions();
+    if (!claim.ok && claim.session.phase !== 'pending') {
+      if (claim.session.phase === 'restoring') return;
+      await eraseBrowserDownload(tracked.id);
+      return;
+    }
+    schedulePendingCapture(tracked, settings, claim.session.id, false, true);
+    return;
+  }
   const decision = decideCreatedAction(store, tracked, settings, extra);
   persistSessions();
 
@@ -687,21 +725,13 @@ export async function onDownloadCreated(
     case 'wait': {
       const session = followCaptureFamily(store, extra);
       requestPause(tracked.id);
-      const timer = setTimeout(() => {
-        const pending = pendingSizeWaits.get(tracked.id);
-        if (!pending) return;
-        pendingSizeWaits.delete(tracked.id);
-        void latestDownloadSnapshot(pending.item).then((latest) =>
-          finalizePendingCapture(latest, settings, pending.sessionId),
-        );
-      }, SIZE_WAIT_MS);
-      pendingSizeWaits.set(tracked.id, {
-        item: tracked,
-        sessionId: session?.id ?? '',
-        timer,
-        waitingForSize: downloadCreatedAction(tracked, settings) === 'wait',
-        waitingForName: needsFilenameHint(tracked),
-      });
+      schedulePendingCapture(
+        tracked,
+        settings,
+        session?.id ?? '',
+        downloadCreatedAction(tracked, settings) === 'wait',
+        needsFilenameHint(tracked),
+      );
       return;
     }
     default: {
@@ -735,6 +765,11 @@ export function onDownloadChanged(
 
   const known = knownDownloadBytes(merged);
   const state = deltaCurrent(delta.state);
+  // Completing the shelf item must not skip the Chromium name wait — C1/C8
+  // finish the URL-basename body before onDeterminingFilename yields app.zip.
+  if (pending.waitingForName && needsFilenameHint(merged)) {
+    return;
+  }
   if (known == null && state !== 'complete') return;
   if (state !== 'complete' && stillWaitingForCaptureSignals(merged, pending)) {
     return;
@@ -777,6 +812,15 @@ export function onChromiumBeforeSendHeaders(details: ChromiumBeforeSendHeadersDe
   rememberRequestAuth(details);
 }
 
+export function onHtmlDownloadHint(
+  url: string,
+  filename: string,
+  settings: ExtensionIntegrationSettings | null,
+): void {
+  if (!rememberHtmlDownloadHint(url, filename)) return;
+  flushPendingFilenameHint(url, settings);
+}
+
 export function onChromiumDeterminingFilename(
   item: ChromiumDeterminingFilenameItem,
   suggest: (suggestion?: { filename?: string }) => void,
@@ -785,10 +829,10 @@ export function onChromiumDeterminingFilename(
   const name = applyDeterminedFilename(item, suggest);
   const pending = pendingSizeWaits.get(item.id);
   if (!pending || !settings) return;
-  pending.item = {
+  pending.item = applyChromiumCaptureHints({
     ...pending.item,
     ...(name ? { filename: name } : {}),
-  };
+  });
   followCaptureFamily(store, familyProbe(pending.item));
   persistSessions();
   if (stillWaitingForCaptureSignals(pending.item, pending)) return;

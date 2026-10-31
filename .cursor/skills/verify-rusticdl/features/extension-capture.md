@@ -59,10 +59,13 @@ Kit gap ids (`kit-G1`..`kit-G6`) are separate from EXT-SCOPE gap ids. EXT-SCOPE 
 
 Product xfails in `scripts/ext-cases.json` (Chromium, not this harness):
 
-- kit-G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3 inline zip, C7 `location.href`, C8 programmatic `a.click()`).
 - kit-G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
-- kit-G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
 - kit-G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
+
+Closed by the Chromium capture coordinator (header-hint / URL-basename filename, final decision at `onDeterminingFilename`):
+
+- kit-G1 — was: Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3 inline zip, C7 `location.href`, C8 programmatic `a.click()`).
+- kit-G4 — was: Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
 
 Harness (PR1 lands with this documented):
 

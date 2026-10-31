@@ -293,12 +293,18 @@ export function shouldCaptureDownloadItem(
   }
 
   if (strongName) return true;
-  if (ext) return false;
-  // MIME-only octet-stream with no name is page noise. Chromium CDN tokens
-  // (UUID / long hex) still count so we can wait for Content-Disposition.
-  if (hasAttachment && dispositionHint) return true;
-  const name = downloadBasename(item.filename);
-  return Boolean(name && isWeakSuggestedFilename(name) && dispositionHint);
+  // Non-captured extensions (.mkv, .bin) are a veto unless the server marked
+  // a real shelf download (attachment + download MIME). L1 is huge.bin +
+  // octet-stream + attachment; copying that name must not drop the capture.
+  if (ext && !(hasAttachment && dispositionHint)) return false;
+  // Download MIME with no (blocking) extension. Chromium onCreated often has
+  // an empty filename; the coordinator fills it from the header hint or URL
+  // basename (`/get?id=5` → `get`). A completely nameless MIME-only body is
+  // still page noise.
+  if (dispositionHint && (hasAttachment || downloadBasename(item.filename))) {
+    return true;
+  }
+  return false;
 }
 
 /**
