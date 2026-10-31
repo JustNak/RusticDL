@@ -168,6 +168,15 @@ export function readFixtureHits(runDir) {
     .map((line) => JSON.parse(line));
 }
 
+export function readFixtureServes(runDir) {
+  const logPath = path.join(runDir, 'fixture-serves.jsonl');
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

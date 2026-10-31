@@ -158,6 +158,18 @@ function accepted(requestId) {
   return { ok: true, type: 'accepted', requestId, payload: { status: 'queued', appState: 'running' } };
 }
 
+function targetServe(pathname, extra = {}) {
+  return {
+    pathname,
+    nonce,
+    attempt,
+    status: 200,
+    bytes: 65536,
+    completed: true,
+    ...extra,
+  };
+}
+
 function run(mod, caseDef, extra) {
   const expectedUrl = extra.expectedUrl;
   const pageUrl = extra.pageUrl || `${origin}/page/${caseDef.id}?nonce=${nonce}&attempt=${attempt}`;
@@ -174,6 +186,7 @@ function run(mod, caseDef, extra) {
     enqueueLines: extra.enqueueLines || [],
     downloads: extra.downloads || [],
     fixtureHits: extra.fixtureHits || [],
+    fixtureServes: extra.fixtureServes || [],
     pageEvidence: extra.pageEvidence || { href: pageUrl, text: '', dataPage: caseDef.id },
     playwrightDownload: extra.playwrightDownload,
   });
@@ -280,6 +293,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n1Url,
     promptLines: [],
     fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
     pageEvidence: { href: n1Url, text: 'html document, not a file', dataPage: 'N1-target' },
   });
   const c2fail = run(fixed, c2Def(), {
@@ -465,6 +479,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n1Url,
     promptLines: [],
     fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
     pageEvidence: { href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`, text: 'N1 html page', dataPage: 'N1' },
     downloads: [],
   };
@@ -533,10 +548,12 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
 // R3-1 fetch-attachment must not pass on fixture hit alone
 {
   const hits = [{ pathname: '/N5', nonce, attempt }];
+  const n5Serve = [targetServe('/N5')];
   const stay = {
     expectedUrl: n5Url,
     promptLines: [],
     fixtureHits: hits,
+    fixtureServes: n5Serve,
     downloads: [],
     pageEvidence: { href: n5Page, text: 'N5 fetch', dataPage: 'N5' },
   };
@@ -550,6 +567,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n5Url,
     promptLines: [],
     fixtureHits: hits,
+    fixtureServes: n5Serve,
     downloads: [],
     pageEvidence: {
       href: n5Page,
@@ -571,6 +589,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n5Url,
     promptLines: [],
     fixtureHits: hits,
+    fixtureServes: n5Serve,
     downloads: [],
     pageEvidence: {
       href: n5Page,
@@ -592,6 +611,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n1Url,
     promptLines: [],
     fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
     downloads: [],
     pageEvidence: {
       href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`,
@@ -650,6 +670,7 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     expectedUrl: n1Url,
     promptLines: [],
     fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
     pageEvidence: {
       href: n1Url,
       text: 'html document, not a file',
@@ -661,6 +682,134 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     next: run(fixed, n1Def(), extra),
     oldWant: (r) => r.status === 'pass',
     newWant: (r) => r.status === 'pass',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5', { status: 500, bytes: 9 })],
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R4-1a', 'N5 forged 200/65536 vs serve 500/9 is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5', { status: 200, bytes: 0, completed: false })],
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R4-1b', 'N5 hang (body not sent) is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5')],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/decoy?nonce=${nonce}&attempt=${attempt}&dataPage=N5-target`,
+      dataPage: 'N5-target',
+    },
+  };
+  check('R4-2a', 'N5 /decoy with data-page=N5-target is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/decoy?nonce=${nonce}&attempt=${attempt}&dataPage=N1-target`,
+      dataPage: 'N1-target',
+    },
+  };
+  check('R4-2b', 'N1 /decoy with data-page=N1-target is FAIL', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5')],
+    downloads: [{
+      id: 9,
+      state: 'complete',
+      url: `${origin}/N6?nonce=${nonce}&attempt=${attempt}`,
+      referrer: n5Page,
+      startTime: new Date(startedAt + 10).toISOString(),
+    }],
+    pageEvidence: { href: n5Page, dataPage: 'N5' },
+  };
+  check('R4-3', 'N6 download does not prove N5 keep', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const lateNull = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: null,
+    requestId: 'end-null',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateNull]);
+  fixed.recheckLateMissXfails([newEarly], [lateNull]);
+  check('R4-4', 'end-window null filename turns G1 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL',
   });
 }
 

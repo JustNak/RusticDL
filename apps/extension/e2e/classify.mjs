@@ -91,40 +91,58 @@ function routePathname(route) {
   return q === -1 ? route : route.slice(0, q);
 }
 
-function downloadIsThisAttempt(item, { triggerAt, attempt, nonce, expectedUrl, caseDef }) {
-  if (!item || item.error) return false;
-  const url = typeof item.url === 'string' ? item.url : '';
-  const referrer = typeof item.referrer === 'string' ? item.referrer : '';
-  if (attempt && (url.includes(`attempt=${attempt}`) || referrer.includes(`attempt=${attempt}`))) {
-    return true;
+export function pathnameOfUrl(value) {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return '';
   }
-  if (expectedUrl && url === expectedUrl) return true;
-  if (typeof triggerAt === 'number' && item.startTime) {
-    const startMs = Date.parse(item.startTime);
-    if (Number.isFinite(startMs) && startMs >= triggerAt - 50) {
-      if (caseDef.id === 'C5' && url.startsWith('blob:')) return true;
-      if (caseDef.id === 'C6' && url.startsWith('data:')) return true;
-      if (expectedUrl && url === expectedUrl) return true;
+}
+
+export function fixtureServeForTarget(serves, { pathname, nonce, attempt }) {
+  const rows = (serves || []).filter((row) => (
+    row
+    && row.pathname === pathname
+    && String(row.nonce) === String(nonce)
+    && String(row.attempt) === String(attempt)
+  ));
+  return rows.find((row) => row.completed) || rows[0] || null;
+}
+
+export function downloadKeptTarget(items, { path, nonce, attempt, triggerAt }) {
+  return (items || []).some((item) => {
+    if (!item || item.error || item.state !== 'complete') return false;
+    let parsed;
+    try {
+      parsed = new URL(item.url);
+    } catch {
+      return false;
     }
-  }
-  if (nonce && (url.includes(`nonce=${nonce}`) && attempt && url.includes(`attempt=${attempt}`))) {
+    if (parsed.pathname !== path) return false;
+    if (parsed.searchParams.get('nonce') !== String(nonce)) return false;
+    if (parsed.searchParams.get('attempt') !== String(attempt)) return false;
+    if (typeof triggerAt === 'number' && item.startTime) {
+      const startMs = Date.parse(item.startTime);
+      if (!Number.isFinite(startMs) || startMs < triggerAt - 50) return false;
+    }
     return true;
-  }
-  return false;
+  });
 }
 
-export function fetchMarkerThisAttempt(pageEvidence, { nonce, attempt, caseDef }) {
-  if (!pageEvidence || !caseDef) return false;
-  if (String(pageEvidence.dataPage) !== `${caseDef.id}-target`) return false;
-  const status = Number(pageEvidence.fetchStatus);
-  const bytes = Number(pageEvidence.fetchBytes);
-  return String(pageEvidence.fetchNonce) === String(nonce)
-    && String(pageEvidence.fetchAttempt) === String(attempt)
-    && Number.isFinite(status) && status >= 200 && status < 400
-    && Number.isFinite(bytes) && bytes > 0;
+export function blobDataKept(items, { caseDef, triggerAt }) {
+  return (items || []).some((item) => {
+    if (!item || item.error) return false;
+    const url = typeof item.url === 'string' ? item.url : '';
+    if (typeof triggerAt !== 'number' || !item.startTime) return false;
+    const startMs = Date.parse(item.startTime);
+    if (!Number.isFinite(startMs) || startMs < triggerAt - 50) return false;
+    if (caseDef.id === 'C5' && url.startsWith('blob:')) return true;
+    if (caseDef.id === 'C6' && url.startsWith('data:')) return true;
+    return false;
+  });
 }
 
-export function pageRenderThisAttempt(pageEvidence, { path, nonce, attempt, caseDef }) {
+export function pageRenderTarget(pageEvidence, { path, nonce, attempt }) {
   let pageUrl = null;
   try {
     if (pageEvidence?.href) pageUrl = new URL(pageEvidence.href);
@@ -132,61 +150,85 @@ export function pageRenderThisAttempt(pageEvidence, { path, nonce, attempt, case
     pageUrl = null;
   }
   if (!pageUrl) return false;
-  const pagePath = pageUrl.pathname;
-  if (!pagePath || pagePath.startsWith('/page/')) return false;
-  const onTarget = pagePath === path
-    || (pageEvidence?.dataPage && String(pageEvidence.dataPage) === `${caseDef.id}-target`);
-  if (!onTarget) return false;
+  if (pageUrl.pathname !== path) return false;
   return pageUrl.searchParams.get('nonce') === String(nonce)
     && pageUrl.searchParams.get('attempt') === String(attempt);
 }
 
+export function fetchKeptFromServe(pageEvidence, serve, { path, nonce, attempt, caseDef }) {
+  if (!serve || serve.pathname !== path || !serve.completed) return false;
+  if (!(Number(serve.status) >= 200 && Number(serve.status) < 400)) return false;
+  let pageUrl = null;
+  try {
+    if (pageEvidence?.href) pageUrl = new URL(pageEvidence.href);
+  } catch {
+    pageUrl = null;
+  }
+  if (!pageUrl) return false;
+  if (pageUrl.pathname !== `/page/${caseDef.id}`) return false;
+  if (pageUrl.searchParams.get('nonce') !== String(nonce)) return false;
+  if (pageUrl.searchParams.get('attempt') !== String(attempt)) return false;
+  const status = Number(pageEvidence.fetchStatus);
+  const bytes = Number(pageEvidence.fetchBytes);
+  return String(pageEvidence.fetchNonce) === String(nonce)
+    && String(pageEvidence.fetchAttempt) === String(attempt)
+    && status === Number(serve.status)
+    && bytes === Number(serve.bytes)
+    && bytes > 0;
+}
+
 export function keepClickProved(caseDef, {
   hits,
+  fixtureServes,
   downloads,
   pageEvidence,
   nonce,
   attempt,
-  expectedUrl,
   playwrightDownload,
   triggerAt,
 }) {
   const path = routePathname(caseDef.route);
   const fileOnFixture = path && !path.startsWith('/page/');
+  const serves = fixtureServes || [];
+  const serve = fileOnFixture
+    ? fixtureServeForTarget(serves, { pathname: path, nonce, attempt })
+    : null;
+
   if (fileOnFixture) {
-    if (!fixtureHitForAttempt(hits, { pathname: path, nonce, attempt })) {
+    const hitOk = fixtureHitForAttempt(hits, { pathname: path, nonce, attempt });
+    if (!serve && !hitOk) {
       return { ok: false, reason: `no fixture hit for ${path} nonce=${nonce} attempt=${attempt}` };
+    }
+    if (!serve || !serve.completed) {
+      return { ok: false, reason: `no completed fixture serve for ${path} nonce=${nonce} attempt=${attempt}` };
     }
   }
 
   const items = Array.isArray(downloads) ? downloads : [];
-  const downloadKept = items.some((item) => downloadIsThisAttempt(item, {
-    triggerAt,
-    attempt,
-    nonce,
-    expectedUrl,
-    caseDef,
-  }));
-  const renderKept = pageRenderThisAttempt(pageEvidence, {
+
+  if (caseDef.trigger === 'fetch-attachment') {
+    if (fetchKeptFromServe(pageEvidence, serve, { path, nonce, attempt, caseDef })) {
+      return { ok: true, reason: null };
+    }
+    return { ok: false, reason: 'fetch-attachment produced no this-attempt page-render marker' };
+  }
+
+  if (!fileOnFixture) {
+    if (blobDataKept(items, { caseDef, triggerAt }) || playwrightDownload) {
+      return { ok: true, reason: null };
+    }
+    return { ok: false, reason: 'no this-attempt chrome.downloads.search / playwright download for blob/data keep' };
+  }
+
+  const downloadKept = downloadKeptTarget(items, {
     path,
     nonce,
     attempt,
-    caseDef,
+    triggerAt,
   });
-  const fetchKept = caseDef.trigger === 'fetch-attachment'
-    && fetchMarkerThisAttempt(pageEvidence, { nonce, attempt, caseDef });
-
-  if (fileOnFixture && (downloadKept || renderKept || fetchKept)) {
+  const renderKept = pageRenderTarget(pageEvidence, { path, nonce, attempt });
+  if (downloadKept || renderKept) {
     return { ok: true, reason: null };
-  }
-  if (!fileOnFixture && (downloadKept || playwrightDownload)) {
-    return { ok: true, reason: null };
-  }
-  if (caseDef.trigger === 'fetch-attachment') {
-    return { ok: false, reason: 'fetch-attachment produced no this-attempt page-render marker' };
-  }
-  if (!fileOnFixture) {
-    return { ok: false, reason: 'no this-attempt chrome.downloads.search / playwright download for blob/data keep' };
   }
   return { ok: false, reason: 'keep click produced no this-attempt download or page-render evidence' };
 }
@@ -243,6 +285,7 @@ export function classifyCase(input) {
     enqueueLines,
     downloads,
     fixtureHits,
+    fixtureServes,
     pageEvidence,
     playwrightDownload,
   } = input;
@@ -377,11 +420,11 @@ export function classifyCase(input) {
   } else {
     const proof = keepClickProved(caseDef, {
       hits: fixtureHits,
+      fixtureServes,
       downloads,
       pageEvidence,
       nonce,
       attempt,
-      expectedUrl,
       playwrightDownload: Boolean(playwrightDownload),
       triggerAt,
     });
@@ -414,26 +457,42 @@ export function invalidateNegatives(items, reason) {
   }
 }
 
+function promptForCaseUrl(line, expectedUrl, startedAt) {
+  if (!line || line.type !== 'prompt_download') return false;
+  if (typeof startedAt === 'number' && !(line.receivedAt >= startedAt)) return false;
+  return (line.payload ?? {}).url === expectedUrl;
+}
+
 export function recheckLateMissXfails(results, hostLog) {
   for (const item of results) {
     if (item.status !== 'xfail') continue;
     if (!item.gap || !['G1', 'G4'].includes(item.gap)) continue;
-    const match = (hostLog || []).find((line) => exactPromptMatch(line, {
-      url: item.expectedUrl,
-      filename: item.filename,
-      startedAt: item.startedAt,
-    }));
-    if (!match) continue;
-    item.status = 'XPASS';
+    const lines = (hostLog || []).filter((line) => promptForCaseUrl(line, item.expectedUrl, item.startedAt));
+    if (lines.length === 0) continue;
+    const match = lines.length === 1
+      && exactPromptMatch(lines[0], {
+        url: item.expectedUrl,
+        filename: item.filename,
+        startedAt: item.startedAt,
+      })
+      ? lines[0]
+      : null;
+    const first = lines[0];
     item.observed = 'capture';
-    item.capturedUrl = match.payload?.url ?? null;
-    item.suggestedFilename = match.payload?.suggestedFilename ?? null;
-    item.entryPoint = match.payload?.source?.entryPoint ?? null;
-    item.hostReceivedAt = match.receivedAt ?? null;
+    item.capturedUrl = (match ?? first)?.payload?.url ?? null;
+    item.suggestedFilename = (match ?? first)?.payload?.suggestedFilename ?? null;
+    item.entryPoint = (match ?? first)?.payload?.source?.entryPoint ?? null;
+    item.hostReceivedAt = (match ?? first)?.receivedAt ?? null;
     if (item.triggerAt != null && item.hostReceivedAt != null) {
       item.latencyMs = item.hostReceivedAt - item.triggerAt;
     }
-    item.reason = `xfail ${item.gap} passed`;
+    if (match) {
+      item.status = 'XPASS';
+      item.reason = `xfail ${item.gap} passed`;
+    } else {
+      item.status = 'FAIL';
+      item.reason = `xfail ${item.gap} failed for a different reason (timeout/harness/wrong line)`;
+    }
   }
 }
 

@@ -14,6 +14,7 @@ const BODY_3K = 3 * 1024;
 const BODY_200M = 200 * 1024 * 1024;
 const COOKIE_NAME = 'rusticdl_e2e';
 const HIT_LOG = RUN_DIR ? `${RUN_DIR}/fixture-requests.jsonl` : '';
+const SERVE_LOG = RUN_DIR ? `${RUN_DIR}/fixture-serves.jsonl` : '';
 
 const attackMod = process.env.EXT_ATTACK
   ? await import(new URL('../../../../apps/extension/e2e/ext-attack.mjs', import.meta.url).href)
@@ -61,6 +62,52 @@ function logHit(req, url) {
     host: req.headers.host || '',
   };
   appendFileSync(HIT_LOG, `${JSON.stringify(record)}\n`);
+}
+
+function logServe(record) {
+  if (!SERVE_LOG) return;
+  mkdirSync(dirnameHit(SERVE_LOG), { recursive: true });
+  appendFileSync(SERVE_LOG, `${JSON.stringify({ at: Date.now(), ...record })}\n`);
+}
+
+function attachServeLog(req, res, url) {
+  let statusCode = 200;
+  let byteCount = 0;
+  let logged = false;
+  const origWriteHead = res.writeHead.bind(res);
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+  const flush = (completed) => {
+    if (logged) return;
+    logged = true;
+    logServe({
+      method: req.method || 'GET',
+      href: url.href,
+      pathname: url.pathname,
+      nonce: url.searchParams.get('nonce') || '',
+      attempt: url.searchParams.get('attempt') || '',
+      status: statusCode,
+      bytes: byteCount,
+      completed,
+    });
+  };
+  res.writeHead = (code, ...rest) => {
+    statusCode = Number(code);
+    return origWriteHead(code, ...rest);
+  };
+  res.write = (chunk, ...rest) => {
+    if (chunk) byteCount += Buffer.byteLength(chunk);
+    return origWrite(chunk, ...rest);
+  };
+  res.end = (chunk, ...rest) => {
+    if (chunk) byteCount += Buffer.byteLength(chunk);
+    flush(true);
+    return origEnd(chunk, ...rest);
+  };
+  res.logServeIncomplete = (status) => {
+    if (status != null) statusCode = Number(status);
+    flush(false);
+  };
 }
 
 function dirnameHit(filePath) {
@@ -183,6 +230,16 @@ document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
 });
 </script>`);
       }
+      if (attackMod?.n1IsWrongPage?.()) {
+        return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>
+<script>
+document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
+  event.preventDefault();
+  fetch(event.currentTarget.href);
+  location.href = "${file('/decoy')}&dataPage=N1-target";
+});
+</script>`);
+      }
       return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>`);
     case 'N2':
       return wrap(`<a data-case="N2" href="${file('/N2')}">N2 inline pdf</a>`);
@@ -218,6 +275,47 @@ document.querySelector("[data-case=N5]").addEventListener("click", async () => {
   root.setAttribute("data-fetch-nonce", "stale-nonce");
   root.setAttribute("data-fetch-attempt", "other-attempt");
   root.textContent = "N5-target status=" + res.status + " bytes=" + buf.byteLength + " nonce=stale-nonce attempt=other-attempt";
+});
+</script>`);
+      }
+      if (n5Mode === 'forged' || n5Mode === 'hang') {
+        return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
+<script>
+document.querySelector("[data-case=N5]").addEventListener("click", () => {
+  const parsed = new URL("${n5Href}", location.href);
+  const root = document.querySelector("[data-page]");
+  if (root) {
+    root.setAttribute("data-page", "N5-target");
+    root.setAttribute("data-fetch-status", "200");
+    root.setAttribute("data-fetch-bytes", "65536");
+    root.setAttribute("data-fetch-nonce", parsed.searchParams.get("nonce") || "");
+    root.setAttribute("data-fetch-attempt", parsed.searchParams.get("attempt") || "");
+    root.textContent = "${n5Mode === 'hang' ? 'painted-before-body' : 'painted'} status=200 bytes=65536 nonce="
+      + (parsed.searchParams.get("nonce") || "") + " attempt=" + (parsed.searchParams.get("attempt") || "");
+  }
+  fetch("${n5Href}");
+});
+</script>`);
+      }
+      if (n5Mode === 'wrong-page') {
+        return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
+<script>
+document.querySelector("[data-case=N5]").addEventListener("click", () => {
+  fetch("${n5Href}");
+  location.href = "${file('/decoy')}&dataPage=N5-target";
+});
+</script>`);
+      }
+      if (n5Mode === 'side-download') {
+        return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
+<script>
+document.querySelector("[data-case=N5]").addEventListener("click", () => {
+  fetch("${n5Href}");
+  const a = document.createElement("a");
+  a.href = "${file('/N6')}";
+  a.download = "stub.rar";
+  document.body.appendChild(a);
+  a.click();
 });
 </script>`);
       }
@@ -412,6 +510,7 @@ function onRequest(req, res) {
   const host = req.headers.host || `127.0.0.1:${PORT}`;
   const url = new URL(req.url || '/', `http://${host}`);
   const nonce = nonceOf(url);
+  attachServeLog(req, res, url);
   logHit(req, url);
   if (RUN_DIR && attackMod) {
     if (url.pathname === '/C1' && attackMod.scheduleLateC1Inject) {
@@ -459,6 +558,39 @@ function onRequest(req, res) {
       'Set-Cookie': cookieHeader(nonce),
     }, bytes(BODY_64K));
     return;
+  }
+
+  if (url.pathname === '/decoy') {
+    const dataPage = url.searchParams.get('dataPage') || 'decoy';
+    send(res, 200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Set-Cookie': cookieHeader(nonce),
+      'Cache-Control': 'no-store',
+    }, htmlPage(dataPage, '<p>decoy</p>'));
+    return;
+  }
+
+  if (url.pathname === '/N5') {
+    const n5Mode = attackMod?.n5Mode?.() || 'honest';
+    if (n5Mode === 'hang') {
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': 'attachment; filename="fetched.zip"',
+        'Content-Length': String(BODY_64K),
+        'Set-Cookie': cookieHeader(nonce),
+        'Cache-Control': 'no-store',
+      });
+      if (typeof res.logServeIncomplete === 'function') res.logServeIncomplete(200);
+      return;
+    }
+    if (n5Mode === 'forged') {
+      send(res, 500, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Set-Cookie': cookieHeader(nonce),
+        'Cache-Control': 'no-store',
+      }, 'forged-n5');
+      return;
+    }
   }
 
   if (url.pathname === '/get') {

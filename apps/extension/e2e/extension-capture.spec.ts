@@ -17,6 +17,7 @@ import {
   percentile,
   pingNativeHost,
   readFixtureHits,
+  readFixtureServes,
   readHostLog,
   searchDownloads,
   waitForServiceWorker,
@@ -302,7 +303,7 @@ test('extension capture matrix', async () => {
       }
       writeFileSync(path.join(evidenceDir, 'downloads.json'), `${JSON.stringify(downloads, null, 2)}\n`);
 
-      const shotPage = context.pages().at(-1) ?? page;
+      const shotPage = page;
       try {
         await shotPage.screenshot({ path: path.join(evidenceDir, 'page.png'), fullPage: true });
       } catch {
@@ -332,7 +333,9 @@ test('extension capture matrix', async () => {
       }));
 
       const fixtureHits = readFixtureHits(runDir).filter((hit) => hit.attempt === attempt);
+      const fixtureServes = readFixtureServes(runDir).filter((row) => row.attempt === attempt);
       writeFileSync(path.join(evidenceDir, 'fixture-hits.json'), `${JSON.stringify(fixtureHits, null, 2)}\n`);
+      writeFileSync(path.join(evidenceDir, 'fixture-serves.json'), `${JSON.stringify(fixtureServes, null, 2)}\n`);
 
       const classified = classify.classifyCase({
         caseDef,
@@ -347,6 +350,7 @@ test('extension capture matrix', async () => {
         enqueueLines,
         downloads,
         fixtureHits,
+        fixtureServes,
         pageEvidence,
         playwrightDownload: Boolean(playwrightDownload),
       }) as CaseResult;

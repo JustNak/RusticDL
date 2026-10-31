@@ -36,11 +36,19 @@ export function n1IsFakeTarget() {
   return attackName() === 'n1-fake-target';
 }
 
+export function n1IsWrongPage() {
+  return attackName() === 'n1-wrong-page';
+}
+
 export function n5Mode() {
   const attack = attackName();
   if (attack === 'n5-noop') return 'noop';
   if (attack === 'n5-fetch' || attack === 'n5-stay') return 'stay';
   if (attack === 'n5-stale' || attack === 'n5-stale-marker') return 'stale';
+  if (attack === 'n5-forged') return 'forged';
+  if (attack === 'n5-hang') return 'hang';
+  if (attack === 'n5-wrong-page') return 'wrong-page';
+  if (attack === 'n5-side-download') return 'side-download';
   return 'honest';
 }
 
@@ -280,6 +288,14 @@ export function scheduleLateC1Inject(runDir, fileUrl) {
       filename: null,
       requestId: 'ext-attack-late-c1-nullfile',
       label: 'late-c1-nullfile',
+    });
+    return;
+  }
+  if (attack === 'end-null') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: null,
+      requestId: 'ext-attack-end-null',
+      label: 'end-null',
     });
   }
 }
