@@ -27,7 +27,7 @@ const MAX_MESSAGE_BYTES = 1024 * 1024;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const attackModulePath = join(here, '../../../../apps/extension/e2e/ext-attack.mjs');
-const applyHostAttack = process.env.EXT_ATTACK
+const applyHostAttack = (process.env.EXT_ATTACK || process.env.CHECKER_ATTACK)
   ? (await import(pathToFileURL(attackModulePath).href)).applyHostAttack
   : null;
 
@@ -119,9 +119,9 @@ function logRequest(request, receivedAt, reply) {
   appendFileSync(logPath, `${JSON.stringify(line)}\n`, 'utf8');
 }
 
-process.stderr.write(`mock-native-host: start log=${logPath} attack=${process.env.EXT_ATTACK || ''}\n`);
+process.stderr.write(`mock-native-host: start log=${logPath} attack=${process.env.EXT_ATTACK || process.env.CHECKER_ATTACK || ''}\n`);
 
-if (process.env.EXT_ATTACK === 'kill-immediate') {
+if ((process.env.EXT_ATTACK || process.env.CHECKER_ATTACK) === 'kill-immediate') {
   process.exit(0);
 }
 
@@ -158,7 +158,7 @@ try {
       });
       if (handled) {
         process.stderr.write(
-          `mock-native-host: attack=${process.env.EXT_ATTACK} type=${String(request.type)} requestId=${String(request.requestId)}\n`,
+          `mock-native-host: attack=${process.env.EXT_ATTACK || process.env.CHECKER_ATTACK} type=${String(request.type)} requestId=${String(request.requestId)}\n`,
         );
         continue;
       }

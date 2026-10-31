@@ -135,6 +135,20 @@ function c1Def() {
   };
 }
 
+const G4_REASON = 'Chromium misses octet-stream with no Content-Disposition and no filename in the URL';
+
+function c4Def() {
+  return {
+    id: 'C4',
+    route: '/get',
+    expect: 'capture',
+    filename: 'get',
+    xfail: { gap: 'G4', reason: G4_REASON },
+    skip: null,
+    fidelity: { cookies: false, referrer: true, postBody: false, originalUrl: false },
+  };
+}
+
 function promptLine({ url, filename, entryPoint = 'browser_download', receivedAt = startedAt + 50, requestId = 'req-1', reply, extraPayload }) {
   const line = {
     receivedAt,
@@ -213,6 +227,7 @@ const c10Original = `${origin}/C10?nonce=${nonce}&attempt=${attempt}`;
 const c10Final = fixed.expectedFinalUrl(origin, nonce, attempt);
 const c2Url = `${origin}/C2?nonce=${nonce}&attempt=${attempt}`;
 const c1Url = `${origin}/C1?nonce=${nonce}&attempt=${attempt}`;
+const c4Url = `${origin}/get?id=5&nonce=${nonce}&attempt=${attempt}`;
 const n1Url = `${origin}/N1?nonce=${nonce}&attempt=${attempt}`;
 const n5Url = `${origin}/N5?nonce=${nonce}&attempt=${attempt}`;
 const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
@@ -810,6 +825,91 @@ const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
     next: newEarly,
     oldWant: (r) => r.status === 'xfail',
     newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const lateEnq = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-enqueue',
+    type: 'enqueue_download',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateEnq]);
+  fixed.recheckLateMissXfails([newEarly], [lateEnq]);
+  check('R5-1a', 'end-window exact enqueue_download turns G1 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'keep',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.capturedUrl === c1Url,
+  });
+}
+
+{
+  const lateEnq = lateCaptureLine(c4Url, startedAt + 22_000, {
+    filename: 'get',
+    requestId: 'end-enq-c4',
+    type: 'enqueue_download',
+  });
+  const oldEarly = run(legacy, c4Def(), { expectedUrl: c4Url, promptLines: [] });
+  const newEarly = run(fixed, c4Def(), { expectedUrl: c4Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateEnq]);
+  fixed.recheckLateMissXfails([newEarly], [lateEnq]);
+  check('R5-1b', 'end-window exact enqueue_download turns G4 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'keep',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.capturedUrl === c4Url,
+  });
+}
+
+{
+  const enq = lateCaptureLine(c1Url, startedAt + 1_000, {
+    filename: 'app.zip',
+    requestId: 'enqueue-c1',
+    type: 'enqueue_download',
+  });
+  check('R5-1c', 'in-case exact enqueue_download is FAIL (not G1 xfail)', {
+    old: run(legacy, c1Def(), { expectedUrl: c1Url, enqueueLines: [enq] }),
+    next: run(fixed, c1Def(), { expectedUrl: c1Url, enqueueLines: [enq] }),
+    oldWant: (r) => r.status === 'FAIL' && r.observed === 'capture',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture',
+  });
+}
+
+{
+  const lateExact = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-exact',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateExact]);
+  fixed.recheckLateMissXfails([newEarly], [lateExact]);
+  check('R5-1e', 'end-window exact prompt_download stays XPASS', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'XPASS' && r.observed === 'capture',
+  });
+}
+
+{
+  const lateBadEp = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-badep',
+    entryPoint: 'page_fetch',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateBadEp]);
+  fixed.recheckLateMissXfails([newEarly], [lateBadEp]);
+  check('R5-1f', 'end-window prompt_download with page_fetch stays FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.entryPoint === 'page_fetch',
   });
 }
 

@@ -11,12 +11,18 @@ export const EXPECTED_POST_BODY = 'post-body-c9';
 export const COOKIE_NAME = 'rusticdl_e2e';
 
 export function attackName() {
-  return process.env.EXT_ATTACK || '';
+  return process.env.EXT_ATTACK || process.env.CHECKER_ATTACK || '';
 }
 
 export function attackDelayMs() {
-  const raw = Number(process.env.EXT_ATTACK_DELAY_MS || process.env.CHECKER_DELAY_MS || '15000');
-  return Number.isFinite(raw) && raw >= 0 ? raw : 15_000;
+  const raw = process.env.EXT_ATTACK_DELAY_MS || process.env.CHECKER_DELAY_MS || '';
+  if (raw === 'after') return 22_000;
+  const parsed = Number(raw);
+  if (raw !== '' && Number.isFinite(parsed) && parsed >= 0) return parsed;
+  const name = attackName();
+  if (name.startsWith('end-')) return 22_000;
+  if (name === 'enqueue-c1' || name === 'late-c1-enqueue' || name === 'in-case-enqueue') return 1_000;
+  return 15_000;
 }
 
 export function cookieValueForNonce(nonce) {
@@ -235,16 +241,21 @@ export function applyHostAttack({
   return false;
 }
 
-export function lateCaptureLine(fileUrl, receivedAt, { filename, requestId }) {
+export function lateCaptureLine(fileUrl, receivedAt, {
+  filename,
+  requestId,
+  type = 'prompt_download',
+  entryPoint = 'browser_download',
+}) {
   return {
     receivedAt,
     protocolVersion: 1,
     requestId,
-    type: 'prompt_download',
+    type,
     payload: {
       url: fileUrl,
       suggestedFilename: filename,
-      source: { entryPoint: 'browser_download' },
+      source: { entryPoint },
     },
   };
 }
@@ -258,18 +269,18 @@ export function lateC1LogLine(fileUrl, receivedAt) {
 
 const scheduledLate = new Set();
 
-function scheduleLateLine(runDir, fileUrl, { filename, requestId, label }) {
+function scheduleLateLine(runDir, fileUrl, { filename, requestId, label, type, entryPoint }) {
   const key = `${runDir}:${label}`;
   if (scheduledLate.has(key)) return;
   scheduledLate.add(key);
   const delay = attackDelayMs();
   const logPath = `${runDir}/host-log.jsonl`;
   mkdirSync(dirname(logPath), { recursive: true });
-  note(runDir, `scheduled ${label} delay=${delay} url=${fileUrl}`);
+  note(runDir, `scheduled ${label} delay=${delay} type=${type || 'prompt_download'} url=${fileUrl}`);
   setTimeout(() => {
-    const line = lateCaptureLine(fileUrl, Date.now(), { filename, requestId });
+    const line = lateCaptureLine(fileUrl, Date.now(), { filename, requestId, type, entryPoint });
     appendFileSync(logPath, `${JSON.stringify(line)}\n`, 'utf8');
-    note(runDir, `late-wrote ${label} receivedAt=${line.receivedAt}`);
+    note(runDir, `late-wrote ${label} type=${line.type} receivedAt=${line.receivedAt}`);
   }, delay);
 }
 
@@ -297,14 +308,60 @@ export function scheduleLateC1Inject(runDir, fileUrl) {
       requestId: 'ext-attack-end-null',
       label: 'end-null',
     });
+    return;
+  }
+  if (attack === 'end-exact') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'app.zip',
+      requestId: 'ext-attack-end-exact',
+      label: 'end-exact',
+    });
+    return;
+  }
+  if (attack === 'end-badep') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'app.zip',
+      requestId: 'ext-attack-end-badep',
+      label: 'end-badep',
+      entryPoint: 'page_fetch',
+    });
+    return;
+  }
+  if (attack === 'end-enqueue' || attack === 'end-enq-c1' || attack === 'end-enq') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'app.zip',
+      requestId: 'ext-attack-end-enqueue',
+      label: 'end-enqueue',
+      type: 'enqueue_download',
+    });
+    return;
+  }
+  if (attack === 'enqueue-c1' || attack === 'late-c1-enqueue' || attack === 'in-case-enqueue') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'app.zip',
+      requestId: 'ext-attack-enqueue-c1',
+      label: 'enqueue-c1',
+      type: 'enqueue_download',
+    });
   }
 }
 
 export function scheduleLateC4Inject(runDir, fileUrl) {
-  if (attackName() !== 'late-c4') return;
-  scheduleLateLine(runDir, fileUrl, {
-    filename: 'get',
-    requestId: 'ext-attack-late-c4',
-    label: 'late-c4',
-  });
+  const attack = attackName();
+  if (attack === 'late-c4') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'get',
+      requestId: 'ext-attack-late-c4',
+      label: 'late-c4',
+    });
+    return;
+  }
+  if (attack === 'end-enq-c4' || attack === 'end-enqueue-c4') {
+    scheduleLateLine(runDir, fileUrl, {
+      filename: 'get',
+      requestId: 'ext-attack-end-enq-c4',
+      label: 'end-enq-c4',
+      type: 'enqueue_download',
+    });
+  }
 }

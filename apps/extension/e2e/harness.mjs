@@ -73,8 +73,10 @@ export function browserEnv({ isolatedHome, runDir, nodeBin = process.execPath })
     RUN_DIR: runDir,
     VERIFY_RUN_DIR: runDir,
     NODE_BIN: nodeBin,
-    EXT_ATTACK: process.env.EXT_ATTACK || '',
-    EXT_ATTACK_DELAY_MS: process.env.EXT_ATTACK_DELAY_MS || '',
+    EXT_ATTACK: process.env.EXT_ATTACK || process.env.CHECKER_ATTACK || '',
+    EXT_ATTACK_DELAY_MS: process.env.EXT_ATTACK_DELAY_MS || process.env.CHECKER_DELAY_MS || '',
+    CHECKER_ATTACK: process.env.CHECKER_ATTACK || '',
+    CHECKER_DELAY_MS: process.env.CHECKER_DELAY_MS || '',
     PATH: `${path.dirname(nodeBin)}:${process.env.PATH || '/usr/bin:/bin'}`,
   };
 }

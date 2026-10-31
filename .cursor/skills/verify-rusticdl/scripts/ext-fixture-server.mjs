@@ -16,7 +16,7 @@ const COOKIE_NAME = 'rusticdl_e2e';
 const HIT_LOG = RUN_DIR ? `${RUN_DIR}/fixture-requests.jsonl` : '';
 const SERVE_LOG = RUN_DIR ? `${RUN_DIR}/fixture-serves.jsonl` : '';
 
-const attackMod = process.env.EXT_ATTACK
+const attackMod = (process.env.EXT_ATTACK || process.env.CHECKER_ATTACK)
   ? await import(new URL('../../../../apps/extension/e2e/ext-attack.mjs', import.meta.url).href)
   : null;
 

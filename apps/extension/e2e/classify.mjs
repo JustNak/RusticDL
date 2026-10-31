@@ -68,13 +68,67 @@ export function downloadCompletedFor(downloads, urls) {
   return items.some((item) => item && wanted.has(item.url) && item.state === 'complete');
 }
 
-export function exactPromptMatch(line, { url, filename, entryPoint = 'browser_download', startedAt }) {
-  if (!line || line.type !== 'prompt_download') return false;
+/**
+ * Capture messages `handoffDownload` can send (nativeMessaging.ts):
+ * - auto → enqueueDownload → type `enqueue_download` (lines 139–160, 191–192)
+ * - ask  → promptDownload  → type `prompt_download`  (lines 162–178, 193–194)
+ * ping / open_app / save_extension_settings are not captures.
+ */
+export const CAPTURE_MESSAGE_TYPES = Object.freeze(['prompt_download', 'enqueue_download']);
+
+export function isCaptureMessageType(type) {
+  return type === 'prompt_download' || type === 'enqueue_download';
+}
+
+function captureFieldsMatch(line, { url, filename, entryPoint = 'browser_download', startedAt }) {
+  if (!line || !isCaptureMessageType(line.type)) return false;
   if (typeof startedAt === 'number' && !(line.receivedAt >= startedAt)) return false;
   const payload = line.payload ?? {};
   return payload.url === url
     && payload.suggestedFilename === filename
     && payload.source?.entryPoint === entryPoint;
+}
+
+export function exactPromptMatch(line, { url, filename, entryPoint = 'browser_download', startedAt }) {
+  return line?.type === 'prompt_download' && captureFieldsMatch(line, {
+    url,
+    filename,
+    entryPoint,
+    startedAt,
+  });
+}
+
+/**
+ * Shared capture predicate for the in-case drain and the end-of-run recheck.
+ * `lines` is the caller's window (drain slice, or the full host log).
+ * Recheck sets `matchUrl` so later sentinels with a different URL cannot
+ * flip a G1/G4 miss. In-case leaves it false so any capture in the drain
+ * (wrong URL included) is still a capture.
+ */
+export function classifyCaptureLinesForCase(lines, caseLike, startedAt, { matchUrl = false } = {}) {
+  const url = caseLike?.expectedUrl ?? caseLike?.url;
+  const filename = caseLike?.filename;
+  const captureLines = (lines || []).filter((line) => {
+    if (!line || !isCaptureMessageType(line.type)) return false;
+    if (typeof startedAt === 'number' && !(line.receivedAt >= startedAt)) return false;
+    if (matchUrl && (line.payload ?? {}).url !== url) return false;
+    return true;
+  });
+  const promptLines = captureLines.filter((line) => line.type === 'prompt_download');
+  const enqueueLines = captureLines.filter((line) => line.type === 'enqueue_download');
+  const matchLine = promptLines.find((line) => exactPromptMatch(line, {
+    url,
+    filename,
+    startedAt,
+  })) ?? null;
+  return {
+    captureLines,
+    promptLines,
+    enqueueLines,
+    matchLine,
+    captured: captureLines.length > 0,
+    exactPositive: Boolean(matchLine) && promptLines.length === 1 && enqueueLines.length === 0,
+  };
 }
 
 export function fixtureHitForAttempt(hits, { pathname, nonce, attempt }) {
@@ -262,8 +316,8 @@ function firstPrompt(promptLines) {
  *
  * Early returns / gap branches (each has a fail-closed sibling attack):
  * - skip → skip (L2/L3; not a keep pass)
- * - G1/G4 exactPositiveLine → XPASS (`late-c1` / `late-c4`); wrong shape → FAIL (`late-c1-nullfile`)
- * - G1/G4 empty keep → xfail; observed capture that is not exact → FAIL (`plant-c1`)
+ * - G1/G4 exactPositiveLine → XPASS (`late-c1` / `late-c4` / `end-exact`); wrong shape → FAIL (`late-c1-nullfile` / `end-null` / `end-badep` / `end-enqueue`)
+ * - G1/G4 empty keep → xfail; observed capture that is not exact → FAIL (`plant-c1` / `enqueue-c1`)
  * - expect-capture xfail + fullHandoff → XPASS (G5 prefix rewrite)
  * - expect-keep xfail + exactNegative → XPASS (no keep-xfail rows today)
  * - G3 exactFalseGrab → xfail; other/super/badfile/badep → FAIL (`g3-other`)
@@ -327,12 +381,13 @@ export function classifyCase(input) {
     return result;
   }
 
-  const matchLine = promptLines.find((line) => exactPromptMatch(line, {
-    url: expectedUrl,
-    filename: caseDef.filename,
+  const capture = classifyCaptureLinesForCase(
+    [...(promptLines || []), ...(enqueueLines || [])],
+    { url: expectedUrl, filename: caseDef.filename },
     startedAt,
-  })) ?? null;
-  const prompt = matchLine ?? firstPrompt(promptLines);
+  );
+  const matchLine = capture.matchLine;
+  const prompt = matchLine ?? firstPrompt(capture.promptLines) ?? capture.enqueueLines[0] ?? null;
   if (prompt) {
     result.capturedUrl = prompt.payload?.url ?? null;
     result.suggestedFilename = prompt.payload?.suggestedFilename ?? null;
@@ -347,11 +402,11 @@ export function classifyCase(input) {
     result.reason = [result.reason, 'protocol has no POST body field'].filter(Boolean).join('; ');
   }
 
-  const captured = promptLines.length + enqueueLines.length > 0;
+  const captured = capture.captured;
   result.observed = captured ? 'capture' : 'keep';
 
-  const exactPositiveLine = Boolean(matchLine) && promptLines.length === 1 && enqueueLines.length === 0;
-  const exactNegative = promptLines.length === 0 && enqueueLines.length === 0;
+  const exactPositiveLine = capture.exactPositive;
+  const exactNegative = capture.promptLines.length === 0 && capture.enqueueLines.length === 0;
   const accepted = Boolean(prompt && isAcceptedReply(prompt));
   const completed = downloadCompletedFor(downloads, [expectedUrl, result.capturedUrl, finalUrl]);
   const fullHandoff = exactPositiveLine && Boolean(matchLine && isAcceptedReply(matchLine)) && !completed;
@@ -361,17 +416,17 @@ export function classifyCase(input) {
   const falseGrabGaps = new Set(['G3']);
   const finalUrlGaps = new Set(['G5']);
 
-  const exactFalseGrab = promptLines.length === 1
-    && enqueueLines.length === 0
-    && exactPromptMatch(promptLines[0], {
+  const exactFalseGrab = capture.promptLines.length === 1
+    && capture.enqueueLines.length === 0
+    && exactPromptMatch(capture.promptLines[0], {
       url: expectedUrl,
       filename: caseDef.filename,
       startedAt,
     });
 
-  const exactFinalCapture = promptLines.length === 1
-    && enqueueLines.length === 0
-    && exactPromptMatch(promptLines[0], {
+  const exactFinalCapture = capture.promptLines.length === 1
+    && capture.enqueueLines.length === 0
+    && exactPromptMatch(capture.promptLines[0], {
       url: finalUrl,
       filename: caseDef.filename,
       startedAt,
@@ -407,7 +462,7 @@ export function classifyCase(input) {
       result.status = 'FAIL';
       const bits = [];
       if (!exactPositiveLine) {
-        bits.push(`expected one prompt_download url=${expectedUrl} filename=${caseDef.filename} entryPoint=browser_download; got ${JSON.stringify(promptLines.concat(enqueueLines))}`);
+        bits.push(`expected one prompt_download url=${expectedUrl} filename=${caseDef.filename} entryPoint=browser_download; got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`);
       }
       if (exactPositiveLine && !accepted) {
         bits.push('missing or wrong accepted reply (ok, type=accepted, echoed requestId)');
@@ -434,7 +489,7 @@ export function classifyCase(input) {
       result.status = 'FAIL';
       result.reason = exactNegative
         ? (proof.reason || 'keep click not proved')
-        : `expected keep (zero capture lines); got ${JSON.stringify(promptLines.concat(enqueueLines))}`;
+        : `expected keep (zero capture lines); got ${JSON.stringify(capture.promptLines.concat(capture.enqueueLines))}`;
     }
   }
 
@@ -457,36 +512,22 @@ export function invalidateNegatives(items, reason) {
   }
 }
 
-function promptForCaseUrl(line, expectedUrl, startedAt) {
-  if (!line || line.type !== 'prompt_download') return false;
-  if (typeof startedAt === 'number' && !(line.receivedAt >= startedAt)) return false;
-  return (line.payload ?? {}).url === expectedUrl;
-}
-
 export function recheckLateMissXfails(results, hostLog) {
   for (const item of results) {
     if (item.status !== 'xfail') continue;
     if (!item.gap || !['G1', 'G4'].includes(item.gap)) continue;
-    const lines = (hostLog || []).filter((line) => promptForCaseUrl(line, item.expectedUrl, item.startedAt));
-    if (lines.length === 0) continue;
-    const match = lines.length === 1
-      && exactPromptMatch(lines[0], {
-        url: item.expectedUrl,
-        filename: item.filename,
-        startedAt: item.startedAt,
-      })
-      ? lines[0]
-      : null;
-    const first = lines[0];
+    const capture = classifyCaptureLinesForCase(hostLog, item, item.startedAt, { matchUrl: true });
+    if (!capture.captured) continue;
+    const first = capture.matchLine ?? capture.captureLines[0];
     item.observed = 'capture';
-    item.capturedUrl = (match ?? first)?.payload?.url ?? null;
-    item.suggestedFilename = (match ?? first)?.payload?.suggestedFilename ?? null;
-    item.entryPoint = (match ?? first)?.payload?.source?.entryPoint ?? null;
-    item.hostReceivedAt = (match ?? first)?.receivedAt ?? null;
+    item.capturedUrl = first?.payload?.url ?? null;
+    item.suggestedFilename = first?.payload?.suggestedFilename ?? null;
+    item.entryPoint = first?.payload?.source?.entryPoint ?? null;
+    item.hostReceivedAt = first?.receivedAt ?? null;
     if (item.triggerAt != null && item.hostReceivedAt != null) {
       item.latencyMs = item.hostReceivedAt - item.triggerAt;
     }
-    if (match) {
+    if (capture.exactPositive) {
       item.status = 'XPASS';
       item.reason = `xfail ${item.gap} passed`;
     } else {
