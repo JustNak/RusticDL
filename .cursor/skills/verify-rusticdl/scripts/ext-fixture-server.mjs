@@ -172,6 +172,17 @@ document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
 });
 </script>`);
       }
+      if (attackMod?.n1IsFakeTarget?.()) {
+        return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>
+<script>
+document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
+  event.preventDefault();
+  fetch(event.currentTarget.href);
+  const root = document.querySelector("[data-page]");
+  if (root) root.setAttribute("data-page", "N1-target");
+});
+</script>`);
+      }
       return wrap(`<a data-case="N1" href="${file('/N1')}">N1 html page</a>`);
     case 'N2':
       return wrap(`<a data-case="N2" href="${file('/N2')}">N2 inline pdf</a>`);
@@ -179,13 +190,57 @@ document.querySelector("[data-case=N1]").addEventListener("click", (event) => {
       return wrap(`<a data-case="N3" href="${file('/N3')}">N3 image</a>`);
     case 'N4':
       return wrap(`<a data-case="N4" href="${file('/files/app.zip')}">N4 html as zip path</a>`);
-    case 'N5':
-      return wrap(`<button type="button" data-case="N5" data-file-url="${file('/N5')}">N5 fetch</button>
+    case 'N5': {
+      const n5Href = file('/N5');
+      const n5Mode = attackMod?.n5Mode?.() || 'honest';
+      if (n5Mode === 'noop') {
+        return wrap(`<button type="button" data-case="N5">N5 fetch</button>`);
+      }
+      if (n5Mode === 'stay') {
+        return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
 <script>
 document.querySelector("[data-case=N5]").addEventListener("click", () => {
-  fetch("${file('/N5')}");
+  fetch("${n5Href}");
 });
 </script>`);
+      }
+      if (n5Mode === 'stale') {
+        return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
+<script>
+document.querySelector("[data-case=N5]").addEventListener("click", async () => {
+  const res = await fetch("${n5Href}");
+  const buf = await res.arrayBuffer();
+  const root = document.querySelector("[data-page]");
+  if (!root) return;
+  root.setAttribute("data-page", "N5-target");
+  root.setAttribute("data-fetch-status", String(res.status));
+  root.setAttribute("data-fetch-bytes", String(buf.byteLength));
+  root.setAttribute("data-fetch-nonce", "stale-nonce");
+  root.setAttribute("data-fetch-attempt", "other-attempt");
+  root.textContent = "N5-target status=" + res.status + " bytes=" + buf.byteLength + " nonce=stale-nonce attempt=other-attempt";
+});
+</script>`);
+      }
+      return wrap(`<button type="button" data-case="N5" data-file-url="${n5Href}">N5 fetch</button>
+<script>
+document.querySelector("[data-case=N5]").addEventListener("click", async () => {
+  const url = "${n5Href}";
+  const res = await fetch(url);
+  const buf = await res.arrayBuffer();
+  const parsed = new URL(url, location.href);
+  const root = document.querySelector("[data-page]");
+  if (!root) return;
+  root.setAttribute("data-page", "N5-target");
+  root.setAttribute("data-fetch-status", String(res.status));
+  root.setAttribute("data-fetch-bytes", String(buf.byteLength));
+  root.setAttribute("data-fetch-nonce", parsed.searchParams.get("nonce") || "");
+  root.setAttribute("data-fetch-attempt", parsed.searchParams.get("attempt") || "");
+  root.textContent = "N5-target status=" + res.status + " bytes=" + buf.byteLength
+    + " nonce=" + (parsed.searchParams.get("nonce") || "")
+    + " attempt=" + (parsed.searchParams.get("attempt") || "");
+});
+</script>`);
+    }
     case 'N6':
       return wrap(`<a data-case="N6" href="${file('/N6')}">N6 3kb rar</a>`);
     case 'L1':

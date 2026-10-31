@@ -32,6 +32,18 @@ export function n1IsFetch() {
   return attackName() === 'n1-fetch';
 }
 
+export function n1IsFakeTarget() {
+  return attackName() === 'n1-fake-target';
+}
+
+export function n5Mode() {
+  const attack = attackName();
+  if (attack === 'n5-noop') return 'noop';
+  if (attack === 'n5-fetch' || attack === 'n5-stay') return 'stay';
+  if (attack === 'n5-stale' || attack === 'n5-stale-marker') return 'stale';
+  return 'honest';
+}
+
 export function c6IsNoop() {
   return attackName() === 'c6-noop';
 }

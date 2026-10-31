@@ -79,6 +79,7 @@ type CaseResult = {
   nonce?: string;
   handoffAccepted?: boolean;
   downloadCompleted?: boolean;
+  pageEvidence?: Record<string, unknown>;
 };
 
 function envOr(name: string, fallback: string): string {
@@ -255,6 +256,9 @@ test('extension capture matrix', async () => {
       await locator.click({ timeout: 10_000 });
       await popupPromise;
       const playwrightDownload = await downloadPromise;
+      if (caseDef.trigger === 'fetch-attachment') {
+        await page.locator('[data-fetch-attempt]').waitFor({ state: 'attached', timeout: 2000 }).catch(() => null);
+      }
 
       const missXfail = Boolean(caseDef.xfail && ['G1', 'G4'].includes(caseDef.xfail.gap));
       const keepWait = (caseDef.expect === 'keep' && !caseDef.xfail) || missXfail;
@@ -304,12 +308,28 @@ test('extension capture matrix', async () => {
       } catch {
         writeFileSync(path.join(evidenceDir, 'page.png.missing.txt'), 'screenshot failed\n');
       }
-      const pageEvidence = await shotPage.evaluate(() => ({
-        href: location.href,
-        title: document.title,
-        text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2000),
-        dataPage: document.querySelector('[data-page]')?.getAttribute('data-page') || null,
-      })).catch(() => ({ href: '', title: '', text: '', dataPage: null }));
+      const pageEvidence = await shotPage.evaluate(() => {
+        const root = document.querySelector('[data-page]');
+        return {
+          href: location.href,
+          title: document.title,
+          text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 2000),
+          dataPage: root?.getAttribute('data-page') || null,
+          fetchStatus: root?.getAttribute('data-fetch-status') || null,
+          fetchBytes: root?.getAttribute('data-fetch-bytes') || null,
+          fetchNonce: root?.getAttribute('data-fetch-nonce') || null,
+          fetchAttempt: root?.getAttribute('data-fetch-attempt') || null,
+        };
+      }).catch(() => ({
+        href: '',
+        title: '',
+        text: '',
+        dataPage: null,
+        fetchStatus: null,
+        fetchBytes: null,
+        fetchNonce: null,
+        fetchAttempt: null,
+      }));
 
       const fixtureHits = readFixtureHits(runDir).filter((hit) => hit.attempt === attempt);
       writeFileSync(path.join(evidenceDir, 'fixture-hits.json'), `${JSON.stringify(fixtureHits, null, 2)}\n`);
@@ -331,6 +351,7 @@ test('extension capture matrix', async () => {
         playwrightDownload: Boolean(playwrightDownload),
       }) as CaseResult;
       classified.evidencePath = evidenceDir;
+      classified.pageEvidence = pageEvidence;
       persistResult(classified, { expectedUrl, expectedFinalUrl: expectedFinal, pageUrl, nonce, attempt, pageEvidence });
       if (classified.latencyMs != null && classified.observed === 'capture') {
         latencies.push(classified.latencyMs);

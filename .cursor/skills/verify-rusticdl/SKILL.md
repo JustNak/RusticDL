@@ -239,7 +239,7 @@ Recipe detail: `features/extension-capture.md`.
 | `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
 | `apps/extension/e2e/classify.mjs` | Matrix classifier (exact G3/G5 match, accepted handoff, keep proof, late recheck) |
 | `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot; imported only by `selftest-classifier.mjs` |
-| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9 and R2 attacks against both classifiers |
+| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2, and R3 keep-proof attacks against both classifiers |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 

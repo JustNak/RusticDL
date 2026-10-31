@@ -113,6 +113,34 @@ function downloadIsThisAttempt(item, { triggerAt, attempt, nonce, expectedUrl, c
   return false;
 }
 
+export function fetchMarkerThisAttempt(pageEvidence, { nonce, attempt, caseDef }) {
+  if (!pageEvidence || !caseDef) return false;
+  if (String(pageEvidence.dataPage) !== `${caseDef.id}-target`) return false;
+  const status = Number(pageEvidence.fetchStatus);
+  const bytes = Number(pageEvidence.fetchBytes);
+  return String(pageEvidence.fetchNonce) === String(nonce)
+    && String(pageEvidence.fetchAttempt) === String(attempt)
+    && Number.isFinite(status) && status >= 200 && status < 400
+    && Number.isFinite(bytes) && bytes > 0;
+}
+
+export function pageRenderThisAttempt(pageEvidence, { path, nonce, attempt, caseDef }) {
+  let pageUrl = null;
+  try {
+    if (pageEvidence?.href) pageUrl = new URL(pageEvidence.href);
+  } catch {
+    pageUrl = null;
+  }
+  if (!pageUrl) return false;
+  const pagePath = pageUrl.pathname;
+  if (!pagePath || pagePath.startsWith('/page/')) return false;
+  const onTarget = pagePath === path
+    || (pageEvidence?.dataPage && String(pageEvidence.dataPage) === `${caseDef.id}-target`);
+  if (!onTarget) return false;
+  return pageUrl.searchParams.get('nonce') === String(nonce)
+    && pageUrl.searchParams.get('attempt') === String(attempt);
+}
+
 export function keepClickProved(caseDef, {
   hits,
   downloads,
@@ -139,25 +167,23 @@ export function keepClickProved(caseDef, {
     expectedUrl,
     caseDef,
   }));
+  const renderKept = pageRenderThisAttempt(pageEvidence, {
+    path,
+    nonce,
+    attempt,
+    caseDef,
+  });
+  const fetchKept = caseDef.trigger === 'fetch-attachment'
+    && fetchMarkerThisAttempt(pageEvidence, { nonce, attempt, caseDef });
 
-  let pagePath = '';
-  try {
-    if (pageEvidence?.href) pagePath = new URL(pageEvidence.href).pathname;
-  } catch {
-    pagePath = '';
-  }
-  const pageChangedToTarget = pagePath === path
-    || (pageEvidence?.dataPage && String(pageEvidence.dataPage) === `${caseDef.id}-target`);
-
-  if (caseDef.trigger === 'fetch-attachment') {
-    return { ok: true, reason: null };
-  }
-
-  if (fileOnFixture && (downloadKept || pageChangedToTarget)) {
+  if (fileOnFixture && (downloadKept || renderKept || fetchKept)) {
     return { ok: true, reason: null };
   }
   if (!fileOnFixture && (downloadKept || playwrightDownload)) {
     return { ok: true, reason: null };
+  }
+  if (caseDef.trigger === 'fetch-attachment') {
+    return { ok: false, reason: 'fetch-attachment produced no this-attempt page-render marker' };
   }
   if (!fileOnFixture) {
     return { ok: false, reason: 'no this-attempt chrome.downloads.search / playwright download for blob/data keep' };
@@ -191,6 +217,17 @@ function firstPrompt(promptLines) {
 
 /**
  * Classify one matrix case. Does not mutate host logs.
+ *
+ * Early returns / gap branches (each has a fail-closed sibling attack):
+ * - skip → skip (L2/L3; not a keep pass)
+ * - G1/G4 exactPositiveLine → XPASS (`late-c1` / `late-c4`); wrong shape → FAIL (`late-c1-nullfile`)
+ * - G1/G4 empty keep → xfail; observed capture that is not exact → FAIL (`plant-c1`)
+ * - expect-capture xfail + fullHandoff → XPASS (G5 prefix rewrite)
+ * - expect-keep xfail + exactNegative → XPASS (no keep-xfail rows today)
+ * - G3 exactFalseGrab → xfail; other/super/badfile/badep → FAIL (`g3-other`)
+ * - G5 exactFinal + accepted + !complete → xfail; garbage/complete → FAIL (`c10-wrong-shape`)
+ * - capture fullHandoff → pass; missing accepted or complete download → FAIL (`wrong-shape`)
+ * - keep: exactNegative && keepClickProved → pass, else FAIL
  */
 export function classifyCase(input) {
   const {

@@ -97,6 +97,32 @@ function c6Def() {
   };
 }
 
+function n5Def() {
+  return {
+    id: 'N5',
+    route: '/N5',
+    trigger: 'fetch-attachment',
+    expect: 'keep',
+    filename: 'fetched.zip',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function l2Def() {
+  return {
+    id: 'L2',
+    route: '/L2',
+    trigger: 'user-cancel-shelf',
+    expect: 'keep',
+    filename: 'cancel.bin',
+    xfail: null,
+    skip: 'cannot drive Chrome\'s download-shelf cancel as a real page user action within 1.5s',
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
 function c1Def() {
   return {
     id: 'C1',
@@ -175,6 +201,8 @@ const c10Final = fixed.expectedFinalUrl(origin, nonce, attempt);
 const c2Url = `${origin}/C2?nonce=${nonce}&attempt=${attempt}`;
 const c1Url = `${origin}/C1?nonce=${nonce}&attempt=${attempt}`;
 const n1Url = `${origin}/N1?nonce=${nonce}&attempt=${attempt}`;
+const n5Url = `${origin}/N5?nonce=${nonce}&attempt=${attempt}`;
+const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
 
 // F1: G3 other-case line
 {
@@ -497,6 +525,140 @@ const n1Url = `${origin}/N1?nonce=${nonce}&attempt=${attempt}`;
       downloads: thisAttemptBlob,
       playwrightDownload: false,
     }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+}
+
+// R3-1 fetch-attachment must not pass on fixture hit alone
+{
+  const hits = [{ pathname: '/N5', nonce, attempt }];
+  const stay = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    downloads: [],
+    pageEvidence: { href: n5Page, text: 'N5 fetch', dataPage: 'N5' },
+  };
+  check('R3-1a', 'N5 fetch-and-stay (no marker) is FAIL', {
+    old: run(legacy, n5Def(), stay),
+    next: run(fixed, n5Def(), stay),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const stale = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      text: 'N5-target',
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: 'stale-nonce',
+      fetchAttempt: 'other-attempt',
+    },
+  };
+  check('R3-1b', 'N5 stale marker from another attempt is FAIL', {
+    old: run(legacy, n5Def(), stale),
+    next: run(fixed, n5Def(), stale),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const honest = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      text: `N5-target status=200 bytes=65536 nonce=${nonce} attempt=${attempt}`,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R3-1c', 'N5 this-attempt fetch marker is pass', {
+    old: run(legacy, n5Def(), honest),
+    next: run(fixed, n5Def(), honest),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+  const fakeTarget = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`,
+      text: 'N1 html page',
+      dataPage: 'N1-target',
+    },
+  };
+  check('R3-1d', 'N1 launcher painted as N1-target is FAIL', {
+    old: run(legacy, n1Def(), fakeTarget),
+    next: run(fixed, n1Def(), fakeTarget),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const skipExtra = { expectedUrl: `${origin}/L2`, promptLines: [] };
+  check('SW-skip', 'L2 skip branch stays skip', {
+    old: run(legacy, l2Def(), skipExtra),
+    next: run(fixed, l2Def(), skipExtra),
+    oldWant: (r) => r.status === 'skip',
+    newWant: (r) => r.status === 'skip',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: c9Url,
+    promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+  };
+  check('SW-G3-exact', 'G3 exact false-grab stays xfail', {
+    old: run(legacy, c9Def(), extra),
+    next: run(fixed, c9Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'xfail',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: `${origin}/C10?nonce=${nonce}&attempt=${attempt}`,
+    expectedFinalUrl: c10Final,
+    promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+    downloads: [],
+  };
+  check('SW-G5-honest', 'G5 exact final + accepted + not complete stays xfail', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'xfail',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    pageEvidence: {
+      href: n1Url,
+      text: 'html document, not a file',
+      dataPage: 'N1-target',
+    },
+  };
+  check('SW-N1-nav', 'N1 navigation to this-attempt target is pass', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
     oldWant: (r) => r.status === 'pass',
     newWant: (r) => r.status === 'pass',
   });
