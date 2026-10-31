@@ -209,7 +209,15 @@ The prove script checks the fixture pid owns the port, the unpacked Chromium dis
 .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
 ```
 
-Each case is a real click on `[data-case=Cn]`. Every pass/fail is a row in `PROOF_RULES` (`apps/extension/e2e/classify.mjs`): capture (exact `prompt_download` + accepted), keep (zero capture + this-attempt fixture/DOM/chrome.downloads), stop (erased or `interrupted`+`USER_CANCELED`, match `url` or `finalUrl`), end-window recheck, end-download recheck, and each G-gap conjunct. A pass never comes from a bare download state, an unread log, or another case’s evidence; missing evidence is FAIL named. Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round’s negatives. Recipe: `features/extension-capture.md`.
+Each case is a real click on `[data-case=Cn]`. Capture, keep, stop, end-window recheck, end-download recheck, and the G1/G3/G4/G5 conjuncts are `PROOF_RULES` rows in `apps/extension/e2e/classify.mjs`. Not every verdict goes through that table. Remaining direct sites: `classify.mjs` skip (`:854`), the G5 `XPASS` path (`:927`), `isSentinelOk` (`:968`), `invalidateNegatives` (`:972`), `hostFailedHandoff` (`:1046`), the spec C2/N1 `expect`s and blocker filter (`extension-capture.spec.ts:520-529`), and the metrics `observed === 'capture'` filter (`extension-capture.spec.ts:486`). Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round’s negatives. Recipe: `features/extension-capture.md`.
+
+### Known gaps
+
+- G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8).
+- G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
+- G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
+- G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
+- G6 — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row (`keepClickProved`, `classify.mjs:358`). Unconfirmed: (a) stop compares href strings, so a reordered query on a `complete` item counts as erased; (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
 
 ### Evidence
 
@@ -237,7 +245,7 @@ Recipe detail: `features/extension-capture.md`.
 | `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock; logs the reply next to each request |
 | `scripts/ext-cases.json` | Capture matrix rows (`id, route, trigger, expect, url, filename, xfail`) |
 | `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
-| `apps/extension/e2e/classify.mjs` | Matrix classifier (exact G3/G5 match, accepted handoff, keep proof, late recheck) |
+| `apps/extension/e2e/classify.mjs` | Matrix classifier (`PROOF_RULES`; G1/G3/G4/G5 xfails; G6 blob/data keep arm is a documented harness gap) |
 | `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot; imported only by `selftest-classifier.mjs` |
 | `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2–R7 classifier attacks plus R8 `PROOF_RULES` honest+mutant coverage against both classifiers |
 

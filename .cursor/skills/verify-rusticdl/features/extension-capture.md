@@ -39,7 +39,7 @@ Headless CI wraps the same script with `xvfb-run`. Each case is a real click on 
 
 ## Proof table (`PROOF_RULES` in `apps/extension/e2e/classify.mjs`)
 
-Every pass/fail in `classify.mjs` and every capture-line / evidence-log read in `harness.mjs` goes through this table. A pass never comes from a bare chrome.downloads state, from “no error”, from a log that was not read, or from another case’s path. Missing, empty, partial, errored, unreadable, or ambiguous evidence is FAIL with the reason named.
+Capture, keep, stop, end-window recheck, end-download recheck, and the G1/G3/G4/G5 conjuncts are rows in this table (`evaluateProof`). Not every verdict goes through `PROOF_RULES`. Remaining direct sites: `classify.mjs` skip (`:854`), the G5 `XPASS` path when capture and stop are both ok (`:927`, does not call `g5-final-url`), `isSentinelOk` (`:968`), `invalidateNegatives` (`:972`), `hostFailedHandoff` (`:1046`), the spec C2/N1 `expect`s and blocker filter (`extension-capture.spec.ts:520-529`), and the metrics `observed === 'capture'` filter (`extension-capture.spec.ts:486`). Missing, empty, partial, errored, unreadable, or ambiguous evidence on a table row is FAIL with the reason named, except G6 on the blob/data keep arm.
 
 - `capture` — evidence: mock-host log line for this case (`payload.url`, `suggestedFilename`, `source.entryPoint`, `receivedAt` in window). cause: exactly one `prompt_download` for this case URL+filename+`entryPoint=browser_download` with accepted reply (`ok`, `type=accepted`, echoed `requestId`). default: FAIL if the mock-host log is missing/empty/unreadable/ambiguous, or a capture line is for another URL/filename/entryPoint.
 - `keep` — evidence: mock-host log (this case window; must be zero capture lines); fixture serve log entry for this case path+nonce+attempt (file keeps); chrome.downloads item matched by this-case path+nonce+attempt OR DOM `document.URL` / fetch marker for this path+nonce+attempt. cause: zero `prompt_download`/`enqueue_download` AND a completed this-case fixture serve (file keeps) AND this-attempt keep evidence (complete download, page render, or fetch marker). default: FAIL if mock-host/fixture/DOM/chrome.downloads is missing, the path belongs to another case, or there is no this-attempt keep evidence.
@@ -50,6 +50,24 @@ Every pass/fail in `classify.mjs` and every capture-line / evidence-log read in 
 - `g4-miss` — evidence: mock-host log for this C4-family URL in the case window. cause: successfully read log with zero capture lines for this case (Chromium did not enqueue this URL). default: FAIL if the log is missing/unreadable, or a capture line for this URL is not exact `prompt_download`.
 - `g3-false-grab` — evidence: mock-host log line for this-attempt POST URL. cause: exactly one `prompt_download` with `url=`this-attempt POST URL, `suggestedFilename=posted.zip`, `entryPoint=browser_download`. default: FAIL if the log is missing/unreadable, or the line is another case’s URL, a superstring, the wrong filename, or a non-prompt type.
 - `g5-final-url` — evidence: mock-host log line for origin+`/C10/final`+this-attempt query; `chrome.downloads.search` matched by `url` OR `finalUrl`. cause: exactly one `prompt_download` with `payload.url===`final URL, accepted reply, AND stop (erased or `USER_CANCELED`). default: FAIL if the log/search is missing, the URL is evil/super/garbage, or the download is `in_progress`/`complete`/other interrupt named.
+
+## Known gaps
+
+Product xfails in `scripts/ext-cases.json` (Chromium, not this harness):
+
+- G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3 inline zip, C7 `location.href`, C8 programmatic `a.click()`).
+- G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
+- G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
+- G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
+
+Harness (PR1 lands with this documented):
+
+- G6 — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row’s `blobDataKept(...) || playwrightDownload` arm (`keepClickProved` / keep row, `classify.mjs:358`). File keeps (N1) still require `state === 'complete'` plus path+nonce+attempt.
+
+Unconfirmed suspicions (not findings):
+
+- (a) the stop match compares href strings, so a reordered query on a `complete` item counts as erased.
+- (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
 
 ## Gotchas
 
