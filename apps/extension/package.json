@@ -6,13 +6,15 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node ./scripts/test-firefox-capture.mjs"
+    "test": "node ./scripts/test-firefox-capture.mjs",
+    "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "dependencies": {
     "@rusticdl/protocol": "file:../../packages/protocol",
     "webextension-polyfill": "^0.12.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@types/firefox-webext-browser": "^120.0.4",
     "esbuild": "^0.25.0",
     "typescript": "^5.8.0"

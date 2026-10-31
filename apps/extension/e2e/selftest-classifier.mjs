@@ -1,0 +1,1706 @@
+#!/usr/bin/env node
+/**
+ * Plants each checker attack against the 9227e12 classifier and the fixed
+ * classifier. Exit 0 only when every finding is red on legacy and green after
+ * the fix. No browser; uses the same classify*.mjs modules as the spec.
+ */
+import { mkdtempSync, writeFileSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import * as fixed from './classify.mjs';
+import * as legacy from './classify.legacy.mjs';
+import { EXPECTED_POST_BODY, lateC1LogLine, lateCaptureLine } from './ext-attack.mjs';
+import { drainCaptureLines } from './harness.mjs';
+
+const G3_REASON = 'Chromium false-captures the POST attachment and would replay it as GET';
+const G5_REASON = 'Chromium handed off the final same-origin redirect URL (/C10/final), not the original /C10 URL';
+const G1_REASON = 'Chromium did not capture <a download> same-origin zip (no Content-Disposition attachment)';
+
+const nonce = '79d242b0-8243-4c96-8cb2-03930921b6f1';
+const attempt = '1793438122840-mr9dov';
+const origin = 'http://127.0.0.1:18765';
+const startedAt = 1_793_438_122_000;
+const triggerAt = startedAt;
+
+function c9Def() {
+  return {
+    id: 'C9',
+    route: '/C9',
+    expect: 'keep',
+    filename: 'posted.zip',
+    xfail: { gap: 'G3', reason: G3_REASON },
+    skip: null,
+    fidelity: { cookies: false, referrer: true, postBody: true, originalUrl: false },
+  };
+}
+
+function c10Def() {
+  return {
+    id: 'C10',
+    route: '/C10',
+    expect: 'capture',
+    filename: 'archive.zip',
+    xfail: { gap: 'G5', reason: G5_REASON },
+    skip: null,
+    fidelity: { cookies: false, referrer: true, postBody: false, originalUrl: true },
+  };
+}
+
+function c2Def() {
+  return {
+    id: 'C2',
+    route: '/C2',
+    expect: 'capture',
+    filename: 'setup.exe',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: true, referrer: true, postBody: false, originalUrl: false },
+  };
+}
+
+function n1Def() {
+  return {
+    id: 'N1',
+    route: '/N1',
+    trigger: 'click-link',
+    expect: 'keep',
+    filename: null,
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function c5Def() {
+  return {
+    id: 'C5',
+    route: '/page/C5',
+    trigger: 'blob-anchor',
+    expect: 'keep',
+    filename: 'blob.zip',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function c6Def() {
+  return {
+    id: 'C6',
+    route: '/page/C6',
+    trigger: 'data-anchor',
+    expect: 'keep',
+    filename: 'data.zip',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function n5Def() {
+  return {
+    id: 'N5',
+    route: '/N5',
+    trigger: 'fetch-attachment',
+    expect: 'keep',
+    filename: 'fetched.zip',
+    xfail: null,
+    skip: null,
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function l2Def() {
+  return {
+    id: 'L2',
+    route: '/L2',
+    trigger: 'user-cancel-shelf',
+    expect: 'keep',
+    filename: 'cancel.bin',
+    xfail: null,
+    skip: 'cannot drive Chrome\'s download-shelf cancel as a real page user action within 1.5s',
+    fidelity: { cookies: false, referrer: false, postBody: false, originalUrl: false },
+  };
+}
+
+function c1Def() {
+  return {
+    id: 'C1',
+    route: '/C1',
+    expect: 'capture',
+    filename: 'app.zip',
+    xfail: { gap: 'G1', reason: G1_REASON },
+    skip: null,
+    fidelity: { cookies: false, referrer: true, postBody: false, originalUrl: false },
+  };
+}
+
+const G4_REASON = 'Chromium misses octet-stream with no Content-Disposition and no filename in the URL';
+
+function c4Def() {
+  return {
+    id: 'C4',
+    route: '/get',
+    expect: 'capture',
+    filename: 'get',
+    xfail: { gap: 'G4', reason: G4_REASON },
+    skip: null,
+    fidelity: { cookies: false, referrer: true, postBody: false, originalUrl: false },
+  };
+}
+
+function promptLine({ url, filename, entryPoint = 'browser_download', receivedAt = startedAt + 50, requestId = 'req-1', reply, extraPayload }) {
+  const line = {
+    receivedAt,
+    requestId,
+    type: 'prompt_download',
+    payload: {
+      url,
+      suggestedFilename: filename,
+      source: { entryPoint, referrer: `${origin}/page/X?nonce=${nonce}&attempt=${attempt}` },
+      ...extraPayload,
+    },
+  };
+  if (reply !== undefined) line.reply = reply;
+  else {
+    line.reply = { ok: true, type: 'accepted', requestId, payload: { status: 'queued', appState: 'running' } };
+  }
+  return line;
+}
+
+function accepted(requestId) {
+  return { ok: true, type: 'accepted', requestId, payload: { status: 'queued', appState: 'running' } };
+}
+
+function targetServe(pathname, extra = {}) {
+  return {
+    pathname,
+    nonce,
+    attempt,
+    status: 200,
+    bytes: 65536,
+    completed: true,
+    ...extra,
+  };
+}
+
+function run(mod, caseDef, extra) {
+  const expectedUrl = extra.expectedUrl;
+  const pageUrl = extra.pageUrl || `${origin}/page/${caseDef.id}?nonce=${nonce}&attempt=${attempt}`;
+  return mod.classifyCase({
+    caseDef,
+    expectedUrl,
+    expectedFinalUrl: extra.expectedFinalUrl ?? null,
+    pageUrl,
+    nonce,
+    attempt: extra.attempt || attempt,
+    startedAt,
+    triggerAt: extra.triggerAt ?? triggerAt,
+    promptLines: extra.promptLines || [],
+    enqueueLines: extra.enqueueLines || [],
+    hostLog: extra.hostLog,
+    hostLogOk: extra.hostLogOk,
+    hostLogReason: extra.hostLogReason,
+    downloads: extra.downloads || [],
+    downloadsOk: extra.downloadsOk,
+    downloadsReason: extra.downloadsReason,
+    fixtureHits: extra.fixtureHits || [],
+    fixtureServes: extra.fixtureServes || [],
+    fixtureServesOk: extra.fixtureServesOk,
+    fixtureServesReason: extra.fixtureServesReason,
+    pageEvidence: extra.pageEvidence || { href: pageUrl, text: '', dataPage: caseDef.id },
+    pageEvidenceOk: extra.pageEvidenceOk,
+    playwrightDownload: extra.playwrightDownload,
+  });
+}
+
+const findings = [];
+
+function check(id, title, { old: oldGot, next: newGot, oldWant, newWant }) {
+  const oldOk = oldWant(oldGot);
+  const newOk = newWant(newGot);
+  const pass = oldOk && newOk;
+  findings.push({ id, title, pass, oldGot, newGot });
+  const fmt = (got) => {
+    if (typeof got === 'string') return got;
+    const reason = got.reason ? `/reason=${got.reason}` : '';
+    return `${got.status}/obs=${got.observed}/url=${got.capturedUrl ?? ''}/file=${got.suggestedFilename ?? ''}/cookies=${got.fidelity?.cookies ?? ''}/postBody=${got.fidelity?.postBody ?? ''}${reason}`;
+  };
+  console.log(
+    `${pass ? 'PASS' : 'FAIL'} ${id} ${title}\n  old=${fmt(oldGot)}\n  new=${fmt(newGot)}`,
+  );
+}
+
+const c9Url = `${origin}/C9?nonce=${nonce}&attempt=${attempt}`;
+const c10Original = `${origin}/C10?nonce=${nonce}&attempt=${attempt}`;
+const c10Final = fixed.expectedFinalUrl(origin, nonce, attempt);
+const c2Url = `${origin}/C2?nonce=${nonce}&attempt=${attempt}`;
+const c1Url = `${origin}/C1?nonce=${nonce}&attempt=${attempt}`;
+const c4Url = `${origin}/get?id=5&nonce=${nonce}&attempt=${attempt}`;
+const n1Url = `${origin}/N1?nonce=${nonce}&attempt=${attempt}`;
+const n5Url = `${origin}/N5?nonce=${nonce}&attempt=${attempt}`;
+const n5Page = `${origin}/page/N5?nonce=${nonce}&attempt=${attempt}`;
+
+// F1: G3 other-case line
+{
+  const lines = [promptLine({
+    url: 'http://127.0.0.1:18765/C2?from=other-case',
+    filename: 'setup.exe',
+  })];
+  const extra = { expectedUrl: c9Url, promptLines: lines };
+  check('F1', 'G3 other-case line is FAIL, not xfail', {
+    old: run(legacy, c9Def(), extra),
+    next: run(fixed, c9Def(), extra),
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'capture',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// F2 evil
+{
+  const lines = [promptLine({ url: 'http://evil.example/C10/final', filename: 'archive.zip' })];
+  const extra = { expectedUrl: c10Original, expectedFinalUrl: c10Final, promptLines: lines };
+  check('F2a', 'G5 evil host is FAIL, not xfail', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail' && String(r.capturedUrl).includes('/C10/final'),
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// F2 superstring
+{
+  const superUrl = `${c10Final}&extra=1`;
+  const lines = [promptLine({ url: superUrl, filename: 'archive.zip' })];
+  const extra = { expectedUrl: c10Original, expectedFinalUrl: c10Final, promptLines: lines };
+  check('F2b', 'G5 superstring is FAIL, not xfail', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// F2 control prefix
+{
+  const lines = [promptLine({ url: `${origin}/C10`, filename: 'archive.zip' })];
+  const extra = { expectedUrl: c10Original, expectedFinalUrl: c10Final, promptLines: lines };
+  check('F2c', 'G5 prefix (no /final) FAIL on both', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'FAIL',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// F3 wrong-shape / complete download
+{
+  const requestId = 'c2-1';
+  const lines = [promptLine({
+    url: c2Url,
+    filename: 'setup.exe',
+    requestId,
+    reply: { hello: 'wrong-shape' },
+  })];
+  const downloads = [{ id: 2, state: 'complete', url: c2Url, filename: '/tmp/x' }];
+  const extra = { expectedUrl: c2Url, promptLines: lines, downloads };
+  check('F3a', 'C2 with wrong-shape + complete download is FAIL', {
+    old: run(legacy, c2Def(), extra),
+    next: run(fixed, c2Def(), extra),
+    oldWant: (r) => r.status === 'pass' && r.observed === 'capture',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const n1 = run(fixed, n1Def(), {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    pageEvidence: { href: n1Url, text: 'html document, not a file', dataPage: 'N1-target' },
+  });
+  const c2fail = run(fixed, c2Def(), {
+    expectedUrl: c2Url,
+    promptLines: [promptLine({ url: c2Url, filename: 'setup.exe', reply: undefined })],
+    downloads: [{ id: 1, state: 'complete', url: c2Url }],
+  });
+  c2fail.handoffAccepted = false;
+  c2fail.downloadCompleted = true;
+  c2fail.status = 'FAIL';
+  const round = [n1];
+  if (fixed.hostFailedHandoff([c2fail, n1]) || !fixed.isSentinelOk(c2fail)) {
+    fixed.invalidateNegatives(round, 'missing or wrong accepted reply; negative keep is INVALID');
+  }
+  const n1Old = run(legacy, n1Def(), { expectedUrl: n1Url, promptLines: [] });
+  check('F3b', 'N1 INVALID when C2 has no accepted reply', {
+    old: n1Old,
+    next: n1,
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'INVALID',
+  });
+}
+
+// F4 late exact C1
+{
+  const late = lateC1LogLine(c1Url, startedAt + 15_000);
+  const extraEarly = { expectedUrl: c1Url, promptLines: [] };
+  const oldEarly = run(legacy, c1Def(), extraEarly);
+  const newEarly = run(fixed, c1Def(), extraEarly);
+  fixed.recheckLateMissXfails([newEarly], [late]);
+  legacy.recheckLateMissXfails([oldEarly], [late]);
+  check('F4a', 'late exact C1 in-window is XPASS (no accepted reply required for G1)', {
+    old: run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [late] }),
+    next: run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [late] }),
+    oldWant: (r) => r.status === 'XPASS',
+    newWant: (r) => r.status === 'XPASS',
+  });
+  check('F4', 'late exact C1 is xfail on old, XPASS after recheck', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'keep',
+    newWant: (r) => r.status === 'XPASS' && r.observed === 'capture',
+  });
+}
+
+// F5 noop click
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/page/N1', nonce, attempt }],
+    pageEvidence: { href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`, text: 'N1', dataPage: 'N1' },
+  };
+  check('F5', 'N1 href=# noop is FAIL', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// F6 postBody from payload
+{
+  const lines = [promptLine({
+    url: c9Url,
+    filename: 'posted.zip',
+    extraPayload: { postBody: EXPECTED_POST_BODY },
+  })];
+  const extra = { expectedUrl: c9Url, promptLines: lines };
+  check('F6', 'fidelity.postBody follows payload', {
+    old: run(legacy, c9Def(), extra),
+    next: run(fixed, c9Def(), extra),
+    oldWant: (r) => r.fidelity.postBody === 'fail',
+    newWant: (r) => r.fidelity.postBody === 'pass',
+  });
+}
+
+// F7 cookie === nonce
+{
+  const lines = [promptLine({
+    url: c2Url,
+    filename: 'setup.exe',
+    extraPayload: {
+      handoffAuth: {
+        headers: [{ name: 'Cookie', value: `rusticdl_e2e=${nonce}-tampered` }],
+      },
+    },
+  })];
+  const extra = {
+    expectedUrl: c2Url,
+    promptLines: lines,
+    downloads: [],
+  };
+  check('F7', 'tampered cookie is fidelity fail', {
+    old: run(legacy, c2Def(), extra),
+    next: run(fixed, c2Def(), extra),
+    oldWant: (r) => r.fidelity.cookies === 'pass',
+    newWant: (r) => r.fidelity.cookies === 'fail',
+  });
+}
+
+// F8 repeat: failed sentinel invalidates only its round
+{
+  const n1r1 = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  const n1r2 = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  const oldAll = [n1r1, n1r2];
+  const oldIds = ['N1'];
+  for (const item of oldAll) {
+    if (oldIds.includes(item.id) && item.status === 'pass') {
+      item.status = 'INVALID';
+      item.invalid = true;
+      item.reason = 'sentinel C2 did not capture; negative keep is INVALID';
+    }
+  }
+  const n1r1b = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  const n1r2b = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  fixed.invalidateNegatives([n1r2b], 'sentinel C2 did not capture; negative keep is INVALID');
+  check('F8', 'repeat sentinel fail invalidates only its round', {
+    old: `${n1r1.status}/${n1r2.status}`,
+    next: `${n1r1b.status}/${n1r2b.status}`,
+    oldWant: (s) => s === 'INVALID/INVALID',
+    newWant: (s) => s === 'pass/INVALID',
+  });
+}
+
+// F9 end sentinel
+{
+  const n1Old = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  const n1New = { id: 'N1', expect: 'keep', status: 'pass', invalid: false, reason: null };
+  if (legacy.INVALIDATE_END_SENTINEL) {
+    legacy.invalidateNegatives([n1Old], 'end sentinel C2 did not capture; negative keep is INVALID');
+  }
+  if (fixed.INVALIDATE_END_SENTINEL) {
+    fixed.invalidateNegatives([n1New], 'end sentinel C2 did not capture; negative keep is INVALID');
+  }
+  check('F9', 'end sentinel fail marks preceding negatives INVALID', {
+    old: n1Old,
+    next: n1New,
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'INVALID',
+  });
+}
+
+// R2-1 late wrong-shape filename is FAIL, not xfail
+{
+  const lateBad = lateCaptureLine(c1Url, startedAt + 15_000, {
+    filename: null,
+    requestId: 'late-null',
+  });
+  check('R2-1b', 'late C1 with null filename is FAIL', {
+    old: run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [lateBad] }),
+    next: run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [lateBad] }),
+    oldWant: (r) => r.status === 'FAIL',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+// R2-2 G5 wrong-shape + complete download
+{
+  const finalUrl = c10Final;
+  const lines = [promptLine({
+    url: finalUrl,
+    filename: 'archive.zip',
+    reply: { hello: 'wrong-shape' },
+  })];
+  const extra = {
+    expectedUrl: c10Original,
+    expectedFinalUrl: finalUrl,
+    promptLines: lines,
+    downloads: [{ id: 4, state: 'complete', url: finalUrl }],
+  };
+  check('R2-2', 'G5 garbage reply + complete download is FAIL', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+// R2-4 N1 fetch-and-stay
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    pageEvidence: { href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`, text: 'N1 html page', dataPage: 'N1' },
+    downloads: [],
+  };
+  check('R2-4a', 'N1 fetch-and-stay is FAIL', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const leftover = [{
+    id: 2,
+    state: 'complete',
+    url: 'blob:http://127.0.0.1:18765/0415dce4-94d1-4d37-a590-9c45f8448dab',
+    referrer: `${origin}/page/C5?nonce=${nonce}&attempt=other-attempt`,
+    startTime: new Date(startedAt - 60_000).toISOString(),
+    filename: 'blob.zip',
+  }];
+  check('R2-4b', 'C5 no-op leftover blob is FAIL', {
+    old: run(legacy, c5Def(), { expectedUrl: `${origin}/page/C5`, promptLines: [], downloads: leftover }),
+    next: run(fixed, c5Def(), {
+      expectedUrl: `${origin}/page/C5`,
+      promptLines: [],
+      downloads: leftover,
+      triggerAt: startedAt,
+      attempt,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  check('R2-4c', 'C6 no-op after C5 blob is FAIL', {
+    old: run(legacy, c6Def(), { expectedUrl: `${origin}/page/C6`, promptLines: [], downloads: leftover }),
+    next: run(fixed, c6Def(), {
+      expectedUrl: `${origin}/page/C6`,
+      promptLines: [],
+      downloads: leftover,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const thisAttemptBlob = [{
+    id: 3,
+    state: 'complete',
+    url: 'blob:http://127.0.0.1:18765/this-attempt',
+    referrer: `${origin}/page/C5?nonce=${nonce}&attempt=${attempt}`,
+    startTime: new Date(startedAt + 20).toISOString(),
+    filename: 'blob.zip',
+  }];
+  check('R2-4d', 'C5 this-attempt blob is still pass', {
+    old: run(legacy, c5Def(), { expectedUrl: `${origin}/page/C5`, promptLines: [], downloads: thisAttemptBlob }),
+    next: run(fixed, c5Def(), {
+      expectedUrl: `${origin}/page/C5`,
+      promptLines: [],
+      downloads: thisAttemptBlob,
+      playwrightDownload: false,
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+}
+
+// R3-1 fetch-attachment must not pass on fixture hit alone
+{
+  const hits = [{ pathname: '/N5', nonce, attempt }];
+  const n5Serve = [targetServe('/N5')];
+  const stay = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    fixtureServes: n5Serve,
+    downloads: [],
+    pageEvidence: { href: n5Page, text: 'N5 fetch', dataPage: 'N5' },
+  };
+  check('R3-1a', 'N5 fetch-and-stay (no marker) is FAIL', {
+    old: run(legacy, n5Def(), stay),
+    next: run(fixed, n5Def(), stay),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const stale = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    fixtureServes: n5Serve,
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      text: 'N5-target',
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: 'stale-nonce',
+      fetchAttempt: 'other-attempt',
+    },
+  };
+  check('R3-1b', 'N5 stale marker from another attempt is FAIL', {
+    old: run(legacy, n5Def(), stale),
+    next: run(fixed, n5Def(), stale),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+  const honest = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: hits,
+    fixtureServes: n5Serve,
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      text: `N5-target status=200 bytes=65536 nonce=${nonce} attempt=${attempt}`,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R3-1c', 'N5 this-attempt fetch marker is pass', {
+    old: run(legacy, n5Def(), honest),
+    next: run(fixed, n5Def(), honest),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+  const fakeTarget = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/page/N1?nonce=${nonce}&attempt=${attempt}`,
+      text: 'N1 html page',
+      dataPage: 'N1-target',
+    },
+  };
+  check('R3-1d', 'N1 launcher painted as N1-target is FAIL', {
+    old: run(legacy, n1Def(), fakeTarget),
+    next: run(fixed, n1Def(), fakeTarget),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const skipExtra = { expectedUrl: `${origin}/L2`, promptLines: [] };
+  check('SW-skip', 'L2 skip branch stays skip', {
+    old: run(legacy, l2Def(), skipExtra),
+    next: run(fixed, l2Def(), skipExtra),
+    oldWant: (r) => r.status === 'skip',
+    newWant: (r) => r.status === 'skip',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: c9Url,
+    promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+  };
+  check('SW-G3-exact', 'G3 exact false-grab stays xfail', {
+    old: run(legacy, c9Def(), extra),
+    next: run(fixed, c9Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'xfail',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: `${origin}/C10?nonce=${nonce}&attempt=${attempt}`,
+    expectedFinalUrl: c10Final,
+    promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+    downloads: [],
+  };
+  check('SW-G5-honest', 'G5 exact final + accepted + not complete stays xfail', {
+    old: run(legacy, c10Def(), extra),
+    next: run(fixed, c10Def(), extra),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'xfail',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    pageEvidence: {
+      href: n1Url,
+      text: 'html document, not a file',
+      dataPage: 'N1-target',
+    },
+  };
+  check('SW-N1-nav', 'N1 navigation to this-attempt target is pass', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5', { status: 500, bytes: 9 })],
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R4-1a', 'N5 forged 200/65536 vs serve 500/9 is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5', { status: 200, bytes: 0, completed: false })],
+    downloads: [],
+    pageEvidence: {
+      href: n5Page,
+      dataPage: 'N5-target',
+      fetchStatus: '200',
+      fetchBytes: '65536',
+      fetchNonce: nonce,
+      fetchAttempt: attempt,
+    },
+  };
+  check('R4-1b', 'N5 hang (body not sent) is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5')],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/decoy?nonce=${nonce}&attempt=${attempt}&dataPage=N5-target`,
+      dataPage: 'N5-target',
+    },
+  };
+  check('R4-2a', 'N5 /decoy with data-page=N5-target is FAIL', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n1Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+    fixtureServes: [targetServe('/N1', { bytes: 120 })],
+    downloads: [],
+    pageEvidence: {
+      href: `${origin}/decoy?nonce=${nonce}&attempt=${attempt}&dataPage=N1-target`,
+      dataPage: 'N1-target',
+    },
+  };
+  check('R4-2b', 'N1 /decoy with data-page=N1-target is FAIL', {
+    old: run(legacy, n1Def(), extra),
+    next: run(fixed, n1Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const extra = {
+    expectedUrl: n5Url,
+    promptLines: [],
+    fixtureHits: [{ pathname: '/N5', nonce, attempt }],
+    fixtureServes: [targetServe('/N5')],
+    downloads: [{
+      id: 9,
+      state: 'complete',
+      url: `${origin}/N6?nonce=${nonce}&attempt=${attempt}`,
+      referrer: n5Page,
+      startTime: new Date(startedAt + 10).toISOString(),
+    }],
+    pageEvidence: { href: n5Page, dataPage: 'N5' },
+  };
+  check('R4-3', 'N6 download does not prove N5 keep', {
+    old: run(legacy, n5Def(), extra),
+    next: run(fixed, n5Def(), extra),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const lateNull = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: null,
+    requestId: 'end-null',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateNull]);
+  fixed.recheckLateMissXfails([newEarly], [lateNull]);
+  check('R4-4', 'end-window null filename turns G1 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL',
+  });
+}
+
+{
+  const lateEnq = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-enqueue',
+    type: 'enqueue_download',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateEnq]);
+  fixed.recheckLateMissXfails([newEarly], [lateEnq]);
+  check('R5-1a', 'end-window exact enqueue_download turns G1 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'keep',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.capturedUrl === c1Url,
+  });
+}
+
+{
+  const lateEnq = lateCaptureLine(c4Url, startedAt + 22_000, {
+    filename: 'get',
+    requestId: 'end-enq-c4',
+    type: 'enqueue_download',
+  });
+  const oldEarly = run(legacy, c4Def(), { expectedUrl: c4Url, promptLines: [] });
+  const newEarly = run(fixed, c4Def(), { expectedUrl: c4Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateEnq]);
+  fixed.recheckLateMissXfails([newEarly], [lateEnq]);
+  check('R5-1b', 'end-window exact enqueue_download turns G4 xfail into FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail' && r.observed === 'keep',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.capturedUrl === c4Url,
+  });
+}
+
+{
+  const enq = lateCaptureLine(c1Url, startedAt + 1_000, {
+    filename: 'app.zip',
+    requestId: 'enqueue-c1',
+    type: 'enqueue_download',
+  });
+  check('R5-1c', 'in-case exact enqueue_download is FAIL (not G1 xfail)', {
+    old: run(legacy, c1Def(), { expectedUrl: c1Url, enqueueLines: [enq] }),
+    next: run(fixed, c1Def(), { expectedUrl: c1Url, enqueueLines: [enq] }),
+    oldWant: (r) => r.status === 'FAIL' && r.observed === 'capture',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture',
+  });
+}
+
+{
+  const lateExact = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-exact',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateExact]);
+  fixed.recheckLateMissXfails([newEarly], [lateExact]);
+  check('R5-1e', 'end-window exact prompt_download stays XPASS', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'XPASS' && r.observed === 'capture',
+  });
+}
+
+{
+  const lateBadEp = lateCaptureLine(c1Url, startedAt + 22_000, {
+    filename: 'app.zip',
+    requestId: 'end-badep',
+    entryPoint: 'page_fetch',
+  });
+  const oldEarly = run(legacy, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  const newEarly = run(fixed, c1Def(), { expectedUrl: c1Url, promptLines: [] });
+  legacy.recheckLateMissXfails([oldEarly], [lateBadEp]);
+  fixed.recheckLateMissXfails([newEarly], [lateBadEp]);
+  check('R5-1f', 'end-window prompt_download with page_fetch stays FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.observed === 'capture' && r.entryPoint === 'page_fetch',
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1a', 'C2 in_progress download is FAIL, not pass', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'in_progress', bytesReceived: 0, url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'in_progress', bytesReceived: 0, url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.browserDownloadStopped === false,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1b', 'C2 chrome.downloads.search error is FAIL, not pass', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: { error: 'boom' } }),
+    next: run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: { error: 'boom' } }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadSearchError === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  check('R6-1c', 'G5 in_progress final download is FAIL, not xfail', {
+    old: run(legacy, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'in_progress', bytesReceived: 0, url: c10Final }],
+    }),
+    next: run(fixed, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'in_progress', bytesReceived: 0, url: c10Final }],
+    }),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.browserDownloadStopped === false,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R6-1d', 'C2 interrupted (cancelled) download still passes', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass' && r.browserDownloadStopped === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  const oldEarly = run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] });
+  const newEarly = run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] });
+  if (typeof legacy.recheckCaptureDownloads === 'function') {
+    legacy.recheckCaptureDownloads([oldEarly], [{ id: 3, state: 'complete', url: c2Url }]);
+  }
+  fixed.recheckCaptureDownloads([newEarly], [{ id: 3, state: 'complete', url: c2Url }]);
+  check('R6-1e', 'end-of-run complete C2 download flips pass to FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  const extra = {
+    expectedUrl: c10Original,
+    expectedFinalUrl: c10Final,
+    promptLines: lines,
+    downloads: [],
+  };
+  const oldEarly = run(legacy, c10Def(), extra);
+  const newEarly = run(fixed, c10Def(), extra);
+  if (typeof legacy.recheckCaptureDownloads === 'function') {
+    legacy.recheckCaptureDownloads([oldEarly], [{ id: 4, state: 'complete', url: c10Final }]);
+  }
+  fixed.recheckCaptureDownloads([newEarly], [{ id: 4, state: 'complete', url: c10Final }]);
+  check('R6-1f', 'end-of-run complete C10 final download flips G5 xfail to FAIL', {
+    old: oldEarly,
+    next: newEarly,
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1a', 'C2 NETWORK_FAILED interrupt is FAIL, not pass', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL'
+      && r.browserDownloadStopped === false
+      && String(r.reason).includes('NETWORK_FAILED'),
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1b', 'C2 SERVER_CONTENT_LENGTH_MISMATCH interrupt is FAIL', {
+    old: run(legacy, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'SERVER_CONTENT_LENGTH_MISMATCH', url: c2Url }],
+    }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{ id: 1, state: 'interrupted', error: 'SERVER_CONTENT_LENGTH_MISMATCH', url: c2Url }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL'
+      && String(r.reason).includes('SERVER_CONTENT_LENGTH_MISMATCH'),
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  const outsider = {
+    id: 9,
+    state: 'complete',
+    url: 'http://other.example/not-this-click',
+    finalUrl: c2Url,
+  };
+  check('R7-1c', 'item with url outside and finalUrl inside is counted (complete is FAIL)', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [outsider] }),
+    next: run(fixed, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [outsider] }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'FAIL' && r.downloadCompleted === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c2Url, filename: 'setup.exe' })];
+  check('R7-1d', 'item with url outside and finalUrl inside USER_CANCELED still passes', {
+    old: run(legacy, c2Def(), { expectedUrl: c2Url, promptLines: lines, downloads: [] }),
+    next: run(fixed, c2Def(), {
+      expectedUrl: c2Url,
+      promptLines: lines,
+      downloads: [{
+        id: 9,
+        state: 'interrupted',
+        error: 'USER_CANCELED',
+        url: 'http://other.example/not-this-click',
+        finalUrl: c2Url,
+      }],
+    }),
+    oldWant: (r) => r.status === 'pass',
+    newWant: (r) => r.status === 'pass' && r.browserDownloadStopped === true,
+  });
+}
+
+{
+  const lines = [promptLine({ url: c10Final, filename: 'archive.zip' })];
+  check('R7-1e', 'G5 NETWORK_FAILED interrupt is FAIL with error named, not xfail', {
+    old: run(legacy, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+    }),
+    next: run(fixed, c10Def(), {
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      promptLines: lines,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+    }),
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'FAIL'
+      && r.browserDownloadStopped === false
+      && String(r.reason).includes('NETWORK_FAILED'),
+  });
+}
+
+{
+  const dir = mkdtempSync(path.join(tmpdir(), 'r2-drain-'));
+  writeFileSync(path.join(dir, 'host-log.jsonl'), '');
+  const startedAt = Date.now();
+  const delayMs = 400;
+  const timer = setTimeout(() => {
+    appendFileSync(path.join(dir, 'host-log.jsonl'), `${JSON.stringify({
+      receivedAt: Date.now(),
+      type: 'prompt_download',
+      payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+    })}\n`);
+  }, delayMs);
+  const t0 = Date.now();
+  const withoutWaitOut = await drainCaptureLines(dir, startedAt, {
+    minWaitMs: 50,
+    quietMs: 80,
+    maxWaitMs: 1500,
+    waitOutEmpty: false,
+  });
+  const earlyElapsed = Date.now() - t0;
+  const withWaitOut = await drainCaptureLines(dir, startedAt, {
+    minWaitMs: 0,
+    quietMs: 80,
+    maxWaitMs: 1500,
+    waitOutEmpty: true,
+  });
+  clearTimeout(timer);
+  const waitedElapsed = Date.now() - t0;
+  check('R2-1-drain', 'waitOutEmpty keeps draining empty logs past min+quiet', {
+    old: {
+      status: withoutWaitOut.length === 0 && earlyElapsed < delayMs ? 'xfail' : 'FAIL',
+      observed: withoutWaitOut.length ? 'capture' : 'keep',
+    },
+    next: {
+      status: withWaitOut.length === 1 && waitedElapsed >= delayMs ? 'XPASS' : 'FAIL',
+      observed: withWaitOut.length ? 'capture' : 'keep',
+    },
+    oldWant: (r) => r.status === 'xfail',
+    newWant: (r) => r.status === 'XPASS',
+  });
+}
+
+function proofCheck(testId, title, proof, wantFn) {
+  check(testId, title, {
+    old: { status: 'n/a', observed: '', capturedUrl: '', suggestedFilename: '', fidelity: {} },
+    next: {
+      status: proof.verdict,
+      observed: proof.ok ? 'ok' : 'fail',
+      capturedUrl: proof.capture?.matchLine?.payload?.url ?? '',
+      suggestedFilename: proof.capture?.matchLine?.payload?.suggestedFilename ?? '',
+      fidelity: {},
+      reason: proof.reason,
+    },
+    oldWant: () => true,
+    newWant: () => wantFn(proof),
+  });
+}
+
+function failNamed(proof, needle) {
+  return proof.verdict === 'FAIL' && proof.ok === false && String(proof.reason || '').includes(needle);
+}
+
+function passOk(proof, verdict = 'pass') {
+  return proof.ok === true && proof.verdict === verdict;
+}
+
+{
+  console.log('PROOF_RULES');
+  for (const row of fixed.PROOF_RULES) {
+    console.log(`  ${row.id}`);
+    console.log(`    evidence: ${row.evidence.join('; ')}`);
+    console.log(`    cause: ${row.cause}`);
+    console.log(`    default: ${row.missingDefault}`);
+  }
+}
+
+{
+  const ctx = {
+    caseDef: c2Def(),
+    expectedUrl: c2Url,
+    filename: 'setup.exe',
+    startedAt,
+    promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+    hostLogOk: true,
+  };
+  proofCheck('R8-capture-honest', 'capture exact prompt+accepted passes',
+    fixed.evaluateProof('capture', ctx),
+    (p) => passOk(p, 'pass'));
+}
+
+{
+  proofCheck('R8-capture-mutant-missing', 'capture unread host log FAILs named',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-capture-mutant-other-case', 'capture other-case URL FAILs',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'setup.exe' })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'expected one prompt_download'));
+}
+
+{
+  proofCheck('R8-capture-mutant-no-accepted', 'capture without accepted reply FAILs',
+    fixed.evaluateProof('capture', {
+      caseDef: c2Def(),
+      expectedUrl: c2Url,
+      filename: 'setup.exe',
+      startedAt,
+      promptLines: [promptLine({
+        url: c2Url,
+        filename: 'setup.exe',
+        reply: { hello: 'wrong-shape' },
+      })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'accepted reply'));
+}
+
+{
+  const downloads = [{
+    id: 1,
+    state: 'complete',
+    url: n1Url,
+    startTime: new Date(triggerAt).toISOString(),
+  }];
+  proofCheck('R8-keep-honest', 'keep zero capture + this-attempt serve+download passes',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: true,
+      downloads,
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      fixtureHits: [{ pathname: '/N1', nonce, attempt }],
+      pageEvidence: { href: n1Url, text: 'html', dataPage: 'N1-target' },
+      pageEvidenceOk: true,
+    }),
+    (p) => passOk(p, 'pass'));
+}
+
+{
+  proofCheck('R8-keep-mutant-missing', 'keep unread host log FAILs named',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      downloads: [],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      pageEvidence: { href: n1Url },
+      pageEvidenceOk: true,
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-keep-mutant-other-case', 'keep N6 serve does not prove N1',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [],
+      hostLogOk: true,
+      downloads: [{
+        id: 1,
+        state: 'complete',
+        url: `${origin}/N6?nonce=${nonce}&attempt=${attempt}`,
+        startTime: new Date(triggerAt).toISOString(),
+      }],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N6')],
+      fixtureServesOk: true,
+      fixtureHits: [{ pathname: '/N6', nonce, attempt }],
+      pageEvidence: { href: `${origin}/N6?nonce=${nonce}&attempt=${attempt}` },
+      pageEvidenceOk: true,
+    }),
+    (p) => p.verdict === 'FAIL' && p.ok === false);
+}
+
+{
+  proofCheck('R8-keep-mutant-capture-line', 'keep with a capture line FAILs',
+    fixed.evaluateProof('keep', {
+      caseDef: n1Def(),
+      expectedUrl: n1Url,
+      startedAt,
+      triggerAt,
+      nonce,
+      attempt,
+      promptLines: [promptLine({ url: n1Url, filename: 'x' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+      fixtureServes: [targetServe('/N1')],
+      fixtureServesOk: true,
+      pageEvidence: { href: n1Url },
+      pageEvidenceOk: true,
+    }),
+    (p) => failNamed(p, 'expected keep'));
+}
+
+{
+  proofCheck('R8-stop-honest', 'stop USER_CANCELED for this URL passes',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'pass') && p.stopped === true);
+}
+
+{
+  proofCheck('R8-stop-mutant-complete', 'stop complete is state-without-cause FAIL',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'complete', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-stop-mutant-missing', 'stop unread search FAILs named',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [],
+      downloadsOk: false,
+      downloadsReason: 'chrome.downloads.search not read',
+    }),
+    (p) => failNamed(p, 'chrome.downloads.search not read'));
+}
+
+{
+  proofCheck('R8-stop-mutant-network-failed', 'stop NETWORK_FAILED is wrong-cause FAIL',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [{ id: 1, state: 'interrupted', error: 'NETWORK_FAILED', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'NETWORK_FAILED'));
+}
+
+{
+  proofCheck('R8-stop-mutant-other-cancel-this-complete', 'other URL USER_CANCELED does not prove this complete',
+    fixed.evaluateProof('stop', {
+      expectedUrl: c2Url,
+      downloads: [
+        { id: 1, state: 'interrupted', error: 'USER_CANCELED', url: c9Url },
+        { id: 2, state: 'complete', url: c2Url },
+      ],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-end-window-recheck-honest', 'end-window empty miss holds as xfail',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: [],
+      hostLogOk: true,
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-end-window-recheck-mutant-missing', 'end-window unread log FAILs named',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: { ok: false, reason: 'mock-host log missing', items: [] },
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  const enq = {
+    receivedAt: startedAt + 50,
+    type: 'enqueue_download',
+    payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+  };
+  proofCheck('R8-end-window-recheck-mutant-enqueue', 'end-window enqueue for this URL FAILs',
+    fixed.evaluateProof('end-window-recheck', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      hostLog: [enq],
+      hostLogOk: true,
+      matchUrl: true,
+      gap: 'G1',
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-end-download-recheck-honest', 'end-download erased still holds',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      capturedUrl: c2Url,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'pass') && p.stopped === true);
+}
+
+{
+  proofCheck('R8-end-download-recheck-mutant-complete', 'end-download later complete FAILs',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      capturedUrl: c2Url,
+      downloads: [{ id: 1, state: 'complete', url: c2Url }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'complete'));
+}
+
+{
+  proofCheck('R8-end-download-recheck-mutant-missing', 'end-download unread search FAILs named',
+    fixed.evaluateProof('end-download-recheck', {
+      expectedUrl: c2Url,
+      downloads: [],
+      downloadsOk: false,
+      downloadsReason: 'chrome.downloads.search not read',
+    }),
+    (p) => failNamed(p, 'chrome.downloads.search not read'));
+}
+
+{
+  proofCheck('R8-g1-miss-honest', 'g1 empty log after successful read is xfail',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      promptLines: [],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g1-miss-mutant-missing', 'g1 unread log FAILs named',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g1-miss-mutant-other-shape', 'g1 this-URL enqueue is FAIL not xfail',
+    fixed.evaluateProof('g1-miss', {
+      caseDef: c1Def(),
+      expectedUrl: c1Url,
+      filename: 'app.zip',
+      startedAt,
+      enqueueLines: [{
+        receivedAt: startedAt + 50,
+        type: 'enqueue_download',
+        payload: { url: c1Url, suggestedFilename: 'app.zip', source: { entryPoint: 'browser_download' } },
+      }],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-g4-miss-honest', 'g4 empty log after successful read is xfail',
+    fixed.evaluateProof('g4-miss', {
+      caseDef: c4Def(),
+      expectedUrl: c4Url,
+      filename: 'get',
+      startedAt,
+      promptLines: [],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g4-miss-mutant-missing', 'g4 unread log FAILs named',
+    fixed.evaluateProof('g4-miss', {
+      caseDef: c4Def(),
+      expectedUrl: c4Url,
+      filename: 'get',
+      startedAt,
+      promptLines: [],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-honest', 'g3 exact this-attempt POST is xfail',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+      hostLogOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-mutant-other-case', 'g3 other-case URL FAILs',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c2Url, filename: 'setup.exe' })],
+      hostLogOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  proofCheck('R8-g3-false-grab-mutant-missing', 'g3 unread log FAILs named',
+    fixed.evaluateProof('g3-false-grab', {
+      caseDef: c9Def(),
+      expectedUrl: c9Url,
+      filename: 'posted.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c9Url, filename: 'posted.zip' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g5-final-url-honest', 'g5 exact final+accepted+erased is xfail',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => passOk(p, 'xfail'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-network-failed', 'g5 NETWORK_FAILED is state-without-cause FAIL',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [{ id: 2, state: 'interrupted', error: 'NETWORK_FAILED', url: c10Final }],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'NETWORK_FAILED'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-missing', 'g5 unread host log FAILs named',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Final, filename: 'archive.zip' })],
+      hostLogOk: false,
+      hostLogReason: 'mock-host log missing',
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'mock-host log missing'));
+}
+
+{
+  proofCheck('R8-g5-final-url-mutant-original-url', 'g5 original URL is wrong-cause FAIL',
+    fixed.evaluateProof('g5-final-url', {
+      caseDef: c10Def(),
+      expectedUrl: c10Original,
+      expectedFinalUrl: c10Final,
+      filename: 'archive.zip',
+      startedAt,
+      promptLines: [promptLine({ url: c10Original, filename: 'archive.zip' })],
+      hostLogOk: true,
+      downloads: [],
+      downloadsOk: true,
+    }),
+    (p) => failNamed(p, 'failed for a different reason'));
+}
+
+{
+  console.log('PROOF_RULES coverage');
+  let coverageFail = false;
+  for (const row of fixed.PROOF_RULES) {
+    const honest = findings.filter((item) => item.id.startsWith(`R8-${row.id}-honest`));
+    const mutant = findings.filter((item) => item.id.startsWith(`R8-${row.id}-mutant`));
+    const honestIds = honest.map((item) => item.id).join(',') || 'MISSING';
+    const mutantIds = mutant.map((item) => item.id).join(',') || 'MISSING';
+    console.log(`  ${row.id}: honest=${honestIds} mutant=${mutantIds}`);
+    if (honest.length === 0 || mutant.length === 0) coverageFail = true;
+  }
+  if (coverageFail) {
+    findings.push({
+      id: 'R8-coverage',
+      title: 'every PROOF_RULES row needs ≥1 honest pass and ≥1 mutant FAIL',
+      pass: false,
+      oldGot: 'n/a',
+      newGot: 'incomplete coverage',
+    });
+    console.log('FAIL R8-coverage every PROOF_RULES row needs ≥1 honest pass and ≥1 mutant FAIL');
+  } else {
+    findings.push({
+      id: 'R8-coverage',
+      title: 'every PROOF_RULES row has honest+mutant',
+      pass: true,
+      oldGot: 'n/a',
+      newGot: 'complete',
+    });
+    console.log('PASS R8-coverage every PROOF_RULES row has honest+mutant');
+  }
+}
+
+const failed = findings.filter((row) => !row.pass);
+console.log(`SELFTEST ${failed.length === 0 ? 'OK' : 'FAIL'} ${findings.filter((r) => r.pass).length}/${findings.length}`);
+if (failed.length) {
+  console.error(`failed: ${failed.map((row) => row.id).join(', ')}`);
+  process.exit(1);
+}
+process.exit(0);

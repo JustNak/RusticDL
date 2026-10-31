@@ -1,6 +1,6 @@
 ---
 name: verify-rusticdl
-description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup, plus a headless download-engine recipe against a local HTTP fixture. Use when verifying queue, add-download, settings, search, pause/resume, close-window, or download-engine behavior, or when a UI/IPC change needs cold-agent proof."
+description: "Drive and prove RusticDL's GPUI desktop app (Windows + Linux) with launch, doctor, xdotool/IPC harness, screenshots, and cleanup, plus a headless download-engine recipe against a local HTTP fixture and a Chromium extension capture matrix against a mock native host. Use when verifying queue, add-download, settings, search, pause/resume, close-window, download-engine, or extension-capture behavior, or when a UI/IPC change needs cold-agent proof."
 ---
 
 # Verify RusticDL
@@ -176,6 +176,59 @@ No window, no `launch.sh`. The helper compiles a small driver over the existing 
 
 Stdout shows the job state and `final_sha256` compared with `expected_sha256` (the identity payload) and with `wire_sha256` (the GET body). Details and the server request log are in `features/download-engine.md`.
 
+## Extension capture (Chromium)
+
+No desktop window and no `launch.sh`. Playwright's bundled Chromium loads `apps/extension/dist/chromium`, talks to `scripts/mock-native-host.sh` via native messaging, and clicks `[data-case=Cn]` on the local fixture server.
+
+### Launch
+
+```bash
+export RUN_ID="${RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh
+```
+
+Ready when:
+
+1. Fixture log contains `READY port=… pid=…` and `/health` reports that pid
+2. `apps/extension/dist/chromium/manifest.json` exists
+3. Host manifest exists at `$VERIFY_RUN_DIR/chromium-profile/NativeMessagingHosts/com.rusticdl.native_host.json`
+4. `doctor.json` records a `ping` → `pong` round-trip from the service worker
+
+The host manifest path that works is `<user-data-dir>/NativeMessagingHosts/` (proven first; do not skip that). Chromium runs with isolated `HOME` and a copied `XAUTHORITY` so X11 still authenticates. CI wraps the same script with `xvfb-run`.
+
+### Doctor
+
+The prove script checks the fixture pid owns the port, the unpacked Chromium dist is present, the host manifest resolves, and the service-worker ping round-trips. A failed ping is not a keep; it fails doctor.
+
+### Drive
+
+```bash
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --case C2
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --repeat 5
+.cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh --live
+```
+
+Each case is a real click on `[data-case=Cn]`. Capture, keep, stop, end-window recheck, end-download recheck, and the kit-G1/kit-G3/kit-G4/kit-G5 conjuncts are `PROOF_RULES` rows in `apps/extension/e2e/classify.mjs`. Not every verdict goes through that table. Remaining direct sites: `classify.mjs` skip (`:854`), the `g5-final-url` original-URL `XPASS` path (`:929`), `isSentinelOk` (`:968`), `invalidateNegatives` (`:972`), `hostFailedHandoff` (`:1046`), the spec C2/N1 `expect`s and blocker filter (`extension-capture.spec.ts:520-529`), and the metrics `observed === 'capture'` filter (`extension-capture.spec.ts:486`). Every negative batch and the whole run ends with sentinel C2; a failed sentinel INVALID-ates that round’s negatives. Recipe: `features/extension-capture.md`.
+
+Baseline at d0f7f75b (master merge base 0dd08e23): capture_rate=5/10 false_grab_rate=1/9 (CI run 41227323808, Extension e2e). PR2-PR5 are graded against this; EXT-METRICS is printed, not asserted, so graders compare it by hand.
+
+### Known gaps
+
+Kit gap ids (`kit-G1`..`kit-G6`) are separate from EXT-SCOPE gap ids. EXT-SCOPE G2 (Firefox inline PDF) is out of scope for PR1 and lands in PR3.
+
+- kit-G1 — Chromium did not capture `<a download>` same-origin zip with no Content-Disposition attachment (also C3, C7, C8).
+- kit-G3 — Chromium false-captures the POST attachment and would replay it as GET (C9).
+- kit-G4 — Chromium misses octet-stream with no Content-Disposition and no filename in the URL (C4).
+- kit-G5 — Chromium handed off the final same-origin redirect URL (`/C10/final`), not the original `/C10` URL.
+- kit-G6 (R8-1, Medium, V4) — the blob/data keep arm (C5/C6) passes on the Playwright download flag or any no-error blob/data item. It does not require a complete this-attempt item, so an extension that erases blob/data downloads still passes keep. See `blobDataKept` (`classify.mjs:274`) and the keep row (`keepClickProved`, `classify.mjs:359`). Unconfirmed: (a) stop compares href strings, so a reordered query on a `complete` item counts as erased; (b) a late exact this-URL `prompt_download` after keep’s window is not rechecked.
+
+### Evidence
+
+`/tmp/rusticdl-verify-$RUN_ID/evidence/extension/<case>/{host-log.jsonl,downloads.json,page.png,result.json}` plus `evidence/extension/metrics.json`. The run prints one `EXT-METRICS` line. Cleanup kills only pidfile processes (the fixture) and keeps this evidence.
+
+Recipe detail: `features/extension-capture.md`.
+
 ## Helpers
 
 | Script | Purpose |
@@ -191,6 +244,14 @@ Stdout shows the job state and `final_sha256` compared with `expected_sha256` (t
 | `scripts/prove-download-engine.sh` | Headless proof of the `download-engine` feature (local HTTP fixture) |
 | `scripts/engine_http_server.py` | Fixture server used by `prove-download-engine.sh` |
 | `scripts/engine_drive.rs` | Engine driver source compiled by `prove-download-engine.sh` |
+| `scripts/prove-extension-capture.sh` | Chromium extension capture matrix against the mock native host (runs `e2e/selftest-classifier.mjs` first) |
+| `scripts/ext-fixture-server.mjs` | Per-case HTTP fixture (127.0.0.1 and localhost); logs hits to `fixture-requests.jsonl` |
+| `scripts/mock-native-host.sh` / `mock-native-host.mjs` | Length-prefixed native-messaging mock; logs the reply next to each request |
+| `scripts/ext-cases.json` | Capture matrix rows (`id, route, trigger, expect, url, filename, xfail`) |
+| `apps/extension/e2e/ext-attack.mjs` | Test-only `EXT_ATTACK` hook (never product code) |
+| `apps/extension/e2e/classify.mjs` | Matrix classifier (`PROOF_RULES`; kit-G1/kit-G3/kit-G4/kit-G5 xfails; kit-G6 blob/data keep arm is a documented harness gap) |
+| `apps/extension/e2e/classify.legacy.mjs` | 9227e12 classifier snapshot; imported only by `selftest-classifier.mjs` |
+| `apps/extension/e2e/selftest-classifier.mjs` | Plants F1–F9, R2–R7 classifier attacks plus R8 `PROOF_RULES` honest+mutant coverage against both classifiers |
 
 All scripts are executable. Source `env.sh` in the same shell before calling the others when you set `RUN_ID` yourself.
 
