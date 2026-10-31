@@ -48,4 +48,5 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Settings](./settings.md) — open Settings categories and Save settings.
 - [Pause and resume](./pause-resume.md) — pause/resume a selected active job from the queue.
 - [Download engine](./download-engine.md) — headless engine run against a local HTTP fixture (identity, gzip, Content-Length, 206).
+- [Extension capture](./extension-capture.md) — Chromium extension matrix against a mock native host (Playwright, fixture server, ask mode).
 - [Close window](./close-window.md) — caption close keeps the process; Ctrl+Q quits.
