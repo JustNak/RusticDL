@@ -2445,6 +2445,10 @@ await withCoordinator(async () => {
     'coordinator cancel-during-name-wait onChanged interrupted does not prompt that URL',
     coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(7),
   );
+  assert(
+    'entry onChanged interrupted records browser-interrupted',
+    coord.captureTransitionTrace().includes('browser-interrupted'),
+  );
 });
 
 await withCoordinator(async () => {
@@ -2507,7 +2511,12 @@ await withCoordinator(async () => {
     return [{ ...found, state: 'in_progress', paused: false }];
   });
   await coord.onDownloadCreated(item, defaultSettings);
-  await coord.finalizePendingCapture(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 9, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
   assert(
     'coordinator finalize interrupted snapshot does not prompt that URL',
     coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(9),
@@ -2534,10 +2543,15 @@ await withCoordinator(async () => {
   };
   coordBrowser._test.downloadItems.set(1, { ...item });
   await coord.onDownloadCreated(item, defaultSettings);
-  await coord.finalizePendingCapture(item, defaultSettings);
+  await sleep(1700);
+  await coord.whenCaptureIdleForTests();
   assert(
     'coordinator missing-state finalize does not prompt that URL',
     coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(1),
+  );
+  assert(
+    'entry timer records timer',
+    coord.captureTransitionTrace().includes('timer'),
   );
 });
 
@@ -2563,7 +2577,12 @@ await withCoordinator(async () => {
   coordBrowser._test.downloadItems.set(8, { ...item });
   coordBrowser._test.setSearchImpl(async () => []);
   await coord.onDownloadCreated(item, defaultSettings);
-  await coord.finalizePendingCapture(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 8, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
   assert(
     'coordinator erase-during-wait search [] does not prompt that URL',
     coordPrompts(url).length === 0,
@@ -2625,22 +2644,35 @@ await withCoordinator(async () => {
     paused: false,
   };
   coordBrowser._test.downloadItems.set(22, { ...item });
-  coord.pauseIfLikelyCapture(item, defaultSettings);
-  await sleep(50);
-  assert(
-    'coordinator known-name C2 pauses instead of erasing before send',
-    !coordBrowser._test.erased.includes(22)
-      && coordBrowser._test.downloadItems.get(22)?.paused === true,
-  );
+  coordBrowser._test.setSendImpl(async (msg) => {
+    const shelf = coordBrowser._test.downloadItems.get(22);
+    if (!shelf || shelf.paused !== true || coordBrowser._test.erased.includes(22)) {
+      throw new Error('send happened before pause or after erase');
+    }
+    return {
+      ok: true,
+      requestId: msg.requestId,
+      type: 'accepted',
+      payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+    };
+  });
   await coord.onDownloadCreated(item, defaultSettings);
   assert(
-    'coordinator known-name C2 still prompts after pauseIfLikelyCapture',
+    'coordinator known-name C2 pauses instead of erasing before send',
     coordPrompts(url).length === 1
       && coordPrompts(url)[0].payload.suggestedFilename === 'setup.exe',
   );
   assert(
     'coordinator known-name C2 erases only after the host accepts',
     coordBrowser._test.erased.includes(22),
+  );
+  assert(
+    'entry onCreated records on-created',
+    coord.captureTransitionTrace().includes('on-created'),
+  );
+  assert(
+    'entry host reply records host-reply',
+    coord.captureTransitionTrace().includes('host-reply'),
   );
 });
 
@@ -2671,8 +2703,6 @@ await withCoordinator(async () => {
     code: 'HOST_NOT_AVAILABLE',
     message: 'no host',
   }));
-  coord.pauseIfLikelyCapture(item, defaultSettings);
-  await sleep(50);
   await coord.onDownloadCreated(item, defaultSettings);
   assert(
     'coordinator known-name rejected host does not erase that item',
@@ -2680,7 +2710,156 @@ await withCoordinator(async () => {
   );
   assert(
     'coordinator known-name rejected host leaves the download item',
-    coordBrowser._test.downloadItems.has(33),
+    coordBrowser._test.downloadItems.has(33)
+      && coordBrowser._test.downloadItems.get(33)?.paused !== true,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=ghost-waits';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  let releaseHost = () => {};
+  const hostGate = new Promise((resolve) => {
+    releaseHost = resolve;
+  });
+  coordBrowser._test.setSendImpl(async (msg) => {
+    await hostGate;
+    return {
+      ok: true,
+      requestId: msg.requestId,
+      type: 'accepted',
+      payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+    };
+  });
+  const first = {
+    id: 51,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  const second = { ...first, id: 52 };
+  coordBrowser._test.downloadItems.set(51, { ...first });
+  coordBrowser._test.downloadItems.set(52, { ...second });
+  const firstDone = coord.onDownloadCreated(first, defaultSettings);
+  await sleep(40);
+  await coord.onDownloadCreated(second, defaultSettings);
+  assert(
+    'coordinator ghost is not erased before the family is accepted',
+    !coordBrowser._test.erased.includes(52) && coordPrompts(url).length === 1,
+  );
+  releaseHost();
+  await firstDone;
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator ghost is erased once the family host reply is accepted',
+    coordBrowser._test.erased.includes(52) && coordPrompts(url).length === 1,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=complete-before-send';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 41,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(41, { ...item });
+  coordBrowser._test.setSearchImpl(async () => [{ ...item, state: 'complete', paused: false }]);
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator complete-before-send does not prompt or erase that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(41),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C1?coord=determining-trace';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 61,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(61, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 61, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'entry onDeterminingFilename records on-determining-filename',
+    coord.captureTransitionTrace().includes('on-determining-filename')
+      && coordPrompts(url).length === 1,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-once';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 71,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(71, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'entry hydrate starts from one accepted send',
+    coordPrompts(url).length === 1 && coordBrowser._test.erased.includes(71),
+  );
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'entry hydrate records hydrate and does not send again',
+    coord.captureTransitionTrace().includes('hydrate') && coordPrompts(url).length === 1,
   );
 });
 

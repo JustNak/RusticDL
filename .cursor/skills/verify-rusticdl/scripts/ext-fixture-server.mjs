@@ -116,8 +116,27 @@ function dirnameHit(filePath) {
 }
 
 function send(res, status, headers, body) {
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  // Playwright turns safebrowsing downloads off, so a paused item whose body
+  // already arrived completes in ~8ms (raw Chrome without that pref waits
+  // ~1.6s, then completes while still paused). Split the body across a gap
+  // so downloads.pause in onCreated lands first. Once paused, Chrome stops
+  // reading and the remainder does not flip the item to complete.
+  const gap = Number(process.env.EXT_FIXTURE_BODY_GAP_MS ?? 200);
+  const holdForPause = Buffer.isBuffer(body) && payload.length > 8192 && Number.isFinite(gap) && gap >= 0;
   res.writeHead(status, headers);
-  res.end(body);
+  if (!holdForPause) {
+    res.end(payload);
+    return;
+  }
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true);
+  res.write(payload.subarray(0, 4096));
+  const timer = setTimeout(() => {
+    if (res.writableEnded || res.destroyed) return;
+    res.end(payload.subarray(4096));
+  }, gap);
+  res.on('close', () => clearTimeout(timer));
 }
 
 function htmlPage(id, inner, nonce = '') {

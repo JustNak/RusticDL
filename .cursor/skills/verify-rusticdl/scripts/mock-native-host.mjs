@@ -107,6 +107,14 @@ function respond(request) {
   };
 }
 
+function syncDelay(ms) {
+  const shared = new SharedArrayBuffer(4);
+  const view = new Int32Array(shared);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+const replyDelayMs = Number(process.env.EXT_HOST_REPLY_DELAY_MS || '0');
+
 function logRequest(request, receivedAt, reply) {
   const line = {
     receivedAt,
@@ -168,6 +176,13 @@ try {
     process.stderr.write(
       `mock-native-host: received type=${String(request.type)} requestId=${String(request.requestId)} at=${receivedAt}\n`,
     );
+    if (
+      (request.type === 'prompt_download' || request.type === 'enqueue_download')
+      && Number.isFinite(replyDelayMs)
+      && replyDelayMs > 0
+    ) {
+      syncDelay(replyDelayMs);
+    }
     writeMessage(reply);
   }
 } catch (error) {

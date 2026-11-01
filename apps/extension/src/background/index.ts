@@ -18,7 +18,6 @@ import {
   onChromiumHeadersReceived,
   onDownloadChanged,
   onDownloadCreated,
-  pauseIfLikelyCapture,
 } from './captureCoordinator';
 import {
   getChromiumDeterminingFilenameApi,
@@ -349,7 +348,10 @@ function registerDownloadCaptureListeners(
   registerChromiumFilenameHints();
   if (browser.downloads?.onCreated) {
     browser.downloads.onCreated.addListener((item) => {
-      pauseIfLikelyCapture(item, settingsForSyncCapture());
+      // First call can run before hydrate and must not write the session
+      // store. The second call settles the same download once sessions and
+      // settings are ready. Both go through the capture transition table.
+      void onDownloadCreated(item, settingsForSyncCapture());
       void whenReady.then((settings) => onDownloadCreated(item, settings));
     });
   }
