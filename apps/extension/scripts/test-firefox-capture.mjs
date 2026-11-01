@@ -9,6 +9,15 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 
+// Node 20 (CI) has no global navigator; Node 22+ does. Stub before any
+// bundled coordinator code calls detectBrowser().
+if (typeof globalThis.navigator === 'undefined') {
+  globalThis.navigator = {
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0',
+    platform: 'Linux x86_64',
+  };
+}
+
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tmp = mkdtempSync(join(tmpdir(), 'rusticdl-capture-'));
 const outfile = join(tmp, 'firefoxCapture.cjs');
@@ -56,10 +65,15 @@ const {
   rememberResponseFilenameHint,
   lookupFilenameHint,
   rememberDeterminedFilename,
+  rememberResourceType,
   resolveSuggestedFilename,
   applyDeterminedFilename,
+  applyChromiumCaptureHints,
+  downloadUrlBasename,
+  needsDeterminedFilename,
   rememberRequestAuth,
   lookupOriginAuth,
+  lookupResourceType,
 } = require(chromiumOutfile);
 const sessionOutfile = join(tmp, 'captureSession.cjs');
 await esbuild.build({
@@ -100,6 +114,10 @@ const {
   shouldCaptureDownloadItem,
   shouldWaitForDownloadSize,
   downloadCreatedAction,
+  downloadStateAllowsHandoff,
+  isNonUserInitiatedResourceType,
+  MAX_SUGGESTED_FILENAME_LENGTH,
+  sanitizeSuggestedFilename,
   knownDownloadBytes,
   matchesInterceptedDownload,
   followRestoreSkip,
@@ -1625,6 +1643,365 @@ assert(
   ) === false,
 );
 
+console.log('\nChromium empty onCreated filename (G1 / G4)\n');
+
+assert(
+  'URL basename keeps extension-less /get?id=5',
+  downloadUrlBasename('http://127.0.0.1:18765/get?id=5') === 'get',
+);
+
+const emptyZipHintUrl = 'https://cdn.example.com/pr2/C1-hint';
+rememberResponseFilenameHint({
+  url: emptyZipHintUrl,
+  responseHeaders: [
+    { name: 'content-type', value: 'application/zip' },
+    { name: 'content-length', value: '65536' },
+    { name: 'content-disposition', value: 'filename="app.zip"' },
+  ],
+});
+const emptyZipHinted = applyChromiumCaptureHints({
+  id: 101,
+  url: emptyZipHintUrl,
+  filename: '',
+  mime: 'application/zip',
+  totalBytes: 65536,
+});
+assert(
+  'onCreated empty filename + zip header hint (no attachment) is captured',
+  emptyZipHinted.filename === 'app.zip'
+    && emptyZipHinted.hasAttachment !== true
+    && shouldCaptureDownloadItem(emptyZipHinted, defaultSettings) === true
+    && decideCreatedAction(createCaptureSessionStore(), emptyZipHinted, defaultSettings) === 'handoff',
+);
+
+const emptyGet = applyChromiumCaptureHints({
+  id: 104,
+  url: 'https://cdn.example.com/get?id=5',
+  filename: '',
+  mime: 'application/octet-stream',
+  totalBytes: 65536,
+});
+rememberResourceType('https://cdn.example.com/get?id=5', 'main_frame');
+const emptyGetTyped = applyChromiumCaptureHints(emptyGet);
+assert(
+  'octet-stream /get?id=5 with empty onCreated filename is captured as get',
+  emptyGetTyped.filename === 'get'
+    && emptyGetTyped.filenameFromUrlBasename === true
+    && emptyGetTyped.resourceType === 'main_frame'
+    && shouldCaptureDownloadItem(emptyGetTyped, defaultSettings) === true
+    && resolveSuggestedFilename(emptyGetTyped) === 'get'
+    && decideCreatedAction(createCaptureSessionStore(), emptyGetTyped, defaultSettings) === 'handoff',
+);
+
+const emptyC1 = applyChromiumCaptureHints({
+  id: 105,
+  url: 'https://cdn.example.com/C1',
+  filename: '',
+  mime: 'application/zip',
+  totalBytes: 65536,
+});
+rememberResourceType('https://cdn.example.com/C1', 'main_frame');
+const emptyC1Typed = applyChromiumCaptureHints(emptyC1);
+assert(
+  'empty filename + zip MIME uses the URL basename so C1 is not ignored',
+  emptyC1Typed.filename === 'C1'
+    && emptyC1Typed.filenameFromUrlBasename === true
+    && shouldCaptureDownloadItem(emptyC1Typed, defaultSettings) === true,
+);
+
+assert(
+  'G4 octet-stream /get?id=5 waits for Chrome determined name then uses get',
+  emptyGetTyped.filename === 'get'
+    && emptyGetTyped.filenameFromUrlBasename === true
+    && needsDeterminedFilename(emptyGetTyped) === true
+    && needsDeterminedFilename({
+      ...emptyGetTyped,
+      chromeDeterminedFilename: 'get',
+    }) === false
+    && resolveSuggestedFilename({
+      ...emptyGetTyped,
+      chromeDeterminedFilename: 'get',
+    }) === 'get',
+);
+
+assert(
+  'C1 zip URL token waits for Chrome app.zip then finalizes without the timer',
+  emptyC1Typed.filename === 'C1'
+    && emptyC1Typed.filenameFromUrlBasename === true
+    && needsDeterminedFilename(emptyC1Typed) === true
+    && needsDeterminedFilename({
+      ...emptyC1Typed,
+      chromeDeterminedFilename: 'app.zip',
+    }) === false
+    && needsDeterminedFilename({
+      ...emptyC1Typed,
+      chromeDeterminedFilename: 'C1',
+    }) === false,
+);
+
+assert(
+  'Firefox onCreated /get?id=5 without chromium url-basename flag is kept',
+  emptyGetTyped.filenameFromUrlBasename === true
+    && shouldCaptureDownloadItem(emptyGetTyped, defaultSettings) === true
+    && shouldCaptureDownloadItem(
+      {
+        url: 'https://cdn.example.com/get?id=5',
+        filename: 'get',
+        mime: 'application/octet-stream',
+        totalBytes: 65536,
+      },
+      defaultSettings,
+    ) === false
+    && shouldCaptureDownloadItem(
+      {
+        url: 'https://cdn.example.com/get?id=5',
+        filename: 'get',
+        mime: 'application/octet-stream',
+        totalBytes: 65536,
+        filenameFromUrlBasename: true,
+      },
+      defaultSettings,
+    ) === false,
+);
+
+assert(
+  'captures chunked octet-stream attachment named huge.bin (bin is not a captured ext)',
+  shouldCaptureDownloadItem(
+    {
+      url: 'https://cdn.example.com/L1',
+      filename: 'huge.bin',
+      mime: 'application/octet-stream',
+      hasAttachment: true,
+    },
+    defaultSettings,
+  ) === true,
+);
+
+console.log('\nChecker corpus (html-evil, longname, poison, dotdot, trav, cross, cancel, uuid, iframe)\n');
+
+assert(
+  'C1 send name uses Chrome shelf app.zip without capturing as app.zip',
+  (() => {
+    rememberResourceType('https://cdn.example.com/C1-shelf', 'main_frame');
+    const item = applyChromiumCaptureHints({
+      id: 801,
+      url: 'https://cdn.example.com/C1-shelf',
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+      chromeDeterminedFilename: 'app.zip',
+    });
+    return item.filename === 'C1-shelf'
+      && item.filename !== 'app.zip'
+      && item.filenameFromUrlBasename === true
+      && shouldCaptureDownloadItem(item, defaultSettings) === true
+      && resolveSuggestedFilename(item) === 'app.zip';
+  })(),
+);
+
+assert(
+  'html-evil /notes.html stays keep when determined name is evil.exe',
+  (() => {
+    const url = 'http://127.0.0.1:18821/notes.html';
+    applyDeterminedFilename(
+      { id: 201, url, filename: 'evil.exe' },
+      () => undefined,
+    );
+    const item = applyChromiumCaptureHints({
+      id: 201,
+      url,
+      filename: '',
+      mime: 'text/html',
+      totalBytes: 4096,
+    });
+    return item.filename === 'notes.html'
+      && item.filename !== 'evil.exe'
+      && shouldCaptureDownloadItem(item, defaultSettings) === false
+      && resolveSuggestedFilename(item) === 'evil.exe';
+  })(),
+);
+
+assert(
+  'longname 2000 n + .exe is rejected before the extension check',
+  sanitizeSuggestedFilename(`${'n'.repeat(2000)}.exe`) === undefined
+    && `${'n'.repeat(2000)}.exe`.length > MAX_SUGGESTED_FILENAME_LENGTH
+    && sanitizeSuggestedFilename(`${'n'.repeat(2000)}.exe`) !== `${'n'.repeat(2000)}.exe`.slice(0, MAX_SUGGESTED_FILENAME_LENGTH)
+    && sanitizeSuggestedFilename('\u0000evil.exe') === undefined
+    && sanitizeSuggestedFilename('ok.zip') === 'ok.zip',
+);
+
+assert(
+  'poison-then-realzip determined names are keyed by download id not URL',
+  (() => {
+    const url = 'http://127.0.0.1:18821/real.zip?mime=application/zip';
+    rememberDeterminedFilename(301, 'evil.exe');
+    rememberDeterminedFilename(302, 'real.zip');
+    const item = applyChromiumCaptureHints({
+      id: 302,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    return item.filename === 'real.zip'
+      && item.filename !== 'evil.exe'
+      && item.filenameFromUrlBasename === true
+      && resolveSuggestedFilename({ id: 302, url, filename: '' }) === 'real.zip'
+      && resolveSuggestedFilename({ id: 301, url, filename: '' }) === 'evil.exe';
+  })(),
+);
+
+assert(
+  'dotdot download=".." is rejected as a suggested name',
+  sanitizeSuggestedFilename('..') === undefined
+    && sanitizeSuggestedFilename('.') === undefined,
+);
+
+assert(
+  'trav /files/%2e%2e%2fsecret.zip does not suggest ../secret.zip',
+  downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') === undefined
+    && downloadUrlBasename('http://127.0.0.1:18821/files/%2e%2e%2fsecret.zip') !== '../secret.zip'
+    && sanitizeSuggestedFilename('../secret.zip') === undefined
+    && decodeURIComponent('%2e%2e%2fsecret.zip') === '../secret.zip'
+    && sanitizeSuggestedFilename('%2e%2e%2fsecret.zip') === undefined
+    && sanitizeSuggestedFilename('%2E%2E%5Csecret.zip') === undefined
+    && sanitizeSuggestedFilename(decodeURIComponent('%2e%2e%2fsecret.zip')) === undefined,
+);
+
+assert(
+  'cross determined export is not replaced by page download x.zip',
+  (() => {
+    const url = 'http://localhost:18821/api/export?mime=application/octet-stream&bytes=65536';
+    applyDeterminedFilename({ id: 401, url, filename: 'export' }, () => undefined);
+    const item = applyChromiumCaptureHints({
+      id: 401,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return item.filename === 'export'
+      && item.filenameFromUrlBasename === true
+      && item.filename !== 'x.zip'
+      && resolveSuggestedFilename({
+        id: 401,
+        url,
+        filename: 'x.zip',
+      }) === 'export';
+  })(),
+);
+
+assert(
+  'cancel-during-name-wait interrupted state does not allow handoff',
+  downloadStateAllowsHandoff('interrupted') === false
+    && downloadStateAllowsHandoff('in_progress') === true
+    && downloadStateAllowsHandoff('in_progress', true) === false
+    && downloadStateAllowsHandoff('complete') === true
+    && downloadStateAllowsHandoff(undefined) === false
+    && downloadStateAllowsHandoff('') === false
+    && downloadStateAllowsHandoff('unknown') === false,
+);
+
+assert(
+  'uuid aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee is weak and not a G4 send name',
+  (() => {
+    const uuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const chromeTemp = '1d97dd55-4c2b-4681-8b2e-e65cf9800a8e';
+    const url = `http://127.0.0.1:18821/${uuid}`;
+    applyDeterminedFilename({ id: 501, url, filename: chromeTemp }, () => undefined);
+    const item = applyChromiumCaptureHints({
+      id: 501,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    const sendName = resolveSuggestedFilename(item);
+    return item.filenameFromUrlBasename === true
+      && item.filename === uuid
+      && isWeakSuggestedFilename(uuid) === true
+      && isWeakSuggestedFilename(`${uuid}.zip`) === true
+      && isWeakSuggestedFilename(chromeTemp) === true
+      && isWeakSuggestedFilename(`${chromeTemp}.zip`) === true
+      && isWeakSuggestedFilename(item.filename) === true
+      && isWeakSuggestedFilename(sendName) === true
+      && sendName !== 'get'
+      && resolveSuggestedFilename({
+        id: 501,
+        url,
+        filename: uuid,
+        chromeDeterminedFilename: `${uuid}.zip`,
+      }) !== `${uuid}.zip`;
+  })(),
+);
+
+assert(
+  'iframe-octet sub_frame /api/export stays keep',
+  (() => {
+    const url = 'http://127.0.0.1:18821/api/export?mime=application/octet-stream&bytes=65536&iframe=1';
+    rememberResourceType(url, 'sub_frame');
+    const item = applyChromiumCaptureHints({
+      id: 601,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return item.resourceType === 'sub_frame'
+      && isNonUserInitiatedResourceType('sub_frame') === true
+      && shouldCaptureDownloadItem(item, defaultSettings) === false;
+  })(),
+);
+
+assert(
+  'W195-1 sub_frame veto sticks when a later fetch hits the same URL',
+  (() => {
+    const url = 'http://127.0.0.1:18821/w195-1/export?mime=application/octet-stream&bytes=65536';
+    rememberResourceType(url, 'sub_frame');
+    rememberResourceType(url, 'xmlhttprequest');
+    rememberResourceType(url, 'image');
+    const item = applyChromiumCaptureHints({
+      id: 902,
+      url,
+      filename: '',
+      mime: 'application/octet-stream',
+      totalBytes: 65536,
+    });
+    return lookupResourceType(url) === 'sub_frame'
+      && item.resourceType === 'sub_frame'
+      && shouldCaptureDownloadItem(item, defaultSettings) === false;
+  })(),
+);
+
+assert(
+  'concurrent same-URL items keep distinct determined names',
+  (() => {
+    const url = 'http://127.0.0.1:18821/same.zip';
+    rememberDeterminedFilename(701, 'one.zip');
+    rememberDeterminedFilename(702, 'two.zip');
+    const first = applyChromiumCaptureHints({
+      id: 701,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    const second = applyChromiumCaptureHints({
+      id: 702,
+      url,
+      filename: '',
+      mime: 'application/zip',
+      totalBytes: 65536,
+    });
+    return first.filenameFromUrlBasename === true
+      && second.filenameFromUrlBasename === true
+      && first.filename === 'same.zip'
+      && second.filename === 'same.zip'
+      && resolveSuggestedFilename({ id: 701, url, filename: '' }) === 'one.zip'
+      && resolveSuggestedFilename({ id: 702, url, filename: '' }) === 'two.zip';
+  })(),
+);
+
 assert(
   'skips Drive on Firefox onBeforeRequest (app-owned origin)',
   firefoxBeforeRequestDownloadCandidate(
@@ -1864,6 +2241,1054 @@ assert(
   'MV3 startup does not await hydrate before addListener',
   !/await hydrateCaptureSessions\(\);\s*await getCachedSettings\(\);\s*registerDownloadCaptureListeners/.test(indexSrc),
 );
+assert(
+  'MV3 startup registers onDeterminingFilename before onCreated',
+  indexSrc.indexOf('registerChromiumDeterminingFilename()')
+    < indexSrc.indexOf('browser.downloads.onCreated.addListener'),
+);
+
+console.log('\nCoordinator-driven capture (stubbed chrome.downloads)\n');
+
+const coordStubPath = join(tmp, 'coord-browser-stub.cjs');
+writeFileSync(
+  coordStubPath,
+  `const nativeMessages = [];
+const downloadItems = new Map();
+const erased = [];
+const removedFiles = [];
+let searchImpl = null;
+let sendImpl = null;
+function makeStore() {
+  const data = {};
+  return {
+    data,
+    clear() {
+      for (const key of Object.keys(data)) delete data[key];
+    },
+    async get(keys) {
+      if (keys == null) return { ...data };
+      if (typeof keys === 'string') return { [keys]: data[keys] };
+      if (Array.isArray(keys)) {
+        const out = {};
+        for (const k of keys) out[k] = data[k];
+        return out;
+      }
+      return { ...data };
+    },
+    async set(items) { Object.assign(data, items); },
+  };
+}
+const local = makeStore();
+const session = makeStore();
+const api = {
+  downloads: {
+    search: async (query) => {
+      if (searchImpl) return searchImpl(query, downloadItems);
+      if (query && query.id != null) {
+        const item = downloadItems.get(query.id);
+        return item ? [{ ...item }] : [];
+      }
+      return [...downloadItems.values()].map((item) => ({ ...item }));
+    },
+    pause: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) item.paused = true;
+    },
+    resume: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) item.paused = false;
+    },
+    cancel: async (id) => {
+      const item = downloadItems.get(id);
+      if (item) {
+        item.state = 'interrupted';
+        item.error = 'USER_CANCELED';
+      }
+    },
+    erase: async ({ id }) => {
+      erased.push(id);
+      downloadItems.delete(id);
+      return [id];
+    },
+    removeFile: async (id) => {
+      removedFiles.push(id);
+    },
+  },
+  runtime: {
+    sendNativeMessage: async (_host, msg) => {
+      nativeMessages.push(msg);
+      if (sendImpl) return sendImpl(msg);
+      return {
+        ok: true,
+        requestId: msg.requestId,
+        type: 'accepted',
+        payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+      };
+    },
+    getManifest: () => ({ version: '0.0.0' }),
+    id: 'looccikmfpkiagfaeiocohmcneoacmom',
+  },
+  cookies: {
+    getAllCookieStores: async () => [{ id: '0', tabIds: [] }],
+    getAll: async () => [],
+  },
+  storage: { local, session },
+  action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+  _test: {
+    nativeMessages,
+    downloadItems,
+    erased,
+    removedFiles,
+    session,
+    setSearchImpl(fn) { searchImpl = fn; },
+    setSendImpl(fn) { sendImpl = fn; },
+    reset() {
+      nativeMessages.length = 0;
+      downloadItems.clear();
+      erased.length = 0;
+      removedFiles.length = 0;
+      searchImpl = null;
+      sendImpl = null;
+      local.clear();
+      session.clear();
+    },
+  },
+};
+module.exports = api;
+module.exports.default = api;
+`,
+);
+
+const coordOutfile = join(tmp, 'captureCoordinator.cjs');
+await esbuild.build({
+  entryPoints: [join(root, 'src/background/captureCoordinator.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: coordOutfile,
+  define: {
+    RUSTICDL_CAPTURE_TRACE: 'true',
+  },
+  plugins: [
+    {
+      name: 'stub-browser',
+      setup(build) {
+        build.onResolve(
+          { filter: /^\.\/browser$/ },
+          () => ({ path: coordStubPath, external: true }),
+        );
+      },
+    },
+  ],
+});
+
+const coord = require(coordOutfile);
+const coordBrowser = require(coordStubPath);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function coordPrompts(url) {
+  return coordBrowser._test.nativeMessages.filter(
+    (msg) => msg.type === 'prompt_download' && msg.payload?.url === url,
+  );
+}
+
+async function withCoordinator(fn) {
+  coordBrowser._test.reset();
+  coord.resetCaptureCoordinatorForTests();
+  coord.configureCaptureCoordinator({ updateBadge: async () => {} });
+  await fn();
+}
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C1?coord=appzip';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 11,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(11, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 11, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await sleep(200);
+  assert(
+    'coordinator determining app.zip prompts that exact URL',
+    coordPrompts(url).length === 1
+      && coordPrompts(url)[0].payload.suggestedFilename === 'app.zip',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=cancel&slow=1';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 7,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(7, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onDownloadChanged({ id: 7, state: { current: 'interrupted' } }, defaultSettings);
+  await sleep(1700);
+  assert(
+    'coordinator cancel-during-name-wait onChanged interrupted does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(7),
+  );
+  assert(
+    'entry onChanged interrupted records browser-interrupted',
+    coord.captureTransitionTrace().includes('browser-interrupted'),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=pause&slow=1';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 4,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(4, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onDownloadChanged({ id: 4, paused: { current: true } }, defaultSettings);
+  await sleep(1700);
+  assert(
+    'coordinator pause-during-name-wait does not prompt or erase that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(4),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=finalize-interrupted';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 9,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(9, { ...item });
+  let searchCalls = 0;
+  coordBrowser._test.setSearchImpl(async (query) => {
+    searchCalls += 1;
+    const found = coordBrowser._test.downloadItems.get(query.id);
+    if (!found) return [];
+    if (searchCalls === 1) {
+      return [{ ...found, state: 'interrupted', paused: false }];
+    }
+    return [{ ...found, state: 'in_progress', paused: false }];
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 9, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator finalize interrupted snapshot does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(9),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/get?id=5&ck=missing-state';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 1,
+    url,
+    filename: 'get',
+    mime: 'application/octet-stream',
+    totalBytes: 65536,
+    filenameFromUrlBasename: true,
+  };
+  coordBrowser._test.downloadItems.set(1, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await sleep(1700);
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator missing-state finalize does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(1),
+  );
+  assert(
+    'entry timer records timer',
+    coord.captureTransitionTrace().includes('timer'),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/slowzip?ck=erase';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 8,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(8, { ...item });
+  coordBrowser._test.setSearchImpl(async () => []);
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 8, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator erase-during-wait search [] does not prompt that URL',
+    coordPrompts(url).length === 0,
+  );
+});
+
+await withCoordinator(async () => {
+  const uuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const url = `http://127.0.0.1:18921/${uuid}`;
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 5,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(5, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 5, url, filename: `${uuid}.zip` },
+    () => undefined,
+    defaultSettings,
+  );
+  await sleep(1700);
+  assert(
+    'coordinator uuid.zip determined name does not prompt that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(5),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=known-name';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 22,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(22, { ...item });
+  coordBrowser._test.setSendImpl(async (msg) => {
+    const shelf = coordBrowser._test.downloadItems.get(22);
+    if (!shelf || shelf.paused !== true || coordBrowser._test.erased.includes(22)) {
+      throw new Error('send happened before pause or after erase');
+    }
+    return {
+      ok: true,
+      requestId: msg.requestId,
+      type: 'accepted',
+      payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+    };
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator known-name C2 pauses instead of erasing before send',
+    coordPrompts(url).length === 1
+      && coordPrompts(url)[0].payload.suggestedFilename === 'setup.exe',
+  );
+  assert(
+    'coordinator known-name C2 erases only after the host accepts',
+    coordBrowser._test.erased.includes(22),
+  );
+  assert(
+    'entry onCreated records on-created',
+    coord.captureTransitionTrace().includes('on-created'),
+  );
+  assert(
+    'entry host reply records host-reply',
+    coord.captureTransitionTrace().includes('host-reply'),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=reject-no-erase';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 33,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(33, { ...item });
+  coordBrowser._test.setSendImpl(async (msg) => ({
+    ok: false,
+    requestId: msg.requestId,
+    type: 'rejected',
+    code: 'HOST_NOT_AVAILABLE',
+    message: 'no host',
+  }));
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator known-name rejected host does not erase that item',
+    coordPrompts(url).length === 1 && !coordBrowser._test.erased.includes(33),
+  );
+  assert(
+    'coordinator known-name rejected host leaves the download item',
+    coordBrowser._test.downloadItems.has(33)
+      && coordBrowser._test.downloadItems.get(33)?.paused !== true,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=ghost-waits';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  let releaseHost = () => {};
+  const hostGate = new Promise((resolve) => {
+    releaseHost = resolve;
+  });
+  coordBrowser._test.setSendImpl(async (msg) => {
+    await hostGate;
+    return {
+      ok: true,
+      requestId: msg.requestId,
+      type: 'accepted',
+      payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+    };
+  });
+  const first = {
+    id: 51,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  const second = { ...first, id: 52 };
+  coordBrowser._test.downloadItems.set(51, { ...first });
+  coordBrowser._test.downloadItems.set(52, { ...second });
+  const firstDone = coord.onDownloadCreated(first, defaultSettings);
+  await sleep(40);
+  await coord.onDownloadCreated(second, defaultSettings);
+  assert(
+    'coordinator ghost is not erased before the family is accepted',
+    !coordBrowser._test.erased.includes(52) && coordPrompts(url).length === 1,
+  );
+  releaseHost();
+  await firstDone;
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator ghost is erased once the family host reply is accepted',
+    coordBrowser._test.erased.includes(52) && coordPrompts(url).length === 1,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=complete-before-send';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 41,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(41, { ...item });
+  coordBrowser._test.setSearchImpl(async () => [{ ...item, state: 'complete', paused: false }]);
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'coordinator complete-before-send does not prompt or erase that URL',
+    coordPrompts(url).length === 0 && !coordBrowser._test.erased.includes(41),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C1?coord=determining-trace';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 61,
+    url,
+    filename: '',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(61, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  coord.onChromiumDeterminingFilename(
+    { id: 61, url, filename: 'app.zip' },
+    () => undefined,
+    defaultSettings,
+  );
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'entry onDeterminingFilename records on-determining-filename',
+    coord.captureTransitionTrace().includes('on-determining-filename')
+      && coordPrompts(url).length === 1,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=accept-after-complete';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 81,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(81, { ...item });
+  coordBrowser._test.setSendImpl(async (msg) => {
+    const shelf = coordBrowser._test.downloadItems.get(81);
+    if (shelf) {
+      shelf.state = 'complete';
+      shelf.paused = true;
+      shelf.bytesReceived = 65536;
+    }
+    coord.onDownloadChanged({
+      id: 81,
+      state: { current: 'complete', previous: 'in_progress' },
+      paused: { current: true },
+    }, defaultSettings);
+    return {
+      ok: true,
+      requestId: msg.requestId,
+      type: 'accepted',
+      payload: { status: 'queued', appState: 'running', jobId: 'mock' },
+    };
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator accept after browser-complete erases and removeFile',
+    coordPrompts(url).length === 1
+      && coordBrowser._test.erased.includes(81)
+      && coordBrowser._test.removedFiles.includes(81),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=reject-after-complete';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 82,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(82, { ...item });
+  coordBrowser._test.setSendImpl(async (msg) => {
+    const shelf = coordBrowser._test.downloadItems.get(82);
+    if (shelf) {
+      shelf.state = 'complete';
+      shelf.paused = true;
+    }
+    coord.onDownloadChanged({
+      id: 82,
+      state: { current: 'complete', previous: 'in_progress' },
+      paused: { current: true },
+    }, defaultSettings);
+    return {
+      ok: false,
+      requestId: msg.requestId,
+      type: 'rejected',
+      code: 'HOST_NOT_AVAILABLE',
+      message: 'no host',
+    };
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(82);
+  assert(
+    'coordinator reject after browser-complete leaves the complete file',
+    coordPrompts(url).length === 1
+      && !coordBrowser._test.erased.includes(82)
+      && !coordBrowser._test.removedFiles.includes(82)
+      && shelf?.state === 'complete'
+      && shelf?.paused === true,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=complete-during-search';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/zip' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 83,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(83, { ...item });
+  let searches = 0;
+  coordBrowser._test.setSearchImpl(async () => {
+    searches += 1;
+    if (searches >= 2) return [{ ...item, state: 'complete', paused: true, bytesReceived: 65536 }];
+    return [{ ...item, state: 'in_progress', paused: true }];
+  });
+  await coord.onDownloadCreated(item, defaultSettings);
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator complete during pause round-trip still prompts and erases',
+    coordPrompts(url).length === 1
+      && coordBrowser._test.erased.includes(83)
+      && coordBrowser._test.removedFiles.includes(83)
+      && searches >= 2,
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent';
+  const item = {
+    id: 91,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: true,
+  };
+  coordBrowser._test.downloadItems.set(91, { ...item });
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 91,
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: false,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(91);
+  assert(
+    'coordinator hydrate of sent with no handoff id keeps the browser copy',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(91)
+      && !coordBrowser._test.removedFiles.includes(91)
+      && shelf?.paused === true
+      && shelf?.state === 'in_progress',
+  );
+});
+
+function handoffStatusReply(status) {
+  return async (msg) => ({
+    ok: true,
+    requestId: msg.requestId,
+    type: 'handoff_status',
+    payload: { status },
+  });
+}
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-rejected';
+  const item = {
+    id: 93,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: true,
+  };
+  coordBrowser._test.downloadItems.set(93, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('rejected'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 93,
+    handoffId: 'hid-rejected',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: false,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(93);
+  assert(
+    'coordinator hydrate of sent asks the host and resumes a rejected in-progress download',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(93)
+      && !coordBrowser._test.removedFiles.includes(93)
+      && shelf?.paused === false
+      && shelf?.state === 'in_progress',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-accepted';
+  const item = {
+    id: 94,
+    url,
+    filename: 'app.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: true,
+    bytesReceived: 65536,
+  };
+  coordBrowser._test.downloadItems.set(94, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('accepted'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 94,
+    handoffId: 'hid-accepted',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: true,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator hydrate of sent erases when the host says accepted',
+    coordPrompts(url).length === 0
+      && coordBrowser._test.erased.includes(94)
+      && coordBrowser._test.removedFiles.includes(94),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-pending';
+  const item = {
+    id: 95,
+    url,
+    filename: 'app.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: true,
+  };
+  coordBrowser._test.downloadItems.set(95, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('pending'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 95,
+    handoffId: 'hid-pending',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: false,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(95);
+  const stored = coordBrowser._test.session.data['rusticdl.capture-lifecycle'];
+  const row = Array.isArray(stored) ? stored.find((entry) => entry.id === 95) : undefined;
+  assert(
+    'coordinator hydrate of sent keeps a pending handoff and does not erase',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(95)
+      && !coordBrowser._test.removedFiles.includes(95)
+      && shelf?.paused === true
+      && row?.life?.phase === 'sent'
+      && row?.handoffId === 'hid-pending',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-complete-rejected';
+  const item = {
+    id: 96,
+    url,
+    filename: 'reject.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: true,
+    bytesReceived: 65536,
+  };
+  coordBrowser._test.downloadItems.set(96, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('rejected'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 96,
+    handoffId: 'hid-complete-rejected',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: true,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(96);
+  assert(
+    'coordinator hydrate of sent leaves a complete file when the host rejects',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(96)
+      && !coordBrowser._test.removedFiles.includes(96)
+      && shelf?.state === 'complete',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C3/file.zip?ck=hydrate-accepted-complete';
+  const item = {
+    id: 92,
+    url,
+    filename: 'file.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: true,
+    bytesReceived: 65536,
+  };
+  coordBrowser._test.downloadItems.set(92, { ...item });
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 92,
+    life: {
+      phase: 'accepted',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: true,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator hydrate of accepted browser-complete retries erase and removeFile',
+    coordPrompts(url).length === 0
+      && coordBrowser._test.erased.includes(92)
+      && coordBrowser._test.removedFiles.includes(92),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-once';
+  coord.onChromiumHeadersReceived({
+    url,
+    type: 'main_frame',
+    responseHeaders: [
+      { name: 'content-type', value: 'application/octet-stream' },
+      { name: 'content-disposition', value: 'attachment; filename="setup.exe"' },
+      { name: 'content-length', value: '65536' },
+    ],
+  }, defaultSettings);
+  const item = {
+    id: 71,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: false,
+  };
+  coordBrowser._test.downloadItems.set(71, { ...item });
+  await coord.onDownloadCreated(item, defaultSettings);
+  assert(
+    'entry hydrate starts from one accepted send',
+    coordPrompts(url).length === 1 && coordBrowser._test.erased.includes(71),
+  );
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'entry hydrate records hydrate and does not send again',
+    coord.captureTransitionTrace().includes('hydrate') && coordPrompts(url).length === 1,
+  );
+});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 rmSync(tmp, { recursive: true, force: true });

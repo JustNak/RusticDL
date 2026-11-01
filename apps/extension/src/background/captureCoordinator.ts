@@ -1,12 +1,16 @@
 /**
- * Download capture orchestration: pause / erase / handoff / restore.
+ * Download capture orchestration.
+ *
+ * Chromium hand-off goes through captureLifecycle.ts. This file applies that
+ * table and runs its effects. downloads.pause / resume / cancel / removeFile /
+ * erase are not called here. Firefox still restores with downloads.download.
  *
  * User cancel on the ask prompt aborts (no browser restore). Host errors still
  * restore the shelf item. Session state lives in captureSession (persisted).
- * This module talks to the downloads API and native host. index.ts only
- * registers listeners.
+ * index.ts only registers listeners.
  */
 import {
+  createRequestId,
   isErrorResponse,
   toUserFacingMessage,
   type DownloadRequestMetadata,
@@ -19,17 +23,20 @@ import {
   downloadCreatedAction,
   filenameExtension,
   handoffUrlForCapturedDownload,
+  isNonUserInitiatedResourceType,
   isWeakSuggestedFilename,
   knownDownloadBytes,
   lookupRedirectSessionUrl,
   MIN_CAPTURE_BYTES,
   normalizeCaptureUrl,
   rememberDownloadRedirect,
+  sanitizeSuggestedFilename,
   shouldPauseDownloadItem,
 } from './captureFilter';
 import {
   attachToSession,
   beginHandoff,
+  beginPending,
   CAPTURE_SESSIONS_STORAGE_KEY,
   createCaptureSessionStore,
   decideCreatedAction,
@@ -39,7 +46,6 @@ import {
   finishHandoff,
   firefoxQueuedReplayAction,
   followCaptureFamily,
-  createdActionShouldResume,
   probeFromDownload,
   sessionsFromStorageValue,
   sessionsToStorageValue,
@@ -48,10 +54,14 @@ import {
   type FirefoxCandidateAction,
 } from './captureSession';
 import {
+  applyChromiumCaptureHints,
   applyDeterminedFilename,
   lookupFilenameHint,
   lookupOriginAuth,
+  lookupResourceType,
+  needsDeterminedFilename,
   rememberRequestAuth,
+  rememberResourceType,
   rememberResponseFilenameHint,
   resolveSuggestedFilename,
   type ChromiumBeforeSendHeadersDetails,
@@ -71,12 +81,31 @@ import {
   collectHandoffAuth,
   connectionForErrorCode,
   handoffDownload,
+  queryHandoffStatus,
 } from './nativeMessaging';
+import {
+  applyCaptureTransition,
+  eraseDownload,
+  initialCaptureLifecycle,
+  isTerminalCapturePhase,
+  pauseDownload,
+  readCaptureTransitionTrace,
+  resetCaptureTransitionTrace,
+  resumeDownload,
+  type CaptureEffect,
+  type CaptureEvent,
+  type CaptureLifecycle,
+} from './captureLifecycle';
 import { setHostError, setLastResult } from './state';
 import type { PopupStateResponse } from '../shared/messages';
 
 /** Wait for size (Firefox stubs) and/or a real filename (Chromium CDN tokens). */
 const SIZE_WAIT_MS = 1_500;
+/** Host round-trip budget. Longer than the slow-host proof delay (1500 ms). */
+const HOST_WAIT_MS = 20_000;
+/** Re-ask the host while a desktop prompt is still open. Shorter than the suspects wait. */
+const STATUS_POLL_MS = 1_000;
+const CAPTURE_LIFECYCLE_STORAGE_KEY = 'rusticdl.capture-lifecycle';
 
 export type CapturedDownloadItem = browser.downloads.DownloadItem & {
   finalUrl?: string;
@@ -85,14 +114,9 @@ export type CapturedDownloadItem = browser.downloads.DownloadItem & {
   fileSize?: number;
   bytesReceived?: number;
   hasAttachment?: boolean;
-};
-
-type PendingSizeWait = {
-  item: CapturedDownloadItem;
-  sessionId: string;
-  timer: ReturnType<typeof setTimeout>;
-  waitingForSize: boolean;
-  waitingForName: boolean;
+  filenameFromUrlBasename?: boolean;
+  resourceType?: string;
+  chromeDeterminedFilename?: string;
 };
 
 type DownloadChangeDelta = {
@@ -101,19 +125,18 @@ type DownloadChangeDelta = {
   filename?: { current?: string };
   mime?: { current?: string };
   state?: { current?: string };
+  paused?: { current?: boolean };
   totalBytes?: { current?: number };
   fileSize?: { current?: number };
+  error?: { current?: string } | string;
 };
 
-type HandoffAttempt = 'accepted' | 'already_claimed' | 'dismissed' | 'rejected';
+type HandoffAttempt = 'accepted' | 'already_claimed' | 'dismissed' | 'rejected' | 'disconnected';
 type HandoffOutcome = 'accepted' | 'dismissed' | 'rejected';
 
 type CoordinatorHostHooks = {
   updateBadge(state: PopupStateResponse): Promise<void>;
 };
-
-const pendingSizeWaits = new Map<number, PendingSizeWait>();
-const pausedForCapture = new Set<number>();
 
 type QueuedCaptureEvent =
   | { kind: 'redirect'; from: string; to: string; requestId?: string }
@@ -128,6 +151,7 @@ const queuedCaptureEvents: QueuedCaptureEvent[] = [];
 
 let store: CaptureSessionStore = createCaptureSessionStore();
 let sessionsReady = false;
+const tracks = new Map<number, CaptureTrack>();
 let persistChain = Promise.resolve();
 let hostHooks: CoordinatorHostHooks = {
   async updateBadge() {
@@ -182,26 +206,46 @@ function persistSessions(): void {
 export async function hydrateCaptureSessions(): Promise<void> {
   await persistChain;
   try {
-    const stored = await sessionStorageArea().get(CAPTURE_SESSIONS_STORAGE_KEY);
+    const stored = await sessionStorageArea().get([
+      CAPTURE_SESSIONS_STORAGE_KEY,
+      CAPTURE_LIFECYCLE_STORAGE_KEY,
+    ]);
     store = sessionsFromStorageValue(stored[CAPTURE_SESSIONS_STORAGE_KEY]);
+    sessionsReady = true;
+    restoreLifecycles(stored[CAPTURE_LIFECYCLE_STORAGE_KEY]);
   } catch {
     store = createCaptureSessionStore();
+    sessionsReady = true;
   }
-  sessionsReady = true;
 }
 
 export function resetCaptureCoordinatorForTests(): void {
   store = createCaptureSessionStore();
   sessionsReady = true;
   queuedCaptureEvents.length = 0;
-  pendingSizeWaits.clear();
-  pausedForCapture.clear();
+  for (const track of tracks.values()) clearTrackTimers(track);
+  tracks.clear();
+  resetCaptureTransitionTrace();
+}
+
+export function captureTransitionTrace(): readonly string[] {
+  return readCaptureTransitionTrace();
+}
+
+export async function whenCaptureIdleForTests(): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const pending = [...tracks.values()].map((track) => track.drainDone);
+    await Promise.all(pending);
+    const busy = [...tracks.values()].some((track) => track.draining || track.queue.length > 0);
+    if (!busy) return;
+  }
 }
 
 export function flushQueuedCaptureEvents(
   settings: ExtensionIntegrationSettings,
 ): void {
   if (!sessionsReady) return;
+  bindCaptureSettings(settings);
   const events = queuedCaptureEvents.splice(0, queuedCaptureEvents.length);
   for (const event of events) {
     switch (event.kind) {
@@ -252,20 +296,15 @@ export function followCaptureRedirect(
 }
 
 function withHeaderSize(item: CapturedDownloadItem): CapturedDownloadItem {
-  const hint = lookupFilenameHint(item.finalUrl || item.url) ?? lookupFilenameHint(item.url);
-  const next: CapturedDownloadItem = { ...item };
-  if (knownDownloadBytes(item) == null && hint?.totalBytes != null) {
-    next.totalBytes = hint.totalBytes;
-  }
-  if (hint?.hasAttachment) {
-    next.hasAttachment = true;
-  }
-  return next;
+  return applyChromiumCaptureHints(item);
 }
 
-function needsFilenameHint(item: CapturedDownloadItem): boolean {
-  const resolved = resolveSuggestedFilename(item);
-  return isWeakSuggestedFilename(resolved) || filenameExtension(resolved) == null;
+function needsResourceType(item: CapturedDownloadItem): boolean {
+  if (!item.filenameFromUrlBasename) return false;
+  const type = item.resourceType
+    ?? lookupResourceType(item.finalUrl)
+    ?? lookupResourceType(item.url);
+  return type == null || type === '';
 }
 
 function isCaptureSizeStub(item: CapturedDownloadItem): boolean {
@@ -280,51 +319,6 @@ function ignoredResolvedExtension(
   const ext = filenameExtension(filename);
   if (!ext) return false;
   return (settings.ignoredFileExtensions ?? []).some((value) => value.toLowerCase() === ext);
-}
-
-function requestPause(id: number): void {
-  pausedForCapture.add(id);
-  void pauseBrowserDownload(id);
-}
-
-async function pauseBrowserDownload(id: number): Promise<void> {
-  try {
-    await browser.downloads.pause(id);
-  } catch {
-    // already finished, interrupted, or pause is unavailable
-  }
-}
-
-async function resumeBrowserDownload(id: number): Promise<void> {
-  pausedForCapture.delete(id);
-  try {
-    await browser.downloads.resume(id);
-  } catch {
-    // user canceled, already complete, or resume is unavailable
-  }
-}
-
-async function eraseBrowserDownload(id: number): Promise<void> {
-  pausedForCapture.delete(id);
-  try {
-    await browser.downloads.cancel(id);
-  } catch {
-    // may already be canceled / interrupted by webRequest
-  }
-  try {
-    await browser.downloads.removeFile(id);
-  } catch {
-    // no dest file, or already gone — the usual "File moved or missing" case
-  }
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      const erased = await browser.downloads.erase({ id });
-      if (erased.length > 0) return;
-    } catch {
-      // Firefox sometimes rejects erase until state settles after cancel
-    }
-    await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
-  }
 }
 
 function classifyHandoffResponse(response: HostToExtensionResponse): HandoffOutcome {
@@ -443,6 +437,7 @@ async function handOffUrl(
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
     ...metadata,
     handoffAuth: metadata.handoffAuth ?? handoffAuth,
+    ...(metadata.handoffId ? { handoffId: metadata.handoffId } : {}),
   });
 
   const outcome = classifyHandoffResponse(response);
@@ -470,47 +465,13 @@ async function handOffUrl(
         );
         await hostHooks.updateBadge(state);
       }
+      if (response.requestId === 'native_messaging_error') return 'disconnected';
       return 'rejected';
     default: {
       const _exhaustive: never = outcome;
       return _exhaustive;
     }
   }
-}
-
-async function handoffBrowserDownload(
-  item: CapturedDownloadItem,
-  settings: ExtensionIntegrationSettings,
-  sessionId?: string,
-) {
-  const url = handoffUrlForCapturedDownload(item);
-  if (!url) {
-    if (sessionId) dropCaptureSession(store, sessionId);
-    persistSessions();
-    return;
-  }
-
-  const suggestedFilename = resolveSuggestedFilename(item);
-  await eraseBrowserDownload(item.id);
-
-  const attempt = await handOffUrl(url, settings, {
-    suggestedFilename,
-    totalBytes: knownDownloadBytes(item) ?? lookupFilenameHint(item.finalUrl || url)?.totalBytes,
-  }, {
-    pageUrl: item.referrer,
-    referrer: item.referrer,
-    incognito: item.incognito,
-    cookieStoreId: item.cookieStoreId,
-    finalUrl: item.finalUrl,
-    filename: suggestedFilename,
-    sessionId,
-  });
-
-  await restoreIfHandoffRejected(attempt, {
-    url,
-    filename: suggestedFilename,
-    sessionId,
-  });
 }
 
 function deltaCurrent<T>(field: { current?: T } | T | undefined): T | undefined {
@@ -527,14 +488,21 @@ function mergeDownloadDelta(
 ): CapturedDownloadItem {
   const totalBytes = deltaCurrent(delta.totalBytes);
   const fileSize = deltaCurrent(delta.fileSize);
-  const filename = deltaCurrent(delta.filename);
   const mime = deltaCurrent(delta.mime);
   const url = deltaCurrent(delta.url);
+  const filename = deltaCurrent(delta.filename);
+  const paused = deltaCurrent(delta.paused);
+  const state = deltaCurrent(delta.state);
+  const chromeDeterminedFilename = sanitizeSuggestedFilename(filename);
+  // Keep DownloadItem.filename off the capture decision. Chrome's onChanged
+  // name is send-only (C1 `app.zip` / html-evil `evil.exe`).
   const next: CapturedDownloadItem = {
     ...item,
     ...(url ? { url } : {}),
-    ...(filename ? { filename } : {}),
     ...(mime ? { mime } : {}),
+    ...(chromeDeterminedFilename ? { chromeDeterminedFilename } : {}),
+    ...(typeof paused === 'boolean' ? { paused } : {}),
+    ...(state ? { state: state as CapturedDownloadItem['state'] } : {}),
     ...(typeof fileSize === 'number' && fileSize > 0 ? { fileSize } : {}),
     ...(typeof totalBytes === 'number' && totalBytes > 0 ? { totalBytes } : {}),
   };
@@ -543,22 +511,23 @@ function mergeDownloadDelta(
   return next;
 }
 
-function clearPendingSizeWait(id: number): PendingSizeWait | undefined {
-  const pending = pendingSizeWaits.get(id);
-  if (!pending) return undefined;
-  clearTimeout(pending.timer);
-  pendingSizeWaits.delete(id);
-  return pending;
-}
-
-async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<CapturedDownloadItem> {
+async function latestDownloadSnapshot(
+  item: CapturedDownloadItem,
+): Promise<CapturedDownloadItem | undefined> {
   try {
     const found = await browser.downloads.search({ id: item.id });
     const latest = found[0] as CapturedDownloadItem | undefined;
-    if (!latest) return item;
+    if (!latest) return undefined;
     const merged: CapturedDownloadItem = {
       ...item,
       ...latest,
+      filename: item.filename,
+      filenameFromUrlBasename: item.filenameFromUrlBasename,
+      chromeDeterminedFilename:
+        sanitizeSuggestedFilename(latest.filename) ?? item.chromeDeterminedFilename,
+      paused: typeof latest.paused === 'boolean' ? latest.paused : item.paused,
+      hasAttachment: item.hasAttachment === true || latest.hasAttachment === true,
+      resourceType: item.resourceType ?? latest.resourceType,
       cookieStoreId: latest.cookieStoreId ?? item.cookieStoreId,
       fileSize: latest.fileSize && latest.fileSize > 0 ? latest.fileSize : item.fileSize,
     };
@@ -573,85 +542,373 @@ async function latestDownloadSnapshot(item: CapturedDownloadItem): Promise<Captu
   }
 }
 
-async function finalizePendingCapture(
-  item: CapturedDownloadItem,
-  settings: ExtensionIntegrationSettings,
-  sessionId?: string,
-) {
-  const tracked = withHeaderSize(item);
-  const probe = familyProbe(tracked);
-  const existing = followCaptureFamily(store, probe);
-  if (existing?.phase === 'restoring') {
-    persistSessions();
-    return;
-  }
-  if (existing && existing.phase !== 'pending') {
-    await eraseBrowserDownload(item.id);
-    persistSessions();
-    return;
-  }
+type TimerKind = 'name' | 'size' | 'host' | 'status';
+type PendingTerminal = 'resume' | 'erase';
 
-  if (
-    !settings.enabled
-    || settings.downloadHandoffMode === 'off'
-    || isCaptureSizeStub(tracked)
-    || ignoredResolvedExtension(resolveSuggestedFilename(tracked), settings)
-  ) {
-    if (sessionId) dropCaptureSession(store, sessionId);
-    persistSessions();
-    if (pausedForCapture.has(item.id)) {
-      await resumeBrowserDownload(item.id);
-    }
-    return;
-  }
-  await handoffBrowserDownload(tracked, settings, sessionId ?? existing?.id);
+type CaptureTrack = {
+  life: CaptureLifecycle;
+  item: CapturedDownloadItem;
+  settings: ExtensionIntegrationSettings | null;
+  sessionId?: string;
+  handoffId?: string;
+  pendingTerminal?: PendingTerminal;
+  nameSettled: boolean;
+  sizeSettled: boolean;
+  sizeForced: boolean;
+  decidedWait: boolean;
+  pauseRequested: boolean;
+  pendingComplete: boolean;
+  resumeRequested: boolean;
+  preHydrate: boolean;
+  settled: boolean;
+  consumed: boolean;
+  timers: Partial<Record<TimerKind, ReturnType<typeof setTimeout>>>;
+  queue: CaptureEffect[];
+  draining: boolean;
+  drainDone: Promise<void>;
+};
+
+type StoredLifecycle = {
+  id: number;
+  life: CaptureLifecycle;
+  item: CapturedDownloadItem;
+  sessionId?: string;
+  handoffId?: string;
+  pendingTerminal?: PendingTerminal;
+  nameSettled: boolean;
+  sizeSettled: boolean;
+  sizeForced: boolean;
+  decidedWait: boolean;
+};
+
+type CreatedCaptureEvent = Extract<CaptureEvent, { type: 'on-created' }>;
+type HoldDecision = 'wait' | 'drop' | 'send';
+
+function refreshTrackedItem(item: CapturedDownloadItem): CapturedDownloadItem {
+  return withHeaderSize(item);
 }
 
-function stillWaitingForCaptureSignals(
-  item: CapturedDownloadItem,
-  pending: PendingSizeWait,
-): boolean {
-  if (pending.waitingForSize && knownDownloadBytes(item) == null) return true;
-  return pending.waitingForName && needsFilenameHint(item);
-}
-
-/**
- * Stop the shelf item before any await. Known captures with a real name are
- * canceled immediately so Ask-mode does not sit on "Paused — 30 MB of 2.5 GB".
- */
-export function pauseIfLikelyCapture(
+function makeTrack(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings | null,
-): void {
-  const tracked = withHeaderSize(item);
-  if (!sessionsReady) {
-    // Pause on the waking onCreated turn; do not touch the session store
-    // until hydrate finishes (peek/follow would write into an empty store).
-    if (shouldPauseDownloadItem(tracked, heuristicCaptureSettings(settings))) {
-      requestPause(item.id);
+): CaptureTrack {
+  const hinted = refreshTrackedItem(item);
+  const sized = knownDownloadBytes(hinted) != null;
+  return {
+    life: initialCaptureLifecycle(),
+    item: hinted,
+    settings,
+    nameSettled: !needsDeterminedFilename(hinted),
+    sizeSettled: sized,
+    sizeForced: sized,
+    decidedWait: false,
+    pauseRequested: false,
+    pendingComplete: false,
+    resumeRequested: false,
+    preHydrate: false,
+    settled: false,
+    consumed: false,
+    timers: {},
+    queue: [],
+    draining: false,
+    drainDone: Promise.resolve(),
+  };
+}
+
+function clearTrackTimers(track: CaptureTrack): void {
+  for (const timer of Object.values(track.timers)) {
+    if (timer) clearTimeout(timer);
+  }
+  track.timers = {};
+}
+
+function shouldPersist(track: CaptureTrack): boolean {
+  if (track.preHydrate || !track.settled) return false;
+  if (track.pendingTerminal) return true;
+  if (track.consumed) return false;
+  if (!isTerminalCapturePhase(track.life.phase)) return true;
+  return track.life.phase === 'erased' || track.life.phase === 'accepted';
+}
+
+function persistLifecycles(): void {
+  if (!sessionsReady) return;
+  const snapshot: StoredLifecycle[] = [];
+  for (const [id, track] of tracks) {
+    if (!shouldPersist(track)) continue;
+    snapshot.push({
+      id,
+      life: { ...track.life },
+      item: { ...track.item },
+      sessionId: track.sessionId,
+      ...(track.handoffId ? { handoffId: track.handoffId } : {}),
+      ...(track.pendingTerminal ? { pendingTerminal: track.pendingTerminal } : {}),
+      nameSettled: track.nameSettled,
+      sizeSettled: track.sizeSettled,
+      sizeForced: track.sizeForced,
+      decidedWait: track.decidedWait,
+    });
+  }
+  persistChain = persistChain.then(
+    () => sessionStorageArea().set({ [CAPTURE_LIFECYCLE_STORAGE_KEY]: snapshot }),
+    () => sessionStorageArea().set({ [CAPTURE_LIFECYCLE_STORAGE_KEY]: snapshot }),
+  );
+}
+
+function isStoredLifecycle(value: unknown): value is StoredLifecycle {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Partial<StoredLifecycle>;
+  return typeof row.id === 'number' && !!row.life && !!row.item;
+}
+
+function restoreLifecycles(value: unknown): void {
+  if (!Array.isArray(value)) return;
+  for (const row of value) {
+    if (!isStoredLifecycle(row)) continue;
+    const existing = tracks.get(row.id);
+    if (existing?.draining) continue;
+    if (existing) clearTrackTimers(existing);
+    const track = makeTrack(row.item, existing?.settings ?? null);
+    track.life = { ...row.life };
+    track.sessionId = row.sessionId;
+    track.handoffId = typeof row.handoffId === 'string' && row.handoffId ? row.handoffId : undefined;
+    track.pendingTerminal = row.pendingTerminal === 'resume' || row.pendingTerminal === 'erase'
+      ? row.pendingTerminal
+      : undefined;
+    track.nameSettled = row.nameSettled;
+    track.sizeSettled = row.sizeSettled;
+    track.sizeForced = row.sizeForced;
+    track.decidedWait = row.decidedWait;
+    track.settled = true;
+    track.pauseRequested = row.life.wePaused || row.life.phase === 'pausing' || row.life.phase === 'paused';
+    track.consumed = isTerminalCapturePhase(row.life.phase) && !track.pendingTerminal;
+    if (!track.settings) track.life = { ...track.life, eligible: false };
+    tracks.set(row.id, track);
+    dispatch(track, { type: 'hydrate' });
+    let replay = false;
+    if (track.pendingTerminal === 'resume' && !track.queue.some((effect) => effect.type === 'resume')) {
+      track.queue.push({ type: 'resume' });
+      replay = true;
     }
+    if (
+      track.pendingTerminal === 'erase'
+      && track.life.phase === 'accepted'
+      && !track.queue.some((effect) => effect.type === 'erase')
+    ) {
+      track.queue.push({ type: 'erase' });
+      replay = true;
+    }
+    if (replay) kick(track);
+  }
+}
+
+function bindCaptureSettings(settings: ExtensionIntegrationSettings): void {
+  for (const track of tracks.values()) {
+    if (track.preHydrate || track.settings) continue;
+    track.settings = settings;
+    track.item = refreshTrackedItem(track.item);
+    if (track.life.sendCount > 0 || isTerminalCapturePhase(track.life.phase)) continue;
+    publish(track, 'hint');
+  }
+}
+
+function kick(track: CaptureTrack): void {
+  if (track.draining) return;
+  track.draining = true;
+  track.drainDone = (async () => {
+    try {
+      while (track.queue.length > 0) {
+        const effect = track.queue.shift();
+        if (!effect) break;
+        await runEffect(track, effect);
+      }
+    } finally {
+      track.draining = false;
+      if (track.queue.length === 0) settleTerminal(track);
+    }
+    if (track.queue.length > 0) kick(track);
+  })();
+}
+
+function notePendingTerminal(track: CaptureTrack): void {
+  if (track.queue.some((effect) => effect.type === 'erase')) {
+    track.pendingTerminal = 'erase';
     return;
   }
-  if (!settings) return;
-  const decision = peekCreatedAction(store, tracked, settings, familyProbe(tracked));
+  if (
+    isTerminalCapturePhase(track.life.phase)
+    && track.queue.some((effect) => effect.type === 'resume')
+  ) {
+    track.pendingTerminal = 'resume';
+  }
+}
+
+function settleTerminal(track: CaptureTrack): void {
+  if (track.queue.length > 0) return;
+  if (track.pendingTerminal === 'resume') {
+    track.pendingTerminal = undefined;
+  } else if (track.pendingTerminal === 'erase' && track.life.phase === 'erased') {
+    track.pendingTerminal = undefined;
+  }
+  if (
+    track.life.role === 'primary'
+    && isTerminalCapturePhase(track.life.phase)
+    && !track.pendingTerminal
+  ) {
+    abandonOpenSession(track);
+  }
+  persistLifecycles();
+}
+
+function notifyFamily(track: CaptureTrack, outcome: 'accepted' | 'rejected' | 'timeout'): void {
+  if (!track.sessionId) return;
+  for (const other of tracks.values()) {
+    if (other === track || other.sessionId !== track.sessionId || other.life.role !== 'ghost') continue;
+    dispatch(other, { type: 'family', outcome });
+  }
+}
+
+function abandonOpenSession(track: CaptureTrack): void {
+  if (!sessionsReady || !track.sessionId || track.life.role !== 'primary') return;
+  const session = store.sessions.find((entry) => entry.id === track.sessionId);
+  if (!session) return;
+  if (session.phase !== 'pending' && session.phase !== 'handoff') return;
+  dropCaptureSession(store, track.sessionId);
   persistSessions();
+  notifyFamily(track, 'rejected');
+}
+
+function dispatch(track: CaptureTrack, event: CaptureEvent): void {
+  const result = applyCaptureTransition(track.life, event);
+  track.life = result.state;
+  for (const effect of result.effects) track.queue.push(effect);
+  if (
+    track.life.phase === 'accepted'
+    && event.type !== 'erase'
+    && event.type !== 'erase-ok'
+    && event.type !== 'erase-fail'
+  ) {
+    const eraseStep = applyCaptureTransition(track.life, { type: 'erase' });
+    track.life = eraseStep.state;
+    for (const effect of eraseStep.effects) track.queue.push(effect);
+  }
+  notePendingTerminal(track);
+  persistLifecycles();
+  kick(track);
+}
+
+function computeEligible(track: CaptureTrack): boolean {
+  const settings = track.settings ?? heuristicCaptureSettings(null);
+  const item = track.item;
+  const sendName = sanitizeSuggestedFilename(resolveSuggestedFilename(item));
+  if (!track.nameSettled || !track.sizeSettled) return false;
+  if (!settings.enabled || settings.downloadHandoffMode === 'off') return false;
+  if (isCaptureSizeStub(item)) return false;
+  if (ignoredResolvedExtension(sendName, settings)) return false;
+  if (!sendName || isWeakSuggestedFilename(sendName)) return false;
+  if (isNonUserInitiatedResourceType(item.resourceType)) return false;
+  if (item.filenameFromUrlBasename && !item.resourceType) return false;
+  const action = downloadCreatedAction(item, settings);
+  if (action === 'ignore') return false;
+  if (action === 'wait' && !track.sizeForced) return false;
+  return true;
+}
+
+function classifyHold(track: CaptureTrack): HoldDecision {
+  track.item = refreshTrackedItem(track.item);
+  if (!track.nameSettled || !track.sizeSettled) return 'wait';
+  if (needsResourceType(track.item) && !track.decidedWait) return 'wait';
+  if (computeEligible(track)) return 'send';
+  return 'drop';
+}
+
+function signalWaits(item: CapturedDownloadItem): Array<'name' | 'size'> {
+  const wait: Array<'name' | 'size'> = [];
+  if (needsDeterminedFilename(item)) wait.push('name');
+  if (knownDownloadBytes(item) == null || needsResourceType(item)) wait.push('size');
+  return wait;
+}
+
+function createdEvent(
+  intent: CreatedCaptureEvent['intent'],
+  eligible: boolean,
+  familyAccepted: boolean,
+  wait: Array<'name' | 'size'>,
+): CreatedCaptureEvent {
+  return { type: 'on-created', intent, eligible, familyAccepted, wait };
+}
+
+function createdEventFor(track: CaptureTrack, event: CreatedCaptureEvent): CreatedCaptureEvent {
+  if (event.intent !== 'pause') return event;
+  const hold = classifyHold(track);
+  if (hold === 'drop') return { ...event, intent: 'ignore', eligible: false, wait: [] };
+  return { ...event, eligible: hold === 'send' };
+}
+
+function resolveCreated(
+  item: CapturedDownloadItem,
+  settings: ExtensionIntegrationSettings,
+): { event: CreatedCaptureEvent; sessionId?: string } {
+  const extra = familyProbe(item);
+  const peek = peekCreatedAction(store, item, settings, extra);
+  const nameNeeded = needsDeterminedFilename(item);
+  const resourceNeeded = needsResourceType(item);
+  if (peek === 'handoff' && (nameNeeded || resourceNeeded)) {
+    const claim = beginPending(store, extra);
+    persistSessions();
+    if (!claim.ok && claim.session.phase !== 'pending') {
+      if (claim.session.phase === 'restoring') {
+        return { event: createdEvent('skip-restore', false, false, []), sessionId: claim.session.id };
+      }
+      if (claim.session.phase === 'canceled') {
+        return { event: createdEvent('ignore', false, false, []), sessionId: claim.session.id };
+      }
+      return {
+        event: createdEvent('ghost', false, claim.session.phase === 'accepted', []),
+        sessionId: claim.session.id,
+      };
+    }
+    return {
+      event: createdEvent('wait', false, false, signalWaits(item)),
+      sessionId: claim.session.id,
+    };
+  }
+  if (peek === 'ignore' && resourceNeeded) {
+    const claim = beginPending(store, extra);
+    persistSessions();
+    if (!claim.ok && claim.session.phase !== 'pending') {
+      if (claim.session.phase === 'restoring') {
+        return { event: createdEvent('skip-restore', false, false, []), sessionId: claim.session.id };
+      }
+      return { event: createdEvent('ignore', false, false, []), sessionId: claim.session.id };
+    }
+    return {
+      event: createdEvent('wait', false, false, signalWaits(item)),
+      sessionId: claim.session.id,
+    };
+  }
+  const decision = decideCreatedAction(store, item, settings, extra);
+  persistSessions();
+  const session = followCaptureFamily(store, extra);
+  const sessionId = session?.id;
   switch (decision) {
     case 'skip-restore':
+      return { event: createdEvent('skip-restore', false, false, []), sessionId };
     case 'ignore':
-      return;
+      return { event: createdEvent('ignore', false, false, []), sessionId };
     case 'erase-ghost':
-      void eraseBrowserDownload(item.id);
-      return;
-    case 'handoff':
-      if (!needsFilenameHint(tracked)) {
-        void eraseBrowserDownload(item.id);
-        return;
+      if (!session || session.phase === 'canceled' || session.phase === 'restoring') {
+        return { event: createdEvent('ignore', false, false, []), sessionId };
       }
-      requestPause(item.id);
-      return;
+      return {
+        event: createdEvent('ghost', false, session.phase === 'accepted', []),
+        sessionId,
+      };
+    case 'handoff':
     case 'wait':
-      requestPause(item.id);
-      return;
+      if (nameNeeded) {
+        return { event: createdEvent('wait', false, false, signalWaits(item)), sessionId };
+      }
+      return { event: createdEvent('pause', false, false, signalWaits(item)), sessionId };
     default: {
       const _exhaustive: never = decision;
       return _exhaustive;
@@ -659,109 +916,467 @@ export function pauseIfLikelyCapture(
   }
 }
 
-export async function onDownloadCreated(
+function publish(
+  track: CaptureTrack,
+  kind: 'name' | 'bytes' | 'determined' | 'hint',
+): void {
+  track.item = refreshTrackedItem(track.item);
+  if (!needsDeterminedFilename(track.item)) track.nameSettled = true;
+  if (knownDownloadBytes(track.item) != null) track.sizeSettled = true;
+  const hold = classifyHold(track);
+  const eligible = hold === 'send';
+  switch (kind) {
+    case 'determined':
+      dispatch(track, { type: 'on-determining-filename', eligible });
+      break;
+    case 'name':
+      dispatch(track, { type: 'on-changed', change: 'filename', eligible });
+      break;
+    case 'bytes':
+      dispatch(track, { type: 'on-changed', change: 'bytes', eligible });
+      break;
+    case 'hint':
+      dispatch(track, { type: 'eligible', eligible });
+      break;
+    default: {
+      const _exhaustive: never = kind;
+      return _exhaustive;
+    }
+  }
+  if (hold === 'drop' && track.life.role !== 'ghost' && !isTerminalCapturePhase(track.life.phase)) {
+    dispatch(track, { type: 'release' });
+  }
+}
+
+function timerDelay(timer: TimerKind): number {
+  switch (timer) {
+    case 'host':
+      return HOST_WAIT_MS;
+    case 'status':
+      return STATUS_POLL_MS;
+    case 'name':
+    case 'size':
+      return SIZE_WAIT_MS;
+    default: {
+      const _exhaustive: never = timer;
+      return _exhaustive;
+    }
+  }
+}
+
+function scheduleTimer(track: CaptureTrack, timer: TimerKind): void {
+  const existing = track.timers[timer];
+  if (existing) clearTimeout(existing);
+  const delay = timerDelay(timer);
+  track.timers[timer] = setTimeout(() => {
+    delete track.timers[timer];
+    if (timer === 'name') track.nameSettled = true;
+    if (timer === 'size') {
+      track.sizeSettled = true;
+      track.sizeForced = true;
+    }
+    if (timer === 'name' || timer === 'size') track.decidedWait = true;
+    if (timer === 'host' || timer === 'status') {
+      dispatch(track, { type: 'timer', timer, eligible: false });
+      if (track.life.phase === 'timeout') notifyFamily(track, 'timeout');
+      return;
+    }
+    const hold = classifyHold(track);
+    dispatch(track, { type: 'timer', timer, eligible: hold === 'send' });
+    if (hold === 'drop' && track.life.role !== 'ghost' && !isTerminalCapturePhase(track.life.phase)) {
+      dispatch(track, { type: 'release' });
+    }
+  }, delay);
+}
+
+function shouldUndoPause(track: CaptureTrack): boolean {
+  switch (track.life.phase) {
+    case 'rejected':
+    case 'timeout':
+    case 'resumed':
+    case 'left':
+      return true;
+    case 'user-paused':
+    case 'user-cancelled':
+    case 'interrupted':
+    case 'completed-by-browser':
+    case 'erased':
+    case 'created':
+    case 'pausing':
+    case 'paused':
+    case 'naming':
+    case 'sent':
+    case 'accepted':
+      return false;
+    default: {
+      const _exhaustive: never = track.life.phase;
+      return _exhaustive;
+    }
+  }
+}
+
+function interruptEvent(item: CapturedDownloadItem): CaptureEvent {
+  return item.error === 'USER_CANCELED'
+    ? { type: 'user-cancel' }
+    : { type: 'browser-interrupted' };
+}
+
+async function confirmPause(track: CaptureTrack): Promise<void> {
+  track.pauseRequested = true;
+  // Captured before onChanged can merge a one-shot completion into the item.
+  const startedInProgress = track.item.state !== 'complete';
+  try {
+    await pauseDownload(track.item.id);
+  } catch {
+    if (!isTerminalCapturePhase(track.life.phase)) dispatch(track, { type: 'pause-fail' });
+    return;
+  }
+  if (shouldUndoPause(track)) {
+    try {
+      await resumeDownload(track.item.id);
+    } catch {
+      // the shelf item is already gone
+    }
+    return;
+  }
+  const latest = await latestDownloadSnapshot(track.item);
+  if (shouldUndoPause(track)) {
+    try {
+      await resumeDownload(track.item.id);
+    } catch {
+      // released while the search was in flight
+    }
+    return;
+  }
+  if (!latest) {
+    dispatch(track, { type: 'pause-fail' });
+    return;
+  }
+  track.item = latest;
+  if (latest.state === 'complete' || track.pendingComplete) {
+    track.pendingComplete = false;
+    // The body finished during pause(). Arm the send while the table still
+    // sees an in-progress capture, then record the completion so accept erases.
+    if (startedInProgress && track.life.phase === 'pausing') {
+      dispatch(track, { type: 'pause-ok' });
+    }
+    if (track.life.phase === 'sent' || track.life.phase === 'pausing' || track.life.phase === 'paused') {
+      dispatch(track, { type: 'browser-complete' });
+    }
+    return;
+  }
+  if (latest.state === 'interrupted') {
+    dispatch(track, interruptEvent(latest));
+    return;
+  }
+  if (latest.paused === true && latest.state === 'in_progress') {
+    dispatch(track, { type: 'pause-ok' });
+    return;
+  }
+  dispatch(track, { type: 'pause-fail' });
+}
+
+async function confirmResume(track: CaptureTrack): Promise<void> {
+  track.resumeRequested = true;
+  try {
+    await resumeDownload(track.item.id);
+  } catch {
+    // user canceled, already complete, or resume is unavailable
+  }
+  track.resumeRequested = false;
+}
+
+async function confirmHandoffStatus(track: CaptureTrack): Promise<void> {
+  if (track.life.phase !== 'sent' || track.life.sendCount < 1) return;
+  const handoffId = track.handoffId;
+  if (!handoffId) {
+    dispatch(track, { type: 'host-status', status: 'unknown' });
+    return;
+  }
+  const status = await queryHandoffStatus(handoffId);
+  if (track.life.phase !== 'sent') return;
+  dispatch(track, { type: 'host-status', status });
+}
+
+async function confirmErase(track: CaptureTrack): Promise<void> {
+  if (track.life.phase !== 'accepted') return;
+  const latest = await latestDownloadSnapshot(track.item);
+  if (latest) track.item = latest;
+  if (track.life.phase !== 'accepted') return;
+  const erased = await eraseDownload(track.item.id);
+  if (track.life.phase !== 'accepted') return;
+  dispatch(track, erased ? { type: 'erase-ok' } : { type: 'erase-fail' });
+}
+
+function noteUnsentHostMiss(track: CaptureTrack, attempt: HandoffAttempt): void {
+  if (attempt === 'accepted') notifyFamily(track, 'accepted');
+  else notifyFamily(track, 'rejected');
+}
+
+async function runSend(track: CaptureTrack): Promise<void> {
+  const settings = track.settings;
+  if (!settings || track.life.phase !== 'sent') return;
+  const latest = await latestDownloadSnapshot(track.item);
+  if (track.life.phase !== 'sent') return;
+  if (!latest) {
+    dispatch(track, track.life.browserCompleted ? { type: 'release' } : { type: 'hold-lost' });
+    return;
+  }
+  track.item = latest;
+  if (track.life.browserCompleted || latest.state === 'complete') {
+    // pause-ok already queued this send. A one-shot body can reach complete
+    // before the native call; still hand off, then erase on accept.
+    if (!track.life.browserCompleted) dispatch(track, { type: 'browser-complete' });
+    if (track.life.phase !== 'sent' || track.life.sendCount < 1) {
+      if (track.life.phase === 'sent') dispatch(track, { type: 'release' });
+      return;
+    }
+  } else if (latest.state === 'interrupted') {
+    dispatch(track, interruptEvent(latest));
+    return;
+  } else if (!(latest.paused === true && latest.state === 'in_progress')) {
+    dispatch(track, { type: 'hold-lost' });
+    return;
+  }
+  track.item = refreshTrackedItem(track.item);
+  if (classifyHold(track) !== 'send') {
+    dispatch(track, { type: 'release' });
+    return;
+  }
+  const url = handoffUrlForCapturedDownload(track.item);
+  const sendName = sanitizeSuggestedFilename(resolveSuggestedFilename(track.item));
+  if (!url || !sendName) {
+    dispatch(track, { type: 'release' });
+    return;
+  }
+  if (!track.handoffId) {
+    track.handoffId = createRequestId();
+    persistLifecycles();
+    await persistChain;
+  }
+  const attempt = await handOffUrl(url, settings, {
+    suggestedFilename: sendName,
+    totalBytes: knownDownloadBytes(track.item) ?? lookupFilenameHint(track.item.finalUrl || url)?.totalBytes,
+    handoffId: track.handoffId,
+  }, {
+    pageUrl: track.item.referrer,
+    referrer: track.item.referrer,
+    incognito: track.item.incognito,
+    cookieStoreId: track.item.cookieStoreId,
+    finalUrl: track.item.finalUrl,
+    filename: sendName,
+    sessionId: track.sessionId,
+  });
+  if (track.life.phase !== 'sent') {
+    noteUnsentHostMiss(track, attempt);
+    return;
+  }
+  const after = await latestDownloadSnapshot(track.item);
+  if (after) track.item = after;
+  switch (attempt) {
+    case 'accepted':
+      dispatch(track, { type: 'host-reply', outcome: 'accept' });
+      notifyFamily(track, 'accepted');
+      return;
+    case 'dismissed':
+      dispatch(track, { type: 'host-reply', outcome: 'dismiss' });
+      notifyFamily(track, 'rejected');
+      return;
+    case 'disconnected':
+      dispatch(track, { type: 'host-reply', outcome: 'disconnect' });
+      notifyFamily(track, 'rejected');
+      return;
+    case 'already_claimed':
+    case 'rejected':
+      dispatch(track, { type: 'host-reply', outcome: 'reject' });
+      notifyFamily(track, 'rejected');
+      return;
+    default: {
+      const _exhaustive: never = attempt;
+      return _exhaustive;
+    }
+  }
+}
+
+async function runEffect(track: CaptureTrack, effect: CaptureEffect): Promise<void> {
+  switch (effect.type) {
+    case 'pause':
+      await confirmPause(track);
+      return;
+    case 'resume':
+      await confirmResume(track);
+      return;
+    case 'send':
+      await runSend(track);
+      return;
+    case 'erase':
+      await confirmErase(track);
+      return;
+    case 'query-handoff':
+      await confirmHandoffStatus(track);
+      return;
+    case 'schedule-timer':
+      scheduleTimer(track, effect.timer);
+      return;
+    case 'clear-timers':
+      clearTrackTimers(track);
+      return;
+    case 'log':
+      console.info('[RusticDL] capture transition', effect.event);
+      return;
+    default: {
+      const _exhaustive: never = effect;
+      return _exhaustive;
+    }
+  }
+}
+
+function startPreHydrate(
+  item: CapturedDownloadItem,
+  settings: ExtensionIntegrationSettings | null,
+): Promise<void> {
+  const track = makeTrack(item, settings);
+  track.preHydrate = true;
+  tracks.set(item.id, track);
+  const heuristic = heuristicCaptureSettings(settings);
+  const hinted = track.item;
+  if (shouldPauseDownloadItem(hinted, heuristic) && !needsDeterminedFilename(hinted)) {
+    dispatch(track, createdEvent('pause', false, false, signalWaits(hinted)));
+  } else if (needsDeterminedFilename(hinted) && shouldPauseDownloadItem(hinted, heuristic)) {
+    dispatch(track, createdEvent('wait', false, false, signalWaits(hinted)));
+  }
+  return track.drainDone;
+}
+
+function settlePreHydrate(
+  track: CaptureTrack,
+  settings: ExtensionIntegrationSettings,
+): Promise<void> {
+  track.settings = settings;
+  track.preHydrate = false;
+  track.settled = true;
+  track.item = refreshTrackedItem(track.item);
+  if (
+    track.life.sendCount > 0
+    || track.life.phase === 'sent'
+    || track.life.phase === 'accepted'
+    || track.life.phase === 'erased'
+  ) {
+    return track.drainDone;
+  }
+  const resolved = resolveCreated(track.item, settings);
+  track.sessionId = resolved.sessionId;
+  if (track.life.phase === 'created') {
+    dispatch(track, createdEventFor(track, resolved.event));
+    return track.drainDone;
+  }
+  switch (resolved.event.intent) {
+    case 'ignore':
+    case 'skip-restore':
+      dispatch(track, { type: 'release' });
+      break;
+    case 'ghost':
+      dispatch(track, { type: 'become-ghost', familyAccepted: resolved.event.familyAccepted });
+      break;
+    case 'pause':
+    case 'wait':
+      publish(track, 'hint');
+      break;
+    default: {
+      const _exhaustive: never = resolved.event.intent;
+      return Promise.resolve(_exhaustive);
+    }
+  }
+  return track.drainDone;
+}
+
+function startMachine(
   item: CapturedDownloadItem,
   settings: ExtensionIntegrationSettings,
 ): Promise<void> {
-  if (!sessionsReady) return;
-  const tracked = withHeaderSize(item);
-  const extra = familyProbe(tracked);
-  const decision = decideCreatedAction(store, tracked, settings, extra);
-  persistSessions();
+  const track = makeTrack(item, settings);
+  track.settled = true;
+  tracks.set(item.id, track);
+  const resolved = resolveCreated(track.item, settings);
+  track.sessionId = resolved.sessionId;
+  dispatch(track, createdEventFor(track, resolved.event));
+  return track.drainDone;
+}
 
-  switch (decision) {
-    case 'skip-restore':
-    case 'ignore':
-      if (createdActionShouldResume(decision) && pausedForCapture.has(tracked.id)) {
-        await resumeBrowserDownload(tracked.id);
-      }
-      return;
-    case 'erase-ghost':
-      await eraseBrowserDownload(tracked.id);
-      return;
-    case 'handoff': {
-      const session = followCaptureFamily(store, extra);
-      await handoffBrowserDownload(tracked, settings, session?.id);
-      return;
-    }
-    case 'wait': {
-      const session = followCaptureFamily(store, extra);
-      requestPause(tracked.id);
-      const timer = setTimeout(() => {
-        const pending = pendingSizeWaits.get(tracked.id);
-        if (!pending) return;
-        pendingSizeWaits.delete(tracked.id);
-        void latestDownloadSnapshot(pending.item).then((latest) =>
-          finalizePendingCapture(latest, settings, pending.sessionId),
-        );
-      }, SIZE_WAIT_MS);
-      pendingSizeWaits.set(tracked.id, {
-        item: tracked,
-        sessionId: session?.id ?? '',
-        timer,
-        waitingForSize: downloadCreatedAction(tracked, settings) === 'wait',
-        waitingForName: needsFilenameHint(tracked),
-      });
-      return;
-    }
-    default: {
-      const _exhaustive: never = decision;
-      return _exhaustive;
-    }
-  }
+export function onDownloadCreated(
+  item: CapturedDownloadItem,
+  settings: ExtensionIntegrationSettings | null,
+): Promise<void> {
+  const existing = tracks.get(item.id);
+  if (existing?.settled) return existing.drainDone;
+  if (existing?.preHydrate && sessionsReady && settings) return settlePreHydrate(existing, settings);
+  if (!sessionsReady) return startPreHydrate(item, settings);
+  if (!settings) return Promise.resolve();
+  return startMachine(item, settings);
 }
 
 export function onDownloadChanged(
   delta: DownloadChangeDelta,
   settings: ExtensionIntegrationSettings | null,
 ): void {
-  if (!sessionsReady || !settings) return;
-  const pending = pendingSizeWaits.get(delta.id);
-  if (!pending) return;
-
-  const merged = mergeDownloadDelta(pending.item, delta);
-  pending.item = merged;
-  const existing = followCaptureFamily(store, familyProbe(merged));
-  persistSessions();
-  if (existing && existing.phase !== 'pending' && existing.phase !== 'handoff') {
-    if (existing.phase === 'restoring') {
-      clearPendingSizeWait(delta.id);
+  const track = tracks.get(delta.id);
+  if (!track) return;
+  if (settings) track.settings = settings;
+  track.item = mergeDownloadDelta(track.item, delta);
+  track.item = refreshTrackedItem(track.item);
+  const state = deltaCurrent(delta.state);
+  const paused = deltaCurrent(delta.paused);
+  if (state === 'complete') {
+    if (track.life.phase === 'pausing' && track.life.sendCount === 0) {
+      track.pendingComplete = true;
       return;
     }
-    clearPendingSizeWait(delta.id);
-    void eraseBrowserDownload(delta.id);
+    dispatch(track, { type: 'browser-complete' });
     return;
   }
-
-  const known = knownDownloadBytes(merged);
-  const state = deltaCurrent(delta.state);
-  if (known == null && state !== 'complete') return;
-  if (state !== 'complete' && stillWaitingForCaptureSignals(merged, pending)) {
+  if (state === 'interrupted') {
+    const error = deltaCurrent(delta.error);
+    dispatch(track, error === 'USER_CANCELED' ? { type: 'user-cancel' } : { type: 'browser-interrupted' });
     return;
   }
-
-  clearPendingSizeWait(delta.id);
-  if (known == null && state === 'complete') {
-    void latestDownloadSnapshot(merged).then((latest) =>
-      finalizePendingCapture(latest, settings, pending.sessionId),
-    );
+  if (paused === true && track.pauseRequested) {
+    // The one onChanged echo of our own pause(). A later paused:true is the user.
+    track.pauseRequested = false;
+  } else if (paused === true) {
+    dispatch(track, { type: 'user-pause' });
     return;
   }
-  void finalizePendingCapture(merged, settings, pending.sessionId);
+  if (
+    paused === false
+    && track.life.pauseConfirmed
+    && track.life.wePaused
+    && !track.resumeRequested
+  ) {
+    dispatch(track, { type: 'user-resume' });
+    return;
+  }
+  if (delta.filename) {
+    const filename = deltaCurrent(delta.filename);
+    const shelf = sanitizeSuggestedFilename(filename);
+    if (shelf) track.item = { ...track.item, chromeDeterminedFilename: shelf };
+    publish(track, 'name');
+    return;
+  }
+  if (delta.totalBytes || delta.fileSize) {
+    publish(track, 'bytes');
+  }
 }
 
 export function flushPendingFilenameHint(url: string, settings: ExtensionIntegrationSettings | null): void {
   if (!settings) return;
   const key = normalizeCaptureUrl(url);
-  for (const [id, pending] of pendingSizeWaits) {
-    const itemUrls = [pending.item.finalUrl, pending.item.url]
+  for (const track of tracks.values()) {
+    const itemUrls = [track.item.finalUrl, track.item.url]
       .filter((value): value is string => Boolean(value))
       .map(normalizeCaptureUrl);
     if (!itemUrls.includes(key)) continue;
-    pending.item = withHeaderSize(pending.item);
-    if (stillWaitingForCaptureSignals(pending.item, pending)) continue;
-    clearPendingSizeWait(id);
-    void finalizePendingCapture(pending.item, settings, pending.sessionId);
+    track.settings = settings;
+    publish(track, 'hint');
   }
 }
 
@@ -769,7 +1384,8 @@ export function onChromiumHeadersReceived(
   details: ChromiumHeadersReceivedDetails,
   settings: ExtensionIntegrationSettings | null,
 ): void {
-  if (!rememberResponseFilenameHint(details)) return;
+  rememberResourceType(details.url, details.type);
+  rememberResponseFilenameHint(details);
   flushPendingFilenameHint(details.url, settings);
 }
 
@@ -782,18 +1398,13 @@ export function onChromiumDeterminingFilename(
   suggest: (suggestion?: { filename?: string }) => void,
   settings: ExtensionIntegrationSettings | null,
 ): void {
-  const name = applyDeterminedFilename(item, suggest);
-  const pending = pendingSizeWaits.get(item.id);
-  if (!pending || !settings) return;
-  pending.item = {
-    ...pending.item,
-    ...(name ? { filename: name } : {}),
-  };
-  followCaptureFamily(store, familyProbe(pending.item));
-  persistSessions();
-  if (stillWaitingForCaptureSignals(pending.item, pending)) return;
-  clearPendingSizeWait(item.id);
-  void finalizePendingCapture(pending.item, settings, pending.sessionId);
+  applyDeterminedFilename(item, suggest);
+  const track = tracks.get(item.id);
+  if (!track) return;
+  if (settings) track.settings = settings;
+  const shelf = sanitizeSuggestedFilename(item.filename);
+  if (shelf) track.item = { ...track.item, chromeDeterminedFilename: shelf };
+  publish(track, 'determined');
 }
 
 async function restoreIfHandoffRejected(
@@ -811,6 +1422,7 @@ async function restoreIfHandoffRejected(
     case 'dismissed':
       return;
     case 'rejected':
+    case 'disconnected':
       await restoreBrowserDownload(snapshot);
       return;
     default: {

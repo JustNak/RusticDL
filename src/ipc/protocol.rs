@@ -56,6 +56,8 @@ pub(crate) struct EnqueuePayload {
     pub suggested_filename: Option<String>,
     pub total_bytes: Option<u64>,
     pub handoff_auth: Option<RawHandoffAuth>,
+    #[serde(default)]
+    pub handoff_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +151,21 @@ impl HostResponse {
         }
     }
 
+    pub(crate) fn handoff_status(request_id: String, status: &str) -> Self {
+        let status = match status {
+            "pending" | "accepted" | "rejected" | "expired" | "unknown" => status,
+            _ => "unknown",
+        };
+        Self {
+            ok: true,
+            request_id,
+            message_type: "handoff_status".into(),
+            payload: Some(json!({ "status": status })),
+            code: None,
+            message: None,
+        }
+    }
+
     pub(crate) fn error(
         request_id: String,
         code: &'static str,
@@ -215,6 +232,15 @@ pub(crate) fn parse_enqueue_payload(
                 request_id.to_string(),
                 "METADATA_TOO_LARGE",
                 "suggestedFilename exceeds limit.",
+            ));
+        }
+    }
+    if let Some(id) = parsed.handoff_id.as_deref() {
+        if !is_valid_handoff_id(id) {
+            return Err(HostResponse::error(
+                request_id.to_string(),
+                "INVALID_PAYLOAD",
+                "Handoff id is not supported.",
             ));
         }
     }
@@ -315,6 +341,7 @@ pub(crate) fn validate_host_request(request: &HostRequest) -> Result<(), HostRes
             | "enqueue_download"
             | "prompt_download"
             | "save_extension_settings"
+            | "handoff_status"
     ) {
         return Err(HostResponse::error(
             request.request_id.clone(),
@@ -323,6 +350,28 @@ pub(crate) fn validate_host_request(request: &HostRequest) -> Result<(), HostRes
         ));
     }
     Ok(())
+}
+
+pub(crate) fn parse_handoff_status_payload(
+    request_id: &str,
+    payload: &Value,
+) -> Result<String, HostResponse> {
+    let id = payload
+        .get("handoffId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !is_valid_handoff_id(id) {
+        return Err(HostResponse::error(
+            request_id.to_string(),
+            "INVALID_PAYLOAD",
+            "Handoff id is not supported.",
+        ));
+    }
+    Ok(id.to_string())
+}
+
+pub(crate) fn is_valid_handoff_id(id: &str) -> bool {
+    is_valid_request_id(id)
 }
 
 fn is_valid_request_id(request_id: &str) -> bool {
@@ -372,5 +421,46 @@ mod tests {
     fn accepts_https() {
         let url = validate_http_url("r1", "https://example.com/file.zip").unwrap();
         assert!(url.starts_with("https://"));
+    }
+
+    fn enqueue_body(handoff_id: Option<&str>) -> Value {
+        let mut payload = json!({
+            "url": "https://example.com/file.zip",
+            "source": {
+                "entryPoint": "browser_download",
+                "browser": "chrome",
+                "extensionVersion": "0.1.0"
+            }
+        });
+        if let Some(id) = handoff_id {
+            payload["handoffId"] = json!(id);
+        }
+        payload
+    }
+
+    #[test]
+    fn accepts_handoff_id() {
+        let parsed = parse_enqueue_payload("r1", &enqueue_body(Some("handoff-1"))).unwrap();
+        assert_eq!(parsed.handoff_id.as_deref(), Some("handoff-1"));
+    }
+
+    #[test]
+    fn rejects_handoff_id_with_path_chars() {
+        let err = parse_enqueue_payload("r1", &enqueue_body(Some("../secret"))).unwrap_err();
+        assert_eq!(err.code, Some("INVALID_PAYLOAD"));
+        assert_eq!(err.message.as_deref(), Some("Handoff id is not supported."));
+    }
+
+    #[test]
+    fn rejects_handoff_status_lookup_with_path_chars() {
+        let err =
+            parse_handoff_status_payload("r1", &json!({ "handoffId": "../secret" })).unwrap_err();
+        assert_eq!(err.code, Some("INVALID_PAYLOAD"));
+    }
+
+    #[test]
+    fn accepts_handoff_status_lookup_id() {
+        let id = parse_handoff_status_payload("r1", &json!({ "handoffId": "handoff-1" })).unwrap();
+        assert_eq!(id, "handoff-1");
     }
 }

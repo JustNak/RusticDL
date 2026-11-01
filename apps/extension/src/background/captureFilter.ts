@@ -84,6 +84,15 @@ export type DownloadItemLike = {
   cookieStoreId?: string;
   /** Content-Disposition: attachment from Chromium header hints. */
   hasAttachment?: boolean;
+  /**
+   * Chromium empty-onCreated fill from the URL basename (G4). Firefox
+   * onCreated already has a name and must not take this path.
+   */
+  filenameFromUrlBasename?: boolean;
+  /** webRequest details.type for the request that became this download. */
+  resourceType?: string;
+  state?: string;
+  paused?: boolean;
 };
 
 /** Prefer Firefox totalBytes, then fileSize (totalBytes is often -1 onCreated). */
@@ -109,6 +118,59 @@ export function downloadBasename(filename: string | undefined): string | undefin
   return base || undefined;
 }
 
+/** Bound applied before any extension check so a 2k-char `.exe` cannot sneak through. */
+export const MAX_SUGGESTED_FILENAME_LENGTH = 255;
+
+/**
+ * One path segment for the host. Rejects `.` / `..`, separators, encoded
+ * `%2f`/`%5c`, control chars, and over-long names. Length is checked on the
+ * raw segment before decode so the decision string is the string we send.
+ */
+export function sanitizeSuggestedFilename(filename: string | undefined): string | undefined {
+  if (filename == null) return undefined;
+  const trimmed = filename.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > MAX_SUGGESTED_FILENAME_LENGTH) return undefined;
+  const parts = trimmed.split(/[\\/]/);
+  if (parts.some((part) => {
+    const segment = part.trim();
+    return segment === '.' || segment === '..';
+  })) {
+    return undefined;
+  }
+  const raw = (parts[parts.length - 1] ?? '').trim();
+  if (!raw) return undefined;
+  if (raw.length > MAX_SUGGESTED_FILENAME_LENGTH) return undefined;
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  if (decoded.length > MAX_SUGGESTED_FILENAME_LENGTH) return undefined;
+  if (/[\\/]/.test(decoded)) return undefined;
+  if (decoded === '.' || decoded === '..') return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(decoded)) return undefined;
+  return decoded;
+}
+
+/** iframe / plugin loads the user did not click. */
+export function isNonUserInitiatedResourceType(type: string | undefined): boolean {
+  return type === 'sub_frame' || type === 'object';
+}
+
+/**
+ * Fail closed: missing/unknown state never hands off. A user-paused item
+ * (`paused === true`) is left as the user left it even when still in_progress.
+ */
+export function downloadStateAllowsHandoff(
+  state: string | undefined,
+  paused?: boolean,
+): boolean {
+  if (paused === true) return false;
+  return state === 'complete' || state === 'in_progress';
+}
+
 /**
  * Parse Content-Disposition `filename` / `filename*`.
  * Chromium onCreated often only has the URL token; Firefox webRequest already
@@ -130,15 +192,26 @@ export function filenameFromContentDisposition(value: string): string | undefine
 /**
  * True when the name is a CDN token / Chrome temp name, not a user-facing file.
  */
+const UUID_FILENAME_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const HEX_FILENAME_RE = /^[0-9a-f]{20,}$/i;
+
+function filenameStem(base: string): string {
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return base;
+  const ext = base.slice(dot + 1);
+  if (!/^[a-z0-9]{1,10}$/i.test(ext)) return base;
+  return base.slice(0, dot);
+}
+
 export function isWeakSuggestedFilename(filename: string | undefined): boolean {
   const base = downloadBasename(filename);
   if (!base) return true;
   if (/\.crdownload$/i.test(base)) return true;
   if (/^unconfirmed\s+\d+/i.test(base)) return true;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(base)) {
-    return true;
-  }
-  return /^[0-9a-f]{20,}$/i.test(base);
+  const stem = filenameStem(base);
+  if (UUID_FILENAME_RE.test(base) || UUID_FILENAME_RE.test(stem)) return true;
+  return HEX_FILENAME_RE.test(base) || HEX_FILENAME_RE.test(stem);
 }
 
 /** Prefer a Content-Disposition / Chrome-determined name over a URL token. */
@@ -292,13 +365,33 @@ export function shouldCaptureDownloadItem(
     return Boolean(ext && captured.has(ext) && dispositionHint);
   }
 
+  if (item.resourceType === 'sub_frame' || item.resourceType === 'object') {
+    return false;
+  }
+
   if (strongName) return true;
-  if (ext) return false;
-  // MIME-only octet-stream with no name is page noise. Chromium CDN tokens
-  // (UUID / long hex) still count so we can wait for Content-Disposition.
+  // Non-captured extensions (.mkv, .bin) are a veto unless the server marked
+  // a real shelf download (attachment + download MIME). L1 is huge.bin +
+  // octet-stream + attachment; copying that name must not drop the capture.
+  if (ext && !(hasAttachment && dispositionHint)) return false;
   if (hasAttachment && dispositionHint) return true;
   const name = downloadBasename(item.filename);
-  return Boolean(name && isWeakSuggestedFilename(name) && dispositionHint);
+  // UUID / temp names still count so Chromium can wait for Content-Disposition.
+  if (name && isWeakSuggestedFilename(name) && dispositionHint) return true;
+  // G4: Chromium empty onCreated filled from the URL basename (`/get?id=5` →
+  // `get`). Firefox onCreated already has a name and must not take this path.
+  // Fail closed when the webRequest frame type is missing.
+  if (
+    item.filenameFromUrlBasename
+    && dispositionHint
+    && name
+    && !isWeakSuggestedFilename(name)
+    && item.resourceType
+    && !isNonUserInitiatedResourceType(item.resourceType)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**

@@ -10,7 +10,7 @@
       "trigger": "click-download-attr",
       "expect": "capture",
       "filename": "app.zip",
-      "xfail": { "gap": "G1", "reason": "Chromium did not capture <a download> same-origin zip (no Content-Disposition attachment)" },
+      "xfail": null,
       "skip": null,
       "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
     },
@@ -32,7 +32,7 @@
       "trigger": "click-link",
       "expect": "capture",
       "filename": "file.zip",
-      "xfail": { "gap": "G1", "reason": "Chromium did not capture a .zip navigation served inline with application/zip" },
+      "xfail": null,
       "skip": null,
       "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
     },
@@ -44,7 +44,7 @@
       "expect": "capture",
       "filename": "get",
       "query": { "id": "5" },
-      "xfail": { "gap": "G4", "reason": "Chromium misses octet-stream with no Content-Disposition and no filename in the URL" },
+      "xfail": null,
       "skip": null,
       "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
     },
@@ -77,7 +77,7 @@
       "trigger": "js-location",
       "expect": "capture",
       "filename": "file.zip",
-      "xfail": { "gap": "G1", "reason": "Chromium did not capture JS location.href to a .zip (same miss as C1)" },
+      "xfail": null,
       "skip": null,
       "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
     },
@@ -88,7 +88,7 @@
       "trigger": "js-a-click",
       "expect": "capture",
       "filename": "app.zip",
-      "xfail": { "gap": "G1", "reason": "Chromium did not capture programmatic a.click() with download (same miss as C1)" },
+      "xfail": null,
       "skip": null,
       "fidelity": { "cookies": false, "referrer": true, "postBody": false, "originalUrl": false }
     },

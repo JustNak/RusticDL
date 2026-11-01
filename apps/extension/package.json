@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node ./scripts/test-firefox-capture.mjs",
+    "test": "node ./scripts/test-firefox-capture.mjs && node ./scripts/model-check-capture.mjs",
     "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "dependencies": {

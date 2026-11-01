@@ -137,6 +137,74 @@ jobs:
       - name: Run extension capture matrix
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh
 
+      - name: Race-stress capture matrix
+        run: |
+          export EXT_STRESS_VARIANT=default
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh \
+            --repeat 10 --case C1,C2,C3,C7,C8,C11,C12,N1
+
+      - name: Race-stress slow host
+        run: |
+          export EXT_STRESS_VARIANT=slow-host
+          export EXT_HOST_REPLY_DELAY_MS=1500
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh \
+            --repeat 10 --case C1,C2,C3,C7,C8,C11,C12,N1
+
+      - name: Race-stress one-shot
+        run: |
+          export EXT_STRESS_VARIANT=one-shot
+          export EXT_FIXTURE_BODY_GAP_MS=-1
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh \
+            --repeat 10 --case C1,C2,C3,C7,C8,C11,C12,N1
+
+      - name: Race-stress one-shot slow host
+        run: |
+          export EXT_STRESS_VARIANT=one-shot-slow-host
+          export EXT_FIXTURE_BODY_GAP_MS=-1
+          export EXT_HOST_REPLY_DELAY_MS=3000
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            .cursor/skills/verify-rusticdl/scripts/prove-extension-capture.sh \
+            --repeat 10 --case C1,C2,C3,C7,C8,C11,C12,N1
+
+      - name: Raw Chrome pause determining
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            node apps/extension/e2e/raw-chrome-pause-determining.mjs
+
+      - name: Raw Chrome app.zip accepted reply removes the browser copy
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=1000
+          export RAW_CHROME_WAIT_MS=12000
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            node apps/extension/e2e/raw-chrome-app-zip.mjs
+
+      - name: Raw Chrome suspects host delay 0
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=0
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
+      - name: Raw Chrome suspects host delay 1000
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=1000
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
+      - name: Raw Chrome suspects host delay 3000
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=3000
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4

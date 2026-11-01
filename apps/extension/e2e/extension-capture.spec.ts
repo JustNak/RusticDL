@@ -130,8 +130,10 @@ function persistResult(result: CaseResult, extra: Record<string, unknown> = {}) 
 }
 
 function logCase(evidenceId: string, result: CaseResult) {
+  // Status is not final until invalidateNegatives / end rechecks. Never print
+  // `pass` here — a later INVALID must not already have been logged as pass.
   console.log(
-    `${evidenceId}  ${result.status}  obs=${result.observed}  url=${result.capturedUrl ?? ''}  file=${result.suggestedFilename ?? ''}  ep=${result.entryPoint ?? ''}  reason=${result.reason ?? ''}`,
+    `${evidenceId}  staged  obs=${result.observed}  url=${result.capturedUrl ?? ''}  file=${result.suggestedFilename ?? ''}  ep=${result.entryPoint ?? ''}  reason=${result.reason ?? ''}`,
   );
 }
 
@@ -301,9 +303,17 @@ test('extension capture matrix', async () => {
       const trackedUrls = [expectedUrl, expectedFinal, matchPreview?.payload?.url].filter(Boolean);
       let downloads = await searchDownloads(sw);
       if (caseDef.expect === 'capture' && (promptLines.length + enqueueLines.length) > 0) {
+        // A one-shot body can reach state=complete while the host reply is
+        // still in flight. downloadItemsTerminal treats complete as terminal,
+        // which would freeze that snapshot and hide the later erase. Keep
+        // polling until the row is gone, interrupted, or the settle budget
+        // ends. A row that is still complete at the end is still a failure.
         const settleUntil = Date.now() + classify.DOWNLOAD_SETTLE.maxWaitMs;
         while (Date.now() < settleUntil) {
-          if (classify.downloadItemsTerminal(downloads, trackedUrls)) break;
+          if (classify.downloadSearchFailed(downloads)) break;
+          const matched = classify.matchingDownloadItems(downloads, trackedUrls);
+          const completeLeft = matched.some((item: { state?: string }) => item?.state === 'complete');
+          if (classify.downloadItemsTerminal(downloads, trackedUrls) && !completeLeft) break;
           await sleep(classify.DOWNLOAD_SETTLE.pollMs);
           downloads = await searchDownloads(sw);
         }
@@ -512,6 +522,19 @@ test('extension capture matrix', async () => {
     writeFileSync(path.join(evidenceRoot, 'metrics.json'), `${JSON.stringify(metrics, null, 2)}\n`);
     const extMetrics = `EXT-METRICS capture_rate=${capturedPositives}/${positives.length} false_grab_rate=${falseGrabs}/${negativeDefs.length} latency_ms p50=${metrics.clickToHostLatencyMs.p50} p95=${metrics.clickToHostLatencyMs.p95} n=${latencies.length} skips=${skipRows.length}`;
     console.log(extMetrics);
+    const stressVariant = process.env.EXT_STRESS_VARIANT || 'default';
+    const badRepeats = new Set<string>();
+    for (const item of results) {
+      const evidenceId = path.basename(item.evidencePath);
+      console.log(
+        `FINAL ${evidenceId} status=${item.status} obs=${item.observed} reason=${item.reason ?? ''}`,
+      );
+      if (item.status === 'FAIL' || item.status === 'XPASS' || item.status === 'INVALID') {
+        const repeatMatch = evidenceId.match(/-r(\d+)/);
+        badRepeats.add(repeatMatch ? repeatMatch[1] : '1');
+      }
+    }
+    console.log(`STRESS variant=${stressVariant} repeats=${repeat} failed=${badRepeats.size}`);
     for (const skip of skipRows) {
       console.log(`SKIP ${skip.id} ${skip.skip}`);
     }

@@ -73,6 +73,8 @@ export interface EnqueueDownloadPayload {
   suggestedFilename?: string;
   totalBytes?: number;
   handoffAuth?: HandoffAuth;
+  /** Stable id for this handoff. The host records the decision under it. */
+  handoffId?: string;
 }
 
 export interface PromptDownloadPayload {
@@ -81,12 +83,24 @@ export interface PromptDownloadPayload {
   suggestedFilename?: string;
   totalBytes?: number;
   handoffAuth?: HandoffAuth;
+  handoffId?: string;
+}
+
+export type HandoffStatus = 'pending' | 'accepted' | 'rejected' | 'expired' | 'unknown';
+
+export interface HandoffStatusPayload {
+  handoffId: string;
+}
+
+export interface HandoffStatusResult {
+  status: HandoffStatus;
 }
 
 export interface DownloadRequestMetadata {
   suggestedFilename?: string;
   totalBytes?: number;
   handoffAuth?: HandoffAuth;
+  handoffId?: string;
 }
 
 export interface OpenAppPayload {
@@ -165,6 +179,7 @@ export interface PongPayload {
 export type HostToExtensionResponse =
   | SuccessResponse<'pong', PongPayload>
   | SuccessResponse<'accepted', AcceptedPayload>
+  | SuccessResponse<'handoff_status', HandoffStatusResult>
   | ErrorResponse;
 
 export type ValidationResult<T> =
@@ -328,6 +343,7 @@ export function createEnqueueDownloadRequest(
   const validatedUrl = validateHttpUrl(url);
   if (!validatedUrl.ok) return validatedUrl;
   const handoffAuth = normalizeHandoffAuth(metadata.handoffAuth);
+  const handoffId = normalizeHandoffId(metadata.handoffId);
   return {
     ok: true,
     value: {
@@ -340,6 +356,7 @@ export function createEnqueueDownloadRequest(
         suggestedFilename: trimMetadata(metadata.suggestedFilename),
         totalBytes: normalizeTotalBytes(metadata.totalBytes),
         ...(handoffAuth ? { handoffAuth } : {}),
+        ...(handoffId ? { handoffId } : {}),
       },
     },
   };
@@ -354,6 +371,7 @@ export function createPromptDownloadRequest(
   const validatedUrl = validateHttpUrl(url);
   if (!validatedUrl.ok) return validatedUrl;
   const handoffAuth = normalizeHandoffAuth(metadata.handoffAuth);
+  const handoffId = normalizeHandoffId(metadata.handoffId);
   return {
     ok: true,
     value: {
@@ -366,7 +384,34 @@ export function createPromptDownloadRequest(
         suggestedFilename: trimMetadata(metadata.suggestedFilename),
         totalBytes: normalizeTotalBytes(metadata.totalBytes),
         ...(handoffAuth ? { handoffAuth } : {}),
+        ...(handoffId ? { handoffId } : {}),
       },
+    },
+  };
+}
+
+function normalizeHandoffId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.length > 128) return undefined;
+  if (![...trimmed].every((character) => /[A-Za-z0-9_.:-]/.test(character))) return undefined;
+  return trimmed;
+}
+
+export function createHandoffStatusRequest(
+  handoffId: string,
+  requestId = createRequestId(),
+): ValidationResult<RequestEnvelope<'handoff_status', HandoffStatusPayload>> {
+  const normalized = normalizeHandoffId(handoffId);
+  if (!normalized) {
+    return { ok: false, code: 'INVALID_PAYLOAD', message: 'Handoff id is not supported.' };
+  }
+  return {
+    ok: true,
+    value: {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId,
+      type: 'handoff_status',
+      payload: { handoffId: normalized },
     },
   };
 }

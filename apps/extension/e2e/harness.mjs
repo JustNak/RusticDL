@@ -104,9 +104,50 @@ export async function launchExtensionContext({
       '--disable-dev-shm-usage',
     ],
   });
+  // Playwright maps acceptDownloads to CDP allowAndName (GUID paths), which
+  // skips chrome.downloads.onDeterminingFilename. Raw Chrome uses default
+  // download behavior and fires that event with the <a download> name
+  // (`app.zip`). Restore `default` so C1/C8 send Chrome's determined name
+  // from the extension, not a harness-renamed shelf file.
+  const browser = context.browser();
+  if (browser && typeof browser.newBrowserCDPSession === 'function') {
+    const session = await browser.newBrowserCDPSession();
+    const params = { behavior: 'default', eventsEnabled: false };
+    await session.send('Browser.setDownloadBehavior', params);
+    const { targetInfos } = await session.send('Target.getTargets');
+    const contextIds = new Set(
+      (targetInfos ?? [])
+        .map((target) => target.browserContextId)
+        .filter((id) => typeof id === 'string' && id.length > 0),
+    );
+    for (const browserContextId of contextIds) {
+      await session.send('Browser.setDownloadBehavior', { ...params, browserContextId });
+    }
+  }
+  const cpuRate = Number(process.env.EXT_CPU_THROTTLE_RATE || '0');
+  if (Number.isFinite(cpuRate) && cpuRate >= 4) {
+    const throttle = async (target, label) => {
+      try {
+        const cdp = await context.newCDPSession(target);
+        await cdp.send('Emulation.setCPUThrottlingRate', { rate: cpuRate });
+        console.log(`CPU_THROTTLE label=${label} rate=${cpuRate} ok`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`CPU_THROTTLE label=${label} rate=${cpuRate} fail=${message}`);
+      }
+    };
+    context.on('page', (page) => {
+      void throttle(page, 'page');
+    });
+    context.on('serviceworker', (worker) => {
+      void throttle(worker, 'serviceworker');
+    });
+    for (const page of context.pages()) void throttle(page, 'page');
+    for (const worker of context.serviceWorkers()) void throttle(worker, 'serviceworker');
+  }
   return {
     context,
-    browserVersion: context.browser()?.version() ?? 'unknown',
+    browserVersion: browser?.version() ?? 'unknown',
     executablePath: chromium.executablePath(),
   };
 }

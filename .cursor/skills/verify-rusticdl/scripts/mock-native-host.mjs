@@ -7,7 +7,7 @@
  *
  * EXT_ATTACK loads apps/extension/e2e/ext-attack.mjs (test-only; never product code).
  */
-import { appendFileSync, mkdirSync, writeSync, readSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync, writeSync, readSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -18,6 +18,7 @@ if (!RUN_DIR) {
 }
 
 const logPath = `${RUN_DIR}/host-log.jsonl`;
+const decisionPath = `${RUN_DIR}/handoff-status.json`;
 mkdirSync(dirname(logPath), { recursive: true });
 mkdirSync(RUN_DIR, { recursive: true });
 
@@ -71,9 +72,50 @@ function pongPayload() {
   };
 }
 
+function readDecisions() {
+  try {
+    const parsed = JSON.parse(readFileSync(decisionPath, 'utf8'));
+    if (parsed && typeof parsed === 'object' && parsed.decisions && typeof parsed.decisions === 'object') {
+      return parsed.decisions;
+    }
+  } catch {
+    // no decision file yet
+  }
+  return {};
+}
+
+function writeDecision(id, outcome, resolveAt) {
+  const decisions = readDecisions();
+  decisions[id] = { outcome, resolveAt };
+  const next = `${decisionPath}.tmp`;
+  writeFileSync(next, JSON.stringify({ decisions }));
+  renameSync(next, decisionPath);
+}
+
+function handoffIdOf(request) {
+  const id = request.payload && typeof request.payload === 'object' ? request.payload.handoffId : '';
+  return typeof id === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(id) ? id : '';
+}
+
 function respond(request) {
   const requestId = typeof request.requestId === 'string' ? request.requestId : 'unknown';
   const type = request.type;
+  if (type === 'handoff_status') {
+    const id = handoffIdOf(request);
+    const row = id ? readDecisions()[id] : undefined;
+    let status = 'unknown';
+    if (row && typeof row.resolveAt === 'number') {
+      if (Date.now() < row.resolveAt) status = 'pending';
+      else if (row.outcome === 'rejected' || row.outcome === 'expired') status = row.outcome;
+      else status = 'accepted';
+    }
+    return {
+      ok: true,
+      requestId,
+      type: 'handoff_status',
+      payload: { status },
+    };
+  }
   if (type === 'ping' || type === 'get_status' || type === 'open_app' || type === 'save_extension_settings') {
     return {
       ok: true,
@@ -83,9 +125,24 @@ function respond(request) {
     };
   }
   if (type === 'prompt_download' || type === 'enqueue_download') {
-    const suggested = request.payload && typeof request.payload === 'object'
-      ? request.payload.suggestedFilename
-      : undefined;
+    const payload = request.payload && typeof request.payload === 'object' ? request.payload : {};
+    const suggested = payload.suggestedFilename;
+    const url = typeof payload.url === 'string' ? payload.url : '';
+    const rejected = url.includes('/reject-restart');
+    const handoffId = handoffIdOf(request);
+    if (handoffId) {
+      const delay = Number.isFinite(replyDelayMs) && replyDelayMs > 0 ? replyDelayMs : 0;
+      writeDecision(handoffId, rejected ? 'rejected' : 'accepted', Date.now() + delay);
+    }
+    if (rejected) {
+      return {
+        ok: false,
+        requestId,
+        type: 'rejected',
+        code: 'DOWNLOAD_FAILED',
+        message: 'rejected',
+      };
+    }
     return {
       ok: true,
       requestId,
@@ -106,6 +163,14 @@ function respond(request) {
     message: `Unsupported request type: ${String(type)}`,
   };
 }
+
+function syncDelay(ms) {
+  const shared = new SharedArrayBuffer(4);
+  const view = new Int32Array(shared);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+const replyDelayMs = Number(process.env.EXT_HOST_REPLY_DELAY_MS || '0');
 
 function logRequest(request, receivedAt, reply) {
   const line = {
@@ -168,6 +233,13 @@ try {
     process.stderr.write(
       `mock-native-host: received type=${String(request.type)} requestId=${String(request.requestId)} at=${receivedAt}\n`,
     );
+    if (
+      (request.type === 'prompt_download' || request.type === 'enqueue_download')
+      && Number.isFinite(replyDelayMs)
+      && replyDelayMs > 0
+    ) {
+      syncDelay(replyDelayMs);
+    }
     writeMessage(reply);
   }
 } catch (error) {
