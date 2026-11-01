@@ -24,6 +24,9 @@ await esbuild.build({
   platform: 'node',
   format: 'cjs',
   outfile,
+  define: {
+    RUSTICDL_CAPTURE_TRACE: 'false',
+  },
   plugins: [
     {
       name: 'stub-browser',
@@ -96,7 +99,7 @@ for (const eligible of [false, true]) {
   events.push({ type: 'on-changed', change: 'filename', eligible });
   events.push({ type: 'on-changed', change: 'bytes', eligible });
   events.push({ type: 'on-changed', change: 'other', eligible });
-  for (const timer of ['name', 'size', 'host']) {
+  for (const timer of ['name', 'size', 'host', 'status']) {
     events.push({ type: 'timer', timer, eligible });
   }
   events.push({ type: 'eligible', eligible });
@@ -106,6 +109,9 @@ events.push({ type: 'become-ghost', familyAccepted: false });
 events.push({ type: 'become-ghost', familyAccepted: true });
 for (const outcome of ['accept', 'reject', 'dismiss', 'disconnect']) {
   events.push({ type: 'host-reply', outcome });
+}
+for (const status of ['pending', 'accepted', 'rejected', 'expired', 'unknown', 'unreachable']) {
+  events.push({ type: 'host-status', status });
 }
 events.push({ type: 'erase' }, { type: 'erase-ok' }, { type: 'erase-fail' });
 for (const outcome of ['accepted', 'rejected', 'timeout']) {
@@ -203,6 +209,111 @@ function assertSendThenCompleteThenAccept() {
     process.exit(1);
   }
 }
+
+function assertHostIsSourceOfTruth() {
+  const seeded = {
+    phase: 'sent',
+    role: 'primary',
+    wePaused: true,
+    pauseConfirmed: true,
+    eligible: true,
+    browserCompleted: false,
+    sendCount: 0,
+    familyAccepted: false,
+  };
+  const unsentAccept = applyCaptureTransition(seeded, { type: 'host-reply', outcome: 'accept' });
+  if (unsentAccept.state.phase === 'accepted' || unsentAccept.effects.some((effect) => effect.type === 'erase')) {
+    console.error('COUNTEREXAMPLE host-reply accept from sent sendCount=0');
+    console.error(JSON.stringify(unsentAccept));
+    process.exit(1);
+  }
+  const unsentStatus = applyCaptureTransition(seeded, { type: 'host-status', status: 'accepted' });
+  if (unsentStatus.state.phase === 'accepted' || unsentStatus.effects.some((effect) => effect.type === 'erase')) {
+    console.error('COUNTEREXAMPLE host-status accepted from sent sendCount=0');
+    console.error(JSON.stringify(unsentStatus));
+    process.exit(1);
+  }
+
+  const held = {
+    role: 'primary',
+    wePaused: true,
+    pauseConfirmed: true,
+    eligible: true,
+    familyAccepted: false,
+  };
+  const persisted = [
+    { ...held, phase: 'pausing', pauseConfirmed: false, browserCompleted: false, sendCount: 0 },
+    { ...held, phase: 'paused', browserCompleted: false, sendCount: 0 },
+    { ...held, phase: 'naming', browserCompleted: false, sendCount: 0 },
+    { ...held, phase: 'sent', browserCompleted: false, sendCount: 1 },
+    { ...held, phase: 'sent', browserCompleted: true, sendCount: 1 },
+    { ...held, phase: 'accepted', browserCompleted: true, sendCount: 1 },
+    { ...held, phase: 'erased', browserCompleted: true, sendCount: 1, wePaused: false, pauseConfirmed: false },
+  ];
+  for (const state of persisted) {
+    const hydrated = applyCaptureTransition(state, { type: 'hydrate' });
+    const erased = hydrated.effects.some((effect) => effect.type === 'erase');
+    const sentAgain = hydrated.effects.some((effect) => effect.type === 'send') && state.sendCount >= 1;
+    if (erased || sentAgain || hydrated.state.sendCount > state.sendCount && state.sendCount >= 1) {
+      console.error(`COUNTEREXAMPLE hydrate lost or duplicated a download from ${state.phase}`);
+      console.error(JSON.stringify(hydrated));
+      process.exit(1);
+    }
+    if (state.phase === 'sent' && state.sendCount >= 1) {
+      const asked = hydrated.effects.some((effect) => effect.type === 'query-handoff');
+      const resumed = hydrated.effects.some((effect) => effect.type === 'resume');
+      if (hydrated.state.phase !== 'sent' || !asked || resumed || hydrated.state.sendCount !== state.sendCount) {
+        console.error('COUNTEREXAMPLE hydrate of sent did not ask the host');
+        console.error(JSON.stringify(hydrated));
+        process.exit(1);
+      }
+    }
+  }
+
+  const inFlight = { ...held, phase: 'sent', browserCompleted: false, sendCount: 1 };
+  const finished = { ...held, phase: 'sent', browserCompleted: true, sendCount: 1 };
+  for (const status of ['rejected', 'expired']) {
+    const released = applyCaptureTransition(inFlight, { type: 'host-status', status });
+    if (
+      released.effects.some((effect) => effect.type === 'erase' || effect.type === 'send')
+      || !released.effects.some((effect) => effect.type === 'resume')
+    ) {
+      console.error(`COUNTEREXAMPLE ${status} handoff dropped an in-progress download`);
+      console.error(JSON.stringify(released));
+      process.exit(1);
+    }
+    const left = applyCaptureTransition(finished, { type: 'host-status', status });
+    if (left.effects.some((effect) => effect.type === 'erase' || effect.type === 'resume' || effect.type === 'send')) {
+      console.error(`COUNTEREXAMPLE ${status} handoff erased or resumed a complete file`);
+      console.error(JSON.stringify(left));
+      process.exit(1);
+    }
+  }
+  for (const status of ['pending', 'unknown', 'unreachable']) {
+    const waiting = applyCaptureTransition(inFlight, { type: 'host-status', status });
+    if (
+      waiting.state.phase !== 'sent'
+      || waiting.effects.some((effect) => effect.type === 'erase' || effect.type === 'resume' || effect.type === 'send')
+    ) {
+      console.error(`COUNTEREXAMPLE ${status} handoff did not keep the browser copy`);
+      console.error(JSON.stringify(waiting));
+      process.exit(1);
+    }
+  }
+  const accepted = applyCaptureTransition(finished, { type: 'host-status', status: 'accepted' });
+  const erased = applyCaptureTransition(accepted.state, { type: 'erase' });
+  if (
+    accepted.state.phase !== 'accepted'
+    || accepted.effects.some((effect) => effect.type === 'erase' || effect.type === 'send')
+    || !erased.effects.some((effect) => effect.type === 'erase')
+  ) {
+    console.error('COUNTEREXAMPLE accepted handoff did not erase only after the host said accepted');
+    console.error(JSON.stringify({ accepted, erased }));
+    process.exit(1);
+  }
+}
+
+assertHostIsSourceOfTruth();
 
 const parent = new Map();
 const states = new Map();

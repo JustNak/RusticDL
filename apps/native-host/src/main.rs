@@ -6,8 +6,9 @@ mod protocol;
 
 use forwarder::{AppForwarder, ForwarderError};
 use protocol::{
-    app_enqueue_request, app_prompt_download_request, app_save_extension_settings_request,
-    app_show_window_request, app_status_request, parse_enqueue_payload, parse_open_app_payload,
+    app_enqueue_request, app_handoff_status_request, app_prompt_download_request,
+    app_save_extension_settings_request, app_show_window_request, app_status_request,
+    parse_enqueue_payload, parse_handoff_status_payload, parse_open_app_payload,
     parse_prompt_download_payload, validate_protocol, AppResponseEnvelope, HostResponseEnvelope,
     NativeRequestEnvelope,
 };
@@ -85,6 +86,16 @@ fn handle_request(request: NativeRequestEnvelope) -> HostResponseEnvelope {
                 payload,
             )) {
                 Ok(response) => map_app_response(response),
+                Err(error) => map_forwarder_error(request.request_id, error),
+            },
+            Err(response) => *response,
+        },
+        "handoff_status" => match parse_handoff_status_payload(&request) {
+            Ok(handoff_id) => match forwarder.send(&app_handoff_status_request(
+                request.request_id.clone(),
+                handoff_id,
+            )) {
+                Ok(response) => map_handoff_status(response),
                 Err(error) => map_forwarder_error(request.request_id, error),
             },
             Err(response) => *response,
@@ -182,6 +193,44 @@ fn map_app_response(response: AppResponseEnvelope) -> HostResponseEnvelope {
             .message
             .unwrap_or_else(|| "RusticDL rejected the request.".to_string()),
     )
+}
+
+fn map_handoff_status(response: AppResponseEnvelope) -> HostResponseEnvelope {
+    if !response.ok || response.message_type != "handoff_status" {
+        return HostResponseEnvelope::rejected(
+            response.request_id,
+            "rejected",
+            response.code.as_deref().unwrap_or("INTERNAL_ERROR"),
+            response
+                .message
+                .unwrap_or_else(|| "RusticDL rejected the handoff status lookup.".to_string()),
+        );
+    }
+    let status = response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if !matches!(
+        status,
+        "pending" | "accepted" | "rejected" | "expired" | "unknown"
+    ) {
+        return HostResponseEnvelope::rejected(
+            response.request_id,
+            "rejected",
+            "INTERNAL_ERROR",
+            "Unexpected handoff status.",
+        );
+    }
+    HostResponseEnvelope {
+        ok: true,
+        request_id: response.request_id,
+        message_type: "handoff_status".into(),
+        payload: Some(serde_json::json!({ "status": status })),
+        code: None,
+        message: None,
+    }
 }
 
 fn map_forwarder_error(request_id: String, error: ForwarderError) -> HostResponseEnvelope {

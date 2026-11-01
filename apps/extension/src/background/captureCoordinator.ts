@@ -10,6 +10,7 @@
  * index.ts only registers listeners.
  */
 import {
+  createRequestId,
   isErrorResponse,
   toUserFacingMessage,
   type DownloadRequestMetadata,
@@ -80,6 +81,7 @@ import {
   collectHandoffAuth,
   connectionForErrorCode,
   handoffDownload,
+  queryHandoffStatus,
 } from './nativeMessaging';
 import {
   applyCaptureTransition,
@@ -101,6 +103,8 @@ import type { PopupStateResponse } from '../shared/messages';
 const SIZE_WAIT_MS = 1_500;
 /** Host round-trip budget. Longer than the slow-host proof delay (1500 ms). */
 const HOST_WAIT_MS = 20_000;
+/** Re-ask the host while a desktop prompt is still open. Shorter than the suspects wait. */
+const STATUS_POLL_MS = 1_000;
 const CAPTURE_LIFECYCLE_STORAGE_KEY = 'rusticdl.capture-lifecycle';
 
 export type CapturedDownloadItem = browser.downloads.DownloadItem & {
@@ -433,6 +437,7 @@ async function handOffUrl(
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
     ...metadata,
     handoffAuth: metadata.handoffAuth ?? handoffAuth,
+    ...(metadata.handoffId ? { handoffId: metadata.handoffId } : {}),
   });
 
   const outcome = classifyHandoffResponse(response);
@@ -537,13 +542,16 @@ async function latestDownloadSnapshot(
   }
 }
 
-type TimerKind = 'name' | 'size' | 'host';
+type TimerKind = 'name' | 'size' | 'host' | 'status';
+type PendingTerminal = 'resume' | 'erase';
 
 type CaptureTrack = {
   life: CaptureLifecycle;
   item: CapturedDownloadItem;
   settings: ExtensionIntegrationSettings | null;
   sessionId?: string;
+  handoffId?: string;
+  pendingTerminal?: PendingTerminal;
   nameSettled: boolean;
   sizeSettled: boolean;
   sizeForced: boolean;
@@ -565,6 +573,8 @@ type StoredLifecycle = {
   life: CaptureLifecycle;
   item: CapturedDownloadItem;
   sessionId?: string;
+  handoffId?: string;
+  pendingTerminal?: PendingTerminal;
   nameSettled: boolean;
   sizeSettled: boolean;
   sizeForced: boolean;
@@ -613,7 +623,9 @@ function clearTrackTimers(track: CaptureTrack): void {
 }
 
 function shouldPersist(track: CaptureTrack): boolean {
-  if (track.preHydrate || !track.settled || track.consumed) return false;
+  if (track.preHydrate || !track.settled) return false;
+  if (track.pendingTerminal) return true;
+  if (track.consumed) return false;
   if (!isTerminalCapturePhase(track.life.phase)) return true;
   return track.life.phase === 'erased' || track.life.phase === 'accepted';
 }
@@ -628,6 +640,8 @@ function persistLifecycles(): void {
       life: { ...track.life },
       item: { ...track.item },
       sessionId: track.sessionId,
+      ...(track.handoffId ? { handoffId: track.handoffId } : {}),
+      ...(track.pendingTerminal ? { pendingTerminal: track.pendingTerminal } : {}),
       nameSettled: track.nameSettled,
       sizeSettled: track.sizeSettled,
       sizeForced: track.sizeForced,
@@ -656,16 +670,34 @@ function restoreLifecycles(value: unknown): void {
     const track = makeTrack(row.item, existing?.settings ?? null);
     track.life = { ...row.life };
     track.sessionId = row.sessionId;
+    track.handoffId = typeof row.handoffId === 'string' && row.handoffId ? row.handoffId : undefined;
+    track.pendingTerminal = row.pendingTerminal === 'resume' || row.pendingTerminal === 'erase'
+      ? row.pendingTerminal
+      : undefined;
     track.nameSettled = row.nameSettled;
     track.sizeSettled = row.sizeSettled;
     track.sizeForced = row.sizeForced;
     track.decidedWait = row.decidedWait;
     track.settled = true;
     track.pauseRequested = row.life.wePaused || row.life.phase === 'pausing' || row.life.phase === 'paused';
-    track.consumed = isTerminalCapturePhase(row.life.phase);
+    track.consumed = isTerminalCapturePhase(row.life.phase) && !track.pendingTerminal;
     if (!track.settings) track.life = { ...track.life, eligible: false };
     tracks.set(row.id, track);
     dispatch(track, { type: 'hydrate' });
+    let replay = false;
+    if (track.pendingTerminal === 'resume' && !track.queue.some((effect) => effect.type === 'resume')) {
+      track.queue.push({ type: 'resume' });
+      replay = true;
+    }
+    if (
+      track.pendingTerminal === 'erase'
+      && track.life.phase === 'accepted'
+      && !track.queue.some((effect) => effect.type === 'erase')
+    ) {
+      track.queue.push({ type: 'erase' });
+      replay = true;
+    }
+    if (replay) kick(track);
   }
 }
 
@@ -691,9 +723,40 @@ function kick(track: CaptureTrack): void {
       }
     } finally {
       track.draining = false;
+      if (track.queue.length === 0) settleTerminal(track);
     }
     if (track.queue.length > 0) kick(track);
   })();
+}
+
+function notePendingTerminal(track: CaptureTrack): void {
+  if (track.queue.some((effect) => effect.type === 'erase')) {
+    track.pendingTerminal = 'erase';
+    return;
+  }
+  if (
+    isTerminalCapturePhase(track.life.phase)
+    && track.queue.some((effect) => effect.type === 'resume')
+  ) {
+    track.pendingTerminal = 'resume';
+  }
+}
+
+function settleTerminal(track: CaptureTrack): void {
+  if (track.queue.length > 0) return;
+  if (track.pendingTerminal === 'resume') {
+    track.pendingTerminal = undefined;
+  } else if (track.pendingTerminal === 'erase' && track.life.phase === 'erased') {
+    track.pendingTerminal = undefined;
+  }
+  if (
+    track.life.role === 'primary'
+    && isTerminalCapturePhase(track.life.phase)
+    && !track.pendingTerminal
+  ) {
+    abandonOpenSession(track);
+  }
+  persistLifecycles();
 }
 
 function notifyFamily(track: CaptureTrack, outcome: 'accepted' | 'rejected' | 'timeout'): void {
@@ -728,9 +791,7 @@ function dispatch(track: CaptureTrack, event: CaptureEvent): void {
     track.life = eraseStep.state;
     for (const effect of eraseStep.effects) track.queue.push(effect);
   }
-  if (track.life.role === 'primary' && isTerminalCapturePhase(track.life.phase)) {
-    abandonOpenSession(track);
-  }
+  notePendingTerminal(track);
   persistLifecycles();
   kick(track);
 }
@@ -887,10 +948,26 @@ function publish(
   }
 }
 
+function timerDelay(timer: TimerKind): number {
+  switch (timer) {
+    case 'host':
+      return HOST_WAIT_MS;
+    case 'status':
+      return STATUS_POLL_MS;
+    case 'name':
+    case 'size':
+      return SIZE_WAIT_MS;
+    default: {
+      const _exhaustive: never = timer;
+      return _exhaustive;
+    }
+  }
+}
+
 function scheduleTimer(track: CaptureTrack, timer: TimerKind): void {
   const existing = track.timers[timer];
   if (existing) clearTimeout(existing);
-  const delay = timer === 'host' ? HOST_WAIT_MS : SIZE_WAIT_MS;
+  const delay = timerDelay(timer);
   track.timers[timer] = setTimeout(() => {
     delete track.timers[timer];
     if (timer === 'name') track.nameSettled = true;
@@ -898,8 +975,8 @@ function scheduleTimer(track: CaptureTrack, timer: TimerKind): void {
       track.sizeSettled = true;
       track.sizeForced = true;
     }
-    if (timer !== 'host') track.decidedWait = true;
-    if (timer === 'host') {
+    if (timer === 'name' || timer === 'size') track.decidedWait = true;
+    if (timer === 'host' || timer === 'status') {
       dispatch(track, { type: 'timer', timer, eligible: false });
       if (track.life.phase === 'timeout') notifyFamily(track, 'timeout');
       return;
@@ -1009,6 +1086,18 @@ async function confirmResume(track: CaptureTrack): Promise<void> {
   track.resumeRequested = false;
 }
 
+async function confirmHandoffStatus(track: CaptureTrack): Promise<void> {
+  if (track.life.phase !== 'sent' || track.life.sendCount < 1) return;
+  const handoffId = track.handoffId;
+  if (!handoffId) {
+    dispatch(track, { type: 'host-status', status: 'unknown' });
+    return;
+  }
+  const status = await queryHandoffStatus(handoffId);
+  if (track.life.phase !== 'sent') return;
+  dispatch(track, { type: 'host-status', status });
+}
+
 async function confirmErase(track: CaptureTrack): Promise<void> {
   if (track.life.phase !== 'accepted') return;
   const latest = await latestDownloadSnapshot(track.item);
@@ -1060,9 +1149,15 @@ async function runSend(track: CaptureTrack): Promise<void> {
     dispatch(track, { type: 'release' });
     return;
   }
+  if (!track.handoffId) {
+    track.handoffId = createRequestId();
+    persistLifecycles();
+    await persistChain;
+  }
   const attempt = await handOffUrl(url, settings, {
     suggestedFilename: sendName,
     totalBytes: knownDownloadBytes(track.item) ?? lookupFilenameHint(track.item.finalUrl || url)?.totalBytes,
+    handoffId: track.handoffId,
   }, {
     pageUrl: track.item.referrer,
     referrer: track.item.referrer,
@@ -1116,6 +1211,9 @@ async function runEffect(track: CaptureTrack, effect: CaptureEffect): Promise<vo
       return;
     case 'erase':
       await confirmErase(track);
+      return;
+    case 'query-handoff':
+      await confirmHandoffStatus(track);
       return;
     case 'schedule-timer':
       scheduleTimer(track, effect.timer);

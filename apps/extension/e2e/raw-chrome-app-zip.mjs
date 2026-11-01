@@ -140,7 +140,7 @@ const proc = spawn(
     '--disable-dev-shm-usage',
     pageUrl,
   ],
-  { stdio: ['ignore', 'ignore', 'pipe'], env },
+  { stdio: 'ignore', env },
 );
 
 const waitMs = Number(process.env.RAW_CHROME_WAIT_MS || 8000);
@@ -246,7 +246,7 @@ print(json.dumps(rows))
   }
 }
 console.log(`RAW_CHROME history=${history}`);
-if (acceptedReply && browserCopy.length > 0 && history.startsWith('[')) {
+if (acceptedReply && history.startsWith('[')) {
   let rows = [];
   try {
     rows = JSON.parse(history);

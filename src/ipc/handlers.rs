@@ -5,10 +5,13 @@ use std::time::Instant;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use super::bridge::{BrowserPrompt, IpcBridge, PromptDecision, DOWNLOAD_PROMPT_TIMEOUT};
+use super::bridge::{
+    BrowserPrompt, HandoffDecision, IpcBridge, PromptDecision, DOWNLOAD_PROMPT_TIMEOUT,
+};
 use super::protocol::{
-    is_side_effect_rate_limited, parse_enqueue_payload, validate_host_request, EnqueuePayload,
-    HostRequest, HostResponse, RawHandoffAuth, RawHandoffAuthHeader, MAX_METADATA_LENGTH,
+    is_side_effect_rate_limited, parse_enqueue_payload, parse_handoff_status_payload,
+    validate_host_request, EnqueuePayload, HostRequest, HostResponse, RawHandoffAuth,
+    RawHandoffAuthHeader, MAX_METADATA_LENGTH,
 };
 use crate::download::{
     derive_filename_from_url, find_active_duplicate, EngineCommand, EnqueueOutcome, EnqueueStatus,
@@ -63,6 +66,14 @@ pub(crate) async fn handle_request(bridge: &IpcBridge, request: HostRequest) -> 
             Ok(payload) => prompt_download(bridge, request.request_id, payload).await,
             Err(response) => response,
         },
+        "handoff_status" => {
+            match parse_handoff_status_payload(&request.request_id, &request.payload) {
+                Ok(id) => {
+                    HostResponse::handoff_status(request.request_id, bridge.lookup_handoff(&id))
+                }
+                Err(response) => response,
+            }
+        }
         "save_extension_settings" => {
             save_extension_settings(bridge, request.request_id, &request.payload)
         }
@@ -146,16 +157,25 @@ fn parse_handoff_auth(raw: Option<RawHandoffAuth>) -> Option<HandoffAuth> {
     }
 }
 
+fn remember_handoff(bridge: &IpcBridge, id: Option<&str>, decision: HandoffDecision) {
+    let Some(id) = id else {
+        return;
+    };
+    let _ = bridge.remember_handoff(id, decision);
+}
+
 async fn enqueue_download(
     bridge: &IpcBridge,
     request_id: String,
     payload: EnqueuePayload,
 ) -> HostResponse {
+    let handoff_id = payload.handoff_id.clone();
     let Some((directory, _, _, jobs)) = bridge.snapshot() else {
         return HostResponse::error(request_id, "INTERNAL_ERROR", "Could not read app state.");
     };
 
     if directory.as_os_str().is_empty() {
+        remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Rejected);
         return HostResponse::error(
             request_id,
             "DESTINATION_NOT_CONFIGURED",
@@ -164,6 +184,7 @@ async fn enqueue_download(
     }
 
     if let Some(existing) = find_active_duplicate(&jobs, &payload.url) {
+        remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Accepted);
         return HostResponse::enqueue_result(
             request_id,
             EnqueueOutcome {
@@ -175,7 +196,7 @@ async fn enqueue_download(
     }
 
     let handoff_auth = parse_handoff_auth(payload.handoff_auth);
-    engine_enqueue(
+    let response = engine_enqueue(
         bridge,
         request_id,
         payload.url,
@@ -185,7 +206,17 @@ async fn enqueue_download(
         FilenameConflictPolicy::Uniquify,
         payload.total_bytes,
     )
-    .await
+    .await;
+    remember_handoff(
+        bridge,
+        handoff_id.as_deref(),
+        if response.ok {
+            HandoffDecision::Accepted
+        } else {
+            HandoffDecision::Rejected
+        },
+    );
+    response
 }
 
 async fn prompt_download(
@@ -193,11 +224,13 @@ async fn prompt_download(
     request_id: String,
     payload: EnqueuePayload,
 ) -> HostResponse {
+    let handoff_id = payload.handoff_id.clone();
     let Some((directory, _, _, jobs)) = bridge.snapshot() else {
         return HostResponse::error(request_id, "INTERNAL_ERROR", "Could not read app state.");
     };
 
     if directory.as_os_str().is_empty() {
+        remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Rejected);
         return HostResponse::error(
             request_id,
             "DESTINATION_NOT_CONFIGURED",
@@ -206,6 +239,7 @@ async fn prompt_download(
     }
 
     if let Some(existing) = find_active_duplicate(&jobs, &payload.url) {
+        remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Accepted);
         return HostResponse::enqueue_result(
             request_id,
             EnqueueOutcome {
@@ -231,24 +265,33 @@ async fn prompt_download(
     };
 
     if bridge.enqueue_prompt(prompt).is_err() {
+        remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Rejected);
         return HostResponse::error(
             request_id,
             "RATE_LIMITED",
             "Too many pending download prompts. Accept or dismiss existing ones first.",
         );
     }
+    remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Pending);
 
     let decision = match tokio::time::timeout(DOWNLOAD_PROMPT_TIMEOUT, reply_rx).await {
         Ok(Ok(decision)) => decision,
-        Ok(Err(_)) => PromptDecision::Dismiss,
+        Ok(Err(_)) => {
+            remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Rejected);
+            return HostResponse::prompt_dismissed(request_id);
+        }
         Err(_) => {
             let _ = bridge.resolve_prompt(&prompt_id, PromptDecision::Dismiss);
-            PromptDecision::Dismiss
+            remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Expired);
+            return HostResponse::prompt_dismissed(request_id);
         }
     };
 
     match decision {
-        PromptDecision::Dismiss => HostResponse::prompt_dismissed(request_id),
+        PromptDecision::Dismiss => {
+            remember_handoff(bridge, handoff_id.as_deref(), HandoffDecision::Rejected);
+            HostResponse::prompt_dismissed(request_id)
+        }
         PromptDecision::Accept {
             filename,
             directory: dir_override,
@@ -261,7 +304,7 @@ async fn prompt_download(
             } else {
                 FilenameConflictPolicy::Uniquify
             };
-            engine_enqueue(
+            let response = engine_enqueue(
                 bridge,
                 request_id,
                 payload.url,
@@ -271,7 +314,17 @@ async fn prompt_download(
                 conflict,
                 payload.total_bytes,
             )
-            .await
+            .await;
+            remember_handoff(
+                bridge,
+                handoff_id.as_deref(),
+                if response.ok {
+                    HandoffDecision::Accepted
+                } else {
+                    HandoffDecision::Rejected
+                },
+            );
+            response
         }
     }
 }

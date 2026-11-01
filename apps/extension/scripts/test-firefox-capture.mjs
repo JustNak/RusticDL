@@ -2366,6 +2366,9 @@ await esbuild.build({
   platform: 'node',
   format: 'cjs',
   outfile: coordOutfile,
+  define: {
+    RUSTICDL_CAPTURE_TRACE: 'true',
+  },
   plugins: [
     {
       name: 'stub-browser',
@@ -3013,10 +3016,202 @@ await withCoordinator(async () => {
   await coord.whenCaptureIdleForTests();
   const shelf = coordBrowser._test.downloadItems.get(91);
   assert(
-    'coordinator hydrate of sent does not send again and resumes the pause',
+    'coordinator hydrate of sent with no handoff id keeps the browser copy',
     coordPrompts(url).length === 0
       && !coordBrowser._test.erased.includes(91)
-      && shelf?.paused === false,
+      && !coordBrowser._test.removedFiles.includes(91)
+      && shelf?.paused === true
+      && shelf?.state === 'in_progress',
+  );
+});
+
+function handoffStatusReply(status) {
+  return async (msg) => ({
+    ok: true,
+    requestId: msg.requestId,
+    type: 'handoff_status',
+    payload: { status },
+  });
+}
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-rejected';
+  const item = {
+    id: 93,
+    url,
+    filename: 'setup.exe',
+    mime: 'application/x-msdownload',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: true,
+  };
+  coordBrowser._test.downloadItems.set(93, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('rejected'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 93,
+    handoffId: 'hid-rejected',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: false,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(93);
+  assert(
+    'coordinator hydrate of sent asks the host and resumes a rejected in-progress download',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(93)
+      && !coordBrowser._test.removedFiles.includes(93)
+      && shelf?.paused === false
+      && shelf?.state === 'in_progress',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-accepted';
+  const item = {
+    id: 94,
+    url,
+    filename: 'app.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: true,
+    bytesReceived: 65536,
+  };
+  coordBrowser._test.downloadItems.set(94, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('accepted'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 94,
+    handoffId: 'hid-accepted',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: true,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  assert(
+    'coordinator hydrate of sent erases when the host says accepted',
+    coordPrompts(url).length === 0
+      && coordBrowser._test.erased.includes(94)
+      && coordBrowser._test.removedFiles.includes(94),
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-pending';
+  const item = {
+    id: 95,
+    url,
+    filename: 'app.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'in_progress',
+    paused: true,
+  };
+  coordBrowser._test.downloadItems.set(95, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('pending'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 95,
+    handoffId: 'hid-pending',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: false,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(95);
+  const stored = coordBrowser._test.session.data['rusticdl.capture-lifecycle'];
+  const row = Array.isArray(stored) ? stored.find((entry) => entry.id === 95) : undefined;
+  assert(
+    'coordinator hydrate of sent keeps a pending handoff and does not erase',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(95)
+      && !coordBrowser._test.removedFiles.includes(95)
+      && shelf?.paused === true
+      && row?.life?.phase === 'sent'
+      && row?.handoffId === 'hid-pending',
+  );
+});
+
+await withCoordinator(async () => {
+  const url = 'http://127.0.0.1:18921/C2?ck=hydrate-sent-complete-rejected';
+  const item = {
+    id: 96,
+    url,
+    filename: 'reject.zip',
+    mime: 'application/zip',
+    totalBytes: 65536,
+    state: 'complete',
+    paused: true,
+    bytesReceived: 65536,
+  };
+  coordBrowser._test.downloadItems.set(96, { ...item });
+  coordBrowser._test.setSendImpl(handoffStatusReply('rejected'));
+  coordBrowser._test.session.data['rusticdl.capture-lifecycle'] = [{
+    id: 96,
+    handoffId: 'hid-complete-rejected',
+    life: {
+      phase: 'sent',
+      role: 'primary',
+      wePaused: true,
+      pauseConfirmed: true,
+      eligible: true,
+      browserCompleted: true,
+      sendCount: 1,
+      familyAccepted: false,
+    },
+    item,
+    nameSettled: true,
+    sizeSettled: true,
+    sizeForced: false,
+    decidedWait: true,
+  }];
+  await coord.hydrateCaptureSessions();
+  await coord.whenCaptureIdleForTests();
+  const shelf = coordBrowser._test.downloadItems.get(96);
+  assert(
+    'coordinator hydrate of sent leaves a complete file when the host rejects',
+    coordPrompts(url).length === 0
+      && !coordBrowser._test.erased.includes(96)
+      && !coordBrowser._test.removedFiles.includes(96)
+      && shelf?.state === 'complete',
   );
 });
 

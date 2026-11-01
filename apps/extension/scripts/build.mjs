@@ -43,6 +43,7 @@ const targets = [
         'contextMenus',
         'cookies',
         'downloads',
+        'history',
         'nativeMessaging',
         'storage',
         'webRequest',
@@ -82,6 +83,7 @@ const targets = [
         'contextMenus',
         'cookies',
         'downloads',
+        'history',
         'nativeMessaging',
         'storage',
         'webRequest',
@@ -141,6 +143,10 @@ for (const target of targets) {
     target: target.name === 'firefox' ? ['firefox140'] : ['chrome110'],
     sourcemap: true,
     logLevel: 'info',
+    define: {
+      RUSTICDL_CAPTURE_TRACE: 'false',
+    },
+    minifySyntax: true,
   });
 
   await writeFile(path.join(outDir, 'manifest.json'), `${JSON.stringify(target.manifest, null, 2)}\n`);

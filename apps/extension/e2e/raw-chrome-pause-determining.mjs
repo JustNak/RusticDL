@@ -236,8 +236,8 @@ if (${arm === 'pause-poll' ? 'true' : 'false'}) {
     if (chromeErr) console.error(chromeErr.slice(0, 1500));
     process.exitCode = 1;
   }
-  if (arm === 'pause' && !determining) {
-    console.error('PAUSE_DET FAIL arm=pause no onDeterminingFilename');
+  if ((arm === 'open' || arm === 'pause' || arm === 'slow-pause') && !determining) {
+    console.error(`PAUSE_DET FAIL arm=${arm} no onDeterminingFilename`);
     if (chromeErr) console.error(chromeErr.slice(0, 1500));
     process.exitCode = 1;
   }

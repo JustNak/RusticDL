@@ -390,7 +390,7 @@ fn remaining_timeout(deadline: Instant) -> Option<Duration> {
 /// User-facing handoffs still auto-start the app when it is not running.
 fn should_launch_app_for(message_type: &str) -> bool {
     match message_type {
-        "get_status" => false,
+        "get_status" | "handoff_status" => false,
         "show_window" | "enqueue_download" | "prompt_download" | "save_extension_settings" => true,
         _ => false,
     }
@@ -404,6 +404,7 @@ mod tests {
     #[test]
     fn status_probes_do_not_launch_the_desktop_app() {
         assert!(!should_launch_app_for("get_status"));
+        assert!(!should_launch_app_for("handoff_status"));
         assert!(should_launch_app_for("show_window"));
         assert!(should_launch_app_for("enqueue_download"));
         assert!(should_launch_app_for("prompt_download"));

@@ -1,4 +1,6 @@
 use std::collections::{HashSet, VecDeque};
+
+use super::protocol::is_valid_handoff_id;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,6 +65,84 @@ impl BrowserPrompt {
     }
 }
 
+/// What the desktop decided for one extension handoff id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffDecision {
+    Pending,
+    Accepted,
+    Rejected,
+    Expired,
+}
+
+#[derive(Clone, Debug)]
+struct HandoffRecord {
+    id: String,
+    decision: HandoffDecision,
+}
+
+/// In-memory decisions for handoff ids. The extension asks after a worker restart.
+/// Accepted and pending rows are kept; rejected and expired rows are the ones dropped at the cap.
+#[derive(Default)]
+pub(crate) struct HandoffBook {
+    records: VecDeque<HandoffRecord>,
+}
+
+const HANDOFF_BOOK_CAP: usize = 1024;
+
+impl HandoffBook {
+    pub(crate) fn remember(&mut self, id: &str, decision: HandoffDecision) -> bool {
+        if !is_valid_handoff_id(id) {
+            return false;
+        }
+        if let Some(existing) = self.records.iter_mut().find(|row| row.id == id) {
+            if existing.decision == HandoffDecision::Accepted {
+                return true;
+            }
+            existing.decision = decision;
+            return true;
+        }
+        if self.records.len() >= HANDOFF_BOOK_CAP && !self.evict_finished() {
+            return false;
+        }
+        self.records.push_back(HandoffRecord {
+            id: id.to_string(),
+            decision,
+        });
+        true
+    }
+
+    pub(crate) fn lookup(&self, id: &str) -> &'static str {
+        if !is_valid_handoff_id(id) {
+            return "unknown";
+        }
+        match self
+            .records
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.decision)
+        {
+            Some(HandoffDecision::Pending) => "pending",
+            Some(HandoffDecision::Accepted) => "accepted",
+            Some(HandoffDecision::Rejected) => "rejected",
+            Some(HandoffDecision::Expired) => "expired",
+            None => "unknown",
+        }
+    }
+
+    fn evict_finished(&mut self) -> bool {
+        let Some(index) = self.records.iter().position(|row| {
+            matches!(
+                row.decision,
+                HandoffDecision::Rejected | HandoffDecision::Expired
+            )
+        }) else {
+            return false;
+        };
+        self.records.remove(index);
+        true
+    }
+}
+
 /// Shared snapshot the IPC server reads; the UI keeps it fresh.
 #[derive(Clone)]
 pub struct IpcBridge {
@@ -96,6 +176,8 @@ pub(crate) struct IpcState {
     pub(crate) complete_hud_shown: HashSet<String>,
     /// Bumped when the main window hides to tray so leftover HUDs can close.
     pub(crate) capture_close_epoch: u64,
+    /// Decision per extension handoff id. Survives the native-host connection, not the process.
+    pub(crate) handoffs: HandoffBook,
 }
 
 impl IpcBridge {
@@ -115,6 +197,7 @@ impl IpcBridge {
                 progress_hud_waiting_urls: HashSet::new(),
                 complete_hud_shown: HashSet::new(),
                 capture_close_epoch: 0,
+                handoffs: HandoffBook::default(),
             })),
             engine,
             paths,
@@ -260,6 +343,21 @@ impl IpcBridge {
             .lock()
             .ok()
             .is_some_and(|guard| guard.prompt_queue.iter().any(|p| p.id == prompt_id))
+    }
+
+    pub(crate) fn remember_handoff(&self, id: &str, decision: HandoffDecision) -> bool {
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        guard.handoffs.remember(id, decision)
+    }
+
+    pub(crate) fn lookup_handoff(&self, id: &str) -> &'static str {
+        self.inner
+            .lock()
+            .ok()
+            .map(|guard| guard.handoffs.lookup(id))
+            .unwrap_or("unknown")
     }
 
     pub(crate) fn enqueue_prompt(
@@ -693,5 +791,62 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(20), wake.notified())
             .await
             .expect("enqueue_progress_job must store a wake permit");
+    }
+
+    #[test]
+    fn handoff_book_rejects_bad_id_and_reports_unknown() {
+        let mut book = HandoffBook::default();
+        assert!(!book.remember("../etc", HandoffDecision::Accepted));
+        assert!(!book.remember("", HandoffDecision::Pending));
+        assert!(!book.remember(&"x".repeat(129), HandoffDecision::Pending));
+        assert_eq!(book.lookup("missing-id"), "unknown");
+        assert_eq!(book.lookup("../etc"), "unknown");
+        assert_eq!(book.lookup(""), "unknown");
+    }
+
+    #[test]
+    fn handoff_book_pending_then_accepted_is_not_downgraded() {
+        let mut book = HandoffBook::default();
+        assert!(book.remember("hid-1", HandoffDecision::Pending));
+        assert_eq!(book.lookup("hid-1"), "pending");
+        assert!(book.remember("hid-1", HandoffDecision::Accepted));
+        assert_eq!(book.lookup("hid-1"), "accepted");
+        assert!(book.remember("hid-1", HandoffDecision::Rejected));
+        assert_eq!(book.lookup("hid-1"), "accepted");
+    }
+
+    #[test]
+    fn handoff_book_keeps_accepted_when_the_cap_drops_finished_rows() {
+        let mut book = HandoffBook::default();
+        assert!(book.remember("kept", HandoffDecision::Accepted));
+        for index in 0..(HANDOFF_BOOK_CAP - 1) {
+            assert!(book.remember(&format!("old-{index}"), HandoffDecision::Rejected));
+        }
+        assert!(book.remember("new-id", HandoffDecision::Pending));
+        assert_eq!(book.lookup("kept"), "accepted");
+        assert_eq!(book.lookup("new-id"), "pending");
+        assert_eq!(book.lookup("old-0"), "unknown");
+    }
+
+    #[test]
+    fn handoff_book_does_not_drop_accepted_to_make_room() {
+        let mut book = HandoffBook::default();
+        for index in 0..HANDOFF_BOOK_CAP {
+            assert!(book.remember(&format!("acc-{index}"), HandoffDecision::Accepted));
+        }
+        assert!(!book.remember("overflow", HandoffDecision::Pending));
+        assert_eq!(book.lookup("acc-0"), "accepted");
+        assert_eq!(book.lookup("overflow"), "unknown");
+    }
+
+    #[test]
+    fn bridge_lookup_matches_the_book() {
+        let ipc = test_bridge();
+        assert_eq!(ipc.lookup_handoff("hid-9"), "unknown");
+        assert!(ipc.remember_handoff("hid-9", HandoffDecision::Pending));
+        assert_eq!(ipc.lookup_handoff("hid-9"), "pending");
+        assert!(ipc.remember_handoff("hid-9", HandoffDecision::Expired));
+        assert_eq!(ipc.lookup_handoff("hid-9"), "expired");
+        assert!(!ipc.remember_handoff("../hid", HandoffDecision::Accepted));
     }
 }

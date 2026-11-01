@@ -3,6 +3,7 @@ import {
   createEnqueueDownloadRequest,
   createOpenAppRequest,
   createPingRequest,
+  createHandoffStatusRequest,
   createPromptDownloadRequest,
   createSaveExtensionSettingsRequest,
   toUserFacingMessage,
@@ -12,6 +13,7 @@ import {
   type ErrorCode,
   type ExtensionIntegrationSettings,
   type HandoffAuthHeader,
+  type HandoffStatus,
   type HostToExtensionResponse,
   type OriginHandoffAuth,
   type RequestSource,
@@ -203,6 +205,33 @@ export async function handoffDownload(
     return enqueueDownload(url, source, metadata);
   }
   return promptDownload(url, source, metadata);
+}
+
+export type HandoffLookup = HandoffStatus | 'unreachable';
+
+/** Ask the desktop app what it decided for a handoff id. Transport failures stay `unreachable`. */
+export async function queryHandoffStatus(handoffId: string): Promise<HandoffLookup> {
+  const request = createHandoffStatusRequest(handoffId);
+  if (!request.ok) return 'unknown';
+  let response: HostToExtensionResponse;
+  try {
+    response = await sendNativeMessage(request.value);
+  } catch {
+    return 'unreachable';
+  }
+  if (!response.ok || response.type !== 'handoff_status') return 'unreachable';
+  switch (response.payload.status) {
+    case 'pending':
+    case 'accepted':
+    case 'rejected':
+    case 'expired':
+    case 'unknown':
+      return response.payload.status;
+    default: {
+      const _exhaustive: never = response.payload.status;
+      return _exhaustive;
+    }
+  }
 }
 
 export async function saveExtensionSettings(

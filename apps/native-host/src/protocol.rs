@@ -69,6 +69,8 @@ pub struct EnqueueDownloadPayload {
     pub total_bytes: Option<u64>,
     #[serde(rename = "handoffAuth")]
     pub handoff_auth: Option<HandoffAuth>,
+    #[serde(default, rename = "handoffId", skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -81,6 +83,8 @@ pub struct PromptDownloadPayload {
     pub total_bytes: Option<u64>,
     #[serde(rename = "handoffAuth")]
     pub handoff_auth: Option<HandoffAuth>,
+    #[serde(default, rename = "handoffId", skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -235,6 +239,7 @@ pub fn parse_enqueue_payload(
         "suggestedFilename",
         payload.suggested_filename.as_deref(),
     )?;
+    validate_optional_handoff_id(&request.request_id, payload.handoff_id.as_deref())?;
     Ok(payload)
 }
 
@@ -258,7 +263,31 @@ pub fn parse_prompt_download_payload(
         "suggestedFilename",
         payload.suggested_filename.as_deref(),
     )?;
+    validate_optional_handoff_id(&request.request_id, payload.handoff_id.as_deref())?;
     Ok(payload)
+}
+
+pub fn parse_handoff_status_payload(request: &NativeRequestEnvelope) -> HostResult<String> {
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(rename = "handoffId")]
+        handoff_id: String,
+    }
+    let payload = serde_json::from_value::<Payload>(request.payload.clone()).map_err(|error| {
+        Box::new(HostResponseEnvelope::rejected(
+            request.request_id.clone(),
+            "invalid_payload",
+            "INVALID_PAYLOAD",
+            format!("Payload could not be parsed: {error}"),
+        ))
+    })?;
+    if !is_valid_request_id(&payload.handoff_id) {
+        return Err(invalid_payload(
+            &request.request_id,
+            "Handoff id is not supported.",
+        ));
+    }
+    Ok(payload.handoff_id)
 }
 
 pub fn parse_open_app_payload(request: &NativeRequestEnvelope) -> HostResult<OpenAppPayload> {
@@ -357,6 +386,14 @@ fn validate_metadata_field(
     Ok(())
 }
 
+fn validate_optional_handoff_id(request_id: &str, id: Option<&str>) -> HostResult<()> {
+    match id {
+        None => Ok(()),
+        Some(id) if is_valid_request_id(id) => Ok(()),
+        Some(_) => Err(invalid_payload(request_id, "Handoff id is not supported.")),
+    }
+}
+
 fn invalid_payload(request_id: &str, message: &str) -> Box<HostResponseEnvelope> {
     Box::new(HostResponseEnvelope::rejected(
         request_id.to_string(),
@@ -383,6 +420,7 @@ fn is_supported_request_type(message_type: &str) -> bool {
             | "enqueue_download"
             | "prompt_download"
             | "save_extension_settings"
+            | "handoff_status"
     )
 }
 
@@ -428,6 +466,18 @@ pub fn app_prompt_download_request(
         request_id,
         message_type: "prompt_download".into(),
         payload,
+    }
+}
+
+pub fn app_handoff_status_request(
+    request_id: String,
+    handoff_id: String,
+) -> AppRequestEnvelope<Value> {
+    AppRequestEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        message_type: "handoff_status".into(),
+        payload: json!({ "handoffId": handoff_id }),
     }
 }
 
@@ -558,5 +608,54 @@ mod tests {
             .expect("originAuth");
         assert_eq!(origin.origin, "https://drive.google.com");
         assert_eq!(origin.headers[0].value, "SID=drive");
+    }
+
+    #[test]
+    fn parse_enqueue_payload_keeps_a_valid_handoff_id() {
+        let request = request(
+            "enqueue_download",
+            json!({
+                "url": "https://example.com/file.zip",
+                "source": valid_source(),
+                "handoffId": "handoff-1"
+            }),
+        );
+        let payload = parse_enqueue_payload(&request).expect("valid handoff id");
+        assert_eq!(payload.handoff_id.as_deref(), Some("handoff-1"));
+    }
+
+    #[test]
+    fn parse_enqueue_payload_rejects_a_path_handoff_id() {
+        let request = request(
+            "enqueue_download",
+            json!({
+                "url": "https://example.com/file.zip",
+                "source": valid_source(),
+                "handoffId": "../secret"
+            }),
+        );
+        let error = parse_enqueue_payload(&request).expect_err("path handoff id");
+        assert_eq!(error.code.as_deref(), Some("INVALID_PAYLOAD"));
+        assert_eq!(
+            error.message.as_deref(),
+            Some("Handoff id is not supported.")
+        );
+    }
+
+    #[test]
+    fn parse_handoff_status_rejects_a_path_id() {
+        let request = request("handoff_status", json!({ "handoffId": "../secret" }));
+        let error = parse_handoff_status_payload(&request).expect_err("path id");
+        assert_eq!(error.code.as_deref(), Some("INVALID_PAYLOAD"));
+    }
+
+    #[test]
+    fn parse_handoff_status_accepts_a_token_id() {
+        let request = request("handoff_status", json!({ "handoffId": "handoff-1" }));
+        let id = parse_handoff_status_payload(&request).expect("token id");
+        assert_eq!(id, "handoff-1");
+        let forwarded = app_handoff_status_request("request-1".into(), id);
+        assert_eq!(forwarded.message_type, "handoff_status");
+        assert_eq!(forwarded.payload["handoffId"], "handoff-1");
     }
 }

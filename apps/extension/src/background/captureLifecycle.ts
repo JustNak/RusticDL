@@ -15,13 +15,25 @@
  * once the browser completed before that send. If the shelf reaches
  * `complete` after the send was delivered, a host accept still erases
  * the row and removeFile deletes the finished copy. Reject, dismiss,
- * disconnect, and timeout leave a complete file and resume only when
- * this machine still holds a pause and the item is not complete.
+ * disconnect, and an expired host decision leave a complete file and
+ * resume only when this machine still holds a pause and the item is
+ * not complete. The host timer re-asks; it does not give the file back
+ * while a desktop prompt can still be accepted.
+ *
+ * The host is the source of truth for an in-flight handoff. A service
+ * worker restart hydrates `sent` and asks the host for that handoff id:
+ * accepted erases, rejected or expired releases the hold, pending keeps
+ * the row and asks again. Unknown and unreachable keep the browser copy.
  *
  * Erase/cancel effects are produced only from phase `accepted`.
  * The downloads.pause/resume/cancel/removeFile/erase calls live in this file.
  */
 import browser from './browser';
+import {
+  readCaptureTransitionTrace as readTrace,
+  recordCaptureTransitionForTests,
+  resetCaptureTransitionTrace as resetTrace,
+} from './captureTrace';
 
 export type CapturePhase =
   | 'created'
@@ -70,11 +82,15 @@ export type CaptureEvent =
   | { type: 'user-cancel' }
   | { type: 'on-determining-filename'; eligible: boolean }
   | { type: 'on-changed'; change: 'filename' | 'bytes' | 'other'; eligible: boolean }
-  | { type: 'timer'; timer: 'name' | 'size' | 'host'; eligible: boolean }
+  | { type: 'timer'; timer: 'name' | 'size' | 'host' | 'status'; eligible: boolean }
   | { type: 'eligible'; eligible: boolean }
   | { type: 'release' }
   | { type: 'become-ghost'; familyAccepted: boolean }
   | { type: 'host-reply'; outcome: 'accept' | 'reject' | 'dismiss' | 'disconnect' }
+  | {
+    type: 'host-status';
+    status: 'pending' | 'accepted' | 'rejected' | 'expired' | 'unknown' | 'unreachable';
+  }
   | { type: 'erase' }
   | { type: 'erase-ok' }
   | { type: 'erase-fail' }
@@ -88,8 +104,9 @@ export type CaptureEffect =
   | { type: 'resume' }
   | { type: 'send' }
   | { type: 'erase' }
-  | { type: 'schedule-timer'; timer: 'name' | 'size' | 'host' }
+  | { type: 'schedule-timer'; timer: 'name' | 'size' | 'host' | 'status' }
   | { type: 'clear-timers' }
+  | { type: 'query-handoff' }
   | { type: 'log'; event: string };
 
 export type CaptureTransitionResult = {
@@ -110,14 +127,18 @@ export function initialCaptureLifecycle(): CaptureLifecycle {
   };
 }
 
-const captureTransitionTrace: string[] = [];
+declare const RUSTICDL_CAPTURE_TRACE: boolean;
 
 export function readCaptureTransitionTrace(): readonly string[] {
-  return captureTransitionTrace;
+  return readTrace();
 }
 
 export function resetCaptureTransitionTrace(): void {
-  captureTransitionTrace.length = 0;
+  resetTrace();
+}
+
+function noteCaptureTransition(event: CaptureEvent): void {
+  if (RUSTICDL_CAPTURE_TRACE) recordCaptureTransitionForTests(event.type);
 }
 
 export function isTerminalCapturePhase(phase: CapturePhase): boolean {
@@ -300,6 +321,41 @@ function pauseOk(state: CaptureLifecycle): CaptureTransitionResult {
   return noop(held);
 }
 
+function hostStatus(
+  state: CaptureLifecycle,
+  status: 'pending' | 'accepted' | 'rejected' | 'expired' | 'unknown' | 'unreachable',
+): CaptureTransitionResult {
+  if (state.phase !== 'sent' || state.sendCount < 1) {
+    if (isTerminalCapturePhase(state.phase)) return noop(state);
+    return failClosed(state, { type: 'host-status', status });
+  }
+  switch (status) {
+    case 'accepted':
+      return {
+        state: { ...state, phase: 'accepted' },
+        effects: [{ type: 'clear-timers' }],
+      };
+    case 'rejected':
+    case 'expired':
+      return releaseHold(state, 'rejected');
+    case 'pending':
+      return { state, effects: [{ type: 'schedule-timer', timer: 'status' }] };
+    case 'unknown':
+    case 'unreachable':
+      return {
+        state,
+        effects: [
+          { type: 'log', event: `handoff-${status}` },
+          { type: 'schedule-timer', timer: 'status' },
+        ],
+      };
+    default: {
+      const _exhaustive: never = status;
+      return _exhaustive;
+    }
+  }
+}
+
 function hostReply(state: CaptureLifecycle, outcome: 'accept' | 'reject' | 'dismiss' | 'disconnect'): CaptureTransitionResult {
   // browserCompleted stays legal here: the shelf can finish during the host
   // wait after the send was delivered. sendCount === 0 still cannot accept.
@@ -329,7 +385,7 @@ export function applyCaptureTransition(
   state: CaptureLifecycle,
   event: CaptureEvent,
 ): CaptureTransitionResult {
-  captureTransitionTrace.push(event.type);
+  noteCaptureTransition(event);
   return captureTransition(state, event);
 }
 
@@ -402,14 +458,24 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
       if (event.change === 'other') return noop(state);
       return applyEligible(state, event.eligible);
     case 'timer':
-      if (event.timer === 'host') {
-        if (state.phase !== 'sent') return noop(state);
-        return releaseHold(state, 'timeout');
+      switch (event.timer) {
+        case 'host':
+        case 'status':
+          // A desktop accept can take minutes. Re-ask the host instead of
+          // releasing the browser copy while the decision is still open.
+          if (state.phase !== 'sent' || state.sendCount < 1) return noop(state);
+          return { state, effects: [{ type: 'query-handoff' }] };
+        case 'name':
+        case 'size':
+          if (state.phase === 'sent' || state.sendCount > 0 || isTerminalCapturePhase(state.phase)) {
+            return noop(state);
+          }
+          return applyEligible(state, event.eligible);
+        default: {
+          const _exhaustive: never = event.timer;
+          return _exhaustive;
+        }
       }
-      if (state.phase === 'sent' || state.sendCount > 0 || isTerminalCapturePhase(state.phase)) {
-        return noop(state);
-      }
-      return applyEligible(state, event.eligible);
     case 'release':
       if (isTerminalCapturePhase(state.phase) || state.phase === 'accepted' || state.phase === 'erased') {
         return noop(state);
@@ -432,6 +498,8 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
       };
     case 'host-reply':
       return hostReply(state, event.outcome);
+    case 'host-status':
+      return hostStatus(state, event.status);
     case 'erase':
       if (state.phase === 'accepted') {
         return { state, effects: [{ type: 'erase' }] };
@@ -469,9 +537,9 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
       if (state.phase === 'erased') return noop(state);
       if (state.phase === 'accepted') return noop(state);
       if (state.phase === 'sent') {
-        // The worker died with the host port. Do not send again. Resume only
-        // when the shelf item is still incomplete (releaseHold checks that).
-        return releaseHold(state, 'rejected');
+        if (state.sendCount < 1) return failClosed(state, event);
+        // The port died. Keep the row and ask the host. Do not send again.
+        return { state, effects: [{ type: 'clear-timers' }, { type: 'query-handoff' }] };
       }
       if (state.sendCount > 0) return noop(state);
       if (state.phase === 'pausing') return { state, effects: [{ type: 'pause' }] };
@@ -514,29 +582,82 @@ export async function resumeDownload(id: number): Promise<void> {
   await browser.downloads.resume(id);
 }
 
+async function downloadStillListed(id: number): Promise<boolean> {
+  try {
+    const rows = await browser.downloads.search({ id });
+    return rows.some((row) => row.id === id);
+  } catch {
+    return true;
+  }
+}
+
 /**
- * Cancel, delete the shelf file (removeFile covers a row that already
- * reached complete), and erase the history row. True when erase removed it.
+ * Chrome writes a finished download into History, then leaves `downloads.erase`
+ * in the open history transaction. Killing the browser before that transaction
+ * commits keeps the completed row. `history.deleteUrl` on a URL that was never
+ * visited commits the transaction and does not remove any visit.
+ */
+const HISTORY_COMMIT_URL = 'https://rusticdl.invalid/capture-history-commit';
+const HISTORY_COMMIT_ATTEMPTS = 8;
+const HISTORY_COMMIT_GAP_MS = 250;
+
+async function commitHistoryTransaction(): Promise<boolean> {
+  const history = browser.history;
+  if (!history?.deleteUrl) return false;
+  try {
+    await history.deleteUrl({ url: HISTORY_COMMIT_URL });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function eraseShelfRow(id: number): Promise<void> {
+  try {
+    await browser.downloads.erase({ id });
+  } catch {
+    // shelf row not ready
+  }
+}
+
+/**
+ * Delete the shelf file, then erase the history row. True when a follow-up
+ * search no longer sees the id. The history commit is repeated so a delete
+ * that lands after the first commit is still flushed before shutdown.
  */
 export async function eraseDownload(id: number): Promise<boolean> {
+  let state = '';
+  let sawRow = false;
   try {
-    await browser.downloads.cancel(id);
+    const [row] = await browser.downloads.search({ id });
+    if (row) {
+      sawRow = true;
+      state = row.state ?? '';
+    }
   } catch {
-    // already finished or canceled
+    sawRow = true;
+  }
+  if (sawRow && state !== 'complete') {
+    try {
+      await browser.downloads.cancel(id);
+    } catch {
+      // already finished or canceled
+    }
   }
   try {
     await browser.downloads.removeFile(id);
   } catch {
     // no dest file yet
   }
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      const erased = await browser.downloads.erase({ id });
-      if (erased.length > 0) return true;
-    } catch {
-      // shelf row not ready
-    }
-    await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+  if (!browser.history?.deleteUrl) {
+    await eraseShelfRow(id);
+    return !(await downloadStillListed(id));
   }
-  return false;
+  for (let attempt = 0; attempt < HISTORY_COMMIT_ATTEMPTS; attempt += 1) {
+    await eraseShelfRow(id);
+    await new Promise((resolve) => setTimeout(resolve, HISTORY_COMMIT_GAP_MS));
+    const committed = await commitHistoryTransaction();
+    if (!committed) break;
+  }
+  return !(await downloadStillListed(id));
 }

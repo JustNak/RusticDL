@@ -181,6 +181,30 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             node apps/extension/e2e/raw-chrome-app-zip.mjs
 
+      - name: Raw Chrome suspects host delay 0
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=0
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
+      - name: Raw Chrome suspects host delay 1000
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=1000
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
+      - name: Raw Chrome suspects host delay 3000
+        run: |
+          export EXT_HOST_REPLY_DELAY_MS=3000
+          for i in 1 2 3; do
+            xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+              node apps/extension/e2e/raw-chrome-suspects.mjs
+          done
+
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
