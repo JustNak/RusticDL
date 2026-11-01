@@ -303,9 +303,17 @@ test('extension capture matrix', async () => {
       const trackedUrls = [expectedUrl, expectedFinal, matchPreview?.payload?.url].filter(Boolean);
       let downloads = await searchDownloads(sw);
       if (caseDef.expect === 'capture' && (promptLines.length + enqueueLines.length) > 0) {
+        // A one-shot body can reach state=complete while the host reply is
+        // still in flight. downloadItemsTerminal treats complete as terminal,
+        // which would freeze that snapshot and hide the later erase. Keep
+        // polling until the row is gone, interrupted, or the settle budget
+        // ends. A row that is still complete at the end is still a failure.
         const settleUntil = Date.now() + classify.DOWNLOAD_SETTLE.maxWaitMs;
         while (Date.now() < settleUntil) {
-          if (classify.downloadItemsTerminal(downloads, trackedUrls)) break;
+          if (classify.downloadSearchFailed(downloads)) break;
+          const matched = classify.matchingDownloadItems(downloads, trackedUrls);
+          const completeLeft = matched.some((item: { state?: string }) => item?.state === 'complete');
+          if (classify.downloadItemsTerminal(downloads, trackedUrls) && !completeLeft) break;
           await sleep(classify.DOWNLOAD_SETTLE.pollMs);
           downloads = await searchDownloads(sw);
         }

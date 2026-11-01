@@ -6,14 +6,16 @@
  *
  * Usage: node e2e/raw-chrome-app-zip.mjs
  */
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -172,6 +174,28 @@ const uuidAsZip = prompts.find(
 const latencyMs = appZip && clickedAt ? appZip.receivedAt - clickedAt : null;
 const timerFallback = latencyMs != null && latencyMs >= 1400;
 
+function collectFiles(dir, acc = []) {
+  if (!existsSync(dir)) return acc;
+  for (const name of readdirSync(dir)) {
+    const full = path.join(dir, name);
+    let st;
+    try {
+      st = statSync(full);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) collectFiles(full, acc);
+    else acc.push({ file: full, size: st.size });
+  }
+  return acc;
+}
+
+const downloadsDir = path.join(isolatedHome, 'Downloads');
+const shelf = collectFiles(downloadsDir);
+console.log(`RAW_CHROME shelf=${JSON.stringify(shelf)}`);
+const acceptedReply = appZip?.reply?.type === 'accepted';
+const browserCopy = shelf.filter((entry) => /^app(?: \(\d+\))?\.zip(?:\.crdownload)?$/.test(path.basename(entry.file)));
+
 console.log(`RAW_CHROME chrome=${chromePath}`);
 console.log(`RAW_CHROME url=${dlUrl}`);
 console.log(`RAW_CHROME suggestedFilename=${appZip?.payload?.suggestedFilename ?? '(none)'}`);
@@ -191,8 +215,50 @@ if (uuidAsZip) {
   console.error('FAIL: a GUID URL was handed off as uuid.zip');
   failed += 1;
 }
+if (acceptedReply && browserCopy.length > 0) {
+  console.error(`FAIL: browser copy remains after accepted reply ${JSON.stringify(browserCopy)}`);
+  failed += 1;
+}
 
-proc.kill('SIGKILL');
+proc.kill('SIGTERM');
+await new Promise((resolve) => {
+  const timer = setTimeout(() => {
+    proc.kill('SIGKILL');
+    resolve();
+  }, 2000);
+  proc.once('exit', () => {
+    clearTimeout(timer);
+    resolve();
+  });
+});
+const historyPath = path.join(userDataDir, 'Default', 'History');
+let history = 'missing';
+if (existsSync(historyPath)) {
+  try {
+    history = execFileSync('python3', ['-c', `
+import sqlite3, json, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute('select target_path, state, received_bytes, total_bytes from downloads').fetchall()
+print(json.dumps(rows))
+`, historyPath], { encoding: 'utf8' }).trim();
+  } catch (error) {
+    history = `error ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+console.log(`RAW_CHROME history=${history}`);
+if (acceptedReply && browserCopy.length > 0 && history.startsWith('[')) {
+  let rows = [];
+  try {
+    rows = JSON.parse(history);
+  } catch {
+    rows = [];
+  }
+  const appRow = rows.find((row) => typeof row?.[0] === 'string' && /app(?: \(\d+\))?\.zip$/.test(row[0].split(/[\\/]/).pop() || ''));
+  if (appRow && Number(appRow[1]) === 1 && Number(appRow[2]) > 0) {
+    console.error(`FAIL: history still has a complete app.zip after accepted reply ${JSON.stringify(appRow)}`);
+    failed += 1;
+  }
+}
 server.close();
 
 if (failed > 0) {

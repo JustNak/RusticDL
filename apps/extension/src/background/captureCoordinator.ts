@@ -88,7 +88,6 @@ import {
   isTerminalCapturePhase,
   pauseDownload,
   readCaptureTransitionTrace,
-  resetCaptureTransitionHooks,
   resetCaptureTransitionTrace,
   resumeDownload,
   type CaptureEffect,
@@ -223,7 +222,6 @@ export function resetCaptureCoordinatorForTests(): void {
   for (const track of tracks.values()) clearTrackTimers(track);
   tracks.clear();
   resetCaptureTransitionTrace();
-  resetCaptureTransitionHooks();
 }
 
 export function captureTransitionTrace(): readonly string[] {
@@ -551,6 +549,7 @@ type CaptureTrack = {
   sizeForced: boolean;
   decidedWait: boolean;
   pauseRequested: boolean;
+  pendingComplete: boolean;
   resumeRequested: boolean;
   preHydrate: boolean;
   settled: boolean;
@@ -594,6 +593,7 @@ function makeTrack(
     sizeForced: sized,
     decidedWait: false,
     pauseRequested: false,
+    pendingComplete: false,
     resumeRequested: false,
     preHydrate: false,
     settled: false,
@@ -946,6 +946,8 @@ function interruptEvent(item: CapturedDownloadItem): CaptureEvent {
 
 async function confirmPause(track: CaptureTrack): Promise<void> {
   track.pauseRequested = true;
+  // Captured before onChanged can merge a one-shot completion into the item.
+  const startedInProgress = track.item.state !== 'complete';
   try {
     await pauseDownload(track.item.id);
   } catch {
@@ -974,8 +976,16 @@ async function confirmPause(track: CaptureTrack): Promise<void> {
     return;
   }
   track.item = latest;
-  if (latest.state === 'complete') {
-    dispatch(track, { type: 'browser-complete' });
+  if (latest.state === 'complete' || track.pendingComplete) {
+    track.pendingComplete = false;
+    // The body finished during pause(). Arm the send while the table still
+    // sees an in-progress capture, then record the completion so accept erases.
+    if (startedInProgress && track.life.phase === 'pausing') {
+      dispatch(track, { type: 'pause-ok' });
+    }
+    if (track.life.phase === 'sent' || track.life.phase === 'pausing' || track.life.phase === 'paused') {
+      dispatch(track, { type: 'browser-complete' });
+    }
     return;
   }
   if (latest.state === 'interrupted') {
@@ -1000,9 +1010,12 @@ async function confirmResume(track: CaptureTrack): Promise<void> {
 }
 
 async function confirmErase(track: CaptureTrack): Promise<void> {
-  if (track.life.phase !== 'accepted' || track.life.browserCompleted) return;
+  if (track.life.phase !== 'accepted') return;
+  const latest = await latestDownloadSnapshot(track.item);
+  if (latest) track.item = latest;
+  if (track.life.phase !== 'accepted') return;
   const erased = await eraseDownload(track.item.id);
-  if (track.life.phase !== 'accepted' || track.life.browserCompleted) return;
+  if (track.life.phase !== 'accepted') return;
   dispatch(track, erased ? { type: 'erase-ok' } : { type: 'erase-fail' });
 }
 
@@ -1013,25 +1026,26 @@ function noteUnsentHostMiss(track: CaptureTrack, attempt: HandoffAttempt): void 
 
 async function runSend(track: CaptureTrack): Promise<void> {
   const settings = track.settings;
-  if (!settings || track.life.phase !== 'sent' || track.life.browserCompleted) {
-    if (track.life.phase === 'sent') dispatch(track, { type: 'release' });
-    return;
-  }
+  if (!settings || track.life.phase !== 'sent') return;
   const latest = await latestDownloadSnapshot(track.item);
+  if (track.life.phase !== 'sent') return;
   if (!latest) {
-    dispatch(track, { type: 'hold-lost' });
+    dispatch(track, track.life.browserCompleted ? { type: 'release' } : { type: 'hold-lost' });
     return;
   }
   track.item = latest;
-  if (latest.state === 'complete') {
-    dispatch(track, { type: 'browser-complete' });
-    return;
-  }
-  if (latest.state === 'interrupted') {
+  if (track.life.browserCompleted || latest.state === 'complete') {
+    // pause-ok already queued this send. A one-shot body can reach complete
+    // before the native call; still hand off, then erase on accept.
+    if (!track.life.browserCompleted) dispatch(track, { type: 'browser-complete' });
+    if (track.life.phase !== 'sent' || track.life.sendCount < 1) {
+      if (track.life.phase === 'sent') dispatch(track, { type: 'release' });
+      return;
+    }
+  } else if (latest.state === 'interrupted') {
     dispatch(track, interruptEvent(latest));
     return;
-  }
-  if (!(latest.paused === true && latest.state === 'in_progress')) {
+  } else if (!(latest.paused === true && latest.state === 'in_progress')) {
     dispatch(track, { type: 'hold-lost' });
     return;
   }
@@ -1058,16 +1072,12 @@ async function runSend(track: CaptureTrack): Promise<void> {
     filename: sendName,
     sessionId: track.sessionId,
   });
-  if (track.life.phase !== 'sent' || track.life.browserCompleted) {
+  if (track.life.phase !== 'sent') {
     noteUnsentHostMiss(track, attempt);
     return;
   }
   const after = await latestDownloadSnapshot(track.item);
-  if (after?.state === 'complete' || after?.state === 'interrupted') {
-    dispatch(track, after.state === 'complete' ? { type: 'browser-complete' } : interruptEvent(after));
-    noteUnsentHostMiss(track, attempt);
-    return;
-  }
+  if (after) track.item = after;
   switch (attempt) {
     case 'accepted':
       dispatch(track, { type: 'host-reply', outcome: 'accept' });
@@ -1219,6 +1229,10 @@ export function onDownloadChanged(
   const state = deltaCurrent(delta.state);
   const paused = deltaCurrent(delta.paused);
   if (state === 'complete') {
+    if (track.life.phase === 'pausing' && track.life.sendCount === 0) {
+      track.pendingComplete = true;
+      return;
+    }
     dispatch(track, { type: 'browser-complete' });
     return;
   }
@@ -1227,7 +1241,10 @@ export function onDownloadChanged(
     dispatch(track, error === 'USER_CANCELED' ? { type: 'user-cancel' } : { type: 'browser-interrupted' });
     return;
   }
-  if (paused === true && !track.pauseRequested) {
+  if (paused === true && track.pauseRequested) {
+    // The one onChanged echo of our own pause(). A later paused:true is the user.
+    track.pauseRequested = false;
+  } else if (paused === true) {
     dispatch(track, { type: 'user-pause' });
     return;
   }

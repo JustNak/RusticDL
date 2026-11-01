@@ -37,22 +37,23 @@ await esbuild.build({
 const lifecycle = await import(outfile);
 const {
   initialCaptureLifecycle,
-  applyCaptureTransition,
-  captureTransitionHooks,
+  applyCaptureTransition: applyRealTransition,
   isTerminalCapturePhase,
 } = lifecycle;
 
-if (mutant === 'erase-from-sent') {
-  captureTransitionHooks.push((state, event) => {
-    if (state.phase === 'sent' && event.type === 'erase') {
-      return {
-        state: { ...state, phase: 'erased', wePaused: false, pauseConfirmed: false },
-        effects: [{ type: 'erase' }],
-      };
-    }
-    return null;
-  });
-} else if (mutant) {
+// Test-only mutant. The product table has no hook, and this wrapper is not
+// part of the extension bundle (the build entry is src/background/index.ts).
+function applyCaptureTransition(state, event) {
+  if (mutant === 'erase-from-sent' && state.phase === 'sent' && event.type === 'erase') {
+    return {
+      state: { ...state, phase: 'erased', wePaused: false, pauseConfirmed: false },
+      effects: [{ type: 'erase' }],
+    };
+  }
+  return applyRealTransition(state, event);
+}
+
+if (mutant && mutant !== 'erase-from-sent') {
   console.error(`unknown CAPTURE_MODEL_MUTANT=${mutant}`);
   process.exit(1);
 }
@@ -114,7 +115,7 @@ events.push({ type: 'hydrate' }, { type: 'hold-lost' }, { type: 'duplicate' });
 
 function edgeViolation(prev, result) {
   const erase = result.effects.some((effect) => effect.type === 'erase');
-  if (erase && (prev.phase !== 'accepted' || prev.browserCompleted)) {
+  if (erase && prev.phase !== 'accepted') {
     return `erase from ${prev.phase} browserCompleted=${prev.browserCompleted}`;
   }
   const send = result.effects.some((effect) => effect.type === 'send');
@@ -129,6 +130,7 @@ function edgeViolation(prev, result) {
     result.state.phase === 'accepted'
     && prev.phase !== 'accepted'
     && (prev.browserCompleted || result.state.browserCompleted)
+    && prev.sendCount < 1
   ) {
     return 'accepted after the browser completed';
   }
@@ -144,8 +146,62 @@ function edgeViolation(prev, result) {
 function finishes(state) {
   if (!isTerminalCapturePhase(state.phase)) return false;
   if (state.wePaused) return false;
-  if (state.phase === 'erased') return !state.browserCompleted;
   return true;
+}
+
+function assertSendThenCompleteThenAccept() {
+  const steps = [
+    { type: 'on-created', intent: 'pause', eligible: true, familyAccepted: false, wait: [] },
+    { type: 'pause-ok' },
+    { type: 'browser-complete' },
+    { type: 'host-reply', outcome: 'accept' },
+    { type: 'erase' },
+  ];
+  let state = initialCaptureLifecycle();
+  const seen = [];
+  for (const event of steps) {
+    const result = applyCaptureTransition(state, event);
+    seen.push({
+      event: event.type,
+      phase: result.state.phase,
+      browserCompleted: result.state.browserCompleted,
+      sendCount: result.state.sendCount,
+      effects: result.effects.map((effect) => effect.type),
+    });
+    state = result.state;
+  }
+  const afterSend = seen[1];
+  const afterComplete = seen[2];
+  const afterAccept = seen[3];
+  const afterErase = seen[4];
+  if (
+    afterSend.phase !== 'sent'
+    || afterSend.sendCount !== 1
+    || !afterSend.effects.includes('send')
+    || afterComplete.phase !== 'sent'
+    || afterComplete.browserCompleted !== true
+    || afterComplete.sendCount !== 1
+    || afterAccept.phase !== 'accepted'
+    || afterAccept.sendCount !== 1
+    || afterAccept.browserCompleted !== true
+    || !afterErase.effects.includes('erase')
+  ) {
+    console.error('COUNTEREXAMPLE send delivered, then browser-complete, then accept');
+    for (const row of seen) console.error(JSON.stringify(row));
+    process.exit(1);
+  }
+  let before = initialCaptureLifecycle();
+  before = applyCaptureTransition(before, steps[0]).state;
+  const completedFirst = applyCaptureTransition(before, { type: 'browser-complete' });
+  if (
+    completedFirst.state.phase !== 'completed-by-browser'
+    || completedFirst.state.sendCount !== 0
+    || completedFirst.effects.some((effect) => effect.type === 'send' || effect.type === 'erase')
+  ) {
+    console.error('COUNTEREXAMPLE complete before send still handed off');
+    console.error(JSON.stringify(completedFirst));
+    process.exit(1);
+  }
 }
 
 const parent = new Map();
@@ -161,6 +217,7 @@ let maxDepth = 0;
 let sawSend = false;
 let sawLegalErase = false;
 let sawCompleteBeforeSend = false;
+let sawAcceptAfterBrowserComplete = false;
 const STATE_CAP = 8000;
 
 function fail(message, key, event) {
@@ -201,6 +258,16 @@ while (queue.length > 0) {
     ) {
       sawCompleteBeforeSend = true;
     }
+    if (
+      event.type === 'host-reply'
+      && event.outcome === 'accept'
+      && current.state.phase === 'sent'
+      && current.state.browserCompleted
+      && current.state.sendCount >= 1
+      && result.state.phase === 'accepted'
+    ) {
+      sawAcceptAfterBrowserComplete = true;
+    }
     if (!states.has(nextKey)) {
       if (states.size >= STATE_CAP) {
         console.error(`COUNTEREXAMPLE state explosion at ${states.size}`);
@@ -227,6 +294,12 @@ for (const [key, state] of states) {
   if (!progress && !(isTerminalCapturePhase(state.phase) && !state.wePaused)) {
     fail(`sink with no progress phase=${state.phase} wePaused=${state.wePaused}`, key, { type: 'duplicate' });
   }
+  if (state.phase === 'accepted' && state.browserCompleted && state.sendCount >= 1) {
+    const erased = applyCaptureTransition(state, { type: 'erase' });
+    if (!erased.effects.some((effect) => effect.type === 'erase')) {
+      fail('accepted browser copy was not erased', key, { type: 'erase' });
+    }
+  }
   if (state.wePaused && !finishes(state)) {
     let escape = false;
     const seen = new Set([key]);
@@ -250,10 +323,12 @@ for (const [key, state] of states) {
   }
 }
 
-if (!sawSend || !sawLegalErase || !sawCompleteBeforeSend) {
-  console.error(`COUNTEREXAMPLE vacuous sawSend=${sawSend} sawLegalErase=${sawLegalErase} sawCompleteBeforeSend=${sawCompleteBeforeSend}`);
+if (!sawSend || !sawLegalErase || !sawCompleteBeforeSend || !sawAcceptAfterBrowserComplete) {
+  console.error(`COUNTEREXAMPLE vacuous sawSend=${sawSend} sawLegalErase=${sawLegalErase} sawCompleteBeforeSend=${sawCompleteBeforeSend} sawAcceptAfterBrowserComplete=${sawAcceptAfterBrowserComplete}`);
   process.exit(1);
 }
+
+assertSendThenCompleteThenAccept();
 
 console.log(`states explored=${states.size} bound=${maxDepth} events=${events.length}`);
 console.log('MODEL-CHECK OK');
@@ -264,13 +339,13 @@ if (!mutant) {
     encoding: 'utf8',
   });
   const output = `${child.stdout || ''}${child.stderr || ''}`;
-  if (child.status === 0 || !output.includes('COUNTEREXAMPLE')) {
+  const counter = output.split('\n').find((line) => line.startsWith('COUNTEREXAMPLE'));
+  if (child.status === 0 || !counter || !counter.startsWith('COUNTEREXAMPLE erase from sent')) {
     console.error(`mutant erase-from-sent was not detected status=${child.status}`);
     console.error(output);
     process.exit(1);
   }
   console.log(`MUTANT erase-from-sent exit=${child.status}`);
-  const counter = output.split('\n').find((line) => line.startsWith('COUNTEREXAMPLE'));
   console.log(counter);
 }
 

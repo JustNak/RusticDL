@@ -124,6 +124,27 @@ export async function launchExtensionContext({
       await session.send('Browser.setDownloadBehavior', { ...params, browserContextId });
     }
   }
+  const cpuRate = Number(process.env.EXT_CPU_THROTTLE_RATE || '0');
+  if (Number.isFinite(cpuRate) && cpuRate >= 4) {
+    const throttle = async (target, label) => {
+      try {
+        const cdp = await context.newCDPSession(target);
+        await cdp.send('Emulation.setCPUThrottlingRate', { rate: cpuRate });
+        console.log(`CPU_THROTTLE label=${label} rate=${cpuRate} ok`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`CPU_THROTTLE label=${label} rate=${cpuRate} fail=${message}`);
+      }
+    };
+    context.on('page', (page) => {
+      void throttle(page, 'page');
+    });
+    context.on('serviceworker', (worker) => {
+      void throttle(worker, 'serviceworker');
+    });
+    for (const page of context.pages()) void throttle(page, 'page');
+    for (const worker of context.serviceWorkers()) void throttle(worker, 'serviceworker');
+  }
   return {
     context,
     browserVersion: browser?.version() ?? 'unknown',

@@ -2,13 +2,21 @@
  * Chromium download-capture hand-off as one transition table.
  *
  * Raw Chrome for Testing 156 (Playwright chromium-1248), measured by
- * e2e/raw-chrome-pause-determining.mjs: pause() inside onCreated does not
- * suppress onDeterminingFilename (`app.zip`, createdToDeterminingMs 0–1).
- * A 64 KiB body that is already fully received still reaches `complete`
- * about 1668 ms later with `paused === true`. Under Playwright the same
- * binary completes about 8 ms after pause, because the profile disables
- * safebrowsing downloads. Send only after a search shows `in_progress`
- * and `paused`, and never after `complete`.
+ * `node e2e/raw-chrome-pause-determining.mjs` (Chrome 156.0.8078.4):
+ * arm=pause determining=true filename=app.zip createdToDeterminingMs=1
+ * createdToCompleteMs=1653 pauseError=ok. One `paused:true` onChanged
+ * follows that pause. pause() does not suppress onDeterminingFilename.
+ * The open arm on the same run completed in 2603 ms. A fully received
+ * 64 KiB body still reaches `complete` while `paused` stays true.
+ * Under the Playwright harness the same body can complete about 8 ms
+ * after pause, because that profile disables safebrowsing downloads.
+ *
+ * Send only after a search shows `in_progress` and `paused`. Never send
+ * once the browser completed before that send. If the shelf reaches
+ * `complete` after the send was delivered, a host accept still erases
+ * the row and removeFile deletes the finished copy. Reject, dismiss,
+ * disconnect, and timeout leave a complete file and resume only when
+ * this machine still holds a pause and the item is not complete.
  *
  * Erase/cancel effects are produced only from phase `accepted`.
  * The downloads.pause/resume/cancel/removeFile/erase calls live in this file.
@@ -102,11 +110,6 @@ export function initialCaptureLifecycle(): CaptureLifecycle {
   };
 }
 
-/** Test/mutant seam. A hook that returns a result replaces the table for that event. */
-export const captureTransitionHooks: Array<
-  (state: CaptureLifecycle, event: CaptureEvent) => CaptureTransitionResult | null
-> = [];
-
 const captureTransitionTrace: string[] = [];
 
 export function readCaptureTransitionTrace(): readonly string[] {
@@ -115,10 +118,6 @@ export function readCaptureTransitionTrace(): readonly string[] {
 
 export function resetCaptureTransitionTrace(): void {
   captureTransitionTrace.length = 0;
-}
-
-export function resetCaptureTransitionHooks(): void {
-  captureTransitionHooks.length = 0;
 }
 
 export function isTerminalCapturePhase(phase: CapturePhase): boolean {
@@ -277,6 +276,9 @@ function onCreated(state: CaptureLifecycle, event: Extract<CaptureEvent, { type:
 }
 
 function pauseOk(state: CaptureLifecycle): CaptureTransitionResult {
+  if (state.phase === 'sent' || state.phase === 'accepted') {
+    return noop({ ...state, pauseConfirmed: true, wePaused: true });
+  }
   if (state.browserCompleted || state.phase === 'completed-by-browser') {
     return {
       state: { ...state, phase: 'completed-by-browser', browserCompleted: true, wePaused: false, pauseConfirmed: false },
@@ -284,9 +286,6 @@ function pauseOk(state: CaptureLifecycle): CaptureTransitionResult {
     };
   }
   if (isTerminalCapturePhase(state.phase)) return noop(state);
-  if (state.phase === 'accepted' || state.phase === 'sent') {
-    return noop({ ...state, pauseConfirmed: true, wePaused: true });
-  }
   const held: CaptureLifecycle = {
     ...state,
     pauseConfirmed: true,
@@ -302,7 +301,9 @@ function pauseOk(state: CaptureLifecycle): CaptureTransitionResult {
 }
 
 function hostReply(state: CaptureLifecycle, outcome: 'accept' | 'reject' | 'dismiss' | 'disconnect'): CaptureTransitionResult {
-  if (state.phase !== 'sent' || state.browserCompleted || state.sendCount < 1) {
+  // browserCompleted stays legal here: the shelf can finish during the host
+  // wait after the send was delivered. sendCount === 0 still cannot accept.
+  if (state.phase !== 'sent' || state.sendCount < 1) {
     if (isTerminalCapturePhase(state.phase)) return noop(state);
     return failClosed(state, { type: 'host-reply', outcome });
   }
@@ -323,19 +324,12 @@ function hostReply(state: CaptureLifecycle, outcome: 'accept' | 'reject' | 'dism
   }
 }
 
-/**
- * `(state, event) -> next state + effects`.
- * Hooks run first so a model mutant can add an edge in memory.
- */
+/** `(state, event) -> next state + effects`. */
 export function applyCaptureTransition(
   state: CaptureLifecycle,
   event: CaptureEvent,
 ): CaptureTransitionResult {
   captureTransitionTrace.push(event.type);
-  for (const hook of captureTransitionHooks) {
-    const hooked = hook(state, event);
-    if (hooked) return hooked;
-  }
   return captureTransition(state, event);
 }
 
@@ -360,6 +354,11 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
       };
     case 'browser-complete':
       if (state.phase === 'erased') return noop({ ...state, browserCompleted: true });
+      // The send already reached the host. Stay in sent/accepted so its reply
+      // can erase the browser copy, including a file that is already complete.
+      if ((state.phase === 'sent' || state.phase === 'accepted') && state.sendCount >= 1) {
+        return noop({ ...state, browserCompleted: true });
+      }
       return {
         state: {
           ...state,
@@ -434,7 +433,7 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
     case 'host-reply':
       return hostReply(state, event.outcome);
     case 'erase':
-      if (state.phase === 'accepted' && !state.browserCompleted) {
+      if (state.phase === 'accepted') {
         return { state, effects: [{ type: 'erase' }] };
       }
       if (isTerminalCapturePhase(state.phase)) return noop(state);
@@ -467,9 +466,14 @@ function captureTransition(state: CaptureLifecycle, event: CaptureEvent): Captur
         }
       }
     case 'hydrate':
-      if (state.sendCount > 0 || state.phase === 'sent' || state.phase === 'accepted' || state.phase === 'erased') {
-        return noop(state);
+      if (state.phase === 'erased') return noop(state);
+      if (state.phase === 'accepted') return noop(state);
+      if (state.phase === 'sent') {
+        // The worker died with the host port. Do not send again. Resume only
+        // when the shelf item is still incomplete (releaseHold checks that).
+        return releaseHold(state, 'rejected');
       }
+      if (state.sendCount > 0) return noop(state);
       if (state.phase === 'pausing') return { state, effects: [{ type: 'pause' }] };
       if (state.role === 'ghost' && state.familyAccepted && !isTerminalCapturePhase(state.phase)) {
         return { state: { ...state, phase: 'accepted' }, effects: [] };
@@ -510,7 +514,10 @@ export async function resumeDownload(id: number): Promise<void> {
   await browser.downloads.resume(id);
 }
 
-/** Cancel, delete the partial file, and erase the shelf row. True when erase removed it. */
+/**
+ * Cancel, delete the shelf file (removeFile covers a row that already
+ * reached complete), and erase the history row. True when erase removed it.
+ */
 export async function eraseDownload(id: number): Promise<boolean> {
   try {
     await browser.downloads.cancel(id);
