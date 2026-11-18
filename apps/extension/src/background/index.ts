@@ -23,6 +23,7 @@ import {
 import {
   getChromiumDeterminingFilenameApi,
   getChromiumWebRequest,
+  REQUEST_AUTH_TYPES,
 } from './chromiumCapture';
 import {
   getFirefoxBlockingWebRequest,
@@ -48,6 +49,7 @@ import {
   updatePopupState,
 } from './state';
 import type { PopupRequest, PopupStateResponse } from '../shared/messages';
+import { isPopupRequest, isTrustedPopupSender } from './messageGuard';
 
 const CONTEXT_MENU_ID = 'download-with-rusticdl';
 /** Periodic desktop connection / queue badge refresh (not appearance sync). */
@@ -216,7 +218,11 @@ function registerChromiumFilenameHints(): void {
     ['responseHeaders'],
   );
   if (webRequest?.onBeforeSendHeaders) {
-    const filter = { urls: ['http://*/*', 'https://*/*'] };
+    // Download navigations only: never observe page XHR/fetch API tokens.
+    const filter = {
+      urls: ['http://*/*', 'https://*/*'],
+      types: [...REQUEST_AUTH_TYPES],
+    };
     try {
       webRequest.onBeforeSendHeaders.addListener(
         onChromiumBeforeSendHeaders,
@@ -360,7 +366,11 @@ function registerDownloadCaptureListeners(
   }
 }
 
-browser.runtime.onMessage.addListener((message: PopupRequest) => {
+browser.runtime.onMessage.addListener((message: unknown, sender) => {
+  if (!isTrustedPopupSender(sender, browser.runtime.id, browser.runtime.getURL(''))) {
+    return undefined;
+  }
+  if (!isPopupRequest(message)) return undefined;
   return handlePopupMessage(message);
 });
 

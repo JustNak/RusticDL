@@ -649,3 +649,80 @@ export function urlIsClaimed(
   }
   return false;
 }
+
+function isIpLiteralHost(host: string): boolean {
+  return host.includes(':') || host.startsWith('[') || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+}
+
+/**
+ * Conservative same-site test for cookie scoping (no public-suffix list).
+ * Schemeful; hosts must match or be a parent/child domain. Sibling subdomains
+ * (`www.a.com` vs `dl.a.com`) count as cross-site, which only drops
+ * SameSite=Strict cookies on a navigation — never sends extra ones.
+ */
+export function isSameSiteForCookies(
+  targetUrl: string | undefined,
+  initiatorUrl: string | undefined,
+): boolean {
+  if (!targetUrl || !initiatorUrl) return false;
+  try {
+    const target = new URL(targetUrl);
+    const initiator = new URL(initiatorUrl);
+    if (target.protocol !== initiator.protocol) return false;
+    const a = target.hostname.toLowerCase();
+    const b = initiator.hostname.toLowerCase();
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (isIpLiteralHost(a) || isIpLiteralHost(b)) return false;
+    return a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+  } catch {
+    return false;
+  }
+}
+
+export type HandoffCookieLike = { name: string; value: string; sameSite?: string };
+
+/**
+ * Mirror the browser's SameSite rules before replaying cookies from the
+ * desktop app. Without this, any page could make RusticDL send Strict/Lax
+ * session cookies for another site (a SameSite bypass / CSRF primitive).
+ */
+export function cookieAllowedForHandoff(
+  cookie: HandoffCookieLike,
+  ctx: { sameSite: boolean; topLevelNavigation: boolean; unspecifiedIsLax: boolean },
+): boolean {
+  if (ctx.sameSite) return true;
+  const mode = (cookie.sameSite ?? 'unspecified').toLowerCase();
+  if (mode === 'no_restriction' || mode === 'none') return true;
+  if (mode === 'strict') return false;
+  const laxLike = mode === 'lax' || ctx.unspecifiedIsLax;
+  if (!laxLike) return true;
+  return ctx.topLevelNavigation;
+}
+
+/**
+ * Referer the browser itself would send under the default
+ * `strict-origin-when-cross-origin` policy: full URL same-origin, origin only
+ * cross-origin, nothing on an https → http downgrade.
+ */
+export function handoffReferrer(
+  targetUrl: string,
+  referrer: string | undefined,
+): string | undefined {
+  if (!referrer) return undefined;
+  let target: URL;
+  let source: URL;
+  try {
+    target = new URL(targetUrl);
+    source = new URL(referrer);
+  } catch {
+    return undefined;
+  }
+  if (source.protocol !== 'http:' && source.protocol !== 'https:') return undefined;
+  if (source.protocol === 'https:' && target.protocol !== 'https:') return undefined;
+  source.hash = '';
+  source.username = '';
+  source.password = '';
+  if (source.origin === target.origin) return source.href;
+  return `${source.origin}/`;
+}

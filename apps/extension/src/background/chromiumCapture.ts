@@ -31,8 +31,17 @@ export type ChromiumHeadersReceivedDetails = {
 
 export type ChromiumBeforeSendHeadersDetails = {
   url: string;
+  tabId?: number;
+  type?: string;
   requestHeaders?: Array<{ name: string; value?: string }>;
 };
+
+/**
+ * Request types whose auth can belong to a download. XHR / fetch / script
+ * Authorization headers are page API tokens, not file transfers; never keep
+ * them.
+ */
+export const REQUEST_AUTH_TYPES = ['main_frame', 'sub_frame', 'other'] as const;
 
 export type CapturedOriginAuth = {
   origin: string;
@@ -51,8 +60,33 @@ type SuggestFn = (suggestion?: { filename?: string }) => void;
 const filenameHints = new Map<string, FilenameHint>();
 const determinedFilenames = new Map<number, { filename: string; ts: number }>();
 const REQUEST_AUTH_NAMES = new Set(['cookie', 'authorization']);
-const requestAuthByUrl = new Map<string, CapturedOriginAuth & { ts: number }>();
-const requestAuthByOrigin = new Map<string, CapturedOriginAuth & { ts: number }>();
+type StoredRequestAuth = CapturedOriginAuth & {
+  ts: number;
+  /** Resolved from the tab; undefined while unknown (no tab / lookup failed). */
+  incognito?: boolean;
+};
+const requestAuthByUrl = new Map<string, StoredRequestAuth>();
+const requestAuthByOrigin = new Map<string, StoredRequestAuth>();
+
+type TabIncognitoResolver = (tabId: number) => Promise<boolean | undefined>;
+
+let resolveTabIncognito: TabIncognitoResolver = async (tabId) => {
+  const tabs = (browser as unknown as {
+    tabs?: { get(id: number): Promise<{ incognito?: boolean }> };
+  }).tabs;
+  if (!tabs?.get) return undefined;
+  const tab = await tabs.get(tabId);
+  return tab?.incognito;
+};
+
+export function setTabIncognitoResolverForTests(resolver: TabIncognitoResolver): void {
+  resolveTabIncognito = resolver;
+}
+
+export function resetRequestAuthForTests(): void {
+  requestAuthByUrl.clear();
+  requestAuthByOrigin.clear();
+}
 
 function headerValue(
   headers: ChromiumHeadersReceivedDetails['responseHeaders'],
@@ -93,26 +127,57 @@ export function rememberRequestAuth(
 ): CapturedOriginAuth | undefined {
   const origin = httpOrigin(details.url);
   if (!origin) return undefined;
+  const type = details.type?.toLowerCase();
+  if (type && !(REQUEST_AUTH_TYPES as readonly string[]).includes(type)) return undefined;
   const headers = (details.requestHeaders ?? [])
     .filter((header) => REQUEST_AUTH_NAMES.has(header.name.toLowerCase()) && header.value)
     .map((header) => ({ name: header.name, value: header.value as string }));
   if (headers.length === 0) return undefined;
-  const captured: CapturedOriginAuth & { ts: number } = { origin, headers, ts: Date.now() };
+  const captured: StoredRequestAuth = { origin, headers, ts: Date.now() };
   pruneFilenameHints(captured.ts);
   requestAuthByUrl.set(normalizeCaptureUrl(details.url), captured);
   requestAuthByOrigin.set(origin, captured);
+  // One service worker serves normal + incognito tabs (spanning mode). Tag
+  // the entry so a private session's auth never replays for a normal-profile
+  // download, or the reverse.
+  if (typeof details.tabId === 'number' && details.tabId >= 0) {
+    void resolveTabIncognito(details.tabId).then(
+      (incognito) => {
+        captured.incognito = incognito;
+      },
+      () => {
+        // tab closed — leave unknown
+      },
+    );
+  }
   return { origin, headers };
 }
 
-export function lookupOriginAuth(urls: Array<string | undefined>): CapturedOriginAuth[] {
+/**
+ * Entries with an unknown profile only serve normal-profile downloads; a
+ * private download only takes auth proven to come from a private tab.
+ */
+function requestAuthMatchesProfile(entry: StoredRequestAuth, incognito: boolean): boolean {
+  if (entry.incognito === undefined) return !incognito;
+  return entry.incognito === incognito;
+}
+
+export function lookupOriginAuth(
+  urls: Array<string | undefined>,
+  options: { incognito?: boolean } = {},
+): CapturedOriginAuth[] {
   pruneFilenameHints();
+  const incognito = options.incognito === true;
   const byOrigin = new Map<string, CapturedOriginAuth['headers']>();
   for (const url of urls) {
     if (!url) continue;
     const fromUrl = requestAuthByUrl.get(normalizeCaptureUrl(url));
     const origin = httpOrigin(url);
     const fromOrigin = origin ? requestAuthByOrigin.get(origin) : undefined;
-    const hit = fromUrl ?? fromOrigin;
+    const hit = [fromUrl, fromOrigin].find(
+      (entry): entry is StoredRequestAuth =>
+        Boolean(entry && requestAuthMatchesProfile(entry, incognito)),
+    );
     if (!hit || byOrigin.has(hit.origin)) continue;
     byOrigin.set(hit.origin, hit.headers);
   }
@@ -198,7 +263,7 @@ type ChromiumWebRequestApi = {
   onBeforeSendHeaders?: {
     addListener(
       listener: (details: ChromiumBeforeSendHeadersDetails) => void,
-      filter: { urls: string[] },
+      filter: { urls: string[]; types?: string[] },
       extraInfoSpec: string[],
     ): void;
   };

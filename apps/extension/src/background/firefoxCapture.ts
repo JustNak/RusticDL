@@ -49,6 +49,11 @@ export type FirefoxCaptureCandidate = {
   referrer?: string;
   incognito?: boolean;
   cookieStoreId?: string;
+  /**
+   * main_frame only. Subresource / XHR / plugin captures replay cookies
+   * under cross-site SameSite rules (no Lax/Strict from a foreign page).
+   */
+  topLevelNavigation: boolean;
   reason: string;
 };
 
@@ -402,6 +407,7 @@ export function firefoxWebRequestDownloadCandidate(
     referrer: details.originUrl || details.documentUrl,
     incognito: details.incognito,
     cookieStoreId: details.cookieStoreId,
+    topLevelNavigation: isMainFrame,
     reason,
   };
 }
@@ -497,6 +503,7 @@ export function firefoxBeforeRequestDownloadCandidate(
     referrer: details.originUrl || details.documentUrl,
     incognito: details.incognito,
     cookieStoreId: details.cookieStoreId,
+    topLevelNavigation: (details.type ?? '').toLowerCase() === 'main_frame',
     reason: 'file_host_cdn_url',
   };
 }
