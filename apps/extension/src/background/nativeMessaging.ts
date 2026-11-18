@@ -17,9 +17,12 @@ import {
   type RequestSource,
 } from '@rusticdl/protocol';
 import {
+  cookieAllowedForHandoff,
   cookieStoreIdForHandoff,
   cookieUrlsForHandoff,
+  handoffReferrer,
   httpOrigin,
+  isSameSiteForCookies,
 } from './captureFilter';
 import browser from './browser';
 import type { PopupStateResponse } from '../shared/messages';
@@ -224,6 +227,14 @@ function mergeOriginHeaders(
  *
  * Collect cookies for every origin on the capture (Canvas file URL and the
  * Drive/Inst-FS hop). Do not log header values.
+ *
+ * Security:
+ * - Cookies come only from the download's own cookie store. An incognito or
+ *   container download never falls back to the default store.
+ * - SameSite is enforced against the initiating page, as the browser would:
+ *   a cross-site page cannot make the desktop app send Strict (or, for
+ *   non-navigation fetches, Lax) cookies for another site.
+ * - Referer is trimmed to the origin cross-origin and dropped on downgrade.
  */
 export async function collectHandoffAuth(
   url: string,
@@ -234,6 +245,13 @@ export async function collectHandoffAuth(
     incognito?: boolean;
     cookieStoreId?: string;
     originAuth?: OriginHandoffAuth[];
+    /** Page that started the request; defaults to referrer, then pageUrl. */
+    initiatorUrl?: string;
+    /**
+     * True for top-level navigations and explicit user saves (downloads,
+     * context menu). False for subresource / XHR captures. Default true.
+     */
+    topLevelNavigation?: boolean;
   } = {},
 ): Promise<DownloadRequestMetadata['handoffAuth']> {
   const headers: HandoffAuthHeader[] = [];
@@ -245,6 +263,11 @@ export async function collectHandoffAuth(
     mergeOriginHeaders(byOrigin, origin, entry.headers);
   }
 
+  const initiatorUrl = extra.initiatorUrl ?? extra.referrer ?? extra.pageUrl;
+  const topLevelNavigation = extra.topLevelNavigation ?? true;
+  // Chromium treats SameSite-unspecified as Lax; Firefox (default prefs) as None.
+  const unspecifiedIsLax = detectBrowser() !== 'firefox';
+
   try {
     let storeId = extra.cookieStoreId;
     if (!storeId) {
@@ -255,23 +278,28 @@ export async function collectHandoffAuth(
         // Chromium may omit getAllCookieStores in some contexts.
       }
     }
-    for (const cookieUrl of cookieUrlsForHandoff([
-      url,
-      extra.finalUrl,
-      extra.referrer,
-      extra.pageUrl,
-    ])) {
-      let cookies = await browser.cookies.getAll(storeId ? { url: cookieUrl, storeId } : { url: cookieUrl });
-      // Chromium MV3 can return [] when storeId is guessed ("0"). Retry unbound.
-      if (cookies.length === 0 && storeId) {
-        cookies = await browser.cookies.getAll({ url: cookieUrl });
-      }
-      if (cookies.length === 0) continue;
+    // A private download with no resolvable private store must not read the
+    // default store: that would replay normal-profile cookies.
+    const skipCookies = extra.incognito === true && !storeId;
+    const cookieUrls = skipCookies
+      ? []
+      : cookieUrlsForHandoff([url, extra.finalUrl, extra.referrer, extra.pageUrl]);
+    for (const cookieUrl of cookieUrls) {
+      // Never retry unbound when a store is pinned: that silently switches to
+      // the default profile / container.
+      const cookies = await browser.cookies.getAll(
+        storeId ? { url: cookieUrl, storeId } : { url: cookieUrl },
+      );
+      const sameSite = isSameSiteForCookies(cookieUrl, initiatorUrl);
+      const allowed = cookies.filter((cookie) =>
+        cookieAllowedForHandoff(cookie, { sameSite, topLevelNavigation, unspecifiedIsLax }),
+      );
+      if (allowed.length === 0) continue;
       const origin = httpOrigin(cookieUrl);
       if (!origin) continue;
       mergeOriginHeaders(byOrigin, origin, [{
         name: 'Cookie',
-        value: cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
+        value: allowed.map((cookie) => `${cookie.name}=${cookie.value}`).join('; '),
       }]);
     }
   } catch {
@@ -286,14 +314,10 @@ export async function collectHandoffAuth(
     headers.push(primaryCookie);
   }
 
-  const referrer = extra.referrer || extra.pageUrl;
+  const referrer = handoffReferrer(url, extra.referrer || extra.pageUrl);
   if (referrer) {
     headers.push({ name: 'Referer', value: referrer });
-    try {
-      headers.push({ name: 'Origin', value: new URL(referrer).origin });
-    } catch {
-      // ignore invalid referrer
-    }
+    headers.push({ name: 'Origin', value: new URL(referrer).origin });
   }
 
   if (typeof navigator !== 'undefined' && navigator.userAgent) {

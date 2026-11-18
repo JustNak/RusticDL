@@ -344,12 +344,43 @@ function classifyHandoffResponse(response: HostToExtensionResponse): HandoffOutc
   }
 }
 
-async function restoreBrowserDownload(snapshot: {
+type RestoreSnapshot = {
   url: string;
   filename?: string;
   relatedUrl?: string;
   sessionId?: string;
-}): Promise<void> {
+  incognito?: boolean;
+  cookieStoreId?: string;
+};
+
+/**
+ * Options that re-download in the same profile / container the capture came
+ * from. `null` means the browser cannot target that context, so restoring
+ * would leak a private download into the normal profile (history, cookies).
+ */
+export function restoreDownloadOptions(
+  snapshot: RestoreSnapshot,
+  isFirefox: boolean,
+): { url: string; filename?: string; incognito?: boolean; cookieStoreId?: string } | null {
+  const options: { url: string; filename?: string; incognito?: boolean; cookieStoreId?: string } = {
+    url: snapshot.url,
+  };
+  const name = snapshot.filename?.split(/[\\/]/).pop();
+  if (name && !/[\\/:]/.test(name)) {
+    options.filename = name;
+  }
+  if (isFirefox) {
+    if (snapshot.incognito) options.incognito = true;
+    if (snapshot.cookieStoreId) options.cookieStoreId = snapshot.cookieStoreId;
+    return options;
+  }
+  // Chromium downloads.download has no incognito target: it always lands in
+  // the regular profile from a spanning worker.
+  if (snapshot.incognito) return null;
+  return options;
+}
+
+async function restoreBrowserDownload(snapshot: RestoreSnapshot): Promise<void> {
   const probe: CaptureFamilyProbe = {
     urls: [snapshot.url, snapshot.relatedUrl],
     filename: snapshot.filename,
@@ -371,13 +402,13 @@ async function restoreBrowserDownload(snapshot: {
   }
   persistSessions();
 
+  const options = restoreDownloadOptions(
+    snapshot,
+    navigator.userAgent.toLowerCase().includes('firefox'),
+  );
+  if (!options) return;
   try {
-    const options: { url: string; filename?: string } = { url: snapshot.url };
-    const name = snapshot.filename?.split(/[\\/]/).pop();
-    if (name && !/[\\/:]/.test(name)) {
-      options.filename = name;
-    }
-    await browser.downloads.download(options);
+    await browser.downloads.download(options as Parameters<typeof browser.downloads.download>[0]);
   } catch {
     // Leave the restoring session so a site retry cannot reopen the prompt.
   }
@@ -396,6 +427,8 @@ async function handOffUrl(
     filename?: string;
     requestId?: string;
     sessionId?: string;
+    initiatorUrl?: string;
+    topLevelNavigation?: boolean;
   } = {},
 ): Promise<HandoffAttempt> {
   const probe: CaptureFamilyProbe = {
@@ -438,7 +471,12 @@ async function handOffUrl(
     finalUrl: extra.finalUrl,
     incognito: extra.incognito,
     cookieStoreId: extra.cookieStoreId,
-    originAuth: lookupOriginAuth([url, extra.finalUrl, extra.pageUrl, extra.referrer]),
+    initiatorUrl: extra.initiatorUrl,
+    topLevelNavigation: extra.topLevelNavigation,
+    originAuth: lookupOriginAuth(
+      [url, extra.finalUrl, extra.pageUrl, extra.referrer],
+      { incognito: extra.incognito },
+    ),
   });
   const response = await handoffDownload(url, source, settings.downloadHandoffMode, {
     ...metadata,
@@ -504,12 +542,17 @@ async function handoffBrowserDownload(
     finalUrl: item.finalUrl,
     filename: suggestedFilename,
     sessionId,
+    initiatorUrl: item.referrer,
+    // A shelf download is a navigation (link, <a download>, form GET).
+    topLevelNavigation: true,
   });
 
   await restoreIfHandoffRejected(attempt, {
     url,
     filename: suggestedFilename,
     sessionId,
+    incognito: item.incognito,
+    cookieStoreId: item.cookieStoreId,
   });
 }
 
@@ -798,12 +841,7 @@ export function onChromiumDeterminingFilename(
 
 async function restoreIfHandoffRejected(
   attempt: HandoffAttempt,
-  snapshot: {
-    url: string;
-    filename?: string;
-    relatedUrl?: string;
-    sessionId?: string;
-  },
+  snapshot: RestoreSnapshot,
 ): Promise<void> {
   switch (attempt) {
     case 'accepted':
@@ -840,12 +878,16 @@ async function handoffFirefoxCandidate(
     filename: candidate.filename,
     requestId,
     sessionId,
+    initiatorUrl: candidate.referrer,
+    topLevelNavigation: candidate.topLevelNavigation,
   });
   await restoreIfHandoffRejected(attempt, {
     url,
     filename: candidate.filename,
     relatedUrl: candidate.url !== url ? candidate.url : undefined,
     sessionId,
+    incognito: candidate.incognito,
+    cookieStoreId: candidate.cookieStoreId,
   });
 }
 
@@ -962,6 +1004,8 @@ function replayQueuedFirefoxHandoff(
         url: event.candidate.url,
         filename: event.candidate.filename,
         sessionId: existing?.id,
+        incognito: event.candidate.incognito,
+        cookieStoreId: event.candidate.cookieStoreId,
       });
       return;
     case 'handoff':
